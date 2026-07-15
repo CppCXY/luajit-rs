@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+]
+
+[workspace.dependencies]
+luajit_rs = { path = "crates/luajit_rs", version = "0.1.0" }
