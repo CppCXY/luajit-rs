@@ -1,33 +1,9 @@
-use std::collections::HashMap;
 use std::panic::panic_any;
 
-pub type StrId = u32;
+pub use crate::string::{Interner, StrId};
 
 #[derive(Debug)]
 pub struct CompileError(pub String);
-
-#[derive(Default)]
-pub struct Interner {
-    map: HashMap<Box<[u8]>, StrId>,
-    vec: Vec<Box<[u8]>>,
-}
-
-impl Interner {
-    pub fn intern(&mut self, s: &[u8]) -> StrId {
-        if let Some(&id) = self.map.get(s) {
-            return id;
-        }
-        let id = self.vec.len() as StrId;
-        let b: Box<[u8]> = s.into();
-        self.vec.push(b.clone());
-        self.map.insert(b, id);
-        id
-    }
-
-    pub fn get(&self, id: StrId) -> &[u8] {
-        &self.vec[id as usize]
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tok {

@@ -1780,7 +1780,7 @@ impl Parser {
                 _ => LuaValue::TRUE,
             }
         } else if e.k == VKStr {
-            LuaValue::string(e.sval)
+            LuaValue::string(self.ls.strs.lookup(e.sval))
         } else {
             debug_assert!(e.k == VKNum);
             LuaValue::number(e.nval)

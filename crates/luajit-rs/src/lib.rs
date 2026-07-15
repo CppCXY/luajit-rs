@@ -3,6 +3,7 @@ pub mod dump;
 pub mod lex;
 pub mod parse;
 pub mod proto;
+pub mod string;
 pub mod strscan;
 pub mod table;
 pub mod value;
