@@ -2,11 +2,14 @@ pub mod bc;
 pub mod dump;
 pub mod lex;
 pub mod parse;
+pub mod proto;
 pub mod strscan;
+pub mod table;
+pub mod value;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-pub fn compile(src: Vec<u8>, chunkname: &str) -> Result<(parse::Proto, lex::Interner), String> {
+pub fn compile(src: Vec<u8>, chunkname: &str) -> Result<(proto::Proto, lex::Interner), String> {
     let name = chunkname.to_string();
     let result = catch_unwind(AssertUnwindSafe(move || {
         let parser = parse::Parser::new(src, name);

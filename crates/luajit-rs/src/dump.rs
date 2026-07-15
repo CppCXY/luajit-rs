@@ -1,6 +1,6 @@
 use crate::bc::*;
 use crate::lex::Interner;
-use crate::parse::{KGc, Proto};
+use crate::proto::{KGc, Proto};
 
 fn ctlsub(out: &mut Vec<u8>, b: u8) {
     match b {

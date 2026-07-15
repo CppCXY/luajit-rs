@@ -13,26 +13,166 @@ pub const BCBIAS_J: u32 = 0x8000;
 pub const NO_REG: u32 = BCMAX_A;
 pub const NO_JMP: BCPos = !0;
 
+/// Operand modes for the A/B/C(D) instruction fields.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum BCMode {
     None = 0,
-    Dst,
-    Base,
-    Var,
-    Rbase,
-    Uv,
-    Lit,
-    Lits,
-    Pri,
-    Num,
-    Str,
-    Tab,
-    Func,
-    Jump,
-    Cdata,
+    Dst,   // variable slot number, set by instruction
+    Base,  // base slot number, read-write
+    Var,   // variable slot number, read
+    Rbase, // base slot number, read
+    Uv,    // upvalue number
+    Lit,   // literal
+    Lits,  // signed literal
+    Pri,   // primitive type (~itype)
+    Num,   // number constant, index into kn[]
+    Str,   // string constant, negated index into kgc[]
+    Tab,   // template table, negated index into kgc[]
+    Func,  // prototype, negated index into kgc[]
+    Jump,  // branch target, relative to next instruction, biased with 0x8000
+    Cdata, // cdata constant, negated index into kgc[]
 }
 
+/// Bytecode opcodes. Order matters and must match `bcdef!` below, which is
+/// asserted at compile time. See lj_bc.h for the operand type conventions
+/// encoded in the opcode name suffixes (V = variable, S = string const,
+/// N = number const, P = primitive, B = byte literal, M = multiple).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(u8)]
+pub enum BCOp {
+    // Comparison ops. ORDER OPR.
+    ISLT,
+    ISGE,
+    ISLE,
+    ISGT,
+    ISEQV,
+    ISNEV,
+    ISEQS,
+    ISNES,
+    ISEQN,
+    ISNEN,
+    ISEQP,
+    ISNEP,
+
+    // Unary test and copy ops.
+    ISTC,
+    ISFC,
+    IST,
+    ISF,
+    ISTYPE,
+    ISNUM,
+
+    // Unary ops.
+    MOV,
+    NOT,
+    UNM,
+    LEN,
+
+    // Binary ops. ORDER OPR. VV last, POW must be next.
+    ADDVN,
+    SUBVN,
+    MULVN,
+    DIVVN,
+    MODVN,
+    ADDNV,
+    SUBNV,
+    MULNV,
+    DIVNV,
+    MODNV,
+    ADDVV,
+    SUBVV,
+    MULVV,
+    DIVVV,
+    MODVV,
+    POW,
+    CAT,
+
+    // Constant ops.
+    KSTR,
+    KCDATA,
+    KSHORT,
+    KNUM,
+    KPRI,
+    KNIL,
+
+    // Upvalue and function ops.
+    UGET,
+    USETV,
+    USETS,
+    USETN,
+    USETP,
+    UCLO,
+    FNEW,
+
+    // Table ops.
+    TNEW,
+    TDUP,
+    GGET,
+    GSET,
+    TGETV,
+    TGETS,
+    TGETB,
+    TGETR,
+    TSETV,
+    TSETS,
+    TSETB,
+    TSETM,
+    TSETR,
+
+    // Calls and vararg handling. T = tail call.
+    CALLM,
+    CALL,
+    CALLMT,
+    CALLT,
+    ITERC,
+    ITERN,
+    VARG,
+    ISNEXT,
+
+    // Returns.
+    RETM,
+    RET,
+    RET0,
+    RET1,
+
+    // Loops and branches. I/J = interp/JIT, I/C/L = init/call/loop.
+    FORI,
+    JFORI,
+    FORL,
+    IFORL,
+    JFORL,
+    ITERL,
+    IITERL,
+    JITERL,
+    LOOP,
+    ILOOP,
+    JLOOP,
+    JMP,
+
+    // Bit operators (extension of this fork). ORDER OPR. ORDER BIT.
+    BNOT,
+    BAND,
+    BOR,
+    BXOR,
+    BSHL,
+    BSHR,
+    BSAR,
+
+    // Function headers. I/J = interp/JIT, F/V/C = fixarg/vararg/C func.
+    FUNCF,
+    IFUNCF,
+    JFUNCF,
+    FUNCV,
+    IFUNCV,
+    JFUNCV,
+    FUNCC,
+    FUNCCW,
+}
+
+/// Instruction definition table: (name, mode A, mode B, mode C/D).
+/// Single source of truth for `BC_NAMES`/`BC_MODE`; the opcode order is
+/// checked against the `BCOp` enum at compile time.
 macro_rules! bcdef {
     ($handler:ident) => {
         $handler! {
@@ -144,23 +284,26 @@ macro_rules! bcdef {
     };
 }
 
-macro_rules! bc_enum {
+macro_rules! bc_tables {
     ($(($name:ident, $ma:ident, $mb:ident, $mc:ident),)*) => {
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-        #[repr(u8)]
-        pub enum BCOp {
-            $($name,)*
-        }
-
         pub const BC_NAMES: &[&str] = &[$(stringify!($name),)*];
 
         pub const BC_MODE: &[u16] = &[
             $((BCMode::$ma as u16) | ((BCMode::$mb as u16) << 3) | ((BCMode::$mc as u16) << 7),)*
         ];
+
+        const _: () = {
+            let mut i = 0u8;
+            $(
+                assert!(BCOp::$name as u8 == i);
+                i += 1;
+            )*
+            assert!(i as usize == BC_NAMES.len());
+        };
     };
 }
 
-bcdef!(bc_enum);
+bcdef!(bc_tables);
 
 pub const BC_MAX: u32 = BC_NAMES.len() as u32;
 
@@ -263,6 +406,7 @@ pub fn bc_isret_or_tail(op: BCOp) -> bool {
     matches!(op, BCOp::CALLMT | BCOp::CALLT) || bc_isret(op)
 }
 
+/// Stack slots used by FORI/FORL, relative to operand A.
 pub const FORL_IDX: u32 = 0;
 pub const FORL_STOP: u32 = 1;
 pub const FORL_STEP: u32 = 2;

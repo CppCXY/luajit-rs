@@ -1,15 +1,14 @@
+mod funcstate;
+
 use crate::bc::*;
 use crate::lex::*;
-
-pub const PROTO_CHILD: u8 = 0x01;
-pub const PROTO_VARARG: u8 = 0x02;
-#[allow(dead_code)]
-pub const PROTO_FFI: u8 = 0x04;
-pub const PROTO_HAS_RETURN: u8 = 0x20;
-pub const PROTO_FIXUP_RETURN: u8 = 0x40;
-pub const PROTO_BITOP: u8 = 0x80;
-pub const PROTO_UV_LOCAL: u16 = 0x8000;
-pub const PROTO_UV_IMMUTABLE: u16 = 0x4000;
+use crate::proto::{
+    KGc, Proto, PROTO_BITOP, PROTO_CHILD, PROTO_FIXUP_RETURN, PROTO_HAS_RETURN, PROTO_UV_IMMUTABLE,
+    PROTO_UV_LOCAL, PROTO_VARARG,
+};
+use crate::table::LuaTable;
+use crate::value::LuaValue;
+use funcstate::{FuncScope, FuncState};
 
 const LJ_MAX_LOCVAR: u32 = 200;
 const LJ_MAX_UPVAL: u32 = 60;
@@ -126,160 +125,9 @@ struct VarInfo {
 }
 
 #[derive(Clone, Copy)]
-struct FuncScope {
-    vstart: u32,
-    nactvar: u8,
-    flags: u8,
-}
-
-#[derive(Clone, Copy)]
 struct BCInsLine {
     ins: BCIns,
     line: BCLine,
-}
-
-pub enum KGc {
-    Str(StrId),
-    Proto(Box<Proto>),
-    Table(KTable),
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub enum KVal {
-    Nil,
-    False,
-    True,
-    Num(u64),
-    Str(StrId),
-    Tab,
-}
-
-#[derive(Default)]
-pub struct KTable {
-    pub asize: u32,
-    pub hbits: u32,
-    pub array: Vec<KVal>,
-    pub hash: Vec<(KVal, KVal)>,
-}
-
-impl KTable {
-    fn new(asize: u32, hbits: u32) -> KTable {
-        KTable {
-            asize,
-            hbits,
-            array: vec![KVal::Nil; asize as usize],
-            hash: Vec::new(),
-        }
-    }
-
-    fn int_key(k: &KVal) -> Option<u32> {
-        if let KVal::Num(bits) = k {
-            let n = f64::from_bits(*bits);
-            if n >= 0.0 && n == n.trunc() && n < u32::MAX as f64 {
-                return Some(n as u32);
-            }
-        }
-        None
-    }
-
-    fn set(&mut self, k: KVal, v: KVal) {
-        if let Some(i) = KTable::int_key(&k) {
-            if i < self.asize {
-                self.array[i as usize] = v;
-                return;
-            }
-        }
-        for e in self.hash.iter_mut() {
-            if e.0 == k {
-                e.1 = v;
-                return;
-            }
-        }
-        self.hash.push((k, v));
-    }
-
-    fn reasize(&mut self, nasize: u32) {
-        let asize = nasize + 1;
-        if asize > self.asize {
-            self.array.resize(asize as usize, KVal::Nil);
-            self.asize = asize;
-            let mut i = 0;
-            while i < self.hash.len() {
-                if let Some(idx) = KTable::int_key(&self.hash[i].0) {
-                    if idx < asize {
-                        let (_, v) = self.hash.remove(i);
-                        self.array[idx as usize] = v;
-                        continue;
-                    }
-                }
-                i += 1;
-            }
-        }
-    }
-}
-
-pub struct Proto {
-    pub bc: Vec<BCIns>,
-    pub lines: Vec<BCLine>,
-    pub kgc: Vec<KGc>,
-    pub kn: Vec<f64>,
-    pub uv: Vec<u16>,
-    pub flags: u8,
-    pub numparams: u8,
-    pub framesize: u8,
-    pub firstline: BCLine,
-    pub numline: BCLine,
-    pub uvnames: Vec<String>,
-}
-
-struct FuncState {
-    kn: Vec<f64>,
-    kn_map: std::collections::HashMap<u64, u32>,
-    kgc: Vec<KGc>,
-    kgc_map: std::collections::HashMap<StrId, u32>,
-    pc: BCPos,
-    lasttarget: BCPos,
-    jpc: BCPos,
-    freereg: BCReg,
-    nactvar: BCReg,
-    linedefined: BCLine,
-    bcbase: usize,
-    vbase: usize,
-    flags: u8,
-    numparams: u8,
-    framesize: u8,
-    nuv: u8,
-    varmap: [u16; 250],
-    uvmap: [u16; 60],
-    uvtmp: [u16; 60],
-    scopes: Vec<FuncScope>,
-}
-
-impl FuncState {
-    fn new(vbase: usize) -> FuncState {
-        FuncState {
-            kn: Vec::new(),
-            kn_map: std::collections::HashMap::new(),
-            kgc: Vec::new(),
-            kgc_map: std::collections::HashMap::new(),
-            pc: 0,
-            lasttarget: 0,
-            jpc: NO_JMP,
-            freereg: 0,
-            nactvar: 0,
-            linedefined: 0,
-            bcbase: 0,
-            vbase,
-            flags: 0,
-            numparams: 0,
-            framesize: 1,
-            nuv: 0,
-            varmap: [0; 250],
-            uvmap: [0; 60],
-            uvtmp: [0; 60],
-            scopes: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1924,24 +1772,24 @@ impl Parser {
         self.lex_check(Tok::Char(b']'));
     }
 
-    fn expr_kvalue(&self, e: &ExpDesc) -> KVal {
+    fn expr_kvalue(&self, e: &ExpDesc) -> LuaValue {
         if e.k <= VKTrue {
             match e.k {
-                VKNil => KVal::Nil,
-                VKFalse => KVal::False,
-                _ => KVal::True,
+                VKNil => LuaValue::NIL,
+                VKFalse => LuaValue::FALSE,
+                _ => LuaValue::TRUE,
             }
         } else if e.k == VKStr {
-            KVal::Str(e.sval)
+            LuaValue::string(e.sval)
         } else {
             debug_assert!(e.k == VKNum);
-            KVal::Num(e.nval.to_bits())
+            LuaValue::number(e.nval)
         }
     }
 
     fn expr_table(&mut self, e: &mut ExpDesc) {
         let line = self.ls.linenumber;
-        let mut t: Option<(u32, KTable)> = None;
+        let mut t: Option<(u32, LuaTable)> = None;
         let mut vcall = false;
         let mut needarr = false;
         let mut narr: u32 = 1;
@@ -1982,13 +1830,13 @@ impl Parser {
             let mut nonconst = true;
             if key.isk() && key.k != VKNil && (key.k == VKStr || val.isk_nojump()) {
                 if t.is_none() {
-                    let kt = KTable::new(
+                    let kt = LuaTable::new(
                         if needarr { narr } else { 0 },
                         hsize2hbits(nhash),
                     );
                     let fs = self.cur_mut();
                     let kidx = fs.kgc.len() as u32;
-                    fs.kgc.push(KGc::Table(KTable::default()));
+                    fs.kgc.push(KGc::Table(LuaTable::default()));
                     *self.ins_mut(pc) = bcins_ad(BCOp::TDUP, freg - 1, kidx);
                     t = Some((kidx, kt));
                 }
@@ -1997,13 +1845,13 @@ impl Parser {
                 let tab = &mut t.as_mut().unwrap().1;
                 if val.isk_nojump() {
                     let mut vv = self.expr_kvalue(&val);
-                    if key.k == VKStr && vv == KVal::Nil {
-                        vv = KVal::Tab;
+                    if key.k == VKStr && vv.is_nil() {
+                        vv = LuaValue::table_marker();
                     }
                     tab.set(kv, vv);
                     nonconst = false;
                 } else {
-                    tab.set(kv, KVal::Tab);
+                    tab.set(kv, LuaValue::table_marker());
                 }
             }
             if nonconst {
@@ -2048,7 +1896,7 @@ impl Parser {
             e.k = VNonReloc;
         }
         if let Some((kidx, mut kt)) = t {
-            if needarr && kt.asize < narr {
+            if needarr && kt.asize() < narr {
                 kt.reasize(narr - 1);
             }
             self.cur_mut().kgc[kidx as usize] = KGc::Table(kt);
