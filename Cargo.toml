@@ -6,3 +6,5 @@ members = [
 
 [workspace.dependencies]
 luajit_rs = { path = "crates/luajit-rs", version = "0.1.0" }
+
+

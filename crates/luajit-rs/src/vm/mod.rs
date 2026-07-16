@@ -238,46 +238,54 @@ impl Interp {
         self.knp = pt.kn.as_ptr();
     }
 
-    /// The dispatch loop. Hot state (pc/base/sp/bcp/knp/multres) is kept in
-    /// locals; `sync!`/`resync!` bridge to the fields around cold operations.
+    /// The dispatch loop. The entire hot state is two locals — `bp` (the
+    /// current base as a pointer, LuaJIT's BASE) and `ip` (a walking
+    /// instruction pointer, LuaJIT's PC) — so both live in registers on
+    /// every dispatch. Everything else (`self.knp`, `self.multres`, ...)
+    /// is re-read from `self` in the arms that need it; keeping more locals
+    /// alive across the dispatch forces spills (measured: rustc packs the
+    /// extras into an XMM register and unpacks per instruction).
+    /// `sync!`/`resync!` bridge to the fields around calls and returns.
     fn run(&mut self, frame_floor: usize) -> LuaResult<usize> {
-        let sp = self.sp;
-        let mut base = self.base;
-        let mut pc = self.pc;
-        let mut bcp = self.bcp;
-        let mut knp = self.knp;
-        let mut multres = self.multres;
+        let mut bp = unsafe { self.sp.add(self.base) };
+        let mut ip = unsafe { self.bcp.add(self.pc) };
 
+        macro_rules! cur_base {
+            () => {
+                unsafe { bp.offset_from(self.sp) as usize }
+            };
+        }
         macro_rules! reg {
             ($i:expr) => {
-                unsafe { *sp.add(base + ($i) as usize) }
+                unsafe { *bp.add(($i) as usize) }
             };
         }
         macro_rules! setreg {
             ($i:expr, $v:expr) => {{
                 let v = $v;
-                unsafe { *sp.add(base + ($i) as usize) = v }
+                unsafe { *bp.add(($i) as usize) = v }
             }};
         }
         macro_rules! kslot {
             ($d:expr) => {
-                LuaValue::number_raw(unsafe { *knp.add(($d) as usize) })
+                LuaValue::number_raw(unsafe { *self.knp.add(($d) as usize) })
+            };
+        }
+        macro_rules! jump {
+            ($ins:expr) => {
+                ip = unsafe { ip.offset(bc_j($ins) as isize) }
             };
         }
         macro_rules! sync {
             () => {{
-                self.base = base;
-                self.pc = pc;
-                self.multres = multres;
+                self.base = cur_base!();
+                self.pc = unsafe { ip.offset_from(self.bcp) as usize };
             }};
         }
         macro_rules! resync {
             () => {{
-                base = self.base;
-                pc = self.pc;
-                bcp = self.bcp;
-                knp = self.knp;
-                multres = self.multres;
+                bp = unsafe { self.sp.add(self.base) };
+                ip = unsafe { self.bcp.add(self.pc) };
             }};
         }
         // Numeric binary op fast path; falls to the arithmetic slow error.
@@ -288,6 +296,21 @@ impl Interp {
                 if xv.is_number() && yv.is_number() {
                     let $x = xv.num();
                     let $y = yv.num();
+                    setreg!($a, LuaValue::number_raw($body));
+                } else {
+                    sync!();
+                    return Err(self.arith_err());
+                }
+            }};
+        }
+        // reg `op` constant (*VN) / constant `op` reg (*NV): number constants
+        // need no type check, only the register operand does.
+        macro_rules! arith_k {
+            ($a:expr, $ins:expr, $x:ident, $y:ident, $body:expr) => {{
+                let xv = reg!(bc_b($ins));
+                if xv.is_number() {
+                    let $x = xv.num();
+                    let $y = unsafe { *self.knp.add(bc_c($ins) as usize) };
                     setreg!($a, LuaValue::number_raw($body));
                 } else {
                     sync!();
@@ -308,26 +331,26 @@ impl Interp {
                     sync!();
                     self.cmp_slow($op, xv, yv)?
                 };
-                let jmp = unsafe { *bcp.add(pc) };
-                pc += 1;
+                let jmp = unsafe { *ip };
+                ip = unsafe { ip.add(1) };
                 if cond {
-                    pc = (pc as i64 + bc_j(jmp)) as usize;
+                    jump!(jmp);
                 }
             }};
         }
         macro_rules! branch {
             ($cond:expr) => {{
-                let jmp = unsafe { *bcp.add(pc) };
-                pc += 1;
+                let jmp = unsafe { *ip };
+                ip = unsafe { ip.add(1) };
                 if $cond {
-                    pc = (pc as i64 + bc_j(jmp)) as usize;
+                    jump!(jmp);
                 }
             }};
         }
 
         loop {
-            let ins = unsafe { *bcp.add(pc) };
-            pc += 1;
+            let ins = unsafe { *ip };
+            ip = unsafe { ip.add(1) };
             let a = bc_a(ins);
             match bc_op(ins) {
                 // -- Comparisons (ORDER matters; see bc.rs) --
@@ -426,34 +449,16 @@ impl Interp {
                         x - (x / y).floor() * y
                     )
                 }
-                BCOp::ADDVN => arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x + y),
-                BCOp::SUBVN => arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x - y),
-                BCOp::MULVN => arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x * y),
-                BCOp::DIVVN => arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x / y),
-                BCOp::MODVN => {
-                    arith!(
-                        a,
-                        reg!(bc_b(ins)),
-                        kslot!(bc_c(ins)),
-                        x,
-                        y,
-                        x - (x / y).floor() * y
-                    )
-                }
-                BCOp::ADDNV => arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x + y),
-                BCOp::SUBNV => arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x - y),
-                BCOp::MULNV => arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x * y),
-                BCOp::DIVNV => arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x / y),
-                BCOp::MODNV => {
-                    arith!(
-                        a,
-                        kslot!(bc_c(ins)),
-                        reg!(bc_b(ins)),
-                        x,
-                        y,
-                        x - (x / y).floor() * y
-                    )
-                }
+                BCOp::ADDVN => arith_k!(a, ins, x, y, x + y),
+                BCOp::SUBVN => arith_k!(a, ins, x, y, x - y),
+                BCOp::MULVN => arith_k!(a, ins, x, y, x * y),
+                BCOp::DIVVN => arith_k!(a, ins, x, y, x / y),
+                BCOp::MODVN => arith_k!(a, ins, x, y, x - (x / y).floor() * y),
+                BCOp::ADDNV => arith_k!(a, ins, y, x, x + y),
+                BCOp::SUBNV => arith_k!(a, ins, y, x, x - y),
+                BCOp::MULNV => arith_k!(a, ins, y, x, x * y),
+                BCOp::DIVNV => arith_k!(a, ins, y, x, x / y),
+                BCOp::MODNV => arith_k!(a, ins, y, x, x - (x / y).floor() * y),
                 BCOp::POW => {
                     arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x.powf(y))
                 }
@@ -502,8 +507,8 @@ impl Interp {
                 }
                 BCOp::UCLO => {
                     sync!();
-                    self.close_upvals(base + a as usize);
-                    pc = (pc as i64 + bc_j(ins)) as usize;
+                    self.close_upvals(cur_base!() + a as usize);
+                    jump!(ins);
                 }
                 BCOp::FNEW => {
                     sync!();
@@ -591,7 +596,7 @@ impl Interp {
                     resync!();
                 }
                 BCOp::CALLM => {
-                    let nargs = bc_c(ins) as usize + multres;
+                    let nargs = bc_c(ins) as usize + self.multres;
                     sync!();
                     self.do_call(a, nargs, bc_b(ins) as i32 - 1)?;
                     resync!();
@@ -605,7 +610,7 @@ impl Interp {
                     resync!();
                 }
                 BCOp::CALLMT => {
-                    let nargs = bc_d(ins) as usize + multres;
+                    let nargs = bc_d(ins) as usize + self.multres;
                     sync!();
                     if let Some(n) = self.do_tailcall(a, nargs, frame_floor)? {
                         return Ok(n);
@@ -614,14 +619,14 @@ impl Interp {
                 }
                 BCOp::RET0 => {
                     sync!();
-                    if let Some(n) = self.do_return(base, 0, frame_floor) {
+                    if let Some(n) = self.do_return(cur_base!(), 0, frame_floor) {
                         return Ok(n);
                     }
                     resync!();
                 }
                 BCOp::RET1 => {
                     sync!();
-                    if let Some(n) = self.do_return(base + a as usize, 1, frame_floor) {
+                    if let Some(n) = self.do_return(cur_base!() + a as usize, 1, frame_floor) {
                         return Ok(n);
                     }
                     resync!();
@@ -629,15 +634,15 @@ impl Interp {
                 BCOp::RET => {
                     let n = bc_d(ins) as usize - 1;
                     sync!();
-                    if let Some(n) = self.do_return(base + a as usize, n, frame_floor) {
+                    if let Some(n) = self.do_return(cur_base!() + a as usize, n, frame_floor) {
                         return Ok(n);
                     }
                     resync!();
                 }
                 BCOp::RETM => {
-                    let n = multres + bc_d(ins) as usize;
+                    let n = self.multres + bc_d(ins) as usize;
                     sync!();
-                    if let Some(n) = self.do_return(base + a as usize, n, frame_floor) {
+                    if let Some(n) = self.do_return(cur_base!() + a as usize, n, frame_floor) {
                         return Ok(n);
                     }
                     resync!();
@@ -645,16 +650,15 @@ impl Interp {
 
                 // -- Loops and branches --
                 BCOp::FORI => {
-                    let ai = base + a as usize;
-                    let idx = self.at(ai + FORL_IDX as usize);
-                    let stop = self.at(ai + FORL_STOP as usize);
-                    let step = self.at(ai + FORL_STEP as usize);
+                    let idx = reg!(a + FORL_IDX);
+                    let stop = reg!(a + FORL_STOP);
+                    let step = reg!(a + FORL_STEP);
                     if idx.is_number() && stop.is_number() && step.is_number() {
                         let (i, s, st) = (idx.num(), stop.num(), step.num());
-                        self.set_at(ai + FORL_EXT as usize, LuaValue::number_raw(i));
+                        setreg!(a + FORL_EXT, LuaValue::number_raw(i));
                         let enter = if st >= 0.0 { i <= s } else { i >= s };
                         if !enter {
-                            pc = (pc as i64 + bc_j(ins)) as usize;
+                            jump!(ins);
                         }
                     } else {
                         sync!();
@@ -664,22 +668,21 @@ impl Interp {
                     }
                 }
                 BCOp::FORL => {
-                    let ai = base + a as usize;
-                    let i = self.at(ai + FORL_IDX as usize).num();
-                    let s = self.at(ai + FORL_STOP as usize).num();
-                    let st = self.at(ai + FORL_STEP as usize).num();
+                    let i = reg!(a + FORL_IDX).num();
+                    let s = reg!(a + FORL_STOP).num();
+                    let st = reg!(a + FORL_STEP).num();
                     let ni = i + st;
                     let cont = if st >= 0.0 { ni <= s } else { ni >= s };
                     if cont {
                         let nv = LuaValue::number_raw(ni);
-                        self.set_at(ai + FORL_IDX as usize, nv);
-                        self.set_at(ai + FORL_EXT as usize, nv);
-                        pc = (pc as i64 + bc_j(ins)) as usize;
+                        setreg!(a + FORL_IDX, nv);
+                        setreg!(a + FORL_EXT, nv);
+                        jump!(ins);
                     }
                 }
                 BCOp::LOOP => { /* hotcount hook: no-op for now */ }
-                BCOp::JMP => pc = (pc as i64 + bc_j(ins)) as usize,
-                BCOp::ISNEXT => pc = (pc as i64 + bc_j(ins)) as usize,
+                BCOp::JMP => jump!(ins),
+                BCOp::ISNEXT => jump!(ins),
                 BCOp::ITERC | BCOp::ITERN => {
                     sync!();
                     self.iter_call(a, bc_b(ins) as usize)?;
@@ -689,7 +692,7 @@ impl Interp {
                     let first = reg!(a);
                     if !first.is_nil() {
                         setreg!(a - 1, first);
-                        pc = (pc as i64 + bc_j(ins)) as usize;
+                        jump!(ins);
                     }
                 }
                 BCOp::VARG => {
@@ -698,7 +701,36 @@ impl Interp {
                     resync!();
                 }
 
-                other => {
+                // Explicit list (not `_`) so the match covers every opcode:
+                // a wildcard shrinks the jump table and adds a bounds check
+                // to every dispatch.
+                other @ (BCOp::ISTYPE
+                | BCOp::ISNUM
+                | BCOp::KCDATA
+                | BCOp::TGETR
+                | BCOp::TSETR
+                | BCOp::JFORI
+                | BCOp::IFORL
+                | BCOp::JFORL
+                | BCOp::IITERL
+                | BCOp::JITERL
+                | BCOp::ILOOP
+                | BCOp::JLOOP
+                | BCOp::BNOT
+                | BCOp::BAND
+                | BCOp::BOR
+                | BCOp::BXOR
+                | BCOp::BSHL
+                | BCOp::BSHR
+                | BCOp::BSAR
+                | BCOp::FUNCF
+                | BCOp::IFUNCF
+                | BCOp::JFUNCF
+                | BCOp::FUNCV
+                | BCOp::IFUNCV
+                | BCOp::JFUNCV
+                | BCOp::FUNCC
+                | BCOp::FUNCCW) => {
                     sync!();
                     return Err(self
                         .l()
