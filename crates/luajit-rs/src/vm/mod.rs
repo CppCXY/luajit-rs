@@ -93,6 +93,9 @@ fn call_c(
     let saved_top = l.top;
     l.base = args_base;
     l.top = args_base + nargs;
+    if l.global().heap.should_collect() {
+        crate::gc::full_gc(l.global());
+    }
     let n = f(l)? as usize;
     for i in 0..n {
         l.stack[func_slot + i] = l.stack[args_base + i];
@@ -482,6 +485,7 @@ impl Interp {
                 }
                 BCOp::CAT => {
                     sync!();
+                    self.gc_check();
                     let r = self.concat(bc_b(ins), bc_c(ins))?;
                     setreg!(a, r);
                 }
@@ -530,6 +534,7 @@ impl Interp {
                 }
                 BCOp::FNEW => {
                     sync!();
+                    self.gc_check();
                     let v = self.new_closure(bc_d(ins));
                     setreg!(a, v);
                 }
@@ -537,11 +542,13 @@ impl Interp {
                 // -- Tables --
                 BCOp::TNEW => {
                     sync!();
+                    self.gc_check();
                     let t = self.l().heap().alloc_table(LuaTable::new(0, 0));
                     setreg!(a, LuaValue::table(t));
                 }
                 BCOp::TDUP => {
                     sync!();
+                    self.gc_check();
                     let templ = match &self.proto().kgc[bc_d(ins) as usize] {
                         KGc::Table(t) => t.dup(),
                         _ => unreachable!("expected template table"),
@@ -847,6 +854,28 @@ impl Interp {
 
     // -- Cold slow paths -------------------------------------------------
 
+    /// `lj_gc_check` + `lj_gc_step_fixtop`: run a collection if the
+    /// allocation debt is due. Only called from safe points (before an
+    /// allocating opcode, with locals synced): the marker sees every live
+    /// object through the stacks and roots. Fixes `l.top` up to the running
+    /// frame's full extent first, since returns may have lowered it.
+    #[inline]
+    fn gc_check(&mut self) {
+        if self.l().global().heap.should_collect() {
+            self.gc_collect();
+        }
+    }
+
+    #[cold]
+    fn gc_collect(&mut self) {
+        let need = self.base + self.proto().framesize as usize;
+        let l = self.l();
+        if l.top < need {
+            l.top = need;
+        }
+        crate::gc::full_gc(l.global());
+    }
+
     #[cold]
     fn arith_err(&self) -> LuaError {
         self.l()
@@ -1000,6 +1029,10 @@ impl Interp {
         let saved_top = l.top;
         l.base = args_base;
         l.top = args_base + nargs;
+        // C-call boundary is a GC safe point (args anchored, frames below).
+        if l.global().heap.should_collect() {
+            crate::gc::full_gc(l.global());
+        }
         let n = f(l)? as usize;
         for i in 0..n {
             l.stack[func_slot + i] = l.stack[args_base + i];

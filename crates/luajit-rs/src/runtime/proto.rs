@@ -36,6 +36,18 @@ pub struct Proto {
     pub uvnames: Vec<String>,
 }
 
+impl Proto {
+    /// Approximate heap footprint in bytes, for GC accounting.
+    pub fn gc_size(&self) -> usize {
+        std::mem::size_of::<Proto>()
+            + self.bc.capacity() * 4
+            + self.lines.capacity() * 4
+            + self.kgc.capacity() * std::mem::size_of::<KGc>()
+            + self.kn.capacity() * 8
+            + self.uv.capacity() * 2
+    }
+}
+
 /// Prototype flags (subset of LuaJIT's PROTO_* used by the compiler).
 pub const PROTO_CHILD: u8 = 0x01;
 pub const PROTO_VARARG: u8 = 0x02;

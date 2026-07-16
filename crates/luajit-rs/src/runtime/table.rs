@@ -108,6 +108,32 @@ impl LuaTable {
         self.hmask != 0
     }
 
+    /// GC traversal, per `gc_traverse_tab`: all array values, and key+value
+    /// of every non-empty hash node. Keys of nil-value nodes are *not*
+    /// marked (LuaJIT's dead-key policy: the stale reference stays in the
+    /// node but is only ever compared by identity, never dereferenced).
+    pub(crate) fn gc_traverse(&self, mut mark: impl FnMut(LuaValue)) {
+        for &v in &self.array {
+            mark(v);
+        }
+        if self.has_hpart() {
+            for n in &self.node {
+                if !n.val.is_nil() {
+                    debug_assert!(!n.key.is_nil(), "nil key in non-empty slot");
+                    mark(n.key);
+                    mark(n.val);
+                }
+            }
+        }
+    }
+
+    /// Approximate heap footprint in bytes, for GC accounting.
+    pub fn gc_size(&self) -> usize {
+        std::mem::size_of::<LuaTable>()
+            + self.array.capacity() * std::mem::size_of::<LuaValue>()
+            + self.node.capacity() * std::mem::size_of::<Node>()
+    }
+
     /// The main hash-slot index for `key` (`hashkey` + `hashmask`).
     fn hash_slot(&self, key: LuaValue) -> u32 {
         key.hash_key() & self.hmask

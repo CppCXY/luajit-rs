@@ -65,6 +65,15 @@ impl LuaString {
     pub fn hash(&self) -> u32 {
         self.hash
     }
+
+    /// Approximate heap footprint in bytes, for GC accounting.
+    pub fn gc_size(&self) -> usize {
+        std::mem::size_of::<LuaString>()
+            + match &self.repr {
+                Repr::Inline { .. } => 0,
+                Repr::Heap(b) => b.len(),
+            }
+    }
 }
 
 /// Keyed sparse ARX string hash, ported from LuaJIT's `hash_sparse`
@@ -103,13 +112,16 @@ pub fn hash_sparse(seed: u64, s: &[u8]) -> u32 {
 
 /// The string intern table, corresponding to LuaJIT's global string table
 /// (`lj_str_new`). Equal byte content always maps to the same `StrId`, so
-/// string equality reduces to id equality.
+/// string equality reduces to id equality. Dead ids are recycled by the GC
+/// sweep; a live string's id never changes.
 #[derive(Default)]
 pub struct Interner {
     map: HashMap<Box<[u8]>, StrId>,
-    by_id: Vec<crate::gc::GcPtr<LuaString>>,
+    by_id: Vec<Option<crate::gc::GcPtr<LuaString>>>,
+    free_ids: Vec<StrId>,
     pool: crate::gc::Pool<LuaString>,
     seed: u64,
+    bytes: usize,
 }
 
 impl Interner {
@@ -117,26 +129,52 @@ impl Interner {
         if let Some(&id) = self.map.get(s) {
             return id;
         }
-        let sid = self.by_id.len() as StrId;
+        let sid = match self.free_ids.pop() {
+            Some(id) => id,
+            None => {
+                self.by_id.push(None);
+                (self.by_id.len() - 1) as StrId
+            }
+        };
         let hash = hash_sparse(self.seed, s);
         let p = self.pool.alloc(LuaString::new(s, sid, hash));
-        self.by_id.push(p);
+        self.bytes += p.as_ref().gc_size();
+        self.by_id[sid as usize] = Some(p);
         self.map.insert(s.into(), sid);
         sid
     }
 
     pub fn get(&self, id: StrId) -> &[u8] {
-        self.by_id[id as usize].as_ref().as_bytes()
+        self.lookup(id).as_bytes()
     }
 
     pub fn lookup(&self, id: StrId) -> &LuaString {
-        self.by_id[id as usize].as_ref()
+        self.by_id[id as usize].expect("dead string id").as_ref()
     }
 
     /// A stable pointer to the interned string object, for storing in a
     /// `LuaValue`.
     pub fn lookup_ptr(&self, id: StrId) -> crate::gc::GcPtr<LuaString> {
-        self.by_id[id as usize]
+        self.by_id[id as usize].expect("dead string id")
+    }
+
+    /// Approximate bytes held by interned strings (GC accounting).
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// GC string sweep (`gc_sweepstr`): free unmarked strings, drop their
+    /// intern-map entries and recycle their ids.
+    pub(crate) fn sweep(&mut self) {
+        let map = &mut self.map;
+        let by_id = &mut self.by_id;
+        let free_ids = &mut self.free_ids;
+        self.pool.sweep(|s| {
+            map.remove(s.as_bytes());
+            by_id[s.sid() as usize] = None;
+            free_ids.push(s.sid());
+        });
+        self.bytes = self.pool.iter().map(|s| s.gc_size()).sum();
     }
 }
 

@@ -11,31 +11,54 @@ use crate::value::{GcRef, LJ_TFUNC, LJ_TTAB, LuaValue};
 ///
 /// Every collectable type lives in its own `Pool`, which allocates objects in
 /// fixed pages so their addresses never move (a `LuaValue` stores the raw
-/// pointer in its 47-bit payload). This is the placement layer the future
-/// collector will sweep.
-#[derive(Default)]
+/// pointer in its 47-bit payload). The collector (`gc::full_gc`) marks from
+/// the roots and sweeps these pools. `total`/`threshold` drive the trigger,
+/// like LuaJIT's `gc.total`/`gc.threshold`.
 pub struct GcHeap {
     pub strings: Interner,
     pub protos: Pool<Proto>,
     pub tables: Pool<LuaTable>,
     pub funcs: Pool<GcFunc>,
     pub upvals: Pool<crate::func::Upval>,
+    /// Allocation estimate for non-string objects (strings are tracked by
+    /// the interner itself, which travels to the parser and back).
+    pub total: usize,
+    /// Next collection when `total + strings.bytes()` crosses this.
+    pub threshold: usize,
+}
+
+impl Default for GcHeap {
+    fn default() -> GcHeap {
+        GcHeap {
+            strings: Interner::default(),
+            protos: Pool::new(),
+            tables: Pool::new(),
+            funcs: Pool::new(),
+            upvals: Pool::new(),
+            total: 0,
+            threshold: crate::gc::GC_THRESHOLD_MIN,
+        }
+    }
 }
 
 impl GcHeap {
     pub fn alloc_table(&mut self, t: LuaTable) -> GcPtr<LuaTable> {
+        self.total += t.gc_size();
         self.tables.alloc(t)
     }
 
     pub fn alloc_proto(&mut self, p: Proto) -> GcPtr<Proto> {
+        self.total += p.gc_size();
         self.protos.alloc(p)
     }
 
     pub fn alloc_func(&mut self, f: GcFunc) -> GcPtr<GcFunc> {
+        self.total += crate::gc::account_func(&f);
         self.funcs.alloc(f)
     }
 
     pub fn alloc_upval(&mut self, uv: crate::func::Upval) -> GcPtr<crate::func::Upval> {
+        self.total += crate::gc::account_upval();
         self.upvals.alloc(uv)
     }
 
@@ -46,6 +69,12 @@ impl GcHeap {
     /// A `LuaValue` for an interned string id.
     pub fn str_value(&self, sid: StrId) -> LuaValue {
         LuaValue::string(self.strings.lookup_ptr(sid))
+    }
+
+    /// `lj_gc_check`'s condition: is a collection due?
+    #[inline]
+    pub fn should_collect(&self) -> bool {
+        self.total + self.strings.bytes() >= self.threshold
     }
 }
 
@@ -66,6 +95,8 @@ pub struct GlobalState {
     pub registry: GcPtr<LuaTable>,
     /// Per-type base metatables, indexed by `~itype`.
     pub basemt: [Option<GcPtr<LuaTable>>; ITYPE_COUNT],
+    /// Every thread of this universe: the GC's stack roots.
+    pub threads: Vec<StateRef>,
     /// The main thread. Set once the owning [`Lua`] is pinned. The interpreter
     /// entry points use this when no explicit thread is supplied.
     main: Option<StateRef>,
@@ -81,6 +112,7 @@ impl GlobalState {
             globals,
             registry,
             basemt: [None; ITYPE_COUNT],
+            threads: Vec::new(),
             main: None,
         }
     }
@@ -233,6 +265,7 @@ impl Lua {
         let main_ref = StateRef(NonNull::from(&mut *main));
         lua.threads.push(main);
         lua.g.main = Some(main_ref);
+        lua.g.threads.push(main_ref);
         lua
     }
 
@@ -250,6 +283,7 @@ impl Lua {
         let mut t = Box::new(LuaState::new(gref, false));
         let r = StateRef(NonNull::from(&mut *t));
         self.threads.push(t);
+        self.g.threads.push(r);
         r
     }
 }

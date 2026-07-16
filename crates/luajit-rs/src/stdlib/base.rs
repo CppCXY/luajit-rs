@@ -325,6 +325,31 @@ fn map_bytes(l: &mut LuaState, f: fn(u8) -> u8) -> LuaResult<i32> {
     Ok(1)
 }
 
+/// `collectgarbage([opt])`: "collect"/"step" run a full cycle (the collector
+/// is not incremental; a step is a whole collection), "count" returns the
+/// current allocation estimate in KiB. The C-call boundary already fixed
+/// `l.top`, so this is a safe point.
+fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
+    let opt = match arg(l, 0).as_string_id() {
+        Some(sid) => l.heap().strings.get(sid).to_vec(),
+        None => b"collect".to_vec(),
+    };
+    match opt.as_slice() {
+        b"collect" | b"step" | b"full" => {
+            crate::gc::full_gc(l.global());
+            l.stack[l.base] = LuaValue::number(0.0);
+            Ok(1)
+        }
+        b"count" => {
+            let heap = &l.global().heap;
+            let bytes = heap.total + heap.strings.bytes();
+            l.stack[l.base] = LuaValue::number(bytes as f64 / 1024.0);
+            Ok(1)
+        }
+        _ => Err(l.runtime_error(b"bad argument #1 to 'collectgarbage'")),
+    }
+}
+
 /// Create a global table `name` and populate it with `(field, fn)` entries.
 fn make_lib(l: &mut LuaState, name: &[u8], entries: &[(&[u8], crate::func::CFunction)]) {
     let t = l.heap().alloc_table(crate::table::LuaTable::new(0, 4));
@@ -359,6 +384,7 @@ pub fn open_libs(l: &mut LuaState) {
     l.register(b"__ipairs_iter", lib_ipairs_iter);
     l.register(b"setmetatable", lib_setmetatable);
     l.register(b"assert", lib_assert);
+    l.register(b"collectgarbage", lib_collectgarbage);
 
     // Expose _G self-reference.
     let g = l.global().globals;

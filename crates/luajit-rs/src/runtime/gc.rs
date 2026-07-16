@@ -5,11 +5,13 @@ use std::ptr::NonNull;
 const POOL_PAGE: usize = 64;
 
 /// A pool slot. `data` must stay the first field (`repr(C)`) so a pointer to
-/// the payload can be cast back to the slot for freeing.
+/// the payload can be cast back to the slot for freeing and for the mark
+/// bit (the slot header is our stand-in for LuaJIT's `GCheader.marked`).
 #[repr(C)]
 struct Slot<T> {
     data: MaybeUninit<T>,
     live: bool,
+    marked: bool,
 }
 
 /// A typed, stable-address object pool.
@@ -44,6 +46,7 @@ impl<T> Pool<T> {
             page.push(Slot {
                 data: MaybeUninit::uninit(),
                 live: false,
+                marked: false,
             });
         }
         let mut page = page.into_boxed_slice();
@@ -64,6 +67,7 @@ impl<T> Pool<T> {
             debug_assert!(!s.live);
             s.data.write(v);
             s.live = true;
+            s.marked = false;
             GcPtr::new(NonNull::new_unchecked(s.data.as_mut_ptr()))
         }
     }
@@ -90,13 +94,41 @@ impl<T> Pool<T> {
         self.live == 0
     }
 
-    /// Iterate all live objects (linear page walk, used by future GC sweeps).
+    /// Iterate all live objects (linear page walk, used by GC sweeps).
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.pages
             .iter()
             .flat_map(|p| p.iter())
             .filter(|s| s.live)
             .map(|s| unsafe { s.data.assume_init_ref() })
+    }
+
+    /// Sweep phase: free every live-but-unmarked object (calling `on_free`
+    /// with it just before it is dropped) and clear the mark on survivors.
+    /// The pool equivalent of LuaJIT's `gc_sweep` over the GC object chain.
+    pub fn sweep(&mut self, mut on_free: impl FnMut(&T)) {
+        let mut free = std::mem::take(&mut self.free);
+        let mut live = 0;
+        for page in &mut self.pages {
+            for s in page.iter_mut() {
+                if !s.live {
+                    continue;
+                }
+                if s.marked {
+                    s.marked = false;
+                    live += 1;
+                } else {
+                    unsafe {
+                        on_free(s.data.assume_init_ref());
+                        s.data.assume_init_drop();
+                    }
+                    s.live = false;
+                    free.push(NonNull::from(s));
+                }
+            }
+        }
+        self.free = free;
+        self.live = live;
     }
 }
 
@@ -123,8 +155,10 @@ impl<T> Drop for Pool<T> {
 ///
 /// This is the Rust stand-in for LuaJIT's `GCRef`: the raw address fits the
 /// 47-bit payload of a `LuaValue`. Dereferencing is safe *by convention*:
-/// objects live in stable pool pages, nothing is freed until a collector
-/// exists, and the VM is single-threaded. All `unsafe` is confined here.
+/// objects live in stable pool pages, the collector only frees objects
+/// proven unreachable, and the VM is single-threaded. All `unsafe` is
+/// confined here. Every `GcPtr` must point into a `Pool` slot (the mark
+/// bit lives in the slot header behind the payload).
 pub struct GcPtr<T>(NonNull<T>);
 
 impl<T> GcPtr<T> {
@@ -134,10 +168,6 @@ impl<T> GcPtr<T> {
             "pointer exceeds the 47-bit LuaValue payload"
         );
         GcPtr(p)
-    }
-
-    pub fn from_ref(r: &T) -> GcPtr<T> {
-        GcPtr::new(NonNull::from(r))
     }
 
     /// Reconstruct from a `LuaValue` payload. Returns `None` for a zero
@@ -158,6 +188,22 @@ impl<T> GcPtr<T> {
     #[allow(clippy::mut_from_ref)]
     pub fn as_mut<'a>(self) -> &'a mut T {
         unsafe { &mut *self.0.as_ptr() }
+    }
+
+    #[inline]
+    fn slot(self) -> *mut Slot<T> {
+        self.0.as_ptr() as *mut Slot<T>
+    }
+
+    /// The mark bit in the pool-slot header (LuaJIT's `gch.marked`).
+    #[inline]
+    pub fn is_marked(self) -> bool {
+        unsafe { (*self.slot()).marked }
+    }
+
+    #[inline]
+    pub fn set_marked(self) {
+        unsafe { (*self.slot()).marked = true }
     }
 }
 
@@ -187,6 +233,231 @@ impl<T> std::fmt::Debug for GcPtr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "GcPtr({:p})", self.0.as_ptr())
     }
+}
+
+// -- The collector (port of lj_gc.c's mark & sweep) -------------------------
+//
+// Same algorithm and traversal order as LuaJIT's collector, minus the
+// incremental machinery: LuaJIT interleaves propagation with the mutator
+// (GCSpropagate + write barriers + a two-white scheme to tell "new since
+// sweep started" from "dead"); we always run mark → sweep atomically at an
+// allocation safe point, so one mark bit and no barriers suffice. Weak
+// tables and finalizers do not exist yet (no __mode/__gc in this fork).
+//
+// Dead keys follow LuaJIT's policy (lj_obj.h): a hash node whose value is
+// nil does not keep its key alive; the stale key reference is left in the
+// node and is never dereferenced, only compared by identity. A false
+// bit-identical match after address reuse yields the node whose value is
+// nil, which is exactly the right answer.
+
+use crate::func::{GcFunc, Upval, UpvalState};
+use crate::proto::{KGc, Proto};
+use crate::state::GlobalState;
+use crate::table::LuaTable;
+use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LuaValue};
+
+/// GC pause: new threshold = live estimate * `GC_PAUSE` / 100 (LuaJIT's
+/// default `LUAI_GCPAUSE`).
+const GC_PAUSE: usize = 200;
+
+/// Lower bound for the threshold, so tiny heaps do not collect constantly.
+pub(crate) const GC_THRESHOLD_MIN: usize = 64 * 1024;
+
+/// A gray object awaiting traversal (LuaJIT chains these through
+/// `gch.gclist`; a worklist vector is the STW equivalent).
+enum Gray {
+    Tab(GcPtr<LuaTable>),
+    Func(GcPtr<GcFunc>),
+    Proto(GcPtr<Proto>),
+}
+
+struct Marker<'g> {
+    gray: Vec<Gray>,
+    strings: &'g crate::string::Interner,
+}
+
+impl<'g> Marker<'g> {
+    /// `gc_marktv`: mark the object a value references, queueing
+    /// traversable objects (tables/functions) on the gray list.
+    fn mark_value(&mut self, v: LuaValue) {
+        match v.itype() {
+            LJ_TSTR => {
+                if let Some(p) = v.as_string() {
+                    p.set_marked(); // strings are leaves (black immediately)
+                }
+            }
+            LJ_TTAB => {
+                // `as_table` is None for the zero-payload template marker.
+                if let Some(p) = v.as_table()
+                    && !p.is_marked()
+                {
+                    p.set_marked();
+                    self.gray.push(Gray::Tab(p));
+                }
+            }
+            LJ_TFUNC => {
+                if let Some(p) = v.as_func()
+                    && !p.is_marked()
+                {
+                    p.set_marked();
+                    self.gray.push(Gray::Func(p));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mark_table(&mut self, t: GcPtr<LuaTable>) {
+        if !t.is_marked() {
+            t.set_marked();
+            self.gray.push(Gray::Tab(t));
+        }
+    }
+
+    fn mark_proto(&mut self, p: GcPtr<Proto>) {
+        if !p.is_marked() {
+            p.set_marked();
+            self.gray.push(Gray::Proto(p));
+        }
+    }
+
+    /// `gc_mark` of a GCupval: closed upvalues hold their value inline;
+    /// open ones point into a stack, which is marked as a root anyway.
+    fn mark_upval(&mut self, uv: GcPtr<Upval>) {
+        if !uv.is_marked() {
+            uv.set_marked();
+            if let UpvalState::Closed(v) = uv.as_ref().state {
+                self.mark_value(v);
+            }
+        }
+    }
+
+    /// `gc_propagate_gray`: empty the gray list, turning objects black.
+    fn propagate(&mut self) {
+        while let Some(g) = self.gray.pop() {
+            match g {
+                // gc_traverse_tab (no metatable field / weak modes yet).
+                Gray::Tab(t) => t.as_ref().gc_traverse(|v| self.mark_value(v)),
+                // gc_traverse_func.
+                Gray::Func(f) => match f.as_ref() {
+                    GcFunc::Lua(c) => {
+                        self.mark_table(c.env);
+                        self.mark_proto(c.proto);
+                        for &uv in &c.upvals {
+                            self.mark_upval(uv);
+                        }
+                    }
+                    GcFunc::C(c) => {
+                        self.mark_table(c.env);
+                        for &v in &c.upvals {
+                            self.mark_value(v);
+                        }
+                    }
+                },
+                // gc_traverse_proto: collectable constants.
+                Gray::Proto(p) => {
+                    for k in &p.as_ref().kgc {
+                        match k {
+                            KGc::Str(sid) => self.strings.lookup_ptr(*sid).set_marked(),
+                            KGc::ProtoRef(child) => self.mark_proto(*child),
+                            // Template tables are owned by the proto (not
+                            // heap objects); mark their contents in place.
+                            KGc::Table(t) => t.gc_traverse(|v| self.mark_value(v)),
+                            KGc::Proto(_) => unreachable!("unregistered child proto in heap"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Object size estimates for the allocation accounting (LuaJIT's
+/// `gc.total`). Approximate: Rust-side reallocations (table rehash, vector
+/// growth) are folded in when the total is recomputed after each sweep.
+fn size_func(f: &GcFunc) -> usize {
+    std::mem::size_of::<GcFunc>()
+        + match f {
+            GcFunc::Lua(c) => c.upvals.len() * 8,
+            GcFunc::C(c) => c.upvals.len() * 8,
+        }
+}
+
+const fn size_upval() -> usize {
+    std::mem::size_of::<Upval>()
+}
+
+/// A full GC cycle: mark all roots, propagate, sweep every pool and reset
+/// the threshold — `lj_gc_fullgc`, with the phases of `gc_onestep`
+/// (mark start → propagate → atomic → sweepstring → sweep) run back to
+/// back. Must only be called at a safe point: every live object reachable
+/// from Rust locals must also be anchored on a stack or in a root.
+pub fn full_gc(g: &mut GlobalState) {
+    // -- Mark phase (gc_mark_start + propagate + atomic) --
+    let mut m = Marker {
+        gray: Vec::with_capacity(64),
+        strings: &g.heap.strings,
+    };
+    m.mark_table(g.globals);
+    m.mark_table(g.registry);
+    for mt in g.basemt.iter().flatten() {
+        m.mark_table(*mt);
+    }
+    // gc_traverse_thread for every thread: the whole used stack is marked
+    // (frame-link slots decode as harmless numbers), plus the error value
+    // and the open-upvalue list. Afterwards every slot above `top` is
+    // cleared, exactly like the GCSatomic branch of `gc_traverse_thread`:
+    // this upholds the invariant that anything below `top` survived the
+    // last cycle, so a later `top` raise never exposes a dangling value.
+    for th in &g.threads {
+        let l = th.get();
+        for i in 0..l.top {
+            m.mark_value(l.stack[i]);
+        }
+        m.mark_value(l.errval);
+        for &uv in &l.openuv {
+            m.mark_upval(uv);
+            if let UpvalState::Open(slot) = uv.as_ref().state {
+                m.mark_value(l.stack[slot]);
+            }
+        }
+        for slot in l.stack[l.top..].iter_mut() {
+            *slot = LuaValue::NIL;
+        }
+    }
+    m.propagate();
+
+    // -- Sweep phase (GCSsweepstring + GCSsweep) --
+    let heap = &mut g.heap;
+    heap.strings.sweep();
+    heap.tables.sweep(|_| {});
+    heap.funcs.sweep(|_| {});
+    heap.upvals.sweep(|_| {});
+    heap.protos.sweep(|_| {});
+
+    // -- Recompute the live estimate and set the next threshold --
+    let mut total = 0usize;
+    for t in heap.tables.iter() {
+        total += t.gc_size();
+    }
+    for f in heap.funcs.iter() {
+        total += size_func(f);
+    }
+    total += heap.upvals.len() * size_upval();
+    for p in heap.protos.iter() {
+        total += p.gc_size();
+    }
+    heap.total = total;
+    heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
+}
+
+/// Allocation-time cost bookkeeping (the `lj_mem_newgco` side).
+pub(crate) fn account_func(f: &GcFunc) -> usize {
+    size_func(f)
+}
+
+pub(crate) fn account_upval() -> usize {
+    size_upval()
 }
 
 #[cfg(test)]
