@@ -5,7 +5,7 @@ use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv};
+use super::{LibTarget, arg, err_bad_arg, nargs, push};
 use crate::lual_reg;
 
 use super::sort::introsort;

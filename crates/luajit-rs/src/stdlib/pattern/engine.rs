@@ -6,7 +6,7 @@
 // - Fixed capture slots (no heap alloc during matching)
 
 use super::class::{element_end, is_class_letter, match_class, singlematch};
-use super::{LUA_MAXCAPTURES, MAX_REPETITION, MAXCCALLS_PATTERN, RECURSION_LIMIT};
+use super::{LUA_MAXCAPTURES, MAXCCALLS_PATTERN};
 
 /// Check if pattern has no special characters (can be matched as plain text).
 /// Mirrors C Lua's `nospecials()` in lstrlib.c.

@@ -235,6 +235,30 @@ impl LuaState {
         self.g.get_ref().heap.strings.get_static(sid)
     }
 
+    /// `lua_upvalueindex(i)`: read the i-th upvalue (0-based) of the
+    /// currently running C closure.  The closure lives at `base - 2`.
+    #[inline]
+    pub fn upvalue(&self, i: usize) -> LuaValue {
+        let f = self.stack[self.base - 2];
+        match f.as_func().map(|p| p.as_ref()) {
+            Some(crate::func::GcFunc::C(cc)) => cc.upvals.get(i).copied().unwrap_or(LuaValue::NIL),
+            _ => LuaValue::NIL,
+        }
+    }
+
+    /// `lua_setupvalue`: overwrite the i-th upvalue of the currently
+    /// running C closure.
+    pub fn set_upvalue(&mut self, i: usize, v: LuaValue) {
+        let f = self.stack[self.base - 2];
+        if let Some(gf) = f.as_func() {
+            if let crate::func::GcFunc::C(cc) = gf.as_mut() {
+                if i < cc.upvals.len() {
+                    cc.upvals[i] = v;
+                }
+            }
+        }
+    }
+
     pub fn is_main(&self) -> bool {
         self.is_main
     }

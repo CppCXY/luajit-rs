@@ -6,7 +6,8 @@ use crate::err::{LuaError, LuaResult};
 use crate::state::LuaState;
 use crate::value::{LJ_TNIL, LuaValue};
 
-use super::{arg, err_bad_arg, nargs, push, pushv, tostring_bytes};
+use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv, tostring_bytes};
+use crate::lual_reg;
 
 fn lib_print(l: &mut LuaState) -> LuaResult<i32> {
     use std::io::Write;
@@ -231,7 +232,7 @@ fn lib_error(l: &mut LuaState) -> LuaResult<i32> {
 /// `pcall(f [, arg...])` — protected call.
 fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
     let fv = arg(l, 0);
-    let gf = match fv.as_func() {
+    let _gf = match fv.as_func() {
         Some(p) => p,
         None => return Err(err_bad_arg(l, 1, "pcall", "function", "")),
     };
@@ -262,7 +263,7 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
     let _msgh = arg(l, 1); // error handler (NYI: not invoked on error)
     let fv = arg(l, 0);
-    let gf = match fv.as_func() {
+    let _gf = match fv.as_func() {
         Some(p) => p,
         None => return Err(err_bad_arg(l, 1, "xpcall", "function", "")),
     };
@@ -295,29 +296,31 @@ fn lib_getmetatable(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn open(l: &mut LuaState) {
-    let g = l.global().globals;
-    l.register(b"print", lib_print);
-    l.register(b"type", lib_type);
-    l.register(b"tostring", lib_tostring);
-    l.register(b"tonumber", lib_tonumber);
-    l.register(b"select", lib_select);
-    l.register(b"next", lib_next);
-    l.register(b"pairs", lib_pairs);
-    l.register(b"ipairs", lib_ipairs);
-    l.register(b"__ipairs_iter", lib_ipairs_iter);
-    l.register(b"setmetatable", lib_setmetatable);
-    l.register(b"assert", lib_assert);
-    l.register(b"collectgarbage", lib_collectgarbage);
-    l.register(b"rawget", lib_rawget);
-    l.register(b"rawset", lib_rawset);
-    l.register(b"rawequal", lib_rawequal);
-    l.register(b"error", lib_error);
-    l.register(b"pcall", lib_pcall);
-    l.register(b"xpcall", lib_xpcall);
-    l.register(b"getmetatable", lib_getmetatable);
+    lual_reg!(l, b"", LibTarget::BaseLib)
+        .func(b"print", lib_print)
+        .func(b"type", lib_type)
+        .func(b"tostring", lib_tostring)
+        .func(b"tonumber", lib_tonumber)
+        .func(b"select", lib_select)
+        .func(b"next", lib_next)
+        .func(b"pairs", lib_pairs)
+        .func(b"ipairs", lib_ipairs)
+        .func(b"__ipairs_iter", lib_ipairs_iter)
+        .func(b"setmetatable", lib_setmetatable)
+        .func(b"assert", lib_assert)
+        .func(b"collectgarbage", lib_collectgarbage)
+        .func(b"rawget", lib_rawget)
+        .func(b"rawset", lib_rawset)
+        .func(b"rawequal", lib_rawequal)
+        .func(b"error", lib_error)
+        .func(b"pcall", lib_pcall)
+        .func(b"xpcall", lib_xpcall)
+        .func(b"getmetatable", lib_getmetatable)
+        .build();
 
     let gsid = l.heap().intern(b"_G");
     let key = l.heap().str_value(gsid);
+    let g = l.global().globals;
     g.as_mut().set(key, LuaValue::table(g));
 
     let _ = LJ_TNIL;

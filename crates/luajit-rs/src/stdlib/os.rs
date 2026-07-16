@@ -6,7 +6,7 @@ use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv};
+use super::{LibTarget, arg, err_bad_arg, push};
 use crate::lual_reg;
 
 fn os_clock(l: &mut LuaState) -> LuaResult<i32> {
@@ -48,7 +48,7 @@ fn os_date(l: &mut LuaState) -> LuaResult<i32> {
 
     if fmt == b"*t" {
         let t = l.heap().alloc_table(crate::table::LuaTable::new(0, 4));
-        let mut set_int = |k: &str, v: i64| {
+        let set_int = |k: &str, v: i64| {
             let sid = l.heap().intern(k.as_bytes());
             t.as_mut()
                 .set(l.heap().str_value(sid), LuaValue::number(v as f64));

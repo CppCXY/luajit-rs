@@ -2,6 +2,8 @@
 //! and `randomseed` (which need rng state).  Constants are set via
 //! `table.new` + `table.set`.
 
+#![allow(dead_code)] // `atan`、`log` 由宏生成,在 lib 表中使用
+
 use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::value::LuaValue;
@@ -195,8 +197,8 @@ fn math_random(l: &mut LuaState) -> LuaResult<i32> {
         l,
         LuaValue::number(match (m, n) {
             (None, _) => 0.0,
-            (Some(u), None) => (u % 1.0),
-            (Some(lo), Some(hi)) => lo,
+            (Some(u), None) => u % 1.0,
+            (Some(lo), Some(_hi)) => lo,
         }),
     );
     Ok(1)
@@ -254,7 +256,7 @@ fn math_ult(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn open(l: &mut LuaState) {
-    let t = lual_reg!(l, b"math", LibTarget::Global)
+    lual_reg!(l, b"math", LibTarget::Global)
         .func(b"abs", abs)
         .func(b"acos", acos)
         .func(b"asin", asin)
@@ -285,14 +287,9 @@ pub fn open(l: &mut LuaState) {
         .func(b"tointeger", math_tointeger)
         .func(b"type", math_type)
         .func(b"ult", math_ult)
+        .constant(b"pi", LuaValue::number(std::f64::consts::PI))
+        .constant(b"huge", LuaValue::number(f64::MAX))
+        .constant(b"maxinteger", LuaValue::number(i64::MAX as f64))
+        .constant(b"mininteger", LuaValue::number(i64::MIN as f64))
         .build();
-    // Per-session constants.
-    let set = |t: &crate::gc::GcPtr<crate::table::LuaTable>, k: &str, v: LuaValue| {
-        let sk = l.heap().str_value(l.heap().intern(k.as_bytes()));
-        t.as_mut().set(sk, v);
-    };
-    set(&t, "pi", LuaValue::number(std::f64::consts::PI));
-    set(&t, "huge", LuaValue::number(f64::MAX));
-    set(&t, "maxinteger", LuaValue::number(i64::MAX as f64));
-    set(&t, "mininteger", LuaValue::number(i64::MIN as f64));
 }

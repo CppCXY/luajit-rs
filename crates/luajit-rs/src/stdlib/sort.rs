@@ -165,7 +165,7 @@ fn sift_down(
 /// The stack is arranged for a C call, executed, and the result read back.
 fn compare_lua(
     l: &mut LuaState,
-    comp: crate::gc::GcPtr<crate::func::GcFunc>,
+    _comp: crate::gc::GcPtr<crate::func::GcFunc>,
     a: LuaValue,
     b: LuaValue,
 ) -> LuaResult<bool> {
