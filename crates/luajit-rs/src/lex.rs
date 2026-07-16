@@ -187,6 +187,10 @@ fn is_space(c: i32) -> bool {
 
 impl LexState {
     pub fn new(src: Vec<u8>, chunkname: String) -> LexState {
+        LexState::with_interner(src, chunkname, Interner::default())
+    }
+
+    pub fn with_interner(src: Vec<u8>, chunkname: String, strs: Interner) -> LexState {
         let mut ls = LexState {
             src,
             pos: 0,
@@ -199,7 +203,7 @@ impl LexState {
             linenumber: 1,
             lastline: 1,
             chunkname,
-            strs: Interner::default(),
+            strs,
         };
         ls.next_char();
         if ls.c == 0xef && ls.pos + 1 < ls.src.len() && ls.src[ls.pos] == 0xbb && ls.src[ls.pos + 1] == 0xbf {

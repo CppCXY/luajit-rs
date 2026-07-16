@@ -1,8 +1,11 @@
 pub mod bc;
 pub mod dump;
+pub mod func;
+pub mod gc;
 pub mod lex;
 pub mod parse;
 pub mod proto;
+pub mod state;
 pub mod string;
 pub mod strscan;
 pub mod table;

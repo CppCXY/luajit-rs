@@ -1,11 +1,16 @@
 use crate::bc::{BCIns, BCLine};
+use crate::gc::GcPtr;
 use crate::lex::StrId;
 use crate::table::LuaTable;
 
 /// A collectable constant referenced from a prototype's `kgc` array.
 pub enum KGc {
     Str(StrId),
+    /// A child prototype, as produced by the compiler.
     Proto(Box<Proto>),
+    /// A child prototype after the tree has been registered in the heap
+    /// (see `GcHeap::alloc_proto`).
+    ProtoRef(GcPtr<Proto>),
     Table(LuaTable),
 }
 

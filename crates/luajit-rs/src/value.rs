@@ -1,3 +1,4 @@
+use crate::gc::GcPtr;
 use crate::string::{LuaString, StrId};
 
 /// A non-boxed 64-bit Lua value, bit-identical to LuaJIT's LJ_GC64 TValue
@@ -41,8 +42,20 @@ pub const LJ_TNUMX: u32 = !13;
 /// Integers have itype == LJ_TISNUM, doubles have itype < LJ_TISNUM.
 pub const LJ_TISNUM: u32 = LJ_TNUMX;
 
+/// First collectable itype (`LJ_TISGCV`): values with itype in
+/// `[LJ_TUDATA, LJ_TSTR]` are GC objects.
+pub const LJ_TISGCV: u32 = LJ_TUDATA;
+
+/// `LJ_TISTRUECOND`: values with itype >= this are false-ish (nil, false).
+pub const LJ_TISTRUECOND: u32 = LJ_TFALSE;
+
 /// Mask for the 47-bit GC payload (`LJ_GCVMASK`).
 pub const LJ_GCVMASK: u64 = (1u64 << 47) - 1;
+
+/// A reference to a GC object: a real pointer occupying the 47-bit payload,
+/// exactly as LuaJIT stores a `GCRef`. Objects live in stable-address pools
+/// (see `gc::Pool`), so these addresses stay valid.
+pub type GcRef = u64;
 
 /// Primitive encoding, mirroring `setpriV`: `~((u64)~itype << 47)`.
 const fn pri(itype: u32) -> u64 {
@@ -88,8 +101,23 @@ impl LuaValue {
         LuaValue(bits)
     }
 
-    pub fn string(s: &LuaString) -> LuaValue {
-        LuaValue(gcv(LJ_TSTR, s.sid() as u64))
+    pub fn string(s: GcPtr<LuaString>) -> LuaValue {
+        LuaValue(gcv(LJ_TSTR, s.addr()))
+    }
+
+    /// A GC object reference with an explicit itype (`setgcVraw`).
+    pub fn gcval(itype: u32, addr: GcRef) -> LuaValue {
+        debug_assert!((LJ_TISGCV..=LJ_TSTR).contains(&itype));
+        debug_assert!(addr <= LJ_GCVMASK);
+        LuaValue(gcv(itype, addr))
+    }
+
+    pub fn table(p: GcPtr<crate::table::LuaTable>) -> LuaValue {
+        LuaValue::gcval(LJ_TTAB, p.addr())
+    }
+
+    pub fn func(p: GcPtr<crate::func::GcFunc>) -> LuaValue {
+        LuaValue::gcval(LJ_TFUNC, p.addr())
     }
 
     /// Placeholder reference used by template tables to preserve keys whose
@@ -128,6 +156,24 @@ impl LuaValue {
         self.itype() == LJ_TSTR
     }
 
+    pub fn is_table(self) -> bool {
+        self.itype() == LJ_TTAB
+    }
+
+    pub fn is_func(self) -> bool {
+        self.itype() == LJ_TFUNC
+    }
+
+    /// `tvisgcv`: value references a GC object (string, table, function, ...).
+    pub fn is_gcv(self) -> bool {
+        (LJ_TISGCV..=LJ_TSTR).contains(&self.itype())
+    }
+
+    /// `tvistruecond`: everything except nil and false is truthy.
+    pub fn is_truthy(self) -> bool {
+        self.itype() < LJ_TISTRUECOND
+    }
+
     pub fn as_number(self) -> Option<f64> {
         if self.is_number() {
             Some(f64::from_bits(self.0))
@@ -136,12 +182,39 @@ impl LuaValue {
         }
     }
 
-    pub fn as_string(self) -> Option<StrId> {
+    pub fn as_string(self) -> Option<GcPtr<LuaString>> {
         if self.is_string() {
-            Some((self.0 & LJ_GCVMASK) as u32)
+            GcPtr::from_addr(self.gc_addr())
         } else {
             None
         }
+    }
+
+    /// The interned id of a string value (loaded from the object).
+    pub fn as_string_id(self) -> Option<StrId> {
+        self.as_string().map(|p| p.as_ref().sid())
+    }
+
+    pub fn as_table(self) -> Option<GcPtr<crate::table::LuaTable>> {
+        if self.is_table() {
+            GcPtr::from_addr(self.gc_addr())
+        } else {
+            None
+        }
+    }
+
+    pub fn as_func(self) -> Option<GcPtr<crate::func::GcFunc>> {
+        if self.is_func() {
+            GcPtr::from_addr(self.gc_addr())
+        } else {
+            None
+        }
+    }
+
+    /// The 47-bit GC payload (a pointer address). Only meaningful when the
+    /// value is a GC object (`is_gcv`).
+    pub fn gc_addr(self) -> GcRef {
+        self.0 & LJ_GCVMASK
     }
 
     /// Exact conversion to int32, mirroring `lj_vm_num2int_check` semantics.
@@ -165,7 +238,7 @@ impl LuaValue {
     /// (`hashmask(boolV)`), other GC objects by their payload (`hashgcref`).
     pub fn hash_key(self) -> u32 {
         if self.is_string() {
-            (self.0 & LJ_GCVMASK) as u32
+            self.as_string().unwrap().as_ref().sid()
         } else if self.is_number() {
             hashrot(self.0 as u32, ((self.0 >> 32) as u32) << 1)
         } else if self.is_bool() {
@@ -183,8 +256,9 @@ impl std::fmt::Debug for LuaValue {
             LJ_TNIL => write!(f, "nil"),
             LJ_TFALSE => write!(f, "false"),
             LJ_TTRUE => write!(f, "true"),
-            LJ_TSTR => write!(f, "str#{}", self.0 & LJ_GCVMASK),
-            LJ_TTAB => write!(f, "table#{:#x}", self.0 & LJ_GCVMASK),
+            LJ_TSTR => write!(f, "str@{:#x}", self.gc_addr()),
+            LJ_TTAB => write!(f, "table@{:#x}", self.gc_addr()),
+            LJ_TFUNC => write!(f, "func@{:#x}", self.gc_addr()),
             _ => write!(f, "{}", f64::from_bits(self.0)),
         }
     }
@@ -212,9 +286,9 @@ mod tests {
         assert_eq!(LuaValue::TRUE.itype(), LJ_TTRUE);
         let mut strs = Interner::default();
         let sid = strs.intern(b"x");
-        let v = LuaValue::string(strs.lookup(sid));
+        let v = LuaValue::string(strs.lookup_ptr(sid));
         assert_eq!(v.itype(), LJ_TSTR);
-        assert_eq!(v.as_string(), Some(sid));
+        assert_eq!(v.as_string_id(), Some(sid));
         assert_eq!(LuaValue::table_marker().itype(), LJ_TTAB);
     }
 
@@ -237,7 +311,9 @@ mod tests {
     fn string_tag_encoding_matches_gc64() {
         let mut strs = Interner::default();
         let sid = strs.intern(b"abc");
-        let v = LuaValue::string(strs.lookup(sid));
-        assert_eq!(v.to_bits(), (sid as u64) | ((LJ_TSTR as u64) << 47));
+        let p = strs.lookup_ptr(sid);
+        let v = LuaValue::string(p);
+        assert_eq!(v.to_bits(), p.addr() | ((LJ_TSTR as u64) << 47));
+        assert_eq!(v.as_string().unwrap().addr(), p.addr());
     }
 }

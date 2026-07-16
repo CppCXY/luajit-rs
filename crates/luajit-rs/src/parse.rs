@@ -279,8 +279,12 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(src: Vec<u8>, chunkname: String) -> Parser {
+        Parser::with_interner(src, chunkname, Interner::default())
+    }
+
+    pub fn with_interner(src: Vec<u8>, chunkname: String, strs: Interner) -> Parser {
         Parser {
-            ls: LexState::new(src, chunkname),
+            ls: LexState::with_interner(src, chunkname, strs),
             vstack: Vec::new(),
             bcstack: Vec::new(),
             vhash: [VINDEX_NONE; 32],
@@ -1780,7 +1784,7 @@ impl Parser {
                 _ => LuaValue::TRUE,
             }
         } else if e.k == VKStr {
-            LuaValue::string(self.ls.strs.lookup(e.sval))
+            LuaValue::string(self.ls.strs.lookup_ptr(e.sval))
         } else {
             debug_assert!(e.k == VKNum);
             LuaValue::number(e.nval)

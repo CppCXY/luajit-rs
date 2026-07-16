@@ -106,7 +106,8 @@ pub fn hash_sparse(seed: u64, s: &[u8]) -> u32 {
 /// string equality reduces to id equality.
 pub struct Interner {
     map: HashMap<Box<[u8]>, StrId>,
-    vec: Vec<LuaString>,
+    by_id: Vec<crate::gc::GcPtr<LuaString>>,
+    pool: crate::gc::Pool<LuaString>,
     seed: u64,
 }
 
@@ -114,7 +115,8 @@ impl Default for Interner {
     fn default() -> Interner {
         Interner {
             map: HashMap::new(),
-            vec: Vec::new(),
+            by_id: Vec::new(),
+            pool: crate::gc::Pool::new(),
             seed: 0,
         }
     }
@@ -125,19 +127,26 @@ impl Interner {
         if let Some(&id) = self.map.get(s) {
             return id;
         }
-        let sid = self.vec.len() as StrId;
+        let sid = self.by_id.len() as StrId;
         let hash = hash_sparse(self.seed, s);
-        self.vec.push(LuaString::new(s, sid, hash));
+        let p = self.pool.alloc(LuaString::new(s, sid, hash));
+        self.by_id.push(p);
         self.map.insert(s.into(), sid);
         sid
     }
 
     pub fn get(&self, id: StrId) -> &[u8] {
-        self.vec[id as usize].as_bytes()
+        self.by_id[id as usize].as_ref().as_bytes()
     }
 
     pub fn lookup(&self, id: StrId) -> &LuaString {
-        &self.vec[id as usize]
+        self.by_id[id as usize].as_ref()
+    }
+
+    /// A stable pointer to the interned string object, for storing in a
+    /// `LuaValue`.
+    pub fn lookup_ptr(&self, id: StrId) -> crate::gc::GcPtr<LuaString> {
+        self.by_id[id as usize]
     }
 }
 
@@ -181,13 +190,13 @@ mod tests {
         let mut strs = Interner::default();
         let short = strs.intern(b"s");
         let long = strs.intern(&vec![b'y'; 100]);
-        let vs = LuaValue::string(strs.lookup(short));
-        let vl = LuaValue::string(strs.lookup(long));
+        let vs = LuaValue::string(strs.lookup_ptr(short));
+        let vl = LuaValue::string(strs.lookup_ptr(long));
         // Inline vs heap storage is invisible at the value level: both are
         // plain LJ_TSTR values, distinguished only by their sid payload.
         assert!(vs.is_string() && vl.is_string());
-        assert_eq!(vs.as_string(), Some(short));
-        assert_eq!(vl.as_string(), Some(long));
+        assert_eq!(vs.as_string_id(), Some(short));
+        assert_eq!(vl.as_string_id(), Some(long));
         assert_ne!(vs, vl);
     }
 

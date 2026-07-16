@@ -423,13 +423,13 @@ mod tests {
             .collect();
         for (i, &sid) in keys.iter().enumerate() {
             t.set(
-                LuaValue::string(strs.lookup(sid)),
+                LuaValue::string(strs.lookup_ptr(sid)),
                 LuaValue::number(i as f64),
             );
         }
         for (i, &sid) in keys.iter().enumerate() {
             assert_eq!(
-                t.get(LuaValue::string(strs.lookup(sid))),
+                t.get(LuaValue::string(strs.lookup_ptr(sid))),
                 LuaValue::number(i as f64)
             );
         }
@@ -440,10 +440,10 @@ mod tests {
         let mut strs = Interner::default();
         let mut t = LuaTable::new(4, 1);
         let k = strs.intern(b"x");
-        t.set(LuaValue::string(strs.lookup(k)), LuaValue::number(1.0));
-        t.set(LuaValue::string(strs.lookup(k)), LuaValue::number(2.0));
+        t.set(LuaValue::string(strs.lookup_ptr(k)), LuaValue::number(1.0));
+        t.set(LuaValue::string(strs.lookup_ptr(k)), LuaValue::number(2.0));
         assert_eq!(
-            t.get(LuaValue::string(strs.lookup(k))),
+            t.get(LuaValue::string(strs.lookup_ptr(k))),
             LuaValue::number(2.0)
         );
         t.set(LuaValue::number(2.5), LuaValue::TRUE);
