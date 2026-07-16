@@ -54,7 +54,7 @@ fn g14(n: f64) -> String {
     let mant = format!("{:.13e}", n);
     let (m, e) = mant.split_once('e').unwrap();
     let exp: i32 = e.parse().unwrap();
-    if exp < -4 || exp >= 14 {
+    if !(-4..14).contains(&exp) {
         let m = m.trim_end_matches('0').trim_end_matches('.');
         format!("{}e{}{:02}", m, if exp < 0 { '-' } else { '+' }, exp.abs())
     } else {
@@ -93,8 +93,7 @@ pub fn dump(pt: &Proto, strs: &Interner, chunk: &str, out: &mut Vec<u8>) {
         }
     }
 
-    for i in 1..n {
-        let ins = pt.bc[i];
+    for (i, &ins) in pt.bc.iter().enumerate().skip(1) {
         let op = bc_op(ins);
         let ma = bcmode_a(op);
         let mb = bcmode_b(op);

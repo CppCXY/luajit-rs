@@ -242,6 +242,7 @@ impl LuaState {
 /// through wrapped raw pointers, so their addresses stay fixed.
 pub struct Lua {
     g: Box<GlobalState>,
+    #[allow(clippy::vec_box)] // Box keeps each LuaState address stable while the Vec grows.
     threads: Vec<Box<LuaState>>,
 }
 

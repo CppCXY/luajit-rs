@@ -16,7 +16,7 @@ pub fn g14(n: f64) -> String {
     let mant = format!("{:.13e}", n);
     let (m, e) = mant.split_once('e').unwrap();
     let exp: i32 = e.parse().unwrap();
-    if exp < -4 || exp >= 14 {
+    if !(-4..14).contains(&exp) {
         let m = m.trim_end_matches('0').trim_end_matches('.');
         format!("{}e{}{:02}", m, if exp < 0 { '-' } else { '+' }, exp.abs())
     } else {
@@ -204,9 +204,9 @@ fn pad(s: Vec<u8>, width: Option<usize>, left: bool) -> Vec<u8> {
             let mut out = Vec::with_capacity(w);
             if left {
                 out.extend_from_slice(&s);
-                out.extend(std::iter::repeat(b' ').take(padn));
+                out.extend(std::iter::repeat_n(b' ', padn));
             } else {
-                out.extend(std::iter::repeat(b' ').take(padn));
+                out.extend(std::iter::repeat_n(b' ', padn));
                 out.extend_from_slice(&s);
             }
             out
@@ -224,18 +224,20 @@ fn pad_int(spec: &str, digits: &str, negative: bool) -> String {
         }
     }
     let sign = if negative { "-" } else { "" };
-    if zero && !left && prec.is_none() {
-        if let Some(w) = width {
-            let total = sign.len() + body.len();
-            if total < w {
-                let mut s = String::new();
-                s.push_str(sign);
-                for _ in 0..(w - total) {
-                    s.push('0');
-                }
-                s.push_str(&body);
-                return s;
+    if zero
+        && !left
+        && prec.is_none()
+        && let Some(w) = width
+    {
+        let total = sign.len() + body.len();
+        if total < w {
+            let mut s = String::new();
+            s.push_str(sign);
+            for _ in 0..(w - total) {
+                s.push('0');
             }
+            s.push_str(&body);
+            return s;
         }
     }
     let s = format!("{}{}", sign, body).into_bytes();
@@ -265,18 +267,19 @@ fn fmt_float(spec: &str, conv: u8, n: f64) -> String {
         _ => unreachable!(),
     };
     let sign = if n.is_sign_negative() { "-" } else { "" };
-    if zero && !left {
-        if let Some(w) = width {
-            let total = sign.len() + body.len();
-            if total < w {
-                let mut s = String::new();
-                s.push_str(sign);
-                for _ in 0..(w - total) {
-                    s.push('0');
-                }
-                s.push_str(&body);
-                return s;
+    if zero
+        && !left
+        && let Some(w) = width
+    {
+        let total = sign.len() + body.len();
+        if total < w {
+            let mut s = String::new();
+            s.push_str(sign);
+            for _ in 0..(w - total) {
+                s.push('0');
             }
+            s.push_str(&body);
+            return s;
         }
     }
     body.insert_str(0, sign);

@@ -150,6 +150,7 @@ impl<T> GcPtr<T> {
         self.0.as_ptr() as u64
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref<'a>(self) -> &'a T {
         unsafe { &*self.0.as_ptr() }
     }

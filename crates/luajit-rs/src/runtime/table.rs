@@ -126,10 +126,10 @@ impl LuaTable {
     // -- Getters ---------------------------------------------------------
 
     pub fn get(&self, key: LuaValue) -> LuaValue {
-        if let Some(i) = LuaTable::array_key(key) {
-            if i < self.asize {
-                return self.array[i as usize];
-            }
+        if let Some(i) = LuaTable::array_key(key)
+            && i < self.asize
+        {
+            return self.array[i as usize];
         }
         if key.is_nil() || !self.has_hpart() {
             return LuaValue::NIL;
@@ -163,10 +163,10 @@ impl LuaTable {
         if key.is_nil() {
             return 0;
         }
-        if let Some(k) = LuaTable::array_key(key) {
-            if k < self.asize {
-                return k + 1;
-            }
+        if let Some(k) = LuaTable::array_key(key)
+            && k < self.asize
+        {
+            return k + 1;
         }
         if self.has_hpart() {
             let mut n = self.hash_slot(key);
@@ -211,11 +211,10 @@ impl LuaTable {
     }
 
     /// Table length (a border), ported from `lj_tab_len`.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u32 {
         let mut hi = self.asize;
-        if hi > 0 {
-            hi -= 1;
-        }
+        hi = hi.saturating_sub(1);
         if hi > 0 && self.array[hi as usize].is_nil() {
             let mut lo = 0u32;
             while hi - lo > 1 {
@@ -290,11 +289,11 @@ impl LuaTable {
     pub fn set(&mut self, key: LuaValue, val: LuaValue) {
         debug_assert!(!key.is_nil());
         loop {
-            if let Some(i) = LuaTable::array_key(key) {
-                if i < self.asize {
-                    self.array[i as usize] = val;
-                    return;
-                }
+            if let Some(i) = LuaTable::array_key(key)
+                && i < self.asize
+            {
+                self.array[i as usize] = val;
+                return;
             }
             if self.has_hpart() {
                 let mut n = self.hash_slot(key);
@@ -449,12 +448,12 @@ impl LuaTable {
 
     /// Count an integer key into `bins`, per `countint`. Returns 1 if counted.
     fn count_int(key: LuaValue, bins: &mut [u32]) -> u32 {
-        if let Some(k) = key.as_int32_exact() {
-            if (k as u32) < LJ_MAX_ASIZE {
-                let idx = if k > 2 { fls((k - 1) as u32) } else { 0 };
-                bins[idx as usize] += 1;
-                return 1;
-            }
+        if let Some(k) = key.as_int32_exact()
+            && (k as u32) < LJ_MAX_ASIZE
+        {
+            let idx = if k > 2 { fls((k - 1) as u32) } else { 0 };
+            bins[idx as usize] += 1;
+            return 1;
         }
         0
     }

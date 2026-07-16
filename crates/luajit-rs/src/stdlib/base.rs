@@ -119,11 +119,11 @@ fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_select(l: &mut LuaState) -> LuaResult<i32> {
     let first = arg(l, 0);
     let n = nargs(l);
-    if let Some(sid) = first.as_string_id() {
-        if l.heap().strings.get(sid) == b"#" {
-            l.stack[l.base] = LuaValue::number((n - 1) as f64);
-            return Ok(1);
-        }
+    if let Some(sid) = first.as_string_id()
+        && l.heap().strings.get(sid) == b"#"
+    {
+        l.stack[l.base] = LuaValue::number((n - 1) as f64);
+        return Ok(1);
     }
     let k = match first.as_number() {
         Some(k) if k >= 1.0 => k as usize,

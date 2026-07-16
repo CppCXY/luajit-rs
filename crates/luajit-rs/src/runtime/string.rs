@@ -104,22 +104,12 @@ pub fn hash_sparse(seed: u64, s: &[u8]) -> u32 {
 /// The string intern table, corresponding to LuaJIT's global string table
 /// (`lj_str_new`). Equal byte content always maps to the same `StrId`, so
 /// string equality reduces to id equality.
+#[derive(Default)]
 pub struct Interner {
     map: HashMap<Box<[u8]>, StrId>,
     by_id: Vec<crate::gc::GcPtr<LuaString>>,
     pool: crate::gc::Pool<LuaString>,
     seed: u64,
-}
-
-impl Default for Interner {
-    fn default() -> Interner {
-        Interner {
-            map: HashMap::new(),
-            by_id: Vec::new(),
-            pool: crate::gc::Pool::new(),
-            seed: 0,
-        }
-    }
 }
 
 impl Interner {
@@ -189,7 +179,7 @@ mod tests {
         use crate::value::LuaValue;
         let mut strs = Interner::default();
         let short = strs.intern(b"s");
-        let long = strs.intern(&vec![b'y'; 100]);
+        let long = strs.intern(&[b'y'; 100]);
         let vs = LuaValue::string(strs.lookup_ptr(short));
         let vl = LuaValue::string(strs.lookup_ptr(long));
         // Inline vs heap storage is invisible at the value level: both are

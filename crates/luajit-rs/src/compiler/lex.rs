@@ -180,7 +180,7 @@ fn is_xdigit(c: i32) -> bool {
 
 #[inline]
 fn is_space(c: i32) -> bool {
-    (c >= 9 && c <= 13) || c == 32
+    (9..=13).contains(&c) || c == 32
 }
 
 impl LexState {
@@ -362,7 +362,7 @@ impl LexState {
         if is_str {
             let start = 2 + sep as usize;
             let end = self.sb.len() - start;
-            let id = self.strs.intern(&self.sb[start..end].to_vec());
+            let id = self.strs.intern(&self.sb[start..end]);
             Some(id)
         } else {
             None
@@ -436,7 +436,7 @@ impl LexState {
                                     self.save(0xf0 | (c >> 18));
                                     self.save(0x80 | ((c >> 12) & 0x3f));
                                 } else {
-                                    if c >= 0xd800 && c < 0xe000 {
+                                    if (0xd800..0xe000).contains(&c) {
                                         self.error("invalid escape sequence");
                                     }
                                     self.save(0xe0 | (c >> 12));
@@ -494,190 +494,198 @@ impl LexState {
             }
         }
         self.save_next();
-        self.strs.intern(&self.sb[1..self.sb.len() - 1].to_vec())
+        self.strs.intern(&self.sb[1..self.sb.len() - 1])
+    }
+
+    /// Consume the current character if it equals `c`.
+    #[inline]
+    fn eat(&mut self, c: u8) -> bool {
+        if self.c == c as i32 {
+            self.next_char();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn scan_name_or_keyword(&mut self) -> (Tok, TokVal) {
+        while is_ident(self.c) {
+            self.save_next();
+        }
+        let id = self.strs.intern(&self.sb);
+        let tok = KEYWORDS
+            .iter()
+            .find(|(kw, _)| *kw == self.sb.as_slice())
+            .map_or(Tok::Name, |&(_, t)| t);
+        (tok, TokVal { num: 0.0, str: id })
+    }
+
+    /// Skip a `--` comment (short or long). The leading `--` is consumed.
+    fn scan_comment(&mut self) {
+        if self.c == b'[' as i32 {
+            let sep = self.skip_eq();
+            self.sb.clear();
+            if sep >= 0 {
+                self.long_string(false, sep);
+                self.sb.clear();
+                return;
+            }
+        }
+        while !self.is_eol() && self.c != LEX_EOF {
+            self.next_char();
+        }
     }
 
     fn scan(&mut self) -> (Tok, TokVal) {
         self.sb.clear();
         loop {
-            if is_ident(self.c) {
-                if is_digit(self.c) {
-                    let n = self.lex_number();
-                    return (Tok::Number, TokVal { num: n, str: 0 });
-                }
-                loop {
-                    self.save_next();
-                    if !is_ident(self.c) {
-                        break;
-                    }
-                }
-                let bytes = self.sb.clone();
-                let id = self.strs.intern(&bytes);
-                for (kw, t) in KEYWORDS {
-                    if *kw == &bytes[..] {
-                        return (*t, TokVal { num: 0.0, str: id });
-                    }
-                }
-                return (Tok::Name, TokVal { num: 0.0, str: id });
+            if is_digit(self.c) {
+                let n = self.lex_number();
+                return (Tok::Number, TokVal { num: n, str: 0 });
             }
-            match self.c {
-                c if c == b'\n' as i32 || c == b'\r' as i32 => {
+            if is_ident(self.c) {
+                return self.scan_name_or_keyword();
+            }
+            if self.c == LEX_EOF {
+                return (Tok::Eof, TokVal::default());
+            }
+            let c = self.c as u8;
+            let tok = match c {
+                b'\n' | b'\r' => {
                     self.newline();
+                    continue;
                 }
-                c if c == b' ' as i32 || c == 9 || c == 11 || c == 12 => {
+                b' ' | b'\t' | 0x0b | 0x0c => {
                     self.next_char();
+                    continue;
                 }
-                c if c == b'-' as i32 => {
+                b'-' => {
                     self.next_char();
-                    if self.c != b'-' as i32 {
-                        if self.c != b'>' as i32 {
-                            return (Tok::Char(b'-'), TokVal::default());
-                        }
-                        self.next_char();
-                        return (Tok::Arrow, TokVal::default());
-                    }
-                    self.next_char();
-                    if self.c == b'[' as i32 {
-                        let sep = self.skip_eq();
-                        self.sb.clear();
-                        if sep >= 0 {
-                            self.long_string(false, sep);
-                            self.sb.clear();
-                            continue;
-                        }
-                    }
-                    while !self.is_eol() && self.c != LEX_EOF {
-                        self.next_char();
+                    if self.eat(b'>') {
+                        Tok::Arrow
+                    } else if self.eat(b'-') {
+                        self.scan_comment();
+                        continue;
+                    } else {
+                        Tok::Char(b'-')
                     }
                 }
-                c if c == b'[' as i32 => {
-                    let sep = self.skip_eq();
-                    if sep >= 0 {
+                b'[' => match self.skip_eq() {
+                    sep @ 0.. => {
                         let id = self.long_string(true, sep).unwrap();
                         return (Tok::Str, TokVal { num: 0.0, str: id });
-                    } else if sep == -1 {
-                        return (Tok::Char(b'['), TokVal::default());
+                    }
+                    -1 => Tok::Char(b'['),
+                    _ => self.error("invalid long string delimiter"),
+                },
+                b'=' => {
+                    self.next_char();
+                    if self.eat(b'=') {
+                        Tok::Eq
                     } else {
-                        self.error("invalid long string delimiter");
+                        Tok::Char(b'=')
                     }
                 }
-                c if c == b'=' as i32 => {
+                b'<' => {
                     self.next_char();
-                    if self.c != b'=' as i32 {
-                        return (Tok::Char(b'='), TokVal::default());
+                    if self.eat(b'=') {
+                        Tok::Le
+                    } else if self.eat(b'<') {
+                        Tok::Shl
+                    } else {
+                        Tok::Char(b'<')
                     }
-                    self.next_char();
-                    return (Tok::Eq, TokVal::default());
                 }
-                c if c == b'<' as i32 => {
+                b'>' => {
                     self.next_char();
-                    if self.c == b'=' as i32 {
-                        self.next_char();
-                        return (Tok::Le, TokVal::default());
+                    if self.eat(b'=') {
+                        Tok::Ge
+                    } else if self.eat(b'>') {
+                        Tok::Shr
+                    } else {
+                        Tok::Char(b'>')
                     }
-                    if self.c == b'<' as i32 {
-                        self.next_char();
-                        return (Tok::Shl, TokVal::default());
-                    }
-                    return (Tok::Char(b'<'), TokVal::default());
                 }
-                c if c == b'>' as i32 => {
+                b'~' => {
                     self.next_char();
-                    if self.c == b'=' as i32 {
-                        self.next_char();
-                        return (Tok::Ge, TokVal::default());
-                    }
-                    if self.c == b'>' as i32 {
-                        self.next_char();
-                        return (Tok::Shr, TokVal::default());
-                    }
-                    return (Tok::Char(b'>'), TokVal::default());
-                }
-                c if c == b'~' as i32 => {
-                    self.next_char();
-                    if self.c == b'=' as i32 {
-                        self.next_char();
-                        return (Tok::Ne, TokVal::default());
-                    }
-                    if self.c == b'>' as i32 {
-                        self.next_char();
-                        if self.c != b'>' as i32 {
+                    if self.eat(b'=') {
+                        Tok::Ne
+                    } else if self.eat(b'>') {
+                        if !self.eat(b'>') {
                             self.error("unexpected symbol");
                         }
-                        self.next_char();
-                        return (Tok::Sar, TokVal::default());
+                        Tok::Sar
+                    } else {
+                        Tok::Char(b'~')
                     }
-                    return (Tok::Char(b'~'), TokVal::default());
                 }
-                c if c == b'!' as i32 => {
+                b'!' => {
                     self.next_char();
-                    if self.c != b'=' as i32 {
-                        return (Tok::Char(b'!'), TokVal::default());
+                    if self.eat(b'=') {
+                        Tok::NeBang
+                    } else {
+                        Tok::Char(b'!')
                     }
-                    self.next_char();
-                    return (Tok::NeBang, TokVal::default());
                 }
-                c if c == b':' as i32 => {
+                b':' => {
                     self.next_char();
-                    if self.c != b':' as i32 {
-                        return (Tok::Char(b':'), TokVal::default());
+                    if self.eat(b':') {
+                        Tok::Label
+                    } else {
+                        Tok::Char(b':')
                     }
-                    self.next_char();
-                    return (Tok::Label, TokVal::default());
                 }
-                c if c == b'?' as i32 => {
+                b'?' => {
                     self.next_char();
-                    if self.c == b'.' as i32 {
-                        self.next_char();
-                        return (Tok::Nav, TokVal::default());
+                    if self.eat(b'.') {
+                        Tok::Nav
+                    } else if self.eat(b'?') {
+                        Tok::Coal
+                    } else {
+                        Tok::Char(b'?')
                     }
-                    if self.c == b'?' as i32 {
-                        self.next_char();
-                        return (Tok::Coal, TokVal::default());
-                    }
-                    return (Tok::Char(b'?'), TokVal::default());
                 }
-                c if c == b'&' as i32 => {
+                b'&' => {
                     self.next_char();
-                    if self.c != b'&' as i32 {
-                        return (Tok::Char(b'&'), TokVal::default());
+                    if self.eat(b'&') {
+                        Tok::AndAnd
+                    } else {
+                        Tok::Char(b'&')
                     }
-                    self.next_char();
-                    return (Tok::AndAnd, TokVal::default());
                 }
-                c if c == b'|' as i32 => {
+                b'|' => {
                     self.next_char();
-                    if self.c != b'|' as i32 {
-                        return (Tok::Char(b'|'), TokVal::default());
+                    if self.eat(b'|') {
+                        Tok::OrOr
+                    } else {
+                        Tok::Char(b'|')
                     }
-                    self.next_char();
-                    return (Tok::OrOr, TokVal::default());
                 }
-                c if c == b'"' as i32 || c == b'\'' as i32 => {
+                b'"' | b'\'' => {
                     let id = self.string();
                     return (Tok::Str, TokVal { num: 0.0, str: id });
                 }
-                c if c == b'.' as i32 => {
+                b'.' => {
                     if self.save_next() == b'.' as i32 {
                         self.next_char();
-                        if self.c == b'.' as i32 {
-                            self.next_char();
-                            return (Tok::Dots, TokVal::default());
+                        if self.eat(b'.') {
+                            Tok::Dots
+                        } else {
+                            Tok::Concat
                         }
-                        return (Tok::Concat, TokVal::default());
-                    } else if !is_digit(self.c) {
-                        return (Tok::Char(b'.'), TokVal::default());
-                    } else {
+                    } else if is_digit(self.c) {
                         let n = self.lex_number();
                         return (Tok::Number, TokVal { num: n, str: 0 });
+                    } else {
+                        Tok::Char(b'.')
                     }
                 }
-                LEX_EOF => return (Tok::Eof, TokVal::default()),
-                c => {
+                _ => {
                     self.next_char();
-                    return (Tok::Char(c as u8), TokVal::default());
+                    Tok::Char(c)
                 }
-            }
+            };
+            return (tok, TokVal::default());
         }
     }
 

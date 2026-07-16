@@ -124,6 +124,11 @@ impl Interp {
         }
     }
 
+    /// The interpreter has exclusive access to the `LuaState` for the whole
+    /// `run` invocation; the raw pointer (and this deliberate `&self ->
+    /// &mut` escape hatch) exists so borrows of `Interp` fields and the
+    /// state can overlap without fighting the borrow checker.
+    #[allow(clippy::mut_from_ref)]
     #[inline(always)]
     fn l(&self) -> &mut LuaState {
         unsafe { &mut *self.l }
@@ -972,10 +977,10 @@ impl Interp {
 
     fn find_upval(&mut self, slot: usize) -> GcPtr<Upval> {
         for &uv in self.l().openuv.iter() {
-            if let UpvalState::Open(s) = uv.as_ref().state {
-                if s == slot {
-                    return uv;
-                }
+            if let UpvalState::Open(s) = uv.as_ref().state
+                && s == slot
+            {
+                return uv;
             }
         }
         let uv = self.l().heap().alloc_upval(Upval::new_open(slot, false));

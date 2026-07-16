@@ -36,6 +36,7 @@ const EXPR_F_NONAV: u32 = 0x04;
 const EXPR_F_RET1: u32 = 0x08;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[allow(clippy::enum_variant_names)] // mirrors LuaJIT's VKNIL/VLOCAL/... names
 enum ExpKind {
     VKNil,
     VKFalse,
@@ -132,6 +133,7 @@ struct BCInsLine {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
+#[allow(clippy::enum_variant_names)] // NoBinOp mirrors LuaJIT's OPR_NOBINOPR
 enum BinOp {
     Add,
     Sub,
@@ -456,7 +458,6 @@ impl Parser {
 
     fn jmp_append(&mut self, l1: &mut BCPos, l2: BCPos) {
         if l2 == NO_JMP {
-            return;
         } else if *l1 == NO_JMP {
             *l1 = l2;
         } else {
@@ -1535,12 +1536,7 @@ impl Parser {
 
     fn gola_findlabel(&self, name: &VName) -> Option<usize> {
         let vstart = self.cur().scopes.last().unwrap().vstart as usize;
-        for v in vstart..self.vstack.len() {
-            if self.vstack[v].name == *name && self.gola_islabel(v) {
-                return Some(v);
-            }
-        }
-        None
+        (vstart..self.vstack.len()).find(|&v| self.vstack[v].name == *name && self.gola_islabel(v))
     }
 
     // -- Scope handling ------------------------------------------------------
@@ -1908,10 +1904,8 @@ impl Parser {
             let mut narr = narr;
             if !needarr {
                 narr = 0;
-            } else if narr < 3 {
-                narr = 3;
-            } else if narr > 0x7ff {
-                narr = 0x7ff;
+            } else {
+                narr = narr.clamp(3, 0x7ff);
             }
             setbc_d(self.ins_mut(pc), narr | (hsize2hbits(nhash) << 11));
         }
@@ -2058,15 +2052,14 @@ impl Parser {
         }
         debug_assert!(e.k == VNonReloc);
         let base = e.info;
-        let ins;
-        if args.k == VCall {
-            ins = bcins_abc(BCOp::CALLM, base, 2, args.aux - base - 1 - self.fr2);
+        let ins = if args.k == VCall {
+            bcins_abc(BCOp::CALLM, base, 2, args.aux - base - 1 - self.fr2)
         } else {
             if args.k != VVoid {
                 self.expr_tonextreg(&mut args);
             }
-            ins = bcins_abc(BCOp::CALL, base, 2, self.cur().freereg - base - self.fr2);
-        }
+            bcins_abc(BCOp::CALL, base, 2, self.cur().freereg - base - self.fr2)
+        };
         *e = ExpDesc::init(VCall, self.bcemit(ins));
         e.aux = base;
         let pc = self.cur().pc - 1;
@@ -2582,13 +2575,12 @@ impl Parser {
             ins = bcins_ad(BCOp::RET0, 0, 1);
         } else {
             let mut e = ExpDesc::init(VVoid, 0);
-            let nret;
-            if (eflags & EXPR_F_RET1) != 0 {
+            let nret = if (eflags & EXPR_F_RET1) != 0 {
                 self.expr(&mut e, eflags);
-                nret = 1;
+                1
             } else {
-                nret = self.expr_list(&mut e);
-            }
+                self.expr_list(&mut e)
+            };
             if nret == 1 {
                 if e.k == VCall && bc_op(self.ins(e.info)) != BCOp::VARG {
                     let ip = self.ins(e.info);
@@ -2801,16 +2793,16 @@ impl Parser {
             }
             BCOp::GGET => {
                 let pairs = self.ls.strs.intern(b"pairs");
-                if let Some(&slot) = self.cur().kgc_map.get(&pairs) {
-                    if slot == bc_d(ins) {
-                        return true;
-                    }
+                if let Some(&slot) = self.cur().kgc_map.get(&pairs)
+                    && slot == bc_d(ins)
+                {
+                    return true;
                 }
                 let next = self.ls.strs.intern(b"next");
-                if let Some(&slot) = self.cur().kgc_map.get(&next) {
-                    if slot == bc_d(ins) {
-                        return true;
-                    }
+                if let Some(&slot) = self.cur().kgc_map.get(&next)
+                    && slot == bc_d(ins)
+                {
+                    return true;
                 }
                 return false;
             }
@@ -2973,6 +2965,8 @@ impl Parser {
             Tok::Label => {
                 self.parse_label();
             }
+            // Not expressible as a match guard: `peek` needs `&mut self`.
+            #[allow(clippy::collapsible_match)]
             Tok::Goto => {
                 if lex_isname(self.ls.peek()) {
                     self.ls.next();
