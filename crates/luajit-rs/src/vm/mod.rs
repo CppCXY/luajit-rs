@@ -696,7 +696,9 @@ impl Interp {
                             let nargs = bc_d(ins) as usize - 1;
                             let fs = unsafe { bp.add(a as usize) };
                             unsafe { *bp.sub(2) = f };
-                            for i in 0..nargs {
+                            // Copy args in reverse to avoid overlap
+                            // (same bug as do_tailcall's arg move).
+                            for i in (0..nargs).rev() {
                                 unsafe { *bp.add(i) = *fs.add(2 + i) };
                             }
                             for i in nargs..pt.numparams as usize {
@@ -847,6 +849,67 @@ impl Interp {
                     resync!();
                 }
 
+                // -- Bitwise ops (Lua 5.3+), all operands coerced to i32 --
+                BCOp::BNOT => {
+                    let v = reg!(bc_d(ins));
+                    let n = if v.is_number() { v.num() as i32 } else { 0 };
+                    setreg!(a, LuaValue::number(!n as f64));
+                }
+                BCOp::BAND => {
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
+                    let y = if yv.is_number() { yv.num() as i32 } else { 0 };
+                    setreg!(a, LuaValue::number((x & y) as f64));
+                }
+                BCOp::BOR => {
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
+                    let y = if yv.is_number() { yv.num() as i32 } else { 0 };
+                    setreg!(a, LuaValue::number((x | y) as f64));
+                }
+                BCOp::BXOR => {
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
+                    let y = if yv.is_number() { yv.num() as i32 } else { 0 };
+                    setreg!(a, LuaValue::number((x ^ y) as f64));
+                }
+                BCOp::BSHL => {
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
+                    let y = if yv.is_number() {
+                        (yv.num() as u32) & 31
+                    } else {
+                        0
+                    };
+                    setreg!(a, LuaValue::number((x << y) as f64));
+                }
+                BCOp::BSHR => {
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
+                    let y = if yv.is_number() {
+                        (yv.num() as u32) & 31
+                    } else {
+                        0
+                    };
+                    setreg!(a, LuaValue::number(((x as u32) >> y) as f64));
+                }
+                BCOp::BSAR => {
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
+                    let y = if yv.is_number() {
+                        (yv.num() as u32) & 31
+                    } else {
+                        0
+                    };
+                    setreg!(a, LuaValue::number((x >> y) as f64));
+                }
+
                 // Explicit list (not `_`) so the match covers every opcode:
                 // a wildcard shrinks the jump table and adds a bounds check
                 // to every dispatch.
@@ -862,13 +925,6 @@ impl Interp {
                 | BCOp::JITERL
                 | BCOp::ILOOP
                 | BCOp::JLOOP
-                | BCOp::BNOT
-                | BCOp::BAND
-                | BCOp::BOR
-                | BCOp::BXOR
-                | BCOp::BSHL
-                | BCOp::BSHR
-                | BCOp::BSAR
                 | BCOp::FUNCF
                 | BCOp::IFUNCF
                 | BCOp::JFUNCF
@@ -1098,11 +1154,25 @@ impl Interp {
         let mut base = self.base;
         let link = self.at(base - 1).to_bits();
         if link & FRAME_TYPE_MASK == FRAME_VARG {
-            base -= (link >> 3) as usize;
+            let delta = (link >> 3) as usize;
+            if base >= delta + 2 {
+                base -= delta;
+            }
+            // Else: base would underflow — the caller is so shallow that
+            // dropping the vararg frame puts us past the stack origin.
+            // Fall back to a regular (recursive) call: stack frame reuse
+            // for a vararg tail call is incorrect when the delta pushes
+            // past the stack origin.
+            else if let GcFunc::C(_cc) = gf.as_ref() {
+                let n = execute(self.l(), func_slot, nargs, -1)?;
+                return Ok(self.do_return(func_slot, n));
+            }
         }
         // Move func and args down into the (possibly relocated) frame.
+        // Must copy args in reverse order: when func_slot + 2 > base,
+        // the ranges overlap and a forward copy corrupts later arguments.
         self.set_at(base - 2, f);
-        for i in 0..nargs {
+        for i in (0..nargs).rev() {
             self.set_at(base + i, self.at(func_slot + 2 + i));
         }
 
@@ -1128,14 +1198,13 @@ impl Interp {
                 }
                 Ok(None)
             }
-            GcFunc::C(cc) => {
-                // Tail call to a C function: run it in the reused frame,
-                // then return its results through the frame link, exactly
-                // as if the C function's caller had returned them.
-                let fp = cc.f;
-                self.base = base;
-                let n = self.call_c_inline(fp, base - 2, nargs)?;
-                Ok(self.do_return(base - 2, n))
+            GcFunc::C(_cc) => {
+                // Tail call to a C function: run it as a regular
+                // execute and return. True TCO for C callees is a
+                // much narrower win (they're leaf calls) and the
+                // frame-reuse path has subtle edge cases.
+                let n = execute(self.l(), func_slot, nargs, -1)?;
+                return Ok(self.do_return(func_slot, n));
             }
         }
     }
