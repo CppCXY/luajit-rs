@@ -24,9 +24,29 @@ use crate::err::{LuaError, LuaResult};
 use crate::func::{GcFunc, LuaClosure, Upval, UpvalState};
 use crate::gc::GcPtr;
 use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto};
-use crate::state::{Frame, LuaState};
+use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::*;
+
+/// Frame type markers kept in the low bits of the frame-link slot at
+/// `base-1`, exactly as in LuaJIT's `lj_frame.h` (FR2 layout):
+///
+/// ```text
+///        base-2  base-1      |  base  base+1 ...
+///       [func   PC/delta/ft] | [slots ...]
+///       ^-- frame            | ^-- base    ^-- top
+/// ```
+///
+/// * `FRAME_LUA`: the link is the caller's return PC (a 4-aligned pointer,
+///   low bits 00). Caller base, wanted results and the result slot are all
+///   recovered from the CALL instruction at `pc[-1]`.
+/// * `FRAME_C`: a host (`execute`) entry; bits 3.. hold `want + 1`.
+/// * `FRAME_VARG`: bits 3.. hold the slot delta back to the frame that
+///   carries the real link; varargs live between the two frames.
+const FRAME_LUA: u64 = 0;
+const FRAME_C: u64 = 1;
+const FRAME_VARG: u64 = 3;
+const FRAME_TYPE_MASK: u64 = 3;
 
 /// Call a value with the given arguments and collect all results.
 /// The host entry point into the VM.
@@ -54,9 +74,9 @@ pub fn execute(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> L
         return call_c(l, cc.f, func_slot, nargs, want);
     }
     let mut vm = Interp::new(l);
-    let frame_floor = vm.l().frames.len();
-    vm.enter_lua(gf, func_slot, nargs, want);
-    vm.run(frame_floor)
+    let link = (((want + 1) as u64) << 3) | FRAME_C;
+    vm.enter_lua(gf, func_slot, nargs, link);
+    vm.run()
 }
 
 /// Call a C function with `nargs` args at `func_slot + 2`, moving up to
@@ -102,8 +122,6 @@ struct Interp {
     cl: GcPtr<GcFunc>,
     bcp: *const BCIns,
     knp: *const f64,
-    varg_base: usize,
-    nvarg: usize,
     multres: usize,
 }
 
@@ -118,8 +136,6 @@ impl Interp {
             cl: GcPtr::from_addr(8).unwrap(), // placeholder; set by enter_lua
             bcp: std::ptr::null(),
             knp: std::ptr::null(),
-            varg_base: 0,
-            nvarg: 0,
             multres: 0,
         }
     }
@@ -165,31 +181,10 @@ impl Interp {
     }
 
     /// Set up a Lua frame for the function at `func_slot` and switch the
-    /// `Interp` fields to the callee. The caller must have synced its locals
-    /// into the fields first.
-    fn enter_lua(&mut self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize, want: i32) {
-        if !self.bcp.is_null() {
-            self.l().frames.push(Frame {
-                base: self.base,
-                result_slot: func_slot,
-                return_pc: self.pc,
-                func: LuaValue::func(self.cl),
-                nresults: want,
-                varg_base: self.varg_base,
-                nvarg: self.nvarg,
-            });
-        } else {
-            self.l().frames.push(Frame {
-                base: usize::MAX,
-                result_slot: func_slot,
-                return_pc: usize::MAX,
-                func: LuaValue::NIL,
-                nresults: want,
-                varg_base: 0,
-                nvarg: 0,
-            });
-        }
-
+    /// `Interp` fields to the callee. `link` is stored in the frame-link
+    /// slot (`callbase - 1`); the caller must have synced its locals into
+    /// the fields first. Mirrors LuaJIT's `ins_call` + FUNCF/FUNCV headers.
+    fn enter_lua(&mut self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize, link: u64) {
         let cl = match gf.as_ref() {
             GcFunc::Lua(c) => c,
             _ => unreachable!(),
@@ -197,8 +192,11 @@ impl Interp {
         let pt = cl.proto.as_ref();
         let numparams = pt.numparams as usize;
         let callbase = func_slot + 2;
+        self.set_at(callbase - 1, LuaValue::from_bits(link));
 
         if (pt.flags & PROTO_VARARG) != 0 {
+            // FUNCV: shift the fixed params up past the varargs and chain a
+            // vararg frame back to the one holding the real link.
             let newbase = callbase + nargs + 2;
             self.set_at(newbase - 2, LuaValue::func(gf));
             for i in 0..numparams {
@@ -209,15 +207,13 @@ impl Interp {
                 };
                 self.set_at(newbase + i, v);
             }
-            self.varg_base = callbase + numparams;
-            self.nvarg = nargs.saturating_sub(numparams);
+            let delta = (newbase - callbase) as u64;
+            self.set_at(newbase - 1, LuaValue::from_bits((delta << 3) | FRAME_VARG));
             self.base = newbase;
         } else {
             for i in nargs..numparams {
                 self.set_at(callbase + i, LuaValue::NIL);
             }
-            self.varg_base = 0;
-            self.nvarg = 0;
             self.base = callbase;
         }
 
@@ -238,6 +234,28 @@ impl Interp {
         self.knp = pt.kn.as_ptr();
     }
 
+    /// Whether a return from the frame at `bp` may take the inline fast
+    /// path: a plain Lua frame link and no open upvalues to close. Returns
+    /// the caller's wanted result count (from the CALL instruction's B).
+    #[inline(always)]
+    fn ret_fast(&self, bp: *const LuaValue) -> Option<i32> {
+        let link = unsafe { (*bp.sub(1)).to_bits() };
+        if link & FRAME_TYPE_MASK == FRAME_LUA && self.l().openuv.is_empty() {
+            let ret_ip = link as *const BCIns;
+            let call_ins = unsafe { *ret_ip.sub(1) };
+            Some(bc_b(call_ins) as i32 - 1)
+        } else {
+            None
+        }
+    }
+
+    /// Reload the interpreter for the closure owning the frame at `bp`.
+    #[inline(always)]
+    fn reload_at(&mut self, bp: *const LuaValue) {
+        let cl = unsafe { *bp.sub(2) }.as_func().unwrap();
+        self.reload(cl);
+    }
+
     /// The dispatch loop. The entire hot state is two locals — `bp` (the
     /// current base as a pointer, LuaJIT's BASE) and `ip` (a walking
     /// instruction pointer, LuaJIT's PC) — so both live in registers on
@@ -246,7 +264,7 @@ impl Interp {
     /// alive across the dispatch forces spills (measured: rustc packs the
     /// extras into an XMM register and unpacks per instruction).
     /// `sync!`/`resync!` bridge to the fields around calls and returns.
-    fn run(&mut self, frame_floor: usize) -> LuaResult<usize> {
+    fn run(&mut self) -> LuaResult<usize> {
         let mut bp = unsafe { self.sp.add(self.base) };
         let mut ip = unsafe { self.bcp.add(self.pc) };
 
@@ -590,6 +608,30 @@ impl Interp {
 
                 // -- Calls / returns --
                 BCOp::CALL => {
+                    // Fast path (LuaJIT's ins_call): a Lua callee switches
+                    // frames right here — one store for the frame link, no
+                    // sync round-trip. C callees and vararg protos go slow.
+                    let f = reg!(a);
+                    if let Some(gf) = f.as_func()
+                        && let GcFunc::Lua(cl) = gf.as_ref()
+                    {
+                        let pt = cl.proto.as_ref();
+                        if (pt.flags & PROTO_VARARG) == 0 {
+                            let nargs = bc_c(ins) as usize - 1;
+                            let newbp = unsafe { bp.add(a as usize + 2) };
+                            unsafe { *newbp.sub(1) = LuaValue::from_bits(ip as u64) };
+                            for i in nargs..pt.numparams as usize {
+                                unsafe { *newbp.add(i) = LuaValue::NIL };
+                            }
+                            bp = newbp;
+                            ip = unsafe { pt.bc.as_ptr().add(1) };
+                            self.cl = gf;
+                            self.bcp = pt.bc.as_ptr();
+                            self.knp = pt.kn.as_ptr();
+                            self.l().top = cur_base!() + pt.framesize as usize;
+                            continue;
+                        }
+                    }
                     let nargs = bc_c(ins) as usize - 1;
                     sync!();
                     self.do_call(a, nargs, bc_b(ins) as i32 - 1)?;
@@ -604,7 +646,7 @@ impl Interp {
                 BCOp::CALLT => {
                     let nargs = bc_d(ins) as usize - 1;
                     sync!();
-                    if let Some(n) = self.do_tailcall(a, nargs, frame_floor)? {
+                    if let Some(n) = self.do_tailcall(a, nargs)? {
                         return Ok(n);
                     }
                     resync!();
@@ -612,21 +654,58 @@ impl Interp {
                 BCOp::CALLMT => {
                     let nargs = bc_d(ins) as usize + self.multres;
                     sync!();
-                    if let Some(n) = self.do_tailcall(a, nargs, frame_floor)? {
+                    if let Some(n) = self.do_tailcall(a, nargs)? {
                         return Ok(n);
                     }
                     resync!();
                 }
                 BCOp::RET0 => {
+                    if let Some(want) = self.ret_fast(bp) {
+                        let jmp = unsafe { (*bp.sub(1)).to_bits() } as *const BCIns;
+                        let call_ins = unsafe { *jmp.sub(1) };
+                        let dst = unsafe { bp.sub(2) };
+                        for i in 0..want.max(0) as usize {
+                            unsafe { *dst.add(i) = LuaValue::NIL };
+                        }
+                        self.multres = 0;
+                        bp = unsafe { dst.sub(bc_a(call_ins) as usize) };
+                        ip = jmp;
+                        self.reload_at(bp);
+                        self.l().top = if want >= 0 {
+                            unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
+                        } else {
+                            unsafe { dst.offset_from(self.sp) as usize }
+                        };
+                        continue;
+                    }
                     sync!();
-                    if let Some(n) = self.do_return(cur_base!(), 0, frame_floor) {
+                    if let Some(n) = self.do_return(cur_base!(), 0) {
                         return Ok(n);
                     }
                     resync!();
                 }
                 BCOp::RET1 => {
+                    if let Some(want) = self.ret_fast(bp) {
+                        let jmp = unsafe { (*bp.sub(1)).to_bits() } as *const BCIns;
+                        let call_ins = unsafe { *jmp.sub(1) };
+                        let dst = unsafe { bp.sub(2) };
+                        unsafe { *dst = *bp.add(a as usize) };
+                        for i in 1..want.max(1) as usize {
+                            unsafe { *dst.add(i) = LuaValue::NIL };
+                        }
+                        self.multres = 1;
+                        bp = unsafe { dst.sub(bc_a(call_ins) as usize) };
+                        ip = jmp;
+                        self.reload_at(bp);
+                        self.l().top = if want >= 0 {
+                            unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
+                        } else {
+                            unsafe { dst.add(1).offset_from(self.sp) as usize }
+                        };
+                        continue;
+                    }
                     sync!();
-                    if let Some(n) = self.do_return(cur_base!() + a as usize, 1, frame_floor) {
+                    if let Some(n) = self.do_return(cur_base!() + a as usize, 1) {
                         return Ok(n);
                     }
                     resync!();
@@ -634,7 +713,7 @@ impl Interp {
                 BCOp::RET => {
                     let n = bc_d(ins) as usize - 1;
                     sync!();
-                    if let Some(n) = self.do_return(cur_base!() + a as usize, n, frame_floor) {
+                    if let Some(n) = self.do_return(cur_base!() + a as usize, n) {
                         return Ok(n);
                     }
                     resync!();
@@ -642,7 +721,7 @@ impl Interp {
                 BCOp::RETM => {
                     let n = self.multres + bc_d(ins) as usize;
                     sync!();
-                    if let Some(n) = self.do_return(cur_base!() + a as usize, n, frame_floor) {
+                    if let Some(n) = self.do_return(cur_base!() + a as usize, n) {
                         return Ok(n);
                     }
                     resync!();
@@ -861,7 +940,11 @@ impl Interp {
         };
         match gf.as_ref() {
             GcFunc::Lua(_) => {
-                self.enter_lua(gf, func_slot, nargs, want);
+                // Frame link = the return PC; `want` is re-read from the
+                // CALL/CALLM/ITERC instruction at `pc[-1]` on return.
+                let link = unsafe { self.bcp.add(self.pc) } as u64;
+                debug_assert!(link & FRAME_TYPE_MASK == FRAME_LUA);
+                self.enter_lua(gf, func_slot, nargs, link);
                 Ok(())
             }
             GcFunc::C(cc) => {
@@ -900,29 +983,37 @@ impl Interp {
         Ok(n)
     }
 
-    fn do_tailcall(&mut self, a: u32, nargs: usize, floor: usize) -> LuaResult<Option<usize>> {
+    fn do_tailcall(&mut self, a: u32, nargs: usize) -> LuaResult<Option<usize>> {
         // Simple (non-TCO) tail call: run the callee as a nested execution,
         // then return its results from the current frame. True TCO is later.
         let func_slot = self.base + a as usize;
         let n = execute(self.l(), func_slot, nargs, -1)?;
-        Ok(self.do_return(func_slot, n, floor))
+        Ok(self.do_return(func_slot, n))
     }
 
     /// Move `n` results to the caller's slot, restore the caller frame and
-    /// continue. Returns `Some(n)` when the entry frame returns to the host.
-    fn do_return(&mut self, src: usize, n: usize, frame_floor: usize) -> Option<usize> {
+    /// continue. Everything is recovered from the frame links in the stack,
+    /// as in LuaJIT's BC_RET: the caller base, wanted results and result
+    /// slot all come from the CALL instruction at the stored return PC.
+    /// Returns `Some(n)` when a host (`FRAME_C`) entry returns.
+    fn do_return(&mut self, src: usize, n: usize) -> Option<usize> {
         if !self.l().openuv.is_empty() {
             self.close_upvals(self.base);
         }
-        let frame = self.l().frames.pop().expect("frame underflow");
-        let dst = frame.result_slot;
+        let mut base = self.base;
+        let mut link = self.at(base - 1).to_bits();
+        while link & FRAME_TYPE_MASK == FRAME_VARG {
+            base -= (link >> 3) as usize;
+            link = self.at(base - 1).to_bits();
+        }
+        let dst = base - 2; // results always land at the callee's func slot
         for i in 0..n {
             self.set_at(dst + i, self.at(src + i));
         }
         self.multres = n;
 
-        if self.l().frames.len() < frame_floor || frame.return_pc == usize::MAX {
-            let want = frame.nresults;
+        if link & FRAME_TYPE_MASK == FRAME_C {
+            let want = ((link >> 3) as i32) - 1;
             let got = if want >= 0 {
                 for i in n..(want as usize) {
                     self.set_at(dst + i, LuaValue::NIL);
@@ -935,14 +1026,17 @@ impl Interp {
             return Some(got);
         }
 
-        self.base = frame.base;
-        self.pc = frame.return_pc;
-        self.varg_base = frame.varg_base;
-        self.nvarg = frame.nvarg;
-        let cl = frame.func.as_func().unwrap();
-        self.reload(cl);
+        // FRAME_LUA: the link is the return PC.
+        let ret_ip = link as *const BCIns;
+        let call_ins = unsafe { *ret_ip.sub(1) };
+        let caller_base = dst - bc_a(call_ins) as usize;
+        let want = bc_b(call_ins) as i32 - 1;
 
-        let want = frame.nresults;
+        self.base = caller_base;
+        let cl = self.at(caller_base - 2).as_func().unwrap();
+        self.reload(cl);
+        self.pc = unsafe { ret_ip.offset_from(self.bcp) as usize };
+
         if want >= 0 {
             for i in n..(want as usize) {
                 self.set_at(dst + i, LuaValue::NIL);
@@ -964,25 +1058,35 @@ impl Interp {
         self.set_at(fs, genf);
         self.set_at(fs + 2, state);
         self.set_at(fs + 3, ctl);
-        execute(self.l(), fs, 2, nret as i32 - 1)?;
-        Ok(())
+        self.do_call(a, 2, nret as i32 - 1)
     }
 
     // -- Varargs ---------------------------------------------------------
 
+    /// Copy varargs into `dst..`, per BC_VARG. The varargs sit between the
+    /// vararg frame and the frame below it (see `enter_lua`); their extent
+    /// is recovered from the FRAME_VARG delta, LuaJIT-style.
     fn vararg(&mut self, a: u32, b: u32) {
-        let dst = self.base + a as usize;
+        let base = self.base;
+        let link = self.at(base - 1).to_bits();
+        debug_assert!(link & FRAME_TYPE_MASK == FRAME_VARG);
+        let delta = (link >> 3) as usize;
+        let numparams = self.proto().numparams as usize;
+        let varg_base = base - delta + numparams;
+        let nvarg = (delta - 2).saturating_sub(numparams);
+
+        let dst = base + a as usize;
         if b == 0 {
-            for i in 0..self.nvarg {
-                self.set_at(dst + i, self.at(self.varg_base + i));
+            for i in 0..nvarg {
+                self.set_at(dst + i, self.at(varg_base + i));
             }
-            self.multres = self.nvarg;
-            self.l().top = dst + self.nvarg;
+            self.multres = nvarg;
+            self.l().top = dst + nvarg;
         } else {
             let want = (b - 1) as usize;
             for i in 0..want {
-                let v = if i < self.nvarg {
-                    self.at(self.varg_base + i)
+                let v = if i < nvarg {
+                    self.at(varg_base + i)
                 } else {
                     LuaValue::NIL
                 };

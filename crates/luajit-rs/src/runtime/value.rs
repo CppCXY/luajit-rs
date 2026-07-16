@@ -241,6 +241,13 @@ impl LuaValue {
         self.0
     }
 
+    /// Reinterpret raw bits as a value. Used for the frame-link slot at
+    /// `base-1`, which stores a return PC or frame delta (see `lj_frame.h`),
+    /// not a real tagged value.
+    pub const fn from_bits(bits: u64) -> LuaValue {
+        LuaValue(bits)
+    }
+
     /// Hash for use as a table key, ported from LuaJIT's `hashkey`:
     /// strings hash by their interned `sid` (`hashstr`), numbers by
     /// `hashrot` over their bit halves (`hashnum`), booleans map to 0/1

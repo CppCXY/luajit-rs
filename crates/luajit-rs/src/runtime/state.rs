@@ -129,33 +129,12 @@ impl StateRef {
 /// reallocates during execution, keeping raw stack pointers valid.
 pub const STACK_MAX: usize = 1 << 16;
 
-/// A call-info record for resuming a caller after a Lua->Lua return.
-///
-/// The register window itself follows LuaJIT's FR2 layout (callee `base` =
-/// caller_base + A + 2; function at `base-2`), which the bytecode assumes;
-/// this record holds only the resume state kept off the value stack.
-#[derive(Clone, Copy)]
-pub struct Frame {
-    /// Caller's base to restore.
-    pub base: usize,
-    /// Absolute slot where the callee's results must land (= callee_base - 2).
-    pub result_slot: usize,
-    /// Program counter to resume at in the caller.
-    pub return_pc: usize,
-    /// The caller's running closure.
-    pub func: LuaValue,
-    /// Number of results the caller wants (`-1` = all / multi-result).
-    pub nresults: i32,
-    /// Caller's vararg region base (absolute) and count, to restore on return.
-    pub varg_base: usize,
-    pub nvarg: usize,
-}
-
 /// A Lua execution thread, corresponding to LuaJIT's `lua_State`.
 ///
-/// Owns its value stack, open-upvalue list and call frames, and holds a
-/// back-pointer to the shared [`GlobalState`]. Threads are themselves owned
-/// by the top-level [`Lua`] object.
+/// Owns its value stack and open-upvalue list, and holds a back-pointer to
+/// the shared [`GlobalState`]. Threads are themselves owned by the top-level
+/// [`Lua`] object. There is no separate control stack: call frames live in
+/// the value stack itself, LuaJIT-style (see `vm`'s frame-link encoding).
 pub struct LuaState {
     g: GlobalRef,
     is_main: bool,
@@ -163,8 +142,6 @@ pub struct LuaState {
     pub stack: Vec<LuaValue>,
     pub base: usize,
     pub top: usize,
-    /// Lua->Lua call frames (control stack).
-    pub frames: Vec<Frame>,
     /// Open upvalues pointing into this thread's stack, kept sorted by slot
     /// (descending), mirroring LuaJIT's `L->openupval` list.
     pub openuv: Vec<GcPtr<crate::func::Upval>>,
@@ -184,7 +161,6 @@ impl LuaState {
             stack: vec![LuaValue::NIL; STACK_MAX],
             base: 0,
             top: 0,
-            frames: Vec::new(),
             openuv: Vec::new(),
             errval: LuaValue::NIL,
             nyield: 0,
