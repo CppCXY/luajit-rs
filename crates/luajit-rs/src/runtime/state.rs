@@ -332,7 +332,8 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
 }
 
 /// Recursively register a prototype tree in the heap, turning each child
-/// `KGc::Proto` constant into a `KGc::ProtoRef` pointing at the heap object.
+/// `KGc::Proto` constant into a `KGc::ProtoRef` pointing at the heap object
+/// and resolving string constants into the `kstrv` fast-lookup table.
 pub fn register_proto(heap: &mut GcHeap, mut proto: Proto) -> GcPtr<Proto> {
     for i in 0..proto.kgc.len() {
         if matches!(proto.kgc[i], crate::proto::KGc::Proto(_)) {
@@ -343,6 +344,14 @@ pub fn register_proto(heap: &mut GcHeap, mut proto: Proto) -> GcPtr<Proto> {
             }
         }
     }
+    proto.kstrv = proto
+        .kgc
+        .iter()
+        .map(|k| match k {
+            crate::proto::KGc::Str(sid) => heap.str_value(*sid),
+            _ => LuaValue::NIL,
+        })
+        .collect();
     heap.alloc_proto(proto)
 }
 

@@ -125,6 +125,7 @@ struct Interp {
     cl: GcPtr<GcFunc>,
     bcp: *const BCIns,
     knp: *const f64,
+    ksp: *const LuaValue,
     multres: usize,
 }
 
@@ -139,6 +140,7 @@ impl Interp {
             cl: GcPtr::from_addr(8).unwrap(), // placeholder; set by enter_lua
             bcp: std::ptr::null(),
             knp: std::ptr::null(),
+            ksp: std::ptr::null(),
             multres: 0,
         }
     }
@@ -176,11 +178,14 @@ impl Interp {
         unsafe { *self.sp.add(abs) = v }
     }
 
+    /// A string constant, read from the resolved KBASE table (`ksp`) — the
+    /// value is precomputed at registration, so this is a single load, no
+    /// interner lookup. Only valid for KSTR/GGET/GSET/TGETS/TSETS operands.
+    #[inline(always)]
     fn kstr_at(&self, d: u32) -> LuaValue {
-        match &self.proto().kgc[d as usize] {
-            KGc::Str(sid) => self.l().heap().str_value(*sid),
-            _ => unreachable!("expected string constant"),
-        }
+        let v = unsafe { *self.ksp.add(d as usize) };
+        debug_assert!(v.is_string());
+        v
     }
 
     /// Set up a Lua frame for the function at `func_slot` and switch the
@@ -223,6 +228,7 @@ impl Interp {
         self.cl = gf;
         self.bcp = pt.bc.as_ptr();
         self.knp = pt.kn.as_ptr();
+        self.ksp = pt.kstrv.as_ptr();
         self.pc = 1; // skip the FUNCF/FUNCV header
         self.l().top = self.base + pt.framesize as usize;
     }
@@ -235,6 +241,7 @@ impl Interp {
         self.cl = cl;
         self.bcp = pt.bc.as_ptr();
         self.knp = pt.kn.as_ptr();
+        self.ksp = pt.kstrv.as_ptr();
     }
 
     /// Whether a return from the frame at `bp` may take the inline fast
@@ -559,12 +566,12 @@ impl Interp {
                 BCOp::GGET => {
                     let env = self.lua_cl().env;
                     let key = self.kstr_at(bc_d(ins));
-                    setreg!(a, env.as_ref().get(key));
+                    setreg!(a, env.as_ref().get_str(key));
                 }
                 BCOp::GSET => {
                     let env = self.lua_cl().env;
                     let key = self.kstr_at(bc_d(ins));
-                    env.as_mut().set(key, reg!(a));
+                    env.as_mut().set_str(key, reg!(a));
                 }
                 BCOp::TGETV => {
                     let t = reg!(bc_b(ins));
@@ -575,38 +582,63 @@ impl Interp {
                 }
                 BCOp::TGETS => {
                     let t = reg!(bc_b(ins));
-                    let k = self.kstr_at(bc_c(ins));
-                    sync!();
-                    let v = self.index_get(t, k)?;
-                    setreg!(a, v);
+                    if let Some(tab) = t.as_table() {
+                        let k = self.kstr_at(bc_c(ins));
+                        setreg!(a, tab.as_ref().get_str(k));
+                    } else {
+                        sync!();
+                        let v = self.index_get(t, self.kstr_at(bc_c(ins)))?;
+                        setreg!(a, v);
+                    }
                 }
                 BCOp::TGETB => {
                     let t = reg!(bc_b(ins));
-                    let k = LuaValue::number(bc_c(ins) as f64);
-                    sync!();
-                    let v = self.index_get(t, k)?;
-                    setreg!(a, v);
+                    if let Some(tab) = t.as_table() {
+                        let k = bc_c(ins) as i32;
+                        let v = tab.as_ref().get_int(k);
+                        setreg!(a, v);
+                    } else {
+                        sync!();
+                        let v = self.index_get(t, LuaValue::number(bc_c(ins) as f64))?;
+                        setreg!(a, v);
+                    }
                 }
                 BCOp::TSETV => {
                     let t = reg!(bc_b(ins));
                     let k = reg!(bc_c(ins));
                     let v = reg!(a);
-                    sync!();
-                    self.index_set(t, k, v)?;
+                    let k_is_str = k.is_string();
+                    if let Some(tab) = t.as_table() {
+                        if k_is_str {
+                            tab.as_mut().set_str(k, v);
+                        } else {
+                            tab.as_mut().set(k, v);
+                        }
+                    } else {
+                        sync!();
+                        self.index_set(t, k, v)?;
+                    }
                 }
                 BCOp::TSETS => {
                     let t = reg!(bc_b(ins));
-                    let k = self.kstr_at(bc_c(ins));
                     let v = reg!(a);
-                    sync!();
-                    self.index_set(t, k, v)?;
+                    if let Some(tab) = t.as_table() {
+                        let k = self.kstr_at(bc_c(ins));
+                        tab.as_mut().set_str(k, v);
+                    } else {
+                        sync!();
+                        self.index_set(t, self.kstr_at(bc_c(ins)), v)?;
+                    }
                 }
                 BCOp::TSETB => {
                     let t = reg!(bc_b(ins));
-                    let k = LuaValue::number(bc_c(ins) as f64);
                     let v = reg!(a);
-                    sync!();
-                    self.index_set(t, k, v)?;
+                    if let Some(tab) = t.as_table() {
+                        tab.as_mut().set_int(bc_c(ins) as i32, v);
+                    } else {
+                        sync!();
+                        self.index_set(t, LuaValue::number(bc_c(ins) as f64), v)?;
+                    }
                 }
                 BCOp::TSETM => {
                     sync!();
@@ -635,6 +667,7 @@ impl Interp {
                             self.cl = gf;
                             self.bcp = pt.bc.as_ptr();
                             self.knp = pt.kn.as_ptr();
+                            self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
                             continue;
                         }
@@ -673,6 +706,7 @@ impl Interp {
                             self.cl = gf;
                             self.bcp = pt.bc.as_ptr();
                             self.knp = pt.kn.as_ptr();
+                            self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
                             continue;
                         }
@@ -1088,6 +1122,7 @@ impl Interp {
                     self.cl = gf;
                     self.bcp = pt.bc.as_ptr();
                     self.knp = pt.kn.as_ptr();
+                    self.ksp = pt.kstrv.as_ptr();
                     self.pc = 1; // skip the FUNCF header
                     self.l().top = base + pt.framesize as usize;
                 }

@@ -1708,6 +1708,7 @@ impl Parser {
             lines,
             kgc,
             kn: fs.kn,
+            kstrv: Vec::new(), // resolved when the proto is registered
             uv,
             flags: fs.flags & !(PROTO_HAS_RETURN | PROTO_FIXUP_RETURN),
             numparams: fs.numparams,

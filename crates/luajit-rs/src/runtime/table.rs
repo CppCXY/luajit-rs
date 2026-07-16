@@ -181,6 +181,55 @@ impl LuaTable {
         self.get(LuaValue::number(k as f64))
     }
 
+    /// String-key get: direct hash-chain walk, no type dispatch. The key
+    /// must already be a string (asserted in debug).
+    #[inline]
+    pub fn get_str(&self, key: LuaValue) -> LuaValue {
+        debug_assert!(key.is_string());
+        let mut n = self.hash_slot(key);
+        loop {
+            let node = &self.node[n as usize];
+            if node.key == key {
+                return node.val;
+            }
+            let next = node.next;
+            if next == NIL_NODE {
+                return LuaValue::NIL;
+            }
+            n = next;
+        }
+    }
+
+    /// String-key set that reuses an existing node. Falls back to `set` for
+    /// insertion (which may rehash).
+    #[inline]
+    pub fn set_str(&mut self, key: LuaValue, val: LuaValue) {
+        debug_assert!(key.is_string());
+        let mut n = self.hash_slot(key);
+        loop {
+            let node = &mut self.node[n as usize];
+            if node.key == key {
+                node.val = val;
+                return;
+            }
+            let next = node.next;
+            if next == NIL_NODE {
+                break;
+            }
+            n = next;
+        }
+        self.set(key, val);
+    }
+
+    #[inline]
+    pub fn set_int(&mut self, k: i32, v: LuaValue) {
+        if k >= 0 && (k as u32) < self.asize {
+            self.array[k as usize] = v;
+            return;
+        }
+        self.set(LuaValue::number(k as f64), v);
+    }
+
     // -- Traversal and length --------------------------------------------
 
     /// The successor traversal index for `key` (`lj_tab_keyindex`).

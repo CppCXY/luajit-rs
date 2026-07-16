@@ -2,6 +2,7 @@ use crate::bc::{BCIns, BCLine};
 use crate::gc::GcPtr;
 use crate::lex::StrId;
 use crate::table::LuaTable;
+use crate::value::LuaValue;
 
 /// A collectable constant referenced from a prototype's `kgc` array.
 pub enum KGc {
@@ -25,6 +26,11 @@ pub struct Proto {
     pub kgc: Vec<KGc>,
     /// Number constants.
     pub kn: Vec<f64>,
+    /// String constants resolved to values, indexed like `kgc` (nil for
+    /// non-string entries). This is the interpreter's KBASE view: KSTR /
+    /// GGET / TGETS load one slot instead of chasing `kgc` -> interner.
+    /// Filled by `register_proto`; the GC marks these through `kgc`.
+    pub kstrv: Vec<LuaValue>,
     /// Upvalue references: `PROTO_UV_LOCAL | slot` or parent upvalue index.
     pub uv: Vec<u16>,
     pub flags: u8,
@@ -44,6 +50,7 @@ impl Proto {
             + self.lines.capacity() * 4
             + self.kgc.capacity() * std::mem::size_of::<KGc>()
             + self.kn.capacity() * 8
+            + self.kstrv.capacity() * 8
             + self.uv.capacity() * 2
     }
 }
