@@ -163,6 +163,14 @@ impl Interner {
         self.bytes
     }
 
+    /// Get string content with a `static` lifetime — pool pages never move,
+    /// and an interned string stays alive as long as it is reachable.
+    /// This lets C functions read string args without cloning, even while
+    /// interning results on the same heap.
+    pub fn get_static(&self, id: StrId) -> &'static [u8] {
+        unsafe { std::slice::from_raw_parts(self.get(id).as_ptr(), self.get(id).len()) }
+    }
+
     /// GC string sweep (`gc_sweepstr`): free unmarked strings, drop their
     /// intern-map entries and recycle their ids.
     pub(crate) fn sweep(&mut self) {

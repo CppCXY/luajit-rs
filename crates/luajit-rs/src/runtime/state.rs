@@ -97,6 +97,11 @@ pub struct GlobalState {
     pub basemt: [Option<GcPtr<LuaTable>>; ITYPE_COUNT],
     /// Every thread of this universe: the GC's stack roots.
     pub threads: Vec<StateRef>,
+    /// `os.clock()` baseline: `Instant::now()` captured when the universe is
+    /// created, so the reported time is relative to process start (matches
+    /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
+    /// for cheap differencing at every `os.clock` call.
+    pub boot_time: f64,
     /// The main thread. Set once the owning [`Lua`] is pinned. The interpreter
     /// entry points use this when no explicit thread is supplied.
     main: Option<StateRef>,
@@ -104,6 +109,11 @@ pub struct GlobalState {
 
 impl GlobalState {
     fn new() -> GlobalState {
+        use std::time::UNIX_EPOCH;
+        let boot = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let mut heap = GcHeap::default();
         let globals = heap.alloc_table(LuaTable::new(0, 1));
         let registry = heap.alloc_table(LuaTable::new(0, 1));
@@ -113,6 +123,7 @@ impl GlobalState {
             registry,
             basemt: [None; ITYPE_COUNT],
             threads: Vec::new(),
+            boot_time: boot,
             main: None,
         }
     }
@@ -142,6 +153,14 @@ impl GlobalRef {
     #[allow(clippy::mut_from_ref)]
     pub fn get<'a>(self) -> &'a mut GlobalState {
         unsafe { &mut *self.0.as_ptr() }
+    }
+
+    /// Shared reference with `'static` lifetime — the `Box<GlobalState>`
+    /// outlives every thread, so the address is always valid.  Library
+    /// functions use this to read string data without locking out
+    /// mutable heap access.
+    pub fn get_ref(self) -> &'static GlobalState {
+        unsafe { &*self.0.as_ptr() }
     }
 }
 
@@ -205,6 +224,15 @@ impl LuaState {
 
     pub fn heap(&self) -> &mut GcHeap {
         &mut self.g.get().heap
+    }
+
+    /// Get a string's content without cloning, using pool-stable `'static`
+    /// lifetimes. This is the key zero-copy primitive for library functions:
+    /// read args with `l.str_static(sid)`, intern results with
+    /// `l.heap().intern(...)`, never a borrow conflict.
+    #[inline]
+    pub fn str_static(&self, sid: StrId) -> &'static [u8] {
+        self.g.get_ref().heap.strings.get_static(sid)
     }
 
     pub fn is_main(&self) -> bool {

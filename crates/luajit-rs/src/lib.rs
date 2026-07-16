@@ -6,7 +6,7 @@ pub mod vm;
 
 pub use compiler::{bc, dump, lex, parse};
 pub use runtime::{func, gc, proto, state, string, table, value};
-pub use stdlib::base as lib_base;
+pub use stdlib::open_libs;
 pub use util::{strfmt, strscan};
 pub use vm::err;
 
@@ -45,7 +45,7 @@ pub fn list_bytecode(src: Vec<u8>, chunkname: &str) -> Result<Vec<u8>, String> {
 /// Returns a human-readable error message on failure.
 pub fn run_string(src: Vec<u8>, chunkname: &str) -> Result<(), String> {
     let mut lua = state::Lua::new();
-    lib_base::open_libs(lua.main());
+    open_libs(lua.main());
     let f = state::load(lua.main(), src, chunkname)?;
     match vm::call(lua.main(), f, &[]) {
         Ok(_) => Ok(()),

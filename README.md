@@ -1,0 +1,1 @@
+A Rust implementation of LuaJIT, entirely built by DeepSeek, with me providing guidance on its direction. It is still in a toy stage(NOT JIT IMPL), but in many areas its interpreter performance already exceeds that of the PUC Lua C interpreter.
