@@ -63,7 +63,7 @@ impl VmStatus {
 impl From<LuaResult<i32>> for VmStatus {
     fn from(r: LuaResult<i32>) -> VmStatus {
         match r {
-            Ok(n) => VmStatus(((n as u32 as u64) << 32)),
+            Ok(n) => VmStatus((n as u32 as u64) << 32),
             Err(e) => VmStatus(e as u64),
         }
     }

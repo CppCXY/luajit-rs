@@ -1,19 +1,14 @@
-pub mod bc;
-pub mod dump;
-pub mod err;
-pub mod func;
-pub mod gc;
-pub mod lex;
-pub mod lib_base;
-pub mod parse;
-pub mod proto;
-pub mod state;
-pub mod strfmt;
-pub mod string;
-pub mod strscan;
-pub mod table;
-pub mod value;
+pub mod compiler;
+pub mod runtime;
+pub mod stdlib;
+pub mod util;
 pub mod vm;
+
+pub use compiler::{bc, dump, lex, parse};
+pub use runtime::{func, gc, proto, state, string, table, value};
+pub use stdlib::base as lib_base;
+pub use util::{strfmt, strscan};
+pub use vm::err;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 

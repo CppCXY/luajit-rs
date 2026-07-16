@@ -18,6 +18,8 @@
 //!   looping; `RET` pops one. Only tail calls and re-entrant C calls recurse.
 
 use crate::bc::*;
+
+pub mod err;
 use crate::err::{LuaError, LuaResult};
 use crate::func::{GcFunc, LuaClosure, Upval, UpvalState};
 use crate::gc::GcPtr;
