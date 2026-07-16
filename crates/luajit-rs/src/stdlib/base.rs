@@ -5,7 +5,7 @@
 use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::strfmt::{self, FmtArg};
-use crate::value::{LuaValue, LJ_TNIL};
+use crate::value::{LJ_TNIL, LuaValue};
 
 /// Argument `i` (0-based) of the current C call, or nil.
 fn arg(l: &LuaState, i: usize) -> LuaValue {
@@ -331,11 +331,13 @@ fn make_lib(l: &mut LuaState, name: &[u8], entries: &[(&[u8], crate::func::CFunc
     for &(field, f) in entries {
         let sid = l.heap().intern(field);
         let env = l.global().globals;
-        let fref = l.heap().alloc_func(crate::func::GcFunc::C(crate::func::CClosure {
-            f,
-            env,
-            upvals: Vec::new(),
-        }));
+        let fref = l
+            .heap()
+            .alloc_func(crate::func::GcFunc::C(crate::func::CClosure {
+                f,
+                env,
+                upvals: Vec::new(),
+            }));
         let key = l.heap().str_value(sid);
         t.as_mut().set(key, LuaValue::func(fref));
     }

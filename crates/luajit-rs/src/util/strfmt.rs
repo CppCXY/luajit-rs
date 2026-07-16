@@ -260,11 +260,7 @@ fn fmt_float(spec: &str, conv: u8, n: f64) -> String {
         b'E' => fmt_e(n.abs(), p, true),
         b'g' | b'G' => {
             let s = fmt_g(n.abs(), if prec.is_some() { p.max(1) } else { 6 });
-            if conv == b'G' {
-                s.to_uppercase()
-            } else {
-                s
-            }
+            if conv == b'G' { s.to_uppercase() } else { s }
         }
         _ => unreachable!(),
     };

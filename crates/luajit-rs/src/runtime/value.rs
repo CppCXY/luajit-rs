@@ -83,11 +83,7 @@ impl LuaValue {
     pub const TRUE: LuaValue = LuaValue(pri(LJ_TTRUE));
 
     pub fn boolean(b: bool) -> LuaValue {
-        if b {
-            LuaValue::TRUE
-        } else {
-            LuaValue::FALSE
-        }
+        if b { LuaValue::TRUE } else { LuaValue::FALSE }
     }
 
     pub fn number(n: f64) -> LuaValue {
@@ -238,11 +234,7 @@ impl LuaValue {
     pub fn as_int32_exact(self) -> Option<i32> {
         let n = self.as_number()?;
         let k = n as i32;
-        if (k as f64) == n {
-            Some(k)
-        } else {
-            None
-        }
+        if (k as f64) == n { Some(k) } else { None }
     }
 
     pub fn to_bits(self) -> u64 {

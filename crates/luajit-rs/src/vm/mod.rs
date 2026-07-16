@@ -23,7 +23,7 @@ pub mod err;
 use crate::err::{LuaError, LuaResult};
 use crate::func::{GcFunc, LuaClosure, Upval, UpvalState};
 use crate::gc::GcPtr;
-use crate::proto::{KGc, Proto, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG};
+use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto};
 use crate::state::{Frame, LuaState};
 use crate::table::LuaTable;
 use crate::value::*;
@@ -197,7 +197,11 @@ impl Interp {
             let newbase = callbase + nargs + 2;
             self.set_at(newbase - 2, LuaValue::func(gf));
             for i in 0..numparams {
-                let v = if i < nargs { self.at(callbase + i) } else { LuaValue::NIL };
+                let v = if i < nargs {
+                    self.at(callbase + i)
+                } else {
+                    LuaValue::NIL
+                };
                 self.set_at(newbase + i, v);
             }
             self.varg_base = callbase + numparams;
@@ -245,9 +249,10 @@ impl Interp {
             };
         }
         macro_rules! setreg {
-            ($i:expr, $v:expr) => {
-                unsafe { *sp.add(base + ($i) as usize) = $v }
-            };
+            ($i:expr, $v:expr) => {{
+                let v = $v;
+                unsafe { *sp.add(base + ($i) as usize) = v }
+            }};
         }
         macro_rules! kslot {
             ($d:expr) => {
@@ -407,21 +412,42 @@ impl Interp {
                 BCOp::MULVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x * y),
                 BCOp::DIVVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x / y),
                 BCOp::MODVV => {
-                    arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x - (x / y).floor() * y)
+                    arith!(
+                        a,
+                        reg!(bc_b(ins)),
+                        reg!(bc_c(ins)),
+                        x,
+                        y,
+                        x - (x / y).floor() * y
+                    )
                 }
                 BCOp::ADDVN => arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x + y),
                 BCOp::SUBVN => arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x - y),
                 BCOp::MULVN => arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x * y),
                 BCOp::DIVVN => arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x / y),
                 BCOp::MODVN => {
-                    arith!(a, reg!(bc_b(ins)), kslot!(bc_c(ins)), x, y, x - (x / y).floor() * y)
+                    arith!(
+                        a,
+                        reg!(bc_b(ins)),
+                        kslot!(bc_c(ins)),
+                        x,
+                        y,
+                        x - (x / y).floor() * y
+                    )
                 }
                 BCOp::ADDNV => arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x + y),
                 BCOp::SUBNV => arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x - y),
                 BCOp::MULNV => arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x * y),
                 BCOp::DIVNV => arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x / y),
                 BCOp::MODNV => {
-                    arith!(a, kslot!(bc_c(ins)), reg!(bc_b(ins)), x, y, x - (x / y).floor() * y)
+                    arith!(
+                        a,
+                        kslot!(bc_c(ins)),
+                        reg!(bc_b(ins)),
+                        x,
+                        y,
+                        x - (x / y).floor() * y
+                    )
                 }
                 BCOp::POW => {
                     arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x.powf(y))
@@ -627,7 +653,9 @@ impl Interp {
                         }
                     } else {
                         sync!();
-                        return Err(self.l().runtime_error(b"'for' initial value must be a number"));
+                        return Err(self
+                            .l()
+                            .runtime_error(b"'for' initial value must be a number"));
                     }
                 }
                 BCOp::FORL => {
@@ -740,7 +768,9 @@ impl Interp {
     fn index_get(&self, t: LuaValue, k: LuaValue) -> LuaResult<LuaValue> {
         match t.as_table() {
             Some(tab) => Ok(tab.as_ref().get(k)),
-            None => Err(self.l().runtime_error(b"attempt to index a non-table value")),
+            None => Err(self
+                .l()
+                .runtime_error(b"attempt to index a non-table value")),
         }
     }
 
@@ -753,7 +783,9 @@ impl Interp {
                 tab.as_mut().set(k, v);
                 Ok(())
             }
-            None => Err(self.l().runtime_error(b"attempt to index a non-table value")),
+            None => Err(self
+                .l()
+                .runtime_error(b"attempt to index a non-table value")),
         }
     }
 
@@ -763,7 +795,11 @@ impl Interp {
         let base_key = unsafe { *self.knp.add(d as usize) } as i64 - (1i64 << 52);
         let tab = match t.as_table() {
             Some(t) => t,
-            None => return Err(self.l().runtime_error(b"attempt to index a non-table value")),
+            None => {
+                return Err(self
+                    .l()
+                    .runtime_error(b"attempt to index a non-table value"));
+            }
         };
         for i in 0..self.multres {
             let v = self.at(self.base + a as usize + i);
@@ -780,7 +816,11 @@ impl Interp {
         let f = self.at(func_slot);
         let gf = match f.as_func() {
             Some(p) => p,
-            None => return Err(self.l().runtime_error(b"attempt to call a non-function value")),
+            None => {
+                return Err(self
+                    .l()
+                    .runtime_error(b"attempt to call a non-function value"));
+            }
         };
         match gf.as_ref() {
             GcFunc::Lua(_) => {
@@ -987,11 +1027,10 @@ impl Interp {
             }
         }
         let env = self.lua_cl().env;
-        let fref = self.l().heap().alloc_func(GcFunc::Lua(LuaClosure {
-            proto,
-            env,
-            upvals,
-        }));
+        let fref = self
+            .l()
+            .heap()
+            .alloc_func(GcFunc::Lua(LuaClosure { proto, env, upvals }));
         LuaValue::func(fref)
     }
 }

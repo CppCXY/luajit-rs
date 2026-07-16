@@ -3,8 +3,8 @@ mod funcstate;
 use crate::bc::*;
 use crate::lex::*;
 use crate::proto::{
-    KGc, Proto, PROTO_BITOP, PROTO_CHILD, PROTO_FIXUP_RETURN, PROTO_HAS_RETURN, PROTO_UV_IMMUTABLE,
-    PROTO_UV_LOCAL, PROTO_VARARG,
+    KGc, PROTO_BITOP, PROTO_CHILD, PROTO_FIXUP_RETURN, PROTO_HAS_RETURN, PROTO_UV_IMMUTABLE,
+    PROTO_UV_LOCAL, PROTO_VARARG, Proto,
 };
 use crate::table::LuaTable;
 use crate::value::LuaValue;
@@ -415,7 +415,10 @@ impl Parser {
                 setbc_a(&mut self.bcstack[i].ins, reg);
             } else {
                 let mut ins2 = ins;
-                setbc_op(&mut ins2, op as u32 + (BCOp::IST as u32 - BCOp::ISTC as u32));
+                setbc_op(
+                    &mut ins2,
+                    op as u32 + (BCOp::IST as u32 - BCOp::ISTC as u32),
+                );
                 setbc_a(&mut ins2, 0);
                 self.bcstack[i].ins = ins2;
             }
@@ -694,7 +697,11 @@ impl Parser {
             let mut jfalse = NO_JMP;
             let mut jtrue = NO_JMP;
             if self.jmp_novalue(e.t) || self.jmp_novalue(e.f) {
-                let jval = if e.k == VJmp { NO_JMP } else { self.bcemit_jmp() };
+                let jval = if e.k == VJmp {
+                    NO_JMP
+                } else {
+                    self.bcemit_jmp()
+                };
                 jfalse = self.bcemit_ad(BCOp::KPRI, reg, VKFalse as u32);
                 let freereg = self.cur().freereg;
                 self.bcemit_aj(BCOp::JMP, freereg, 1);
@@ -842,11 +849,7 @@ impl Parser {
             let pc = e.info;
             let ip = self.ins(pc);
             if bc_op(ip) == BCOp::NOT {
-                *self.ins_mut(pc) = bcins_ad(
-                    if cond { BCOp::ISF } else { BCOp::IST },
-                    0,
-                    bc_d(ip),
-                );
+                *self.ins_mut(pc) = bcins_ad(if cond { BCOp::ISF } else { BCOp::IST }, 0, bc_d(ip));
                 return self.bcemit_jmp();
             }
         }
@@ -855,11 +858,7 @@ impl Parser {
             let reg = self.cur().freereg - 1;
             self.expr_toreg_nobranch(e, reg);
         }
-        self.bcemit_ad(
-            if cond { BCOp::ISTC } else { BCOp::ISFC },
-            NO_REG,
-            e.info,
-        );
+        self.bcemit_ad(if cond { BCOp::ISTC } else { BCOp::ISFC }, NO_REG, e.info);
         let pc = self.bcemit_jmp();
         self.expr_free(e);
         pc
@@ -1521,8 +1520,7 @@ impl Parser {
                                 }
                                 _ => "?".into(),
                             };
-                            self.ls
-                                .error(&format!("undefined label '{}'", gname));
+                            self.ls.error(&format!("undefined label '{}'", gname));
                         }
                     }
                 }
@@ -1654,7 +1652,12 @@ impl Parser {
         let fs = self.fs.pop().unwrap();
         let numline = line - fs.linedefined;
         self.checklimitgt_static(fs.kn.len() as u32, BCMAX_D + 1, "constants", fs.linedefined);
-        self.checklimitgt_static(fs.kgc.len() as u32, BCMAX_D + 1, "constants", fs.linedefined);
+        self.checklimitgt_static(
+            fs.kgc.len() as u32,
+            BCMAX_D + 1,
+            "constants",
+            fs.linedefined,
+        );
 
         let n = fs.pc as usize;
         let mut bc = Vec::with_capacity(n);
@@ -1834,10 +1837,7 @@ impl Parser {
             let mut nonconst = true;
             if key.isk() && key.k != VKNil && (key.k == VKStr || val.isk_nojump()) {
                 if t.is_none() {
-                    let kt = LuaTable::new(
-                        if needarr { narr } else { 0 },
-                        hsize2hbits(nhash),
-                    );
+                    let kt = LuaTable::new(if needarr { narr } else { 0 }, hsize2hbits(nhash));
                     let fs = self.cur_mut();
                     let kidx = fs.kgc.len() as u32;
                     fs.kgc.push(KGc::Table(LuaTable::default()));
@@ -2157,8 +2157,13 @@ impl Parser {
     fn suffix_follows(&self) -> bool {
         matches!(
             self.ls.tok,
-            Tok::Nav | Tok::Str | Tok::Char(b'[') | Tok::Char(b':') | Tok::Char(b'(')
-                | Tok::Char(b'{') | Tok::Char(b'.')
+            Tok::Nav
+                | Tok::Str
+                | Tok::Char(b'[')
+                | Tok::Char(b':')
+                | Tok::Char(b'(')
+                | Tok::Char(b'{')
+                | Tok::Char(b'.')
         )
     }
 
@@ -2843,11 +2848,7 @@ impl Parser {
         let isnext = nvars <= 5 && self.cur().pc > exprpc && self.predict_next(exprpc);
         self.var_add(3);
         self.lex_check(Tok::Do);
-        let loop_pc = self.bcemit_aj(
-            if isnext { BCOp::ISNEXT } else { BCOp::JMP },
-            base,
-            -1,
-        );
+        let loop_pc = self.bcemit_aj(if isnext { BCOp::ISNEXT } else { BCOp::JMP }, base, -1);
         self.fscope_begin(0);
         self.var_add(nvars - 3);
         self.bcreg_reserve(nvars - 3);

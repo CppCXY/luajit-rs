@@ -5,7 +5,7 @@ use crate::gc::{GcPtr, Pool};
 use crate::proto::Proto;
 use crate::string::{Interner, StrId};
 use crate::table::LuaTable;
-use crate::value::{GcRef, LuaValue, LJ_TFUNC, LJ_TTAB};
+use crate::value::{GcRef, LJ_TFUNC, LJ_TTAB, LuaValue};
 
 /// The GC heap: stable-address object pools.
 ///

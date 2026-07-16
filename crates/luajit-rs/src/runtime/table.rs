@@ -512,7 +512,11 @@ impl LuaTable {
     /// Grow the array part to cover integer keys up to `nasize`, per
     /// `lj_tab_reasize`.
     pub fn reasize(&mut self, nasize: u32) {
-        let hbits = if self.hmask > 0 { fls(self.hmask) + 1 } else { 0 };
+        let hbits = if self.hmask > 0 {
+            fls(self.hmask) + 1
+        } else {
+            0
+        };
         self.resize(nasize + 1, hbits);
     }
 }
@@ -536,7 +540,10 @@ mod tests {
     fn int_keys_grow_array() {
         let mut t = LuaTable::new(0, 0);
         for i in 1..=100 {
-            t.set(LuaValue::number(i as f64), LuaValue::number((i * 10) as f64));
+            t.set(
+                LuaValue::number(i as f64),
+                LuaValue::number((i * 10) as f64),
+            );
         }
         for i in 1..=100 {
             assert_eq!(

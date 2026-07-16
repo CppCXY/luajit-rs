@@ -10,7 +10,7 @@ pub use stdlib::base as lib_base;
 pub use util::{strfmt, strscan};
 pub use vm::err;
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub fn compile(src: Vec<u8>, chunkname: &str) -> Result<(proto::Proto, lex::Interner), String> {
     let name = chunkname.to_string();

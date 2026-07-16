@@ -84,7 +84,13 @@ mod tests {
 
     #[test]
     fn vmstatus_roundtrips_results() {
-        for r in [Ok(0), Ok(3), Ok(-1), Err(LuaError::Runtime), Err(LuaError::Yield)] {
+        for r in [
+            Ok(0),
+            Ok(3),
+            Ok(-1),
+            Err(LuaError::Runtime),
+            Err(LuaError::Yield),
+        ] {
             let s = VmStatus::from(r);
             let back: LuaResult<i32> = s.into();
             assert_eq!(back, r);

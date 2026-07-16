@@ -175,9 +175,7 @@ fn is_digit(c: i32) -> bool {
 
 #[inline]
 fn is_xdigit(c: i32) -> bool {
-    is_digit(c)
-        || (c >= b'A' as i32 && c <= b'F' as i32)
-        || (c >= b'a' as i32 && c <= b'f' as i32)
+    is_digit(c) || (c >= b'A' as i32 && c <= b'F' as i32) || (c >= b'a' as i32 && c <= b'f' as i32)
 }
 
 #[inline]
@@ -206,7 +204,11 @@ impl LexState {
             strs,
         };
         ls.next_char();
-        if ls.c == 0xef && ls.pos + 1 < ls.src.len() && ls.src[ls.pos] == 0xbb && ls.src[ls.pos + 1] == 0xbf {
+        if ls.c == 0xef
+            && ls.pos + 1 < ls.src.len()
+            && ls.src[ls.pos] == 0xbb
+            && ls.src[ls.pos + 1] == 0xbf
+        {
             ls.pos += 2;
             ls.next_char();
         }
@@ -327,11 +329,7 @@ impl LexState {
         while self.save_next() == b'=' as i32 && count < 0x20000000 {
             count += 1;
         }
-        if self.c == s {
-            count
-        } else {
-            -count - 1
-        }
+        if self.c == s { count } else { -count - 1 }
     }
 
     fn long_string(&mut self, is_str: bool, sep: i32) -> Option<StrId> {
