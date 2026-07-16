@@ -10,12 +10,12 @@ fn main() {
         } else if file.is_none() {
             file = Some(a);
         } else {
-            eprintln!("usage: luajit-rs -bl <file.lua>");
+            eprintln!("usage: luajit-rs [-bl] <file.lua>");
             exit(1);
         }
     }
     let Some(file) = file else {
-        eprintln!("usage: luajit-rs -bl <file.lua>");
+        eprintln!("usage: luajit-rs [-bl] <file.lua>");
         exit(1);
     };
     let src = match std::fs::read(file) {
@@ -29,15 +29,20 @@ fn main() {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| file.to_string());
-    if !list {
-        eprintln!("note: only -bl (bytecode listing) is implemented so far");
-    }
-    match luajit_rs::list_bytecode(src, &chunkname) {
-        Ok(out) => {
-            use std::io::Write;
-            std::io::stdout().write_all(&out).unwrap();
+
+    if list {
+        match luajit_rs::list_bytecode(src, &chunkname) {
+            Ok(out) => {
+                use std::io::Write;
+                std::io::stdout().write_all(&out).unwrap();
+            }
+            Err(e) => {
+                eprintln!("luajit-rs: {}", e);
+                exit(1);
+            }
         }
-        Err(e) => {
+    } else {
+        if let Err(e) = luajit_rs::run_string(src, &format!("@{}", chunkname)) {
             eprintln!("luajit-rs: {}", e);
             exit(1);
         }

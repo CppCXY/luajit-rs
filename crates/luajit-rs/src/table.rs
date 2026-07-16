@@ -147,6 +147,141 @@ impl LuaTable {
         }
     }
 
+    /// Fast integer-key get (`lj_tab_getint`).
+    pub fn get_int(&self, k: i32) -> LuaValue {
+        if k >= 0 && (k as u32) < self.asize {
+            return self.array[k as usize];
+        }
+        self.get(LuaValue::number(k as f64))
+    }
+
+    // -- Traversal and length --------------------------------------------
+
+    /// The successor traversal index for `key` (`lj_tab_keyindex`).
+    /// `0` starts the traversal, `!0` marks an invalid key.
+    fn key_index(&self, key: LuaValue) -> u32 {
+        if key.is_nil() {
+            return 0;
+        }
+        if let Some(k) = LuaTable::array_key(key) {
+            if k < self.asize {
+                return k + 1;
+            }
+        }
+        if self.has_hpart() {
+            let mut n = self.hash_slot(key);
+            loop {
+                if self.node[n as usize].key == key {
+                    return self.asize + n + 1;
+                }
+                let next = self.node[n as usize].next;
+                if next == NIL_NODE {
+                    break;
+                }
+                n = next;
+            }
+        }
+        !0
+    }
+
+    /// The next key/value pair after `key` (`lj_tab_next`). `nil` starts the
+    /// traversal; `None` ends it.
+    pub fn next(&self, key: LuaValue) -> Option<(LuaValue, LuaValue)> {
+        let ki = self.key_index(key);
+        if ki == !0 {
+            return None;
+        }
+        let mut idx = ki;
+        while idx < self.asize {
+            let v = self.array[idx as usize];
+            if !v.is_nil() {
+                return Some((LuaValue::number(idx as f64), v));
+            }
+            idx += 1;
+        }
+        idx -= self.asize;
+        while self.has_hpart() && idx <= self.hmask {
+            let nd = &self.node[idx as usize];
+            if !nd.val.is_nil() {
+                return Some((nd.key, nd.val));
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    /// Table length (a border), ported from `lj_tab_len`.
+    pub fn len(&self) -> u32 {
+        let mut hi = self.asize;
+        if hi > 0 {
+            hi -= 1;
+        }
+        if hi > 0 && self.array[hi as usize].is_nil() {
+            let mut lo = 0u32;
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                if self.array[mid as usize].is_nil() {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            return lo;
+        }
+        if !self.has_hpart() {
+            return hi;
+        }
+        self.len_hash(hi)
+    }
+
+    fn len_hash(&self, mut hi: u32) -> u32 {
+        let mut lo = hi;
+        hi += 1;
+        while !self.get_int(hi as i32).is_nil() {
+            lo = hi;
+            if hi > (0x7fffffff - 2) / 2 {
+                let mut i = 1u32;
+                while !self.get_int(i as i32).is_nil() {
+                    i += 1;
+                }
+                return i - 1;
+            }
+            hi *= 2;
+        }
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if self.get_int(mid as i32).is_nil() {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        lo
+    }
+
+    /// Duplicate a template table (`lj_tab_dup`), replacing table-value markers
+    /// (used to preserve keys with runtime values) with nil.
+    pub fn dup(&self) -> LuaTable {
+        let mut t = LuaTable {
+            array: self.array.clone(),
+            node: self.node.clone(),
+            asize: self.asize,
+            hmask: self.hmask,
+            freetop: self.freetop,
+        };
+        for v in t.array.iter_mut() {
+            if v.is_table() {
+                *v = LuaValue::NIL;
+            }
+        }
+        for nd in t.node.iter_mut() {
+            if nd.val.is_table() {
+                nd.val = LuaValue::NIL;
+            }
+        }
+        t
+    }
+
     // -- Setters ---------------------------------------------------------
 
     /// Set `key` to `val`, mirroring `lj_tab_set` + `lj_tab_newkey`. After a

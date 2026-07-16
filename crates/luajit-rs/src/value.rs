@@ -101,6 +101,23 @@ impl LuaValue {
         LuaValue(bits)
     }
 
+    /// A number value with raw bits preserved (keeps `-0.0` and NaN payloads,
+    /// as arithmetic results do in LuaJIT). x86 arithmetic only produces
+    /// quiet NaNs (hi word <= 0xfff80000), which stay below the tag space.
+    #[inline(always)]
+    pub fn number_raw(n: f64) -> LuaValue {
+        let v = LuaValue(n.to_bits());
+        debug_assert!(v.is_number());
+        v
+    }
+
+    /// Unchecked numeric read; caller must have verified `is_number`.
+    #[inline(always)]
+    pub fn num(self) -> f64 {
+        debug_assert!(self.is_number());
+        f64::from_bits(self.0)
+    }
+
     pub fn string(s: GcPtr<LuaString>) -> LuaValue {
         LuaValue(gcv(LJ_TSTR, s.addr()))
     }

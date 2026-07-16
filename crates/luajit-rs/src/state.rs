@@ -125,25 +125,53 @@ impl StateRef {
     }
 }
 
-/// A call frame recording where to resume the caller on return.
+/// Maximum value-stack size (in slots). Fixed so the backing `Vec` never
+/// reallocates during execution, keeping raw stack pointers valid.
+pub const STACK_MAX: usize = 1 << 16;
+
+/// A call-info record for resuming a caller after a Lua->Lua return.
+///
+/// The register window itself follows LuaJIT's FR2 layout (callee `base` =
+/// caller_base + A + 2; function at `base-2`), which the bytecode assumes;
+/// this record holds only the resume state kept off the value stack.
+#[derive(Clone, Copy)]
 pub struct Frame {
-    pub func: LuaValue,
+    /// Caller's base to restore.
     pub base: usize,
+    /// Absolute slot where the callee's results must land (= callee_base - 2).
+    pub result_slot: usize,
+    /// Program counter to resume at in the caller.
     pub return_pc: usize,
+    /// The caller's running closure.
+    pub func: LuaValue,
+    /// Number of results the caller wants (`-1` = all / multi-result).
+    pub nresults: i32,
+    /// Caller's vararg region base (absolute) and count, to restore on return.
+    pub varg_base: usize,
+    pub nvarg: usize,
 }
 
 /// A Lua execution thread, corresponding to LuaJIT's `lua_State`.
 ///
-/// Owns its value stack and call frames, and holds a back-pointer to the
-/// shared [`GlobalState`]. Threads are themselves owned by the top-level
-/// [`Lua`] object.
+/// Owns its value stack, open-upvalue list and call frames, and holds a
+/// back-pointer to the shared [`GlobalState`]. Threads are themselves owned
+/// by the top-level [`Lua`] object.
 pub struct LuaState {
     g: GlobalRef,
     is_main: bool,
+    /// The value stack / register file. Fixed capacity; see `STACK_MAX`.
     pub stack: Vec<LuaValue>,
     pub base: usize,
     pub top: usize,
+    /// Lua->Lua call frames (control stack).
     pub frames: Vec<Frame>,
+    /// Open upvalues pointing into this thread's stack, kept sorted by slot
+    /// (descending), mirroring LuaJIT's `L->openupval` list.
+    pub openuv: Vec<GcPtr<crate::func::Upval>>,
+    /// The pending error object (`LuaError::Runtime`).
+    pub errval: LuaValue,
+    /// The number of yielded values (`LuaError::Yield`).
+    pub nyield: u32,
 }
 
 impl LuaState {
@@ -153,10 +181,13 @@ impl LuaState {
         LuaState {
             g,
             is_main,
-            stack: Vec::new(),
+            stack: vec![LuaValue::NIL; STACK_MAX],
             base: 0,
             top: 0,
             frames: Vec::new(),
+            openuv: Vec::new(),
+            errval: LuaValue::NIL,
+            nyield: 0,
         }
     }
 
@@ -173,11 +204,7 @@ impl LuaState {
     }
 
     pub fn push(&mut self, v: LuaValue) {
-        if self.top == self.stack.len() {
-            self.stack.push(v);
-        } else {
-            self.stack[self.top] = v;
-        }
+        self.stack[self.top] = v;
         self.top += 1;
     }
 
@@ -185,6 +212,14 @@ impl LuaState {
         debug_assert!(self.top > 0);
         self.top -= 1;
         self.stack[self.top]
+    }
+
+    /// Raise a runtime error carrying a string message. Interns the message
+    /// and stores it as the error object.
+    pub fn runtime_error(&mut self, msg: impl AsRef<[u8]>) -> crate::err::LuaError {
+        let sid = self.heap().intern(msg.as_ref());
+        self.errval = self.heap().str_value(sid);
+        crate::err::LuaError::Runtime
     }
 
     /// Register a builtin function as a global under `name`.
@@ -275,7 +310,7 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
     g.heap.strings = strs;
 
     debug_assert!(proto.uv.is_empty(), "main chunk must have no upvalues");
-    let proto_ref = g.heap.alloc_proto(proto);
+    let proto_ref = register_proto(&mut g.heap, proto);
     let env = g.globals;
     let fref = g.heap.alloc_func(GcFunc::Lua(LuaClosure {
         proto: proto_ref,
@@ -283,6 +318,21 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
         upvals: Vec::new(),
     }));
     Ok(LuaValue::func(fref))
+}
+
+/// Recursively register a prototype tree in the heap, turning each child
+/// `KGc::Proto` constant into a `KGc::ProtoRef` pointing at the heap object.
+pub fn register_proto(heap: &mut GcHeap, mut proto: Proto) -> GcPtr<Proto> {
+    for i in 0..proto.kgc.len() {
+        if matches!(proto.kgc[i], crate::proto::KGc::Proto(_)) {
+            let taken = std::mem::replace(&mut proto.kgc[i], crate::proto::KGc::Str(0));
+            if let crate::proto::KGc::Proto(child) = taken {
+                let r = register_proto(heap, *child);
+                proto.kgc[i] = crate::proto::KGc::ProtoRef(r);
+            }
+        }
+    }
+    heap.alloc_proto(proto)
 }
 
 /// Base-metatable itypes exposed for builtins.
@@ -323,8 +373,8 @@ mod tests {
 
     #[test]
     fn register_and_lookup_global() {
-        fn dummy(_l: &mut LuaState) -> u32 {
-            0
+        fn dummy(_l: &mut LuaState) -> crate::err::LuaResult<i32> {
+            Ok(0)
         }
         let mut lua = Lua::new();
         lua.main().register(b"print", dummy);

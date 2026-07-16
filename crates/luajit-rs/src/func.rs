@@ -55,9 +55,10 @@ pub struct LuaClosure {
 }
 
 /// A builtin implemented in Rust, corresponding to LuaJIT's `GCfuncC`.
-/// Receives the calling thread; arguments live on the stack frame set up by
-/// the interpreter. Returns the number of results pushed.
-pub type CFunction = fn(&mut LuaState) -> u32;
+/// Receives the calling thread with arguments already on its stack frame
+/// (`base..top`). Returns `Ok(n)` having left `n` results at the frame base,
+/// or `Err(LuaError)` (error object / yield count are on the `LuaState`).
+pub type CFunction = fn(&mut LuaState) -> crate::err::LuaResult<i32>;
 
 /// A C-function closure, corresponding to LuaJIT's `GCfuncC`.
 pub struct CClosure {
