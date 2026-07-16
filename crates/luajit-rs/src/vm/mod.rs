@@ -644,6 +644,32 @@ impl Interp {
                     resync!();
                 }
                 BCOp::CALLT => {
+                    // Fast path: Lua callee, no vararg frame on either side
+                    // — reuse the frame in place (BC_CALLT's hot route).
+                    let f = reg!(a);
+                    if let Some(gf) = f.as_func()
+                        && let GcFunc::Lua(cl) = gf.as_ref()
+                    {
+                        let pt = cl.proto.as_ref();
+                        let link = unsafe { (*bp.sub(1)).to_bits() };
+                        if (pt.flags & PROTO_VARARG) == 0 && link & FRAME_TYPE_MASK != FRAME_VARG {
+                            let nargs = bc_d(ins) as usize - 1;
+                            let fs = unsafe { bp.add(a as usize) };
+                            unsafe { *bp.sub(2) = f };
+                            for i in 0..nargs {
+                                unsafe { *bp.add(i) = *fs.add(2 + i) };
+                            }
+                            for i in nargs..pt.numparams as usize {
+                                unsafe { *bp.add(i) = LuaValue::NIL };
+                            }
+                            ip = unsafe { pt.bc.as_ptr().add(1) };
+                            self.cl = gf;
+                            self.bcp = pt.bc.as_ptr();
+                            self.knp = pt.kn.as_ptr();
+                            self.l().top = cur_base!() + pt.framesize as usize;
+                            continue;
+                        }
+                    }
                     let nargs = bc_d(ins) as usize - 1;
                     sync!();
                     if let Some(n) = self.do_tailcall(a, nargs)? {
@@ -983,12 +1009,67 @@ impl Interp {
         Ok(n)
     }
 
+    /// True tail call, per LuaJIT's BC_CALLT: the callee *replaces* the
+    /// current frame. Func and args move down to this frame's slots, the
+    /// frame link stays untouched, and no Rust recursion happens, so tail
+    /// recursion runs in constant stack. A tail call from a vararg function
+    /// first drops its vararg frame (relocating to the frame that holds the
+    /// real link). Returns `Some(n)` only when a C callee finishes a host
+    /// (`FRAME_C`) frame.
     fn do_tailcall(&mut self, a: u32, nargs: usize) -> LuaResult<Option<usize>> {
-        // Simple (non-TCO) tail call: run the callee as a nested execution,
-        // then return its results from the current frame. True TCO is later.
         let func_slot = self.base + a as usize;
-        let n = execute(self.l(), func_slot, nargs, -1)?;
-        Ok(self.do_return(func_slot, n))
+        let f = self.at(func_slot);
+        let gf = match f.as_func() {
+            Some(p) => p,
+            None => {
+                return Err(self
+                    .l()
+                    .runtime_error(b"attempt to call a non-function value"));
+            }
+        };
+
+        let mut base = self.base;
+        let link = self.at(base - 1).to_bits();
+        if link & FRAME_TYPE_MASK == FRAME_VARG {
+            base -= (link >> 3) as usize;
+        }
+        // Move func and args down into the (possibly relocated) frame.
+        self.set_at(base - 2, f);
+        for i in 0..nargs {
+            self.set_at(base + i, self.at(func_slot + 2 + i));
+        }
+
+        match gf.as_ref() {
+            GcFunc::Lua(cl) => {
+                let pt = cl.proto.as_ref();
+                if (pt.flags & PROTO_VARARG) != 0 {
+                    // FUNCV builds its own vararg frame on top, chained to
+                    // the link already sitting at `base - 1`.
+                    let link = self.at(base - 1).to_bits();
+                    self.enter_lua(gf, base - 2, nargs, link);
+                } else {
+                    for i in nargs..pt.numparams as usize {
+                        self.set_at(base + i, LuaValue::NIL);
+                    }
+                    self.base = base;
+                    self.cl = gf;
+                    self.bcp = pt.bc.as_ptr();
+                    self.knp = pt.kn.as_ptr();
+                    self.pc = 1; // skip the FUNCF header
+                    self.l().top = base + pt.framesize as usize;
+                }
+                Ok(None)
+            }
+            GcFunc::C(cc) => {
+                // Tail call to a C function: run it in the reused frame,
+                // then return its results through the frame link, exactly
+                // as if the C function's caller had returned them.
+                let fp = cc.f;
+                self.base = base;
+                let n = self.call_c_inline(fp, base - 2, nargs)?;
+                Ok(self.do_return(base - 2, n))
+            }
+        }
     }
 
     /// Move `n` results to the caller's slot, restore the caller frame and
