@@ -1,3 +1,4 @@
+use crate::gc::GcPtr;
 use crate::value::LuaValue;
 
 /// Max. array part size (`LJ_MAX_ASIZE`) and max. array key bits.
@@ -54,6 +55,7 @@ pub struct LuaTable {
     hmask: u32,
     /// Top of the free-node search (index just past the last free node).
     freetop: u32,
+    pub metatable: Option<GcPtr<LuaTable>>,
 }
 
 impl Default for LuaTable {
@@ -75,6 +77,7 @@ impl LuaTable {
             asize,
             hmask: 0,
             freetop: 0,
+            metatable: None,
         };
         if hbits != 0 {
             t.new_hpart(hbits);
@@ -86,6 +89,12 @@ impl LuaTable {
 
     pub fn asize(&self) -> u32 {
         self.asize
+    }
+
+    /// Raw pointer to the array part for VM inline access (returns
+    /// `*mut` from `&self` — the interpreter holds exclusive access).
+    pub fn array_ptr(&self) -> *mut LuaValue {
+        self.array.as_ptr() as *mut LuaValue
     }
 
     pub fn hbits(&self) -> u32 {
@@ -113,6 +122,9 @@ impl LuaTable {
     /// marked (LuaJIT's dead-key policy: the stale reference stays in the
     /// node but is only ever compared by identity, never dereferenced).
     pub(crate) fn gc_traverse(&self, mut mark: impl FnMut(LuaValue)) {
+        if let Some(mt) = self.metatable {
+            mark(LuaValue::table(mt));
+        }
         for &v in &self.array {
             mark(v);
         }
@@ -223,9 +235,12 @@ impl LuaTable {
 
     #[inline]
     pub fn set_int(&mut self, k: i32, v: LuaValue) {
-        if k >= 0 && (k as u32) < self.asize {
-            self.array[k as usize] = v;
-            return;
+        if k >= 0 {
+            let ku = k as u32;
+            if ku < self.asize {
+                self.array[k as usize] = v;
+                return;
+            }
         }
         self.set(LuaValue::number(k as f64), v);
     }
@@ -342,6 +357,7 @@ impl LuaTable {
             asize: self.asize,
             hmask: self.hmask,
             freetop: self.freetop,
+            metatable: None,
         };
         for v in t.array.iter_mut() {
             if v.is_table() {
