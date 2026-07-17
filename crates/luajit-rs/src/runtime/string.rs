@@ -1,12 +1,7 @@
-use std::collections::HashMap;
+use ahash::RandomState;
 
 pub type StrId = u32;
 
-/// Threshold for the inline small-string optimization. Strings up to this
-/// length are stored inline; longer ones are heap-allocated. This is purely
-/// an internal storage detail (like a smol-str): it is not observable at the
-/// value level. LuaJIT itself has a single interned string type (`GCstr`,
-/// itype `LJ_TSTR`) with no short/long split.
 const INLINE_CAP: usize = 22;
 
 enum Repr {
@@ -14,11 +9,6 @@ enum Repr {
     Heap(Box<[u8]>),
 }
 
-/// A Lua string object, corresponding to LuaJIT's `GCstr`.
-///
-/// Carries the interned string id (`sid`, used for table hashing just like
-/// LuaJIT's `hashstr`) and the cached content hash. Storage uses a
-/// small-string optimization internally, which callers never observe.
 pub struct LuaString {
     sid: StrId,
     hash: u32,
@@ -30,10 +20,7 @@ impl LuaString {
         let repr = if bytes.len() <= INLINE_CAP {
             let mut buf = [0u8; INLINE_CAP];
             buf[..bytes.len()].copy_from_slice(bytes);
-            Repr::Inline {
-                len: bytes.len() as u8,
-                buf,
-            }
+            Repr::Inline { len: bytes.len() as u8, buf }
         } else {
             Repr::Heap(bytes.into())
         };
@@ -54,80 +41,126 @@ impl LuaString {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn sid(&self) -> StrId {
-        self.sid
-    }
-
-    pub fn hash(&self) -> u32 {
-        self.hash
-    }
-
-    /// Approximate heap footprint in bytes, for GC accounting.
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn sid(&self) -> StrId { self.sid }
+    pub fn hash(&self) -> u32 { self.hash }
     pub fn gc_size(&self) -> usize {
         std::mem::size_of::<LuaString>()
-            + match &self.repr {
-                Repr::Inline { .. } => 0,
-                Repr::Heap(b) => b.len(),
-            }
+            + match &self.repr { Repr::Inline { .. } => 0, Repr::Heap(b) => b.len() }
     }
 }
 
-/// Keyed sparse ARX string hash, ported from LuaJIT's `hash_sparse`
-/// (constants from Bob Jenkins' lookup3). Constant time.
-pub fn hash_sparse(seed: u64, s: &[u8]) -> u32 {
-    let len = s.len() as u32;
-    if len == 0 {
-        return seed as u32;
-    }
-    let getu32 = |i: usize| -> u32 { u32::from_le_bytes(s[i..i + 4].try_into().unwrap()) };
-    let mut h = len ^ (seed as u32);
-    let mut a;
-    let mut b;
-    if len >= 4 {
-        a = getu32(0);
-        h ^= getu32(s.len() - 4);
-        b = getu32((len >> 1) as usize - 2);
-        h ^= b;
-        h = h.wrapping_sub(b.rotate_left(14));
-        b = b.wrapping_add(getu32((len >> 2) as usize - 1));
-    } else {
-        a = s[0] as u32;
-        h ^= s[s.len() - 1] as u32;
-        b = s[(len >> 1) as usize] as u32;
-        h ^= b;
-        h = h.wrapping_sub(b.rotate_left(14));
-    }
-    a ^= h;
-    a = a.wrapping_sub(h.rotate_left(11));
-    b ^= a;
-    b = b.wrapping_sub(a.rotate_left(25));
-    h ^= b;
-    h = h.wrapping_sub(b.rotate_left(16));
-    h
+// -- Open-addressed hash table for string interning -----------------------
+
+#[derive(Copy, Clone)]
+enum Slot {
+    Empty,
+    Tombstone,
+    Occupied(crate::gc::GcPtr<LuaString>),
 }
 
-/// The string intern table, corresponding to LuaJIT's global string table
-/// (`lj_str_new`). Equal byte content always maps to the same `StrId`, so
-/// string equality reduces to id equality. Dead ids are recycled by the GC
-/// sweep; a live string's id never changes.
-#[derive(Default)]
 pub struct Interner {
-    map: HashMap<Box<[u8]>, StrId>,
+    slots: Vec<Slot>,
+    nuse: usize,
+    ndead: usize,
     by_id: Vec<Option<crate::gc::GcPtr<LuaString>>>,
     free_ids: Vec<StrId>,
     pool: crate::gc::Pool<LuaString>,
-    seed: u64,
+    hasher: RandomState,
     bytes: usize,
 }
 
+impl Default for Interner {
+    fn default() -> Interner {
+        Interner {
+            slots: vec![Slot::Empty; 512],
+            nuse: 0,
+            ndead: 0,
+            by_id: Vec::new(),
+            free_ids: Vec::new(),
+            pool: crate::gc::Pool::new(),
+            hasher: RandomState::with_seeds(
+                0x243f_6a88_85a3_08d3,
+                0x1319_8a2e_0370_7344,
+                0xa409_3822_299f_31d0,
+                0x082e_fa98_ec4e_6c89,
+            ),
+            bytes: 0,
+        }
+    }
+}
+
 impl Interner {
+    const MAX_LOAD_NUM: usize = 7;
+    const MAX_LOAD_DEN: usize = 10;
+
+    #[inline]
+    fn slot_index(&self, hash: u32) -> usize {
+        (hash as usize) & (self.slots.len() - 1)
+    }
+
+    #[inline]
+    fn should_grow(&self) -> bool {
+        (self.nuse + self.ndead) * Self::MAX_LOAD_DEN >= self.slots.len() * Self::MAX_LOAD_NUM
+    }
+
+    #[inline]
+    fn hash_bytes(&self, s: &[u8]) -> u32 {
+        self.hasher.hash_one(s) as u32
+    }
+
+    fn find_slot(&self, hash: u32, s: &[u8]) -> Result<usize, usize> {
+        let mask = self.slots.len() - 1;
+        let mut index = self.slot_index(hash);
+        let mut first_tombstone = None;
+        loop {
+            match self.slots[index] {
+                Slot::Empty => return Err(first_tombstone.unwrap_or(index)),
+                Slot::Tombstone => {
+                    if first_tombstone.is_none() {
+                        first_tombstone = Some(index);
+                    }
+                }
+                Slot::Occupied(p) => {
+                    let ls = p.as_ref();
+                    if ls.hash() == hash && ls.as_bytes() == s {
+                        return Ok(index);
+                    }
+                }
+            }
+            index = (index + 1) & mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let new_size = self.slots.len() * 2;
+        let mut new_slots = vec![Slot::Empty; new_size];
+        let mask = new_size - 1;
+        for slot in self.slots.iter().copied() {
+            if let Slot::Occupied(p) = slot {
+                let mut idx = (p.as_ref().hash() as usize) & mask;
+                loop {
+                    if matches!(new_slots[idx], Slot::Empty) {
+                        new_slots[idx] = Slot::Occupied(p);
+                        break;
+                    }
+                    idx = (idx + 1) & mask;
+                }
+            }
+        }
+        self.slots = new_slots;
+        self.ndead = 0;
+    }
+
     pub fn intern(&mut self, s: &[u8]) -> StrId {
-        if let Some(&id) = self.map.get(s) {
-            return id;
+        let hash = self.hash_bytes(s);
+        if let Ok(index) = self.find_slot(hash, s) {
+            if let Slot::Occupied(p) = self.slots[index] {
+                return p.as_ref().sid();
+            }
+        }
+        if self.should_grow() {
+            self.grow();
         }
         let sid = match self.free_ids.pop() {
             Some(id) => id,
@@ -136,11 +169,17 @@ impl Interner {
                 (self.by_id.len() - 1) as StrId
             }
         };
-        let hash = hash_sparse(self.seed, s);
         let p = self.pool.alloc(LuaString::new(s, sid, hash));
         self.bytes += p.as_ref().gc_size();
         self.by_id[sid as usize] = Some(p);
-        self.map.insert(s.into(), sid);
+        let slot_idx = match self.find_slot(hash, s) {
+            Ok(idx) | Err(idx) => idx,
+        };
+        if matches!(self.slots[slot_idx], Slot::Tombstone) {
+            self.ndead -= 1;
+        }
+        self.slots[slot_idx] = Slot::Occupied(p);
+        self.nuse += 1;
         sid
     }
 
@@ -149,36 +188,47 @@ impl Interner {
     }
 
     pub fn lookup(&self, id: StrId) -> &LuaString {
-        self.by_id[id as usize].expect("dead string id").as_ref()
+        self.by_id[id as usize]
+            .expect("dead string id")
+            .as_ref()
     }
 
-    /// A stable pointer to the interned string object, for storing in a
-    /// `LuaValue`.
     pub fn lookup_ptr(&self, id: StrId) -> crate::gc::GcPtr<LuaString> {
         self.by_id[id as usize].expect("dead string id")
     }
 
-    /// Approximate bytes held by interned strings (GC accounting).
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// Get string content with a `static` lifetime — pool pages never move,
-    /// and an interned string stays alive as long as it is reachable.
-    /// This lets C functions read string args without cloning, even while
-    /// interning results on the same heap.
     pub fn get_static(&self, id: StrId) -> &'static [u8] {
         unsafe { std::slice::from_raw_parts(self.get(id).as_ptr(), self.get(id).len()) }
     }
 
-    /// GC string sweep (`gc_sweepstr`): free unmarked strings, drop their
-    /// intern-map entries and recycle their ids.
     pub(crate) fn sweep(&mut self) {
-        let map = &mut self.map;
         let by_id = &mut self.by_id;
         let free_ids = &mut self.free_ids;
         self.pool.sweep(|s| {
-            map.remove(s.as_bytes());
+            let hash = s.hash();
+            let bytes = s.as_bytes();
+            let mask = self.slots.len() - 1;
+            let mut idx = (hash as usize) & mask;
+            loop {
+                match self.slots[idx] {
+                    Slot::Occupied(p)
+                        if p.as_ref().hash() == hash && p.as_ref().as_bytes() == bytes =>
+                    {
+                        self.slots[idx] = Slot::Tombstone;
+                        self.nuse -= 1;
+                        self.ndead += 1;
+                        break;
+                    }
+                    Slot::Occupied(_) | Slot::Tombstone => {
+                        idx = (idx + 1) & mask;
+                    }
+                    Slot::Empty => break,
+                }
+            }
             by_id[s.sid() as usize] = None;
             free_ids.push(s.sid());
         });
@@ -228,22 +278,9 @@ mod tests {
         let long = strs.intern(&[b'y'; 100]);
         let vs = LuaValue::string(strs.lookup_ptr(short));
         let vl = LuaValue::string(strs.lookup_ptr(long));
-        // Inline vs heap storage is invisible at the value level: both are
-        // plain LJ_TSTR values, distinguished only by their sid payload.
         assert!(vs.is_string() && vl.is_string());
         assert_eq!(vs.as_string_id(), Some(short));
         assert_eq!(vl.as_string_id(), Some(long));
         assert_ne!(vs, vl);
-    }
-
-    #[test]
-    fn hash_sparse_matches_len_behavior() {
-        let h1 = hash_sparse(0, b"abc");
-        let h2 = hash_sparse(0, b"abd");
-        assert_ne!(h1, h2);
-        let h3 = hash_sparse(0, b"a longer string over four bytes");
-        let h4 = hash_sparse(0, b"a longer string over four bytez");
-        assert_ne!(h3, h4);
-        assert_eq!(hash_sparse(7, b""), 7);
     }
 }

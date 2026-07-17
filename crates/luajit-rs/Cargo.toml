@@ -13,3 +13,4 @@ name = "luajit-rs"
 path = "src/main.rs"
 
 [dependencies]
+ahash = "0.8"

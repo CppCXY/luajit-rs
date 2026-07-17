@@ -622,7 +622,6 @@ impl Interp {
                     let t = reg!(bc_b(ins));
                     let k = reg!(bc_c(ins));
                     let v = reg!(a);
-                    let k_is_str = k.is_string();
                     if let Some(tab) = t.as_table() {
                         if k.is_string() {
                             tab.as_mut().set_str(k, v);
