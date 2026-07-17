@@ -831,6 +831,7 @@ impl Interp {
                     self.gc_check();
                     let templ = match &self.proto().kgc[bc_d(ins) as usize] {
                         KGc::Table(t) => t.dup(),
+                        KGc::TableRef(t) => t.as_ref().dup(),
                         _ => unreachable!("expected template table"),
                     };
                     let t = self.l().heap().alloc_table(templ);

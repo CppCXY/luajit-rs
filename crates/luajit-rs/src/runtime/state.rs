@@ -35,11 +35,11 @@ impl Default for GcHeap {
     fn default() -> GcHeap {
         GcHeap {
             strings: Interner::default(),
-            protos: Pool::new(),
-            tables: Pool::new(),
-            funcs: Pool::new(),
-            upvals: Pool::new(),
-            threads: Pool::new(),
+            protos: Pool::with_page_size(16),
+            tables: Pool::with_page_size(64),
+            funcs: Pool::with_page_size(64),
+            upvals: Pool::with_page_size(128),
+            threads: Pool::with_page_size(4),
             total: 0,
             threshold: crate::gc::GC_THRESHOLD_MIN,
         }

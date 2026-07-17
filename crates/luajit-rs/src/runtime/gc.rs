@@ -1,8 +1,10 @@
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
-/// Slots per pool page.
-const POOL_PAGE: usize = 64;
+/// Default slots per pool page. `Pool::with_page_size` picks a per-type
+/// count so pages stay near a sensible byte size: small objects (upvalues,
+/// strings) pack many per page, huge ones (thread states) only a few.
+const POOL_PAGE_DEFAULT: usize = 64;
 
 /// A pool slot. `data` must stay the first field (`repr(C)`) so a pointer to
 /// the payload can be cast back to the slot for freeing and for the mark
@@ -18,31 +20,35 @@ struct Slot<T> {
 ///
 /// Objects are allocated inside fixed-size pages (`Box<[Slot<T>]>`); pages
 /// are never reallocated or moved, so a `GcPtr<T>` stays valid for the life
-/// of the pool (or until the object is explicitly freed). Freed slots go on
-/// a free list and are reused by later allocations, so long-running churn
-/// does not accumulate holes; unlike one `Box` per object, page allocation
-/// keeps objects of the same type densely packed.
-///
-/// This is the placement layer for the future garbage collector: a sweep
-/// walks the pages linearly and returns dead slots to the free list.
+/// of the pool (or until the object is explicitly freed). The per-page slot
+/// count is chosen at construction so objects of different sizes get pages
+/// of roughly the same byte size (small objects → many slots; huge objects
+/// → few).
 pub struct Pool<T> {
     pages: Vec<Box<[Slot<T>]>>,
     free: Vec<NonNull<Slot<T>>>,
     live: usize,
+    page_cap: usize,
 }
 
 impl<T> Pool<T> {
-    pub fn new() -> Pool<T> {
+    pub fn with_page_size(page_cap: usize) -> Pool<T> {
         Pool {
             pages: Vec::new(),
             free: Vec::new(),
             live: 0,
+            page_cap: page_cap.max(1),
         }
     }
 
+    /// Legacy shortcut: 64 slots per page (medium-sized objects).
+    pub fn new() -> Pool<T> {
+        Pool::with_page_size(POOL_PAGE_DEFAULT)
+    }
+
     fn add_page(&mut self) {
-        let mut page: Vec<Slot<T>> = Vec::with_capacity(POOL_PAGE);
-        for _ in 0..POOL_PAGE {
+        let mut page: Vec<Slot<T>> = Vec::with_capacity(self.page_cap);
+        for _ in 0..self.page_cap {
             page.push(Slot {
                 data: MaybeUninit::uninit(),
                 live: false,
@@ -377,6 +383,7 @@ impl<'g> Marker<'g> {
                             // Template tables are owned by the proto (not
                             // heap objects); mark their contents in place.
                             KGc::Table(t) => t.gc_traverse(|v| self.mark_value(v)),
+                            KGc::TableRef(t) => t.as_ref().gc_traverse(|v| self.mark_value(v)),
                             KGc::Proto(_) => unreachable!("unregistered child proto in heap"),
                         }
                     }
