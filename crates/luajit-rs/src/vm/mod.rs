@@ -49,7 +49,25 @@ use crate::value::*;
 const FRAME_LUA: u64 = 0;
 const FRAME_C: u64 = 1;
 const FRAME_VARG: u64 = 3;
+const FRAME_CONT: u64 = 2;
 const FRAME_TYPE_MASK: u64 = 3;
+
+/// Continuation IDs stored in the cont-slot of a FRAME_CONT frame.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Cont {
+    Ra = 0,
+    Nop = 1,
+    Condt = 2,
+    Condf = 3,
+}
+impl Cont {
+    pub fn encode(self, extra: u32) -> u64 { ((self as u64) << 32) | (extra as u64) }
+    pub fn decode(bits: u64) -> (Cont, u32) {
+        (unsafe { std::mem::transmute::<u8, Cont>((bits >> 32) as u8) },
+         (bits & 0xFFFF_FFFF) as u32)
+    }
+}
 
 /// Call a value with the given arguments and collect all results.
 /// The host entry point into the VM.
@@ -285,6 +303,96 @@ impl Interp {
         self.reload(cl);
     }
 
+    /// `mmcall` + FRAME_CONT (lj_meta.c's `mmcall` + `vm_call_dispatch_f`):
+    /// set up a continuation frame above the current one and enter the Lua
+    /// metamethod. Caller must be synced; afterwards the `Interp` fields
+    /// point into the metamethod's frame (caller must `resync!()`).
+    ///
+    /// Stack layout (FR2):
+    /// ```text
+    ///  mmbase-4  mmbase-3   mmbase-2  mmbase-1  | mmbase  mmbase+1 ..
+    /// [cont      saved PC] [mo        link|CONT] | [arg0   arg1 ..]
+    /// ```
+    fn mmcall_cont(&mut self, cont_id: Cont, extra: u32, mo: LuaValue, args: &[LuaValue]) {
+        let saved_base = self.base;
+        // curr_topL: scratch right above the running frame, +2 for cont/PC.
+        let func_slot = saved_base + self.proto().framesize as usize + 2;
+        let mmbase = func_slot + 2;
+        self.set_at(mmbase - 4, LuaValue::from_bits(cont_id.encode(extra)));
+        self.set_at(mmbase - 3, LuaValue::from_bits(self.pc as u64));
+        self.set_at(func_slot, mo);
+        for (i, &v) in args.iter().enumerate() {
+            self.set_at(mmbase + i, v);
+        }
+        let link = (((mmbase - saved_base) as u64) << 3) | FRAME_CONT;
+        self.enter_lua(mo.as_func().unwrap(), func_slot, args.len(), link);
+    }
+
+    /// Call a C-function metamethod inline (no continuation frame): the
+    /// result is available immediately. Uses scratch above the frame.
+    fn call_c_fn(
+        &mut self,
+        f: crate::func::CFunction,
+        mo: LuaValue,
+        args: &[LuaValue],
+    ) -> LuaResult<LuaValue> {
+        let fs = self.base + self.proto().framesize as usize;
+        self.set_at(fs, mo);
+        self.set_at(fs + 1, LuaValue::NIL);
+        for (i, &v) in args.iter().enumerate() {
+            self.set_at(fs + 2 + i, v);
+        }
+        let n = self.call_c_inline(f, fs, args.len())?;
+        Ok(if n > 0 { self.at(fs) } else { LuaValue::NIL })
+    }
+
+    /// Continuation dispatch (LuaJIT's `->cont_dispatch` + `cont_*`
+    /// handlers): a metamethod called through `mmcall_cont` has returned;
+    /// `mmbase` is its frame base, results were copied to `mmbase - 2` by
+    /// `do_return`. Restores the caller frame and applies the continuation.
+    /// Returns `None`: execution always continues in the caller.
+    fn cont_dispatch(&mut self, mmbase: usize, link: u64, n: usize) -> Option<usize> {
+        let delta = (link >> 3) as usize;
+        let caller_base = mmbase - delta;
+        let (cont, extra) = Cont::decode(self.at(mmbase - 4).to_bits());
+        let saved_pc = self.at(mmbase - 3).to_bits() as usize;
+        // Ensure one valid result (cont_dispatch's "Ensure one valid arg").
+        let result = if n > 0 { self.at(mmbase - 2) } else { LuaValue::NIL };
+
+        self.base = caller_base;
+        let cl = self.at(caller_base - 2).as_func().unwrap();
+        self.reload(cl);
+        self.l().top = caller_base + self.proto().framesize as usize;
+
+        match cont {
+            Cont::Ra => {
+                // Store result in the A register of the triggering
+                // instruction (encoded in `extra`).
+                self.set_at(caller_base + extra as usize, result);
+                self.pc = saved_pc;
+            }
+            Cont::Nop => {
+                self.pc = saved_pc;
+            }
+            Cont::Condt => {
+                // saved_pc points at the fused JMP.
+                let jmp = unsafe { *self.bcp.add(saved_pc) };
+                self.pc = saved_pc + 1;
+                if result.is_truthy() {
+                    self.pc = (self.pc as i64 + bc_j(jmp)) as usize;
+                }
+            }
+            Cont::Condf => {
+                let jmp = unsafe { *self.bcp.add(saved_pc) };
+                self.pc = saved_pc + 1;
+                if !result.is_truthy() {
+                    self.pc = (self.pc as i64 + bc_j(jmp)) as usize;
+                }
+            }
+        }
+        None
+    }
+
     /// The dispatch loop. The entire hot state is two locals — `bp` (the
     /// current base as a pointer, LuaJIT's BASE) and `ip` (a walking
     /// instruction pointer, LuaJIT's PC) — so both live in registers on
@@ -347,8 +455,10 @@ impl Interp {
                     setreg!($a, LuaValue::number_raw($body));
                 } else {
                     sync!();
-                    let r = self.meta_arith($mm, xv, yv)?;
-                    setreg!($a, r);
+                    match self.meta_arith($mm, xv, yv, $a)? {
+                        Some(r) => setreg!($a, r),
+                        None => { resync!(); continue; }
+                    }
                 }
             }};
         }
@@ -363,8 +473,10 @@ impl Interp {
                     setreg!($a, LuaValue::number_raw($body));
                 } else {
                     sync!();
-                    let r = self.meta_arith($mm, xv, kslot!(bc_c($ins)))?;
-                    setreg!($a, r);
+                    match self.meta_arith($mm, xv, kslot!(bc_c($ins)), $a)? {
+                        Some(r) => setreg!($a, r),
+                        None => { resync!(); continue; }
+                    }
                 }
             }};
         }
@@ -380,8 +492,10 @@ impl Interp {
                     setreg!($a, LuaValue::number_raw($body));
                 } else {
                     sync!();
-                    let r = self.meta_arith($mm, $x, yv)?;
-                    setreg!($a, r);
+                    match self.meta_arith($mm, $x, yv, $a)? {
+                        Some(r) => setreg!($a, r),
+                        None => { resync!(); continue; }
+                    }
                 }
             }};
         }
@@ -392,24 +506,26 @@ impl Interp {
             ($op:expr, $xv:expr, $yv:expr) => {{
                 let xv = $xv;
                 let yv = $yv;
-                let cond = if xv.is_number() && yv.is_number() {
+                if xv.is_number() && yv.is_number() {
                     let x = xv.num();
                     let y = yv.num();
-                    match $op {
-                        0 => x < y,
-                        1 => x >= y,
-                        2 => x <= y,
-                        3 => x > y,
+                    let cond = match $op {
+                        0 => x < y, 1 => x >= y, 2 => x <= y, 3 => x > y,
                         _ => unreachable!(),
-                    }
+                    };
+                    let jmp = unsafe { *ip };
+                    ip = unsafe { ip.add(1) };
+                    if cond { jump!(jmp); }
                 } else {
                     sync!();
-                    self.meta_comp(xv, yv, $op)?
-                };
-                let jmp = unsafe { *ip };
-                ip = unsafe { ip.add(1) };
-                if cond {
-                    jump!(jmp);
+                    match self.meta_comp(xv, yv, $op)? {
+                        Some(cond) => {
+                            let jmp = unsafe { *ip };
+                            ip = unsafe { ip.add(1) };
+                            if cond { jump!(jmp); }
+                        }
+                        None => { resync!(); continue; }
+                    }
                 }
             }};
         }
@@ -436,22 +552,34 @@ impl Interp {
                 BCOp::ISEQV => {
                     let x = reg!(a);
                     let y = reg!(bc_d(ins));
-                    let mut cond = val_eq(x, y);
-                    if !cond && x.is_table() && y.is_table() {
+                    let cond = val_eq(x, y);
+                    if cond {
+                        branch!(true);
+                    } else if x.is_table() && y.is_table() {
                         sync!();
-                        cond = self.meta_equal(x, y)?;
+                        match self.meta_equal(x, y, 0)? {
+                            Some(eq) => branch!(eq),
+                            None => { resync!(); continue; }
+                        }
+                    } else {
+                        branch!(false);
                     }
-                    branch!(cond);
                 }
                 BCOp::ISNEV => {
                     let x = reg!(a);
                     let y = reg!(bc_d(ins));
-                    let mut cond = val_eq(x, y);
-                    if !cond && x.is_table() && y.is_table() {
+                    let cond = val_eq(x, y);
+                    if cond {
+                        branch!(false);
+                    } else if x.is_table() && y.is_table() {
                         sync!();
-                        cond = self.meta_equal(x, y)?;
+                        match self.meta_equal(x, y, 1)? {
+                            Some(eq) => branch!(!eq),
+                            None => { resync!(); continue; }
+                        }
+                    } else {
+                        branch!(true);
                     }
-                    branch!(!cond);
                 }
                 BCOp::ISEQS => {
                     let cond = val_eq(reg!(a), self.kstr_at(bc_d(ins)));
@@ -511,8 +639,10 @@ impl Interp {
                         setreg!(a, LuaValue::number_raw(-v.num()));
                     } else {
                         sync!();
-                        let r = self.meta_arith(MM::Unm, v, v)?;
-                        setreg!(a, r);
+                        match self.meta_arith(MM::Unm, v, v, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
                     }
                 }
                 BCOp::LEN => {
@@ -651,9 +781,7 @@ impl Interp {
                     if !v.is_nil() || env.as_ref().metatable.is_none() {
                         setreg!(a, v);
                     } else {
-                        sync!();
-                        let v = self.meta_tget(LuaValue::table(env), key)?;
-                        setreg!(a, v);
+                        sync!(); match self.meta_tget(LuaValue::table(env), key, a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
                     }
                 }
                 BCOp::GSET => {
@@ -663,8 +791,7 @@ impl Interp {
                     if mt.is_none() || !env.as_ref().get_str(key).is_nil() {
                         env.as_mut().set_str(key, reg!(a));
                     } else {
-                        sync!();
-                        self.meta_tset(LuaValue::table(env), key, reg!(a))?;
+                        sync!(); match self.meta_tset(LuaValue::table(env), key, reg!(a))? { Some(_) => {}, None => { resync!(); continue; } }
                     }
                 }
                 BCOp::TGETV => {
@@ -686,14 +813,10 @@ impl Interp {
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
                             setreg!(a, v);
                         } else {
-                            sync!();
-                            let v = self.meta_tget(t, k)?;
-                            setreg!(a, v);
+                            sync!(); match self.meta_tget(t, k, a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
                         }
                     } else {
-                        sync!();
-                        let v = self.meta_tget(t, k)?;
-                        setreg!(a, v);
+                        sync!(); match self.meta_tget(t, k, a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
                     }
                 }
                 BCOp::TGETS => {
@@ -704,14 +827,10 @@ impl Interp {
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
                             setreg!(a, v);
                         } else {
-                            sync!();
-                            let v = self.meta_tget(t, k)?;
-                            setreg!(a, v);
+                            sync!(); match self.meta_tget(t, k, a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
                         }
                     } else {
-                        sync!();
-                        let v = self.meta_tget(t, self.kstr_at(bc_c(ins)))?;
-                        setreg!(a, v);
+                        sync!(); match self.meta_tget(t, self.kstr_at(bc_c(ins)), a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
                     }
                 }
                 BCOp::TGETB => {
@@ -722,14 +841,10 @@ impl Interp {
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
                             setreg!(a, v);
                         } else {
-                            sync!();
-                            let v = self.meta_tget(t, LuaValue::number(k as f64))?;
-                            setreg!(a, v);
+                            sync!(); match self.meta_tget(t, LuaValue::number(k as f64), a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
                         }
                     } else {
-                        sync!();
-                        let v = self.meta_tget(t, LuaValue::number(bc_c(ins) as f64))?;
-                        setreg!(a, v);
+                        sync!(); match self.meta_tget(t, LuaValue::number(bc_c(ins) as f64), a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
                     }
                 }
                 BCOp::TSETV => {
@@ -755,8 +870,7 @@ impl Interp {
                             tab.as_mut().set(k, v);
                         }
                     } else {
-                        sync!();
-                        self.meta_tset(t, k, v)?;
+                        sync!(); match self.meta_tset(t, k, v)? { Some(_) => {}, None => { resync!(); continue; } }
                     }
                 }
                 BCOp::TSETS => {
@@ -768,8 +882,7 @@ impl Interp {
                         let k = self.kstr_at(bc_c(ins));
                         tab.as_mut().set_str(k, v);
                     } else {
-                        sync!();
-                        self.meta_tset(t, self.kstr_at(bc_c(ins)), v)?;
+                        sync!(); match self.meta_tset(t, self.kstr_at(bc_c(ins)), v)? { Some(_) => {}, None => { resync!(); continue; } }
                     }
                 }
                 BCOp::TSETB => {
@@ -780,8 +893,7 @@ impl Interp {
                     {
                         tab.as_mut().set_int(bc_c(ins) as i32, v);
                     } else {
-                        sync!();
-                        self.meta_tset(t, LuaValue::number(bc_c(ins) as f64), v)?;
+                        sync!(); match self.meta_tset(t, LuaValue::number(bc_c(ins) as f64), v)? { Some(_) => {}, None => { resync!(); continue; } }
                     }
                 }
                 BCOp::TSETM => {
@@ -1315,6 +1427,10 @@ impl Interp {
         }
         self.multres = n;
 
+        if link & FRAME_TYPE_MASK == FRAME_CONT {
+            return self.cont_dispatch(base, link, n);
+        }
+
         if link & FRAME_TYPE_MASK == FRAME_C {
             let want = ((link >> 3) as i32) - 1;
             let got = if want >= 0 {
@@ -1491,5 +1607,26 @@ fn val_eq(a: LuaValue, b: LuaValue) -> bool {
         a.num() == b.num()
     } else {
         a.to_bits() == b.to_bits()
+    }
+}
+
+/// `x ^ y` with a small-integer-exponent fast path (`lj_vm_powi`).
+#[inline]
+pub(crate) fn vm_pow(mut x: f64, y: f64) -> f64 {
+    let k = y as i32;
+    if k as f64 == y && k.unsigned_abs() <= 65536 {
+        if k >= 1 {
+            let mut n = k as u32;
+            while n & 1 == 0 { x *= x; n >>= 1; }
+            let mut z = x; n >>= 1;
+            while n != 0 { x *= x; if n & 1 != 0 { z *= x; } n >>= 1; }
+            z
+        } else if k == 0 {
+            1.0
+        } else {
+            1.0 / x.powf(-k as f64)
+        }
+    } else {
+        x.powf(y)
     }
 }
