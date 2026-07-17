@@ -22,12 +22,12 @@ use crate::bc::*;
 pub mod meta;
 
 pub mod err;
-use crate::err::{LuaResult};
-use crate::func::{GcFunc, LuaClosure, Upval, UpvalState};
+use crate::err::{LuaError, LuaResult};
+use crate::func::{GcFunc, LuaClosure, Upval};
 use crate::gc::GcPtr;
 use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto};
 use crate::runtime::meta::MM;
-use crate::state::LuaState;
+use crate::state::{LuaState, Suspend};
 use crate::table::LuaTable;
 use crate::value::*;
 
@@ -86,6 +86,13 @@ pub fn call(l: &mut LuaState, func: LuaValue, args: &[LuaValue]) -> LuaResult<Ve
 /// already placed at `func_slot + 2 ..`. Leaves the results at `func_slot`
 /// and returns their count.
 pub fn execute(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
+    l.c_depth += 1;
+    let r = execute_inner(l, func_slot, nargs, want);
+    l.c_depth -= 1;
+    r
+}
+
+fn execute_inner(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
     let mut nargs = nargs;
     let f = l.stack[func_slot];
     let gf = match f.as_func() {
@@ -1376,7 +1383,11 @@ impl Interp {
             }
             GcFunc::C(cc) => {
                 let f = cc.f;
-                let n = self.call_c_inline(f, func_slot, nargs)?;
+                let n = match self.call_c_inline(f, func_slot, nargs) {
+                    Ok(n) => n,
+                    Err(LuaError::Yield) => return Err(self.suspend_call(func_slot, want)),
+                    Err(e) => return Err(e),
+                };
                 if want >= 0 {
                     for i in n..(want as usize) {
                         self.set_at(func_slot + i, LuaValue::NIL);
@@ -1387,6 +1398,43 @@ impl Interp {
                 Ok(())
             }
         }
+    }
+
+    /// A C function called from a Lua frame yielded (`coroutine.yield`):
+    /// capture the resume point. Yield values move to `func_slot`.
+    #[cold]
+    fn suspend_call(&mut self, func_slot: usize, want: i32) -> LuaError {
+        let ny = self.l().nyield as usize;
+        for i in 0..ny {
+            let v = self.at(func_slot + 2 + i);
+            self.set_at(func_slot + i, v);
+        }
+        let l = self.l();
+        l.suspend = Suspend::Call {
+            pc: self.pc,
+            cl: self.cl,
+            base: self.base,
+            slot: func_slot,
+            want,
+        };
+        l.top = (self.base + self.proto().framesize as usize).max(func_slot + ny);
+        l.base = self.base;
+        LuaError::Yield
+    }
+
+    /// Same for a yield through a tail call (`return coroutine.yield(...)`).
+    #[cold]
+    fn suspend_return(&mut self, func_slot: usize) -> LuaError {
+        let ny = self.l().nyield as usize;
+        for i in 0..ny {
+            let v = self.at(func_slot + 2 + i);
+            self.set_at(func_slot + i, v);
+        }
+        let l = self.l();
+        l.suspend = Suspend::Return { base: self.base, slot: func_slot };
+        l.top = (self.base + self.proto().framesize as usize).max(func_slot + ny);
+        l.base = self.base;
+        LuaError::Yield
     }
 
     fn call_c_inline(
@@ -1442,11 +1490,14 @@ impl Interp {
             }
         };
 
-        // C callee: execute directly (no arg relocation — the overlap
-        // with func_slot is destructive for non-C lua frames).
-        if let GcFunc::C(_cc) = gf.as_ref() {
-            let n = execute(self.l(), func_slot, nargs, -1)?;
-            return Ok(self.do_return(func_slot, n));
+        // C callee: call inline (no c_depth bump) so yields propagate.
+        if let GcFunc::C(cc) = gf.as_ref() {
+            let r = call_c(self.l(), cc.f, func_slot, nargs, -1);
+            return match r {
+                Ok(n) => Ok(self.do_return(func_slot, n)),
+                Err(LuaError::Yield) => Err(self.suspend_return(func_slot)),
+                Err(e) => Err(e),
+            };
         }
 
         let mut base = self.base;
@@ -1603,46 +1654,42 @@ impl Interp {
     // -- Upvalues / closures ---------------------------------------------
 
     fn upval_get(&self, uv: GcPtr<Upval>) -> LuaValue {
-        match &uv.as_ref().state {
-            UpvalState::Open(slot) => self.at(*slot),
-            UpvalState::Closed(v) => *v,
-        }
+        uv.as_ref().get()
     }
 
     fn upval_set(&self, uv: GcPtr<Upval>, v: LuaValue) {
-        match &mut uv.as_mut().state {
-            UpvalState::Open(slot) => self.set_at(*slot, v),
-            UpvalState::Closed(cv) => *cv = v,
-        }
+        uv.as_mut().set(v);
     }
 
+    /// Find or create an open upvalue for the stack slot `slot` (absolute
+    /// index into this thread's stack). Identity is by value pointer,
+    /// exactly like `lj_func_finduv`.
     fn find_upval(&mut self, slot: usize) -> GcPtr<Upval> {
+        let ptr = unsafe { self.sp.add(slot) };
         for &uv in self.l().openuv.iter() {
-            if let UpvalState::Open(s) = uv.as_ref().state
-                && s == slot
-            {
+            if uv.as_ref().value_ptr() == ptr {
                 return uv;
             }
         }
-        let uv = self.l().heap().alloc_upval(Upval::new_open(slot, false));
+        let nn = std::ptr::NonNull::new(ptr).unwrap();
+        let uv = self
+            .l()
+            .heap()
+            .alloc_upval(Upval::new_open(nn, false));
         self.l().openuv.push(uv);
         uv
     }
 
+    /// Close every open upvalue at or above stack `level` (absolute index),
+    /// per `lj_func_closeuv`.
     fn close_upvals(&mut self, level: usize) {
+        let level_ptr = unsafe { self.sp.add(level) } as *const LuaValue;
         let l = self.l();
         let mut i = 0;
         while i < l.openuv.len() {
             let uv = l.openuv[i];
-            let close = match uv.as_ref().state {
-                UpvalState::Open(s) => s >= level,
-                UpvalState::Closed(_) => true,
-            };
-            if close {
-                if let UpvalState::Open(s) = uv.as_ref().state {
-                    let v = self.at(s);
-                    uv.as_mut().state = UpvalState::Closed(v);
-                }
+            if uv.as_ref().value_ptr() as *const LuaValue >= level_ptr {
+                uv.as_mut().close();
                 l.openuv.swap_remove(i);
             } else {
                 i += 1;
@@ -1715,4 +1762,63 @@ pub(crate) fn vm_pow(mut x: f64, y: f64) -> f64 {
     } else {
         x.powf(y)
     }
+}
+
+/// Resume a coroutine suspended via `Suspend::Call`. Rebuilds the Interp
+/// from the saved state and re-enters the dispatch loop.
+pub fn resume_continue(
+    co: &mut LuaState,
+    slot: usize,
+    want: i32,
+    nargs: usize,
+    pc: usize,
+    cl: GcPtr<GcFunc>,
+    sbase: usize,
+) -> LuaResult<usize> {
+    co.c_depth += 1;
+    if want >= 0 {
+        let limit = nargs.min(want as usize);
+        for i in 0..limit { co.stack[slot + i] = co.stack[slot + 2 + i]; }
+        for i in limit..(want as usize) { co.stack[slot + i] = LuaValue::NIL; }
+    } else {
+        for i in 0..nargs { co.stack[slot + i] = co.stack[slot + 2 + i]; }
+    }
+    let mut vm = Interp::new(co);
+    vm.base = sbase;
+    vm.cl = cl;
+    vm.reload(cl);
+    vm.pc = pc;
+    let pt = match cl.as_ref() {
+        GcFunc::Lua(c) => c.proto.as_ref(),
+        _ => unreachable!(),
+    };
+    co.top = sbase + pt.framesize as usize;
+    co.base = sbase;
+    co.status = crate::state::CoStatus::Running;
+    let r = vm.run();
+    co.c_depth -= 1;
+    r
+}
+
+/// Finish a coroutine suspended via `Suspend::Return`. Delivers resume
+/// args as a return from the saved frame, like `do_return`; if the return
+/// lands in a Lua frame, the dispatch loop continues running.
+pub fn resume_finish(co: &mut LuaState, slot: usize, nargs: usize, sbase: usize) -> LuaResult<usize> {
+    co.c_depth += 1;
+    let link = co.stack[slot + 1].to_bits();
+    if link & FRAME_TYPE_MASK != FRAME_C && link & FRAME_TYPE_MASK != FRAME_LUA {
+        co.stack[slot + 1] = LuaValue::from_bits(FRAME_C);
+    }
+    for i in 0..nargs {
+        co.stack[slot + i] = co.stack[slot + 2 + i];
+    }
+    let mut vm = Interp::new(co);
+    vm.base = sbase;
+    co.status = crate::state::CoStatus::Running;
+    let r = match vm.do_return(slot, nargs) {
+        Some(n) => Ok(n),
+        None => vm.run(),
+    };
+    co.c_depth -= 1;
+    r
 }

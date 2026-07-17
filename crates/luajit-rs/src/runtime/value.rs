@@ -133,6 +133,23 @@ impl LuaValue {
         LuaValue::gcval(LJ_TFUNC, p.addr())
     }
 
+    /// A coroutine / thread value (`LJ_TTHREAD`).
+    pub fn thread(p: GcPtr<crate::state::LuaState>) -> LuaValue {
+        LuaValue(gcv(LJ_TTHREAD, p.addr()))
+    }
+
+    pub fn is_thread(self) -> bool {
+        self.itype() == LJ_TTHREAD
+    }
+
+    pub fn as_thread(self) -> Option<GcPtr<crate::state::LuaState>> {
+        if self.is_thread() {
+            GcPtr::from_addr(self.gc_addr())
+        } else {
+            None
+        }
+    }
+
     /// Placeholder reference used by template tables to preserve keys whose
     /// value is only known at runtime (LuaJIT stores the table itself).
     pub fn table_marker() -> LuaValue {

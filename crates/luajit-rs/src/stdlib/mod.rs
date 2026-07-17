@@ -8,6 +8,7 @@
 //! so C functions never need to clone read-only string data.
 
 pub mod base;
+pub mod coroutine;
 pub mod math;
 pub mod os;
 pub mod pattern;
@@ -148,6 +149,7 @@ pub fn make_lib(l: &mut LuaState, name: &[u8], entries: &[(&[u8], crate::func::C
 /// Install every standard library.
 pub fn open_libs(l: &mut LuaState) {
     base::open(l);
+    coroutine::open(l);
     string::open(l);
     table::open(l);
     math::open(l);

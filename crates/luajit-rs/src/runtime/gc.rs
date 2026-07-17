@@ -250,11 +250,11 @@ impl<T> std::fmt::Debug for GcPtr<T> {
 // bit-identical match after address reuse yields the node whose value is
 // nil, which is exactly the right answer.
 
-use crate::func::{GcFunc, Upval, UpvalState};
+use crate::func::{GcFunc, Upval};
 use crate::proto::{KGc, Proto};
-use crate::state::GlobalState;
+use crate::state::{GlobalState, LuaState};
 use crate::table::LuaTable;
-use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LuaValue};
+use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LuaValue};
 
 /// GC pause: new threshold = live estimate * `GC_PAUSE` / 100 (LuaJIT's
 /// default `LUAI_GCPAUSE`).
@@ -269,6 +269,7 @@ enum Gray {
     Tab(GcPtr<LuaTable>),
     Func(GcPtr<GcFunc>),
     Proto(GcPtr<Proto>),
+    Thread(GcPtr<LuaState>),
 }
 
 struct Marker<'g> {
@@ -303,7 +304,22 @@ impl<'g> Marker<'g> {
                     self.gray.push(Gray::Func(p));
                 }
             }
+            LJ_TTHREAD => {
+                if let Some(p) = v.as_thread()
+                    && !p.is_marked()
+                {
+                    p.set_marked();
+                    self.gray.push(Gray::Thread(p));
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn mark_thread(&mut self, th: GcPtr<LuaState>) {
+        if !th.is_marked() {
+            th.set_marked();
+            self.gray.push(Gray::Thread(th));
         }
     }
 
@@ -321,14 +337,12 @@ impl<'g> Marker<'g> {
         }
     }
 
-    /// `gc_mark` of a GCupval: closed upvalues hold their value inline;
-    /// open ones point into a stack, which is marked as a root anyway.
+    /// `gc_mark` of a GCupval: reading through `uv->v` covers both the
+    /// open (stack slot) and closed (inline `tv`) cases.
     fn mark_upval(&mut self, uv: GcPtr<Upval>) {
         if !uv.is_marked() {
             uv.set_marked();
-            if let UpvalState::Closed(v) = uv.as_ref().state {
-                self.mark_value(v);
-            }
+            self.mark_value(uv.as_ref().get());
         }
     }
 
@@ -365,6 +379,27 @@ impl<'g> Marker<'g> {
                             KGc::Table(t) => t.gc_traverse(|v| self.mark_value(v)),
                             KGc::Proto(_) => unreachable!("unregistered child proto in heap"),
                         }
+                    }
+                }
+                // gc_traverse_thread: the whole used stack (frame-link
+                // slots decode as harmless numbers), the error value and
+                // the open-upvalue list. Slots above `top` are cleared,
+                // exactly like the GCSatomic branch of gc_traverse_thread:
+                // anything below `top` survived the last cycle, so a later
+                // `top` raise never exposes a dangling value.
+                Gray::Thread(th) => {
+                    let l = th.as_mut();
+                    for i in 0..l.top {
+                        self.mark_value(l.stack[i]);
+                    }
+                    self.mark_value(l.errval);
+                    for &uv in &l.openuv {
+                        self.mark_upval(uv);
+                    }
+                    // Suspend::Call's saved closure is reachable via
+                    // stack[base-2], which is below top — already marked.
+                    for slot in l.stack[l.top..].iter_mut() {
+                        *slot = LuaValue::NIL;
                     }
                 }
             }
@@ -407,27 +442,13 @@ pub fn full_gc(g: &mut GlobalState) {
     for &v in g.mmname.iter() {
         m.mark_value(v);
     }
-    // gc_traverse_thread for every thread: the whole used stack is marked
-    // (frame-link slots decode as harmless numbers), plus the error value
-    // and the open-upvalue list. Afterwards every slot above `top` is
-    // cleared, exactly like the GCSatomic branch of `gc_traverse_thread`:
-    // this upholds the invariant that anything below `top` survived the
-    // last cycle, so a later `top` raise never exposes a dangling value.
-    for th in &g.threads {
-        let l = th.get();
-        for i in 0..l.top {
-            m.mark_value(l.stack[i]);
-        }
-        m.mark_value(l.errval);
-        for &uv in &l.openuv {
-            m.mark_upval(uv);
-            if let UpvalState::Open(slot) = uv.as_ref().state {
-                m.mark_value(l.stack[slot]);
-            }
-        }
-        for slot in l.stack[l.top..].iter_mut() {
-            *slot = LuaValue::NIL;
-        }
+    // Thread roots: the main thread is permanent; the currently running
+    // thread and every thread in the active resume chain are reachable
+    // through the resumer's stack (the coroutine value is an argument of
+    // the `resume` C frame), so marking main + cur_l covers everything.
+    m.mark_thread(g.main());
+    if let Some(cur) = g.cur_l {
+        m.mark_thread(cur);
     }
     m.propagate();
 
@@ -436,6 +457,14 @@ pub fn full_gc(g: &mut GlobalState) {
     heap.strings.sweep();
     heap.tables.sweep(|_| {});
     heap.funcs.sweep(|_| {});
+    // Threads are swept before upvalues: a dying coroutine first closes
+    // its open upvalues (PUC's luaF_close on thread free), so surviving
+    // closures keep valid values after the stack memory is dropped.
+    heap.threads.sweep(|th| {
+        for &uv in &th.openuv {
+            uv.as_mut().close();
+        }
+    });
     heap.upvals.sweep(|_| {});
     heap.protos.sweep(|_| {});
 
@@ -451,6 +480,9 @@ pub fn full_gc(g: &mut GlobalState) {
     for p in heap.protos.iter() {
         total += p.gc_size();
     }
+    for th in heap.threads.iter() {
+        total += size_thread(th);
+    }
     heap.total = total;
     heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
 }
@@ -462,6 +494,14 @@ pub(crate) fn account_func(f: &GcFunc) -> usize {
 
 pub(crate) fn account_upval() -> usize {
     size_upval()
+}
+
+fn size_thread(th: &LuaState) -> usize {
+    std::mem::size_of::<LuaState>() + th.stack.capacity() * std::mem::size_of::<LuaValue>()
+}
+
+pub(crate) fn account_thread(th: &LuaState) -> usize {
+    size_thread(th)
 }
 
 #[cfg(test)]

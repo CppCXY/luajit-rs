@@ -3,44 +3,84 @@ use crate::proto::Proto;
 use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
+use std::ptr::NonNull;
 
 /// An upvalue object, corresponding to LuaJIT's `GCupval`.
 ///
-/// While the enclosing function's activation record is still live, the
-/// upvalue is *open* and refers to a stack slot; once the scope exits it is
-/// *closed* and owns the value itself (LuaJIT flips `uv->v` from a stack
-/// pointer to `&uv->tv`).
+/// Exactly like LuaJIT/PUC Lua, `v` always points at the live value:
+/// while *open* it points into the owning thread's value stack (stable —
+/// stacks never reallocate); once *closed* it points at the inline `tv`
+/// field (the pool slot address is stable too). This makes cross-thread
+/// upvalue access (a closure created on one coroutine running on another)
+/// a plain pointer dereference, with no thread bookkeeping.
 pub struct Upval {
+    /// Pointer to the current value location (`uv->v`).
+    /// `NonNull::dangling()` marks a freshly built closed upvalue whose
+    /// pool address is not known yet; `GcHeap::alloc_upval` fixes it up.
+    v: NonNull<LuaValue>,
+    /// Inline storage used once closed (`uv->tv`).
+    tv: LuaValue,
     /// Immutable upvalue (from `PROTO_UV_IMMUTABLE`).
     pub immutable: bool,
-    pub state: UpvalState,
-}
-
-pub enum UpvalState {
-    /// Open: refers to an absolute slot in the thread's value stack.
-    Open(usize),
-    /// Closed: the value lives in the upvalue itself.
-    Closed(LuaValue),
 }
 
 impl Upval {
-    pub fn new_open(slot: usize, immutable: bool) -> Upval {
+    /// An open upvalue referring to a stack slot.
+    pub fn new_open(slot: NonNull<LuaValue>, immutable: bool) -> Upval {
         Upval {
+            v: slot,
+            tv: LuaValue::NIL,
             immutable,
-            state: UpvalState::Open(slot),
         }
     }
 
     /// `func_emptyuv`: an empty, already-closed upvalue holding nil.
+    /// The `v` pointer is patched to `&tv` after pool insertion.
     pub fn new_closed(immutable: bool) -> Upval {
         Upval {
+            v: NonNull::dangling(),
+            tv: LuaValue::NIL,
             immutable,
-            state: UpvalState::Closed(LuaValue::NIL),
         }
     }
 
+    /// Fix-up after pool insertion: point a closed upvalue at its own
+    /// (now stable) `tv` field.
+    pub(crate) fn init_closed(&mut self) {
+        if self.v == NonNull::dangling() {
+            self.v = NonNull::from(&mut self.tv);
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> LuaValue {
+        unsafe { *self.v.as_ptr() }
+    }
+
+    #[inline]
+    pub fn set(&mut self, val: LuaValue) {
+        unsafe { *self.v.as_ptr() = val }
+    }
+
+    /// The raw location, used by `find_upval`'s identity check and the
+    /// stack-level comparison in `close_upvals`.
+    #[inline]
+    pub fn value_ptr(&self) -> *mut LuaValue {
+        self.v.as_ptr()
+    }
+
+    #[inline]
     pub fn is_open(&self) -> bool {
-        matches!(self.state, UpvalState::Open(_))
+        !std::ptr::eq(self.v.as_ptr().cast_const(), &self.tv)
+    }
+
+    /// Close: copy the stack value into the inline slot and repoint
+    /// (`lj_func_closeuv`'s flip of `uv->v` to `&uv->tv`).
+    pub fn close(&mut self) {
+        if self.is_open() {
+            self.tv = self.get();
+            self.v = NonNull::from(&mut self.tv);
+        }
     }
 }
 

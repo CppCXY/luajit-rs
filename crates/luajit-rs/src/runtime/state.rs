@@ -20,6 +20,10 @@ pub struct GcHeap {
     pub tables: Pool<LuaTable>,
     pub funcs: Pool<GcFunc>,
     pub upvals: Pool<crate::func::Upval>,
+    /// Threads (the main thread and all coroutines). Coroutines are
+    /// collected by the GC like any other object; the main thread is a
+    /// permanent root.
+    pub threads: Pool<LuaState>,
     /// Allocation estimate for non-string objects (strings are tracked by
     /// the interner itself, which travels to the parser and back).
     pub total: usize,
@@ -35,6 +39,7 @@ impl Default for GcHeap {
             tables: Pool::new(),
             funcs: Pool::new(),
             upvals: Pool::new(),
+            threads: Pool::new(),
             total: 0,
             threshold: crate::gc::GC_THRESHOLD_MIN,
         }
@@ -59,7 +64,16 @@ impl GcHeap {
 
     pub fn alloc_upval(&mut self, uv: crate::func::Upval) -> GcPtr<crate::func::Upval> {
         self.total += crate::gc::account_upval();
-        self.upvals.alloc(uv)
+        let p = self.upvals.alloc(uv);
+        // Closed upvalues point at their own inline slot; the address is
+        // only stable after pool insertion, so patch it up here.
+        p.as_mut().init_closed();
+        p
+    }
+
+    pub fn alloc_thread(&mut self, th: LuaState) -> GcPtr<LuaState> {
+        self.total += crate::gc::account_thread(&th);
+        self.threads.alloc(th)
     }
 
     pub fn intern(&mut self, s: &[u8]) -> StrId {
@@ -98,8 +112,9 @@ pub struct GlobalState {
     /// Interned metamethod name strings, indexed by `MM` (LuaJIT's
     /// `GCROOT_MMNAME` roots, filled by `lj_meta_init`).
     pub mmname: [LuaValue; crate::runtime::meta::MM_MAX],
-    /// Every thread of this universe: the GC's stack roots.
-    pub threads: Vec<StateRef>,
+    /// The currently running thread (LuaJIT's `cur_L`): the main thread or
+    /// the innermost resumed coroutine.
+    pub cur_l: Option<StateRef>,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
@@ -132,7 +147,7 @@ impl GlobalState {
             registry,
             basemt: [None; ITYPE_COUNT],
             mmname,
-            threads: Vec::new(),
+            cur_l: None,
             boot_time: boot,
             main: None,
         }
@@ -174,28 +189,71 @@ impl GlobalRef {
     }
 }
 
-/// A wrapped raw pointer to a [`LuaState`] (used for the stored main thread
-/// and for thread `LuaValue`s).
-#[derive(Clone, Copy)]
-pub struct StateRef(NonNull<LuaState>);
+/// A reference to a [`LuaState`] in the thread pool (used for the stored
+/// main thread and for thread `LuaValue`s). Being a `GcPtr`, it carries the
+/// pool mark bit, so coroutines participate in GC like any other object.
+pub type StateRef = GcPtr<LuaState>;
 
-impl StateRef {
+impl GcPtr<LuaState> {
+    /// Legacy accessor kept from the old `StateRef` wrapper.
     #[allow(clippy::mut_from_ref)]
     pub fn get<'a>(self) -> &'a mut LuaState {
-        unsafe { &mut *self.0.as_ptr() }
+        self.as_mut()
     }
 }
 
-/// Maximum value-stack size (in slots). Fixed so the backing `Vec` never
-/// reallocates during execution, keeping raw stack pointers valid.
+/// Maximum value-stack size (in slots) of the main thread. Fixed so the
+/// backing `Vec` never reallocates during execution, keeping raw stack
+/// pointers valid.
 pub const STACK_MAX: usize = 1 << 16;
+
+/// Value-stack size of a coroutine (16 KiB). Smaller than the main stack so
+/// `coroutine.create` stays cheap; fixed for the same pointer-stability
+/// reason.
+pub const CO_STACK_MAX: usize = 1 << 11; // 2048 slots = 16 KiB
+
+/// Coroutine status, mirroring `lua_State.status` + the distinctions
+/// `coroutine.status` reports.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CoStatus {
+    /// Not started yet, or stopped in a `yield`.
+    Suspended,
+    /// Currently executing (`G->cur_l`).
+    Running,
+    /// Resumed somebody else and is waiting for them.
+    Normal,
+    /// Finished or stopped by an error.
+    Dead,
+}
+
+/// Where and how a coroutine is suspended; consumed by `resume`.
+#[derive(Clone, Copy)]
+pub enum Suspend {
+    /// Fresh coroutine: the entry function sits at `stack[0]`, resume
+    /// arguments become its call arguments.
+    Start,
+    /// Yield from a `CALL coroutine.yield` in a Lua frame: continue at
+    /// `pc` with `cl`, delivering the resume args at `slot` per `want`.
+    Call {
+        pc: usize,
+        cl: GcPtr<GcFunc>,
+        base: usize,
+        slot: usize,
+        want: i32,
+    },
+    /// Yield through a tail call (`return coroutine.yield(...)`) or from
+    /// the entry C function: resume performs a *return* of the resume args
+    /// from `slot` in the frame at `base`.
+    Return { base: usize, slot: usize },
+}
 
 /// A Lua execution thread, corresponding to LuaJIT's `lua_State`.
 ///
 /// Owns its value stack and open-upvalue list, and holds a back-pointer to
-/// the shared [`GlobalState`]. Threads are themselves owned by the top-level
-/// [`Lua`] object. There is no separate control stack: call frames live in
-/// the value stack itself, LuaJIT-style (see `vm`'s frame-link encoding).
+/// the shared [`GlobalState`]. Threads live in the heap's thread pool and
+/// are collected by the GC (except the main thread, a permanent root).
+/// There is no separate control stack: call frames live in the value stack
+/// itself, LuaJIT-style (see `vm`'s frame-link encoding).
 pub struct LuaState {
     g: GlobalRef,
     is_main: bool,
@@ -210,21 +268,40 @@ pub struct LuaState {
     pub errval: LuaValue,
     /// The number of yielded values (`LuaError::Yield`).
     pub nyield: u32,
+    /// Coroutine status.
+    pub status: CoStatus,
+    /// Suspension point for `resume` (meaningful when `status == Suspended`).
+    pub suspend: Suspend,
+    /// Rust-recursion depth (incremented by every `execute` re-entry).
+    /// LuaJIT's cframe-chain stand-in for the yield-across-C-boundary check.
+    pub c_depth: u32,
+    /// `c_depth` recorded when this coroutine was (re)entered; yielding is
+    /// legal only while `c_depth == c_base` (no intervening C frames).
+    pub c_base: u32,
 }
 
 impl LuaState {
     /// Create a thread bound to `g`. `is_main` marks the primary thread.
     /// Mirrors LuaJIT, where a `lua_State` always carries `G(L)`.
     pub fn new(g: GlobalRef, is_main: bool) -> LuaState {
+        let stack_size = if is_main { STACK_MAX } else { CO_STACK_MAX };
         LuaState {
             g,
             is_main,
-            stack: vec![LuaValue::NIL; STACK_MAX],
+            stack: vec![LuaValue::NIL; stack_size],
             base: 0,
             top: 0,
             openuv: Vec::new(),
             errval: LuaValue::NIL,
             nyield: 0,
+            status: if is_main {
+                CoStatus::Running
+            } else {
+                CoStatus::Suspended
+            },
+            suspend: Suspend::Start,
+            c_depth: 0,
+            c_base: 0,
         }
     }
 
@@ -273,6 +350,18 @@ impl LuaState {
         self.is_main
     }
 
+    /// A `GcPtr` to this state itself (valid because every `LuaState`
+    /// lives in the heap's thread pool at a stable address).
+    pub fn self_ref(&self) -> StateRef {
+        GcPtr::from_addr(self as *const LuaState as u64).unwrap()
+    }
+
+    /// Yield is legal when we're inside a coroutine and `c_depth == c_base`
+    /// (no C frames between the resume point and the yield).
+    pub fn is_yieldable(&self) -> bool {
+        !self.is_main && self.c_depth == self.c_base
+    }
+
     pub fn push(&mut self, v: LuaValue) {
         self.stack[self.top] = v;
         self.top += 1;
@@ -308,26 +397,22 @@ impl LuaState {
 }
 
 /// A Lua universe: the single owner of the [`GlobalState`] (and thus the
-/// heap) and of every [`LuaState`] thread. Everything else refers to these
-/// through wrapped raw pointers, so their addresses stay fixed.
+/// heap). Threads (main + coroutines) live in the heap's thread pool;
+/// everything refers to them through `GcPtr`s, so their addresses stay
+/// fixed and the GC can collect dead coroutines.
 pub struct Lua {
     g: Box<GlobalState>,
-    #[allow(clippy::vec_box)] // Box keeps each LuaState address stable while the Vec grows.
-    threads: Vec<Box<LuaState>>,
 }
 
 impl Lua {
     pub fn new() -> Box<Lua> {
         let mut lua = Box::new(Lua {
             g: Box::new(GlobalState::new()),
-            threads: Vec::new(),
         });
         let gref = GlobalRef(NonNull::from(&*lua.g));
-        let mut main = Box::new(LuaState::new(gref, true));
-        let main_ref = StateRef(NonNull::from(&mut *main));
-        lua.threads.push(main);
+        let main_ref = lua.g.heap.alloc_thread(LuaState::new(gref, true));
         lua.g.main = Some(main_ref);
-        lua.g.threads.push(main_ref);
+        lua.g.cur_l = Some(main_ref);
         lua
     }
 
@@ -342,12 +427,15 @@ impl Lua {
     /// Spawn a new (coroutine) thread owned by this universe.
     pub fn new_thread(&mut self) -> StateRef {
         let gref = GlobalRef(NonNull::from(&*self.g));
-        let mut t = Box::new(LuaState::new(gref, false));
-        let r = StateRef(NonNull::from(&mut *t));
-        self.threads.push(t);
-        self.g.threads.push(r);
-        r
+        self.g.heap.alloc_thread(LuaState::new(gref, false))
     }
+}
+
+/// Spawn a coroutine thread from within a running state (`lua_newthread`).
+pub fn new_thread(l: &LuaState) -> StateRef {
+    let g = l.global();
+    let gref = GlobalRef(NonNull::from(&*g));
+    g.heap.alloc_thread(LuaState::new(gref, false))
 }
 
 impl Default for Box<Lua> {
