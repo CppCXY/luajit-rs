@@ -26,6 +26,7 @@ use crate::err::LuaResult;
 /// `lua_push` a single result value.
 #[inline]
 pub fn push(l: &mut LuaState, v: LuaValue) {
+    l.stack_ensure(l.base + 1);
     l.stack[l.base] = v;
     l.top = l.base + 1;
 }
@@ -33,6 +34,7 @@ pub fn push(l: &mut LuaState, v: LuaValue) {
 /// `lua_push` multiple results.
 #[inline]
 pub fn pushv(l: &mut LuaState, vs: &[LuaValue]) {
+    l.stack_ensure(l.base + vs.len().max(1));
     for (i, &v) in vs.iter().enumerate() {
         l.stack[l.base + i] = v;
     }
@@ -58,11 +60,14 @@ pub fn nargs(l: &LuaState) -> usize {
 
 /// Convert a value to its display bytes (`tostring` without metamethods).
 pub fn tostring_bytes(l: &mut LuaState, v: LuaValue) -> Vec<u8> {
+    use crate::strfmt::g14_to_buf;
     if let Some(sid) = v.as_string_id() {
         return l.heap().strings.get(sid).to_vec();
     }
     if let Some(n) = v.as_number() {
-        return crate::strfmt::g14(n).into_bytes();
+        let mut buf = [0u8; 64];
+        let len = g14_to_buf(n, &mut buf);
+        return buf[..len].to_vec();
     }
     if v.is_nil() {
         return b"nil".to_vec();

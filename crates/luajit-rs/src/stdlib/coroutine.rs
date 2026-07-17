@@ -58,6 +58,7 @@ fn do_resume(l: &mut LuaState, co_ref: StateRef, args_at: usize, nargs: usize) -
     let r = match co.suspend {
         Suspend::Start => {
             // First resume: entry function at stack[0], args at [2..].
+            co.stack_ensure(nargs + 16);
             co.stack[1] = LuaValue::from_bits(FRAME_C);
             for i in 0..nargs {
                 co.stack[2 + i] = l.stack[args_at + i];

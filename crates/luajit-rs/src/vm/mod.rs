@@ -72,6 +72,7 @@ impl Cont {
 /// Call a value with the given arguments and collect all results.
 /// The host entry point into the VM.
 pub fn call(l: &mut LuaState, func: LuaValue, args: &[LuaValue]) -> LuaResult<Vec<LuaValue>> {
+    l.stack_ensure(args.len() + STACK_SAFETY);
     l.top = 0;
     l.stack[0] = func;
     l.stack[1] = LuaValue::NIL;
@@ -87,10 +88,17 @@ pub fn call(l: &mut LuaState, func: LuaValue, args: &[LuaValue]) -> LuaResult<Ve
 /// and returns their count.
 pub fn execute(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
     l.c_depth += 1;
+    // Ensure the stack can hold the entry frame (FR2: 2-slot header +
+    // framesize, plus extra for call_c's arg region).
+    l.stack_ensure(func_slot + nargs + STACK_SAFETY);
     let r = execute_inner(l, func_slot, nargs, want);
     l.c_depth -= 1;
     r
 }
+
+/// Safety margin added to every stack_ensure: protects against a few
+/// extra slots written by CALL/VARG/TSETM frame setup.
+const STACK_SAFETY: usize = 64;
 
 fn execute_inner(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
     let mut nargs = nargs;
@@ -244,6 +252,18 @@ impl Interp {
         let pt = cl.proto.as_ref();
         let numparams = pt.numparams as usize;
         let callbase = func_slot + 2;
+
+        // Lazy stack growth: ensure the new frame's extent + margin fits.
+        let need = if (pt.flags & PROTO_VARARG) != 0 {
+            (callbase + nargs + 2) + numparams + pt.framesize as usize + 16
+        } else {
+            callbase + pt.framesize as usize + 16
+        };
+        let l = self.l();
+        l.stack_ensure(need);
+        // sp may have moved after Vec resize.
+        self.sp = l.stack.as_mut_ptr();
+
         self.set_at(callbase - 1, LuaValue::from_bits(link));
 
         if (pt.flags & PROTO_VARARG) != 0 {
@@ -345,6 +365,12 @@ impl Interp {
         // curr_topL: scratch right above the running frame, +2 for cont/PC.
         let func_slot = saved_base + self.proto().framesize as usize + 2;
         let mmbase = func_slot + 2;
+        {
+            let need = mmbase + args.len() + 16;
+            let l = self.l();
+            l.stack_ensure(need);
+            self.sp = l.stack.as_mut_ptr();
+        }
         self.set_at(mmbase - 4, LuaValue::from_bits(cont_id.encode(extra)));
         self.set_at(mmbase - 3, LuaValue::from_bits(self.pc as u64));
         self.set_at(func_slot, mo);
@@ -364,6 +390,12 @@ impl Interp {
         args: &[LuaValue],
     ) -> LuaResult<LuaValue> {
         let fs = self.base + self.proto().framesize as usize;
+        {
+            let need = fs + 2 + args.len() + 8;
+            let l = self.l();
+            l.stack_ensure(need);
+            self.sp = l.stack.as_mut_ptr();
+        }
         self.set_at(fs, mo);
         self.set_at(fs + 1, LuaValue::NIL);
         for (i, &v) in args.iter().enumerate() {
@@ -964,6 +996,14 @@ impl Interp {
                         let pt = cl.proto.as_ref();
                         if (pt.flags & PROTO_VARARG) == 0 {
                             let nargs = bc_c(ins) as usize - 1;
+                            let fs = pt.framesize as usize;
+                            let need = cur_base!() + a as usize + 2 + fs + 8;
+                            if need > self.l().stack.len() {
+                                sync!();
+                                self.l().stack_ensure(need);
+                                self.sp = self.l().stack.as_mut_ptr();
+                                resync!();
+                            }
                             let newbp = unsafe { bp.add(a as usize + 2) };
                             unsafe { *newbp.sub(1) = LuaValue::from_bits(ip as u64) };
                             for i in nargs..pt.numparams as usize {
@@ -1001,6 +1041,13 @@ impl Interp {
                         let link = unsafe { (*bp.sub(1)).to_bits() };
                         if (pt.flags & PROTO_VARARG) == 0 && link & FRAME_TYPE_MASK != FRAME_VARG {
                             let nargs = bc_d(ins) as usize - 1;
+                            let fs_need = cur_base!() + a.max(nargs as u32) as usize + pt.framesize as usize + 8;
+                            if fs_need > self.l().stack.len() {
+                                sync!();
+                                self.l().stack_ensure(fs_need);
+                                self.sp = self.l().stack.as_mut_ptr();
+                                resync!();
+                            }
                             let fs = unsafe { bp.add(a as usize) };
                             unsafe { *bp.sub(2) = f };
                             // Copy args in reverse to avoid overlap
@@ -1776,6 +1823,8 @@ pub fn resume_continue(
     sbase: usize,
 ) -> LuaResult<usize> {
     co.c_depth += 1;
+    // Note: no stack_ensure needed — the suspended frame was alive at
+    // yield time and stack length never shrinks.
     if want >= 0 {
         let limit = nargs.min(want as usize);
         for i in 0..limit { co.stack[slot + i] = co.stack[slot + 2 + i]; }

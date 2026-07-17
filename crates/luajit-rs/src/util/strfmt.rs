@@ -30,6 +30,15 @@ pub fn g14(n: f64) -> String {
     }
 }
 
+/// Like `g14()` but writes into a pre-allocated stack buffer and returns
+/// the byte count. Identical output.
+pub fn g14_to_buf(n: f64, buf: &mut [u8; 64]) -> usize {
+    let s = g14(n);
+    let len = s.len().min(64);
+    buf[..len].copy_from_slice(s.as_bytes());
+    len
+}
+
 /// A single format argument for `string.format`.
 pub enum FmtArg<'a> {
     Num(f64),

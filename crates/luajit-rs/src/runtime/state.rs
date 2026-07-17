@@ -283,12 +283,22 @@ pub struct LuaState {
 impl LuaState {
     /// Create a thread bound to `g`. `is_main` marks the primary thread.
     /// Mirrors LuaJIT, where a `lua_State` always carries `G(L)`.
+    ///
+    /// The stack starts tiny (8 slots) and grows lazily via `stack_ensure`;
+    /// `is_main` pre-allocates the full 512 KiB so the main thread never
+    /// pays for `Vec::resize` during execution. Coroutines cost ~64 bytes
+    /// at creation (zero-fill deferred until the stack is actually used).
     pub fn new(g: GlobalRef, is_main: bool) -> LuaState {
-        let stack_size = if is_main { STACK_MAX } else { CO_STACK_MAX };
+        let max_stack = if is_main { STACK_MAX } else { CO_STACK_MAX };
+        let initial_len = if is_main { STACK_MAX } else { 8 };
         LuaState {
             g,
             is_main,
-            stack: vec![LuaValue::NIL; stack_size],
+            stack: {
+                let mut v = Vec::with_capacity(max_stack);
+                v.resize(initial_len, LuaValue::NIL);
+                v
+            },
             base: 0,
             top: 0,
             openuv: Vec::new(),
@@ -302,6 +312,25 @@ impl LuaState {
             suspend: Suspend::Start,
             c_depth: 0,
             c_base: 0,
+        }
+    }
+
+    /// Ensure the stack can hold at least `need` slots (absolute index).
+    /// Called before any operation that might push `top` beyond the current
+    /// length. The stack grows by doubling, capped at `STACK_MAX`.
+    #[inline]
+    pub fn stack_ensure(&mut self, need: usize) {
+        if need > self.stack.len() {
+            let new_len = (self.stack.len() * 2)
+                .max(need + 16)
+                .min(STACK_MAX);
+            debug_assert!(
+                new_len <= self.stack.capacity(),
+                "stack overflow: {} > {}",
+                new_len,
+                self.stack.capacity()
+            );
+            self.stack.resize(new_len, LuaValue::NIL);
         }
     }
 
