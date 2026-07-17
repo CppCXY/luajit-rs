@@ -698,7 +698,7 @@ impl Interp {
                         MM::Pow,
                         x,
                         y,
-                        x.powf(y)
+                        vm_pow(x, y)
                     )
                 }
                 BCOp::CAT => {
