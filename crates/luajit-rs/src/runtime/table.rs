@@ -186,6 +186,7 @@ impl LuaTable {
     }
 
     /// Fast integer-key get (`lj_tab_getint`).
+    #[inline]
     pub fn get_int(&self, k: i32) -> LuaValue {
         if k >= 0 && (k as u32) < self.asize {
             return self.array[k as usize];
@@ -233,14 +234,20 @@ impl LuaTable {
         self.set(key, val);
     }
 
+    /// Integer-key set with sequential insertion (push) fast path.
+    /// When key == asize+1, expands the array in powers of two instead
+    /// of routing through hash → rehash.
     #[inline]
     pub fn set_int(&mut self, k: i32, v: LuaValue) {
-        if k >= 0 {
-            let ku = k as u32;
-            if ku < self.asize {
-                self.array[k as usize] = v;
-                return;
-            }
+        if k > 0 && (k as u32) < self.asize {
+            self.array[k as usize] = v;
+            return;
+        }
+        if k > 0 && (k as u32) == self.asize {
+            let new_sz = (self.asize * 2).max(4).min(LJ_MAX_ASIZE);
+            self.reasize(new_sz - 1);
+            self.array[k as usize] = v;
+            return;
         }
         self.set(LuaValue::number(k as f64), v);
     }

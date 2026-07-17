@@ -576,9 +576,24 @@ impl Interp {
                 BCOp::TGETV => {
                     let t = reg!(bc_b(ins));
                     let k = reg!(bc_c(ins));
-                    sync!();
-                    let v = self.index_get(t, k)?;
-                    setreg!(a, v);
+                    if let Some(tab) = t.as_table() {
+                        if k.is_string() {
+                            setreg!(a, tab.as_ref().get_str(k));
+                        } else if k.is_number() {
+                            let ki = k.num() as i32;
+                            if ki as f64 == k.num() && ki >= 0 {
+                                setreg!(a, tab.as_ref().get_int(ki));
+                            } else {
+                                setreg!(a, tab.as_ref().get(k));
+                            }
+                        } else {
+                            setreg!(a, tab.as_ref().get(k));
+                        }
+                    } else {
+                        sync!();
+                        let v = self.index_get(t, k)?;
+                        setreg!(a, v);
+                    }
                 }
                 BCOp::TGETS => {
                     let t = reg!(bc_b(ins));
@@ -609,8 +624,15 @@ impl Interp {
                     let v = reg!(a);
                     let k_is_str = k.is_string();
                     if let Some(tab) = t.as_table() {
-                        if k_is_str {
+                        if k.is_string() {
                             tab.as_mut().set_str(k, v);
+                        } else if k.is_number() {
+                            let ki = k.num() as i32;
+                            if ki as f64 == k.num() && ki >= 0 {
+                                tab.as_mut().set_int(ki, v);
+                            } else {
+                                tab.as_mut().set(k, v);
+                            }
                         } else {
                             tab.as_mut().set(k, v);
                         }
@@ -849,11 +871,11 @@ impl Interp {
                     resync!();
                 }
 
-                // -- Bitwise ops (Lua 5.3+), all operands coerced to i32 --
+                // -- Bitwise ops (Lua 5.3+), lj_num2bit / lj_vm_tobit --
                 BCOp::BNOT => {
                     let v = reg!(bc_d(ins));
                     let n = if v.is_number() { v.num() as i32 } else { 0 };
-                    setreg!(a, LuaValue::number(!n as f64));
+                    setreg!(a, LuaValue::number(n as f64));
                 }
                 BCOp::BAND => {
                     let xv = reg!(bc_b(ins));
@@ -863,50 +885,28 @@ impl Interp {
                     setreg!(a, LuaValue::number((x & y) as f64));
                 }
                 BCOp::BOR => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
-                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
-                    let y = if yv.is_number() { yv.num() as i32 } else { 0 };
+                    let x = reg!(bc_b(ins)).num() as i32;
+                    let y = reg!(bc_c(ins)).num() as i32;
                     setreg!(a, LuaValue::number((x | y) as f64));
                 }
                 BCOp::BXOR => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
-                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
-                    let y = if yv.is_number() { yv.num() as i32 } else { 0 };
+                    let x = reg!(bc_b(ins)).num() as i32;
+                    let y = reg!(bc_c(ins)).num() as i32;
                     setreg!(a, LuaValue::number((x ^ y) as f64));
                 }
                 BCOp::BSHL => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
-                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
-                    let y = if yv.is_number() {
-                        (yv.num() as u32) & 31
-                    } else {
-                        0
-                    };
+                    let x = reg!(bc_b(ins)).num() as i32;
+                    let y = (reg!(bc_c(ins)).num() as u32) & 31;
                     setreg!(a, LuaValue::number((x << y) as f64));
                 }
                 BCOp::BSHR => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
-                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
-                    let y = if yv.is_number() {
-                        (yv.num() as u32) & 31
-                    } else {
-                        0
-                    };
+                    let x = reg!(bc_b(ins)).num() as i32;
+                    let y = (reg!(bc_c(ins)).num() as u32) & 31;
                     setreg!(a, LuaValue::number(((x as u32) >> y) as f64));
                 }
                 BCOp::BSAR => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
-                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
-                    let y = if yv.is_number() {
-                        (yv.num() as u32) & 31
-                    } else {
-                        0
-                    };
+                    let x = reg!(bc_b(ins)).num() as i32;
+                    let y = (reg!(bc_c(ins)).num() as u32) & 31;
                     setreg!(a, LuaValue::number((x >> y) as f64));
                 }
 
