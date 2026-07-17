@@ -109,51 +109,37 @@ impl Interner {
         self.hasher.hash_one(s) as u32
     }
 
-    /// Fast path for short strings: pack into u64, no heap alloc on hit.
-    #[inline]
-    fn short_lookup(&self, s: &[u8]) -> Option<StrId> {
-        if s.len() > 7 { return None; }
-        let mut packed = [0; 8];
-        packed[..s.len()].copy_from_slice(s);
-        let key = u64::from_le_bytes(packed) | ((s.len() as u64) << 56);
-        let hash = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32;
+    pub fn intern(&mut self, s: &[u8]) -> StrId {
+        // Compute hash once — consistent between lookup and insert.
+        let hash = if s.len() <= 7 {
+            let mut packed = [0u8; 8];
+            packed[..s.len()].copy_from_slice(s);
+            let key = u64::from_le_bytes(packed) | ((s.len() as u64) << 56);
+            (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32
+        } else {
+            self.hasher.hash_one(s) as u32
+        };
+        // Single probe: find existing entry or insertion slot.
         let mask = self.slots.len() - 1;
-        let mut idx = hash as usize & mask;
+        let mut idx = (hash as usize) & mask;
+        let mut first_dead: Option<usize> = None;
         loop {
             match self.slots[idx] {
-                Slot::Empty => return None,
-                Slot::Tombstone => {}
-                Slot::Occupied(p) => {
-                    let ls = p.as_ref();
-                    if ls.hash() == hash && ls.len() == s.len() && ls.as_bytes() == s {
-                        return Some(ls.sid());
-                    }
+                Slot::Empty => {
+                    let ins = first_dead.unwrap_or(idx);
+                    return self.insert_new(s, hash, ins);
                 }
-            }
-            idx = (idx + 1) & mask;
-        }
-    }
-
-    fn find_slot(&self, hash: u32, s: &[u8]) -> Result<usize, usize> {
-        let mask = self.slots.len() - 1;
-        let mut index = self.slot_index(hash);
-        let mut first_tombstone = None;
-        loop {
-            match self.slots[index] {
-                Slot::Empty => return Err(first_tombstone.unwrap_or(index)),
                 Slot::Tombstone => {
-                    if first_tombstone.is_none() {
-                        first_tombstone = Some(index);
-                    }
+                    if first_dead.is_none() { first_dead = Some(idx); }
                 }
                 Slot::Occupied(p) => {
                     let ls = p.as_ref();
                     if ls.hash() == hash && ls.as_bytes() == s {
-                        return Ok(index);
+                        return ls.sid();
                     }
                 }
             }
-            index = (index + 1) & mask;
+            idx = (idx + 1) & mask;
         }
     }
 
@@ -177,18 +163,18 @@ impl Interner {
         self.ndead = 0;
     }
 
-    pub fn intern(&mut self, s: &[u8]) -> StrId {
-        if let Some(sid) = self.short_lookup(s) {
-            return sid;
-        }
-        let hash = self.hash_bytes(s);
-        if let Ok(index) = self.find_slot(hash, s) {
-            if let Slot::Occupied(p) = self.slots[index] {
-                return p.as_ref().sid();
-            }
-        }
+    fn insert_new(&mut self, s: &[u8], hash: u32, mut slot: usize) -> StrId {
         if self.should_grow() {
             self.grow();
+            // Re-probe after grow.
+            let mask = self.slots.len() - 1;
+            slot = (hash as usize) & mask;
+            loop {
+                match self.slots[slot] {
+                    Slot::Empty | Slot::Tombstone => break,
+                    _ => slot = (slot + 1) & mask,
+                }
+            }
         }
         let sid = match self.free_ids.pop() {
             Some(id) => id,
@@ -200,13 +186,10 @@ impl Interner {
         let p = self.pool.alloc(LuaString::new(s, sid, hash));
         self.bytes += p.as_ref().gc_size();
         self.by_id[sid as usize] = Some(p);
-        let slot_idx = match self.find_slot(hash, s) {
-            Ok(idx) | Err(idx) => idx,
-        };
-        if matches!(self.slots[slot_idx], Slot::Tombstone) {
+        if matches!(self.slots[slot], Slot::Tombstone) {
             self.ndead -= 1;
         }
-        self.slots[slot_idx] = Slot::Occupied(p);
+        self.slots[slot] = Slot::Occupied(p);
         self.nuse += 1;
         sid
     }

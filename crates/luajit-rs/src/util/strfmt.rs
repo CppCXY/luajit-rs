@@ -1,42 +1,109 @@
 //! Number and `string.format` formatting, mirroring the pieces of
 //! `lj_strfmt*` the runtime needs.
 
-/// Format a double like LuaJIT's `STRFMT_G14` (`%.14g`, with integral values
-/// printed without a decimal point and `inf`/`nan` spellings).
-pub fn g14(n: f64) -> String {
-    if n == 0.0 {
-        return if n.is_sign_negative() { "-0" } else { "0" }.to_string();
-    }
-    if n.is_nan() {
-        return "nan".to_string();
-    }
-    if n.is_infinite() {
-        return if n < 0.0 { "-inf" } else { "inf" }.to_string();
-    }
-    let mant = format!("{:.13e}", n);
-    let (m, e) = mant.split_once('e').unwrap();
-    let exp: i32 = e.parse().unwrap();
-    if !(-4..14).contains(&exp) {
-        let m = m.trim_end_matches('0').trim_end_matches('.');
-        format!("{}e{}{:02}", m, if exp < 0 { '-' } else { '+' }, exp.abs())
-    } else {
-        let prec = (13 - exp).max(0) as usize;
-        let s = format!("{:.*}", prec, n);
-        if s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            s
-        }
+use std::fmt::Write;
+
+/// Stack buffer for `core::fmt::Write` — zero-allocation formatting.
+struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+impl<'a> BufWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self { BufWriter { buf, pos: 0 } }
+    fn as_slice(&self) -> &[u8] { &self.buf[..self.pos] }
+    fn len(&self) -> usize { self.pos }
+}
+impl<'a> Write for BufWriter<'a> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let b = s.as_bytes();
+        let end = (self.pos + b.len()).min(self.buf.len());
+        self.buf[self.pos..end].copy_from_slice(&b[..end - self.pos]);
+        self.pos = end;
+        Ok(())
     }
 }
 
+/// Format a double like LuaJIT's `STRFMT_G14` (`%.14g`, with integral values
+/// printed without a decimal point and `inf`/`nan` spellings).
+pub fn g14(n: f64) -> String {
+    let mut buf = [0u8; 64];
+    let len = g14_to_buf(n, &mut buf);
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
 /// Like `g14()` but writes into a pre-allocated stack buffer and returns
-/// the byte count. Identical output.
+/// the byte count. Exact integers take a pure-itoa fast path.
 pub fn g14_to_buf(n: f64, buf: &mut [u8; 64]) -> usize {
-    let s = g14(n);
-    let len = s.len().min(64);
-    buf[..len].copy_from_slice(s.as_bytes());
-    len
+    // Special values
+    if n == 0.0 {
+        if n.is_sign_negative() { buf[0] = b'-'; buf[1] = b'0'; return 2; }
+        buf[0] = b'0'; return 1;
+    }
+    if n.is_nan() { buf[..3].copy_from_slice(b"nan"); return 3; }
+    if n.is_infinite() {
+        if n < 0.0 { buf[..4].copy_from_slice(b"-inf"); return 4; }
+        buf[..3].copy_from_slice(b"inf"); return 3;
+    }
+    // Integer fast path (|n| < 2^53).
+    let i = n as i64;
+    if i as f64 == n && i.unsigned_abs() < (1u64 << 53) {
+        return itoa_i64(i, buf);
+    }
+    // General float — zero-alloc via stack buffer + write!.
+    let mut tmp = [0u8; 64];
+    let mut w = BufWriter::new(&mut tmp);
+    let _ = write!(w, "{:.13e}", n);
+    let mant_str = std::str::from_utf8(w.as_slice()).unwrap();
+    let (m, e) = mant_str.split_once('e').unwrap();
+    let exp: i32 = e.parse().unwrap();
+
+    if !(-4..14).contains(&exp) {
+        // Scientific notation.
+        let m2 = m.trim_end_matches('0').trim_end_matches('.');
+        let mut w2 = BufWriter::new(buf);
+        let _ = write!(w2, "{}e{}{:02}", m2, if exp < 0 { '-' } else { '+' }, exp.abs());
+        return w2.len();
+    }
+    // Decimal notation.
+    let prec = (13 - exp).max(0) as usize;
+    let out = {
+        let mut w3 = BufWriter::new(buf);
+        let _ = write!(w3, "{:.*}", prec, n);
+        let s = std::str::from_utf8(w3.as_slice()).unwrap();
+        if s.contains('.') {
+            let t = s.trim_end_matches('0').trim_end_matches('.');
+            let blen = t.len().min(64);
+            let mut tmp = [0u8; 64];
+            tmp[..blen].copy_from_slice(t.as_bytes());
+            // Need to write back into buf. Drop w3 first.
+            drop(w3);
+            buf[..blen].copy_from_slice(&tmp[..blen]);
+            blen
+        } else {
+            let blen = s.len().min(64);
+            drop(w3);
+            blen
+        }
+    };
+    out
+}
+
+/// Minimal signed integer-to-ASCII, returns byte count.
+#[inline]
+fn itoa_i64(mut v: i64, buf: &mut [u8; 64]) -> usize {
+    let neg = v < 0;
+    let mut tmp = [0u8; 20];
+    let mut t = 20;
+    if neg {
+        let mut u = (v as u64).wrapping_neg();
+        while u >= 10 { t -= 1; tmp[t] = b'0' + (u % 10) as u8; u /= 10; }
+        t -= 1; tmp[t] = b'0' + u as u8;
+    } else {
+        while v >= 10 { t -= 1; tmp[t] = b'0' + (v % 10) as u8; v /= 10; }
+        t -= 1; tmp[t] = b'0' + v as u8;
+    }
+    let digits = 20 - t;
+    let mut o = 0;
+    if neg { buf[0] = b'-'; o = 1; }
+    buf[o..o + digits].copy_from_slice(&tmp[t..]);
+    o + digits
 }
 
 /// A single format argument for `string.format`.
