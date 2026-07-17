@@ -281,6 +281,26 @@ impl Interp {
         self.ksp = pt.kstrv.as_ptr();
     }
 
+    /// Generalised fast-return: walk the VARG chain inline and return the
+    /// real frame's bp, along with `(want, ret_ip, caller_a)`.
+    #[inline(always)]
+    fn ret_fast_n(&self, mut bp: *const LuaValue) -> Option<(*const LuaValue, i32, *const BCIns, i32)> {
+        let mut link = unsafe { (*bp.sub(1)).to_bits() };
+        while link & FRAME_TYPE_MASK == FRAME_VARG {
+            bp = unsafe { bp.sub((link >> 3) as usize) };
+            link = unsafe { (*bp.sub(1)).to_bits() };
+        }
+        if link & FRAME_TYPE_MASK == FRAME_LUA && self.l().openuv.is_empty() {
+            let ret_ip = link as *const BCIns;
+            let call_ins = unsafe { *ret_ip.sub(1) };
+            let want = bc_b(call_ins) as i32 - 1;
+            let caller_a = bc_a(call_ins) as i32;
+            Some((bp, want, ret_ip, caller_a))
+        } else {
+            None
+        }
+    }
+
     /// Whether a return from the frame at `bp` may take the inline fast
     /// path: a plain Lua frame link and no open upvalues to close. Returns
     /// the caller's wanted result count (from the CALL instruction's B).
@@ -759,8 +779,11 @@ impl Interp {
 
                 // -- Tables --
                 BCOp::TNEW => {
-                    sync!();
-                    self.gc_check();
+                    // Inline: only sync when GC is due (cold path).
+                    if self.l().global().heap.should_collect() {
+                        sync!();
+                        self.gc_check();
+                    }
                     let t = self.l().heap().alloc_table(LuaTable::new(0, 0));
                     setreg!(a, LuaValue::table(t));
                 }
@@ -897,8 +920,29 @@ impl Interp {
                     }
                 }
                 BCOp::TSETM => {
-                    sync!();
-                    self.tsetm(a, bc_d(ins))?;
+                    // Inline the fast path: table at R[a-1], values at
+                    // R[a..a+multres-1], base_key from constant table.
+                    let t = reg!(a as usize - 1);
+                    if let Some(tab) = t.as_table() {
+                        let base_key = unsafe { *self.knp.add(bc_d(ins) as usize) } as i64 - (1i64 << 52);
+                        let mr = self.multres;
+                        if mr > 0 && base_key == 1 {
+                            let need = (base_key as u32).wrapping_add(mr as u32);
+                            tab.as_mut().reasize(need);
+                        }
+                        for i in 0..mr {
+                            let key = base_key + i as i64;
+                            let v = reg!(a as usize + i);
+                            if key >= 0 && key <= i32::MAX as i64 {
+                                tab.as_mut().set_int(key as i32, v);
+                            } else {
+                                tab.as_mut().set(LuaValue::number(key as f64), v);
+                            }
+                        }
+                    } else {
+                        sync!();
+                        self.tsetm(a, bc_d(ins))?;
+                    }
                 }
 
                 // -- Calls / returns --
@@ -1037,6 +1081,27 @@ impl Interp {
                 }
                 BCOp::RET => {
                     let n = bc_d(ins) as usize - 1;
+                    if let Some((wbp, want, ret_ip, ca)) = self.ret_fast_n(bp) {
+                        let wbp = wbp as *mut LuaValue;
+                        let src = unsafe { bp.add(a as usize) };
+                        let dst = unsafe { wbp.sub(2) };
+                        for i in 0..n {
+                            unsafe { *dst.add(i) = *src.add(i) };
+                        }
+                        for i in n..(want.max(0) as usize) {
+                            unsafe { *dst.add(i) = LuaValue::NIL };
+                        }
+                        self.multres = n;
+                        bp = unsafe { dst.sub(ca as usize) };
+                        ip = ret_ip;
+                        self.reload_at(bp);
+                        self.l().top = if want >= 0 {
+                            unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
+                        } else {
+                            unsafe { dst.add(n).offset_from(self.sp) as usize }
+                        };
+                        continue;
+                    }
                     sync!();
                     if let Some(n) = self.do_return(cur_base!() + a as usize, n) {
                         return Ok(n);
@@ -1045,6 +1110,27 @@ impl Interp {
                 }
                 BCOp::RETM => {
                     let n = self.multres + bc_d(ins) as usize;
+                    if let Some((wbp, want, ret_ip, ca)) = self.ret_fast_n(bp) {
+                        let wbp = wbp as *mut LuaValue;
+                        let src = unsafe { bp.add(a as usize) };
+                        let dst = unsafe { wbp.sub(2) };
+                        for i in 0..n {
+                            unsafe { *dst.add(i) = *src.add(i) };
+                        }
+                        for i in n..(want.max(0) as usize) {
+                            unsafe { *dst.add(i) = LuaValue::NIL };
+                        }
+                        self.multres = n;
+                        bp = unsafe { dst.sub(ca as usize) };
+                        ip = ret_ip;
+                        self.reload_at(bp);
+                        self.l().top = if want >= 0 {
+                            unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
+                        } else {
+                            unsafe { dst.add(n).offset_from(self.sp) as usize }
+                        };
+                        continue;
+                    }
                     sync!();
                     if let Some(n) = self.do_return(cur_base!() + a as usize, n) {
                         return Ok(n);
