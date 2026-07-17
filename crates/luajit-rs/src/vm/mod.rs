@@ -865,9 +865,29 @@ impl Interp {
                     }
                 }
                 BCOp::VARG => {
-                    sync!();
-                    self.vararg(a, bc_b(ins));
-                    resync!();
+                    let link = unsafe { (*bp.sub(1)).to_bits() };
+                    if link & FRAME_TYPE_MASK == FRAME_VARG {
+                        let delta = (link >> 3) as usize;
+                        let numparams = self.proto().numparams as usize;
+                        let nvarg = (delta - 2).saturating_sub(numparams);
+                        let dst = a as usize;
+                        let src = unsafe { bp.sub(delta).add(numparams) };
+                        if bc_b(ins) == 0 {
+                            for i in 0..nvarg {
+                                unsafe { *bp.add(dst + i) = *src.add(i) };
+                            }
+                            self.multres = nvarg;
+                            self.l().top = cur_base!() + dst + nvarg;
+                        } else {
+                            let want = (bc_b(ins) - 1) as usize;
+                            for i in 0..want {
+                                unsafe {
+                                    *bp.add(dst + i) =
+                                        if i < nvarg { *src.add(i) } else { LuaValue::NIL };
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // -- Bitwise ops (Lua 5.3+), lj_num2bit / lj_vm_tobit --
@@ -1061,10 +1081,20 @@ impl Interp {
                     .runtime_error(b"attempt to index a non-table value"));
             }
         };
+        // Pre-size array: we know the keys are base_key .. base_key+multres-1.
+        // For a fresh table, this avoids per-value hash insertions.
+        if self.multres > 0 && base_key == 1 {
+            let need = (base_key as u32).wrapping_add(self.multres as u32);
+            tab.as_mut().reasize(need);
+        }
         for i in 0..self.multres {
+            let key = base_key + i as i64;
             let v = self.at(self.base + a as usize + i);
-            tab.as_mut()
-                .set(LuaValue::number((base_key + i as i64) as f64), v);
+            if key >= 0 && key <= i32::MAX as i64 {
+                tab.as_mut().set_int(key as i32, v);
+            } else {
+                tab.as_mut().set(LuaValue::number(key as f64), v);
+            }
         }
         Ok(())
     }
