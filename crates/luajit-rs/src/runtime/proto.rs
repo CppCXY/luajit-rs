@@ -12,7 +12,9 @@ pub enum KGc {
     /// A child prototype after the tree has been registered in the heap
     /// (see `GcHeap::alloc_proto`).
     ProtoRef(GcPtr<Proto>),
-    Table(LuaTable),
+    /// A template table for TDUP, boxed to keep the enum small (a
+    /// `LuaTable` is ~90 bytes inline; every other variant is 8-16).
+    Table(Box<LuaTable>),
 }
 
 /// A function prototype: the output of the bytecode compiler, corresponding

@@ -1837,7 +1837,7 @@ impl Parser {
                     let kt = LuaTable::new(if needarr { narr } else { 0 }, hsize2hbits(nhash));
                     let fs = self.cur_mut();
                     let kidx = fs.kgc.len() as u32;
-                    fs.kgc.push(KGc::Table(LuaTable::default()));
+                    fs.kgc.push(KGc::Table(Box::new(LuaTable::default())));
                     *self.ins_mut(pc) = bcins_ad(BCOp::TDUP, freg - 1, kidx);
                     t = Some((kidx, kt));
                 }
@@ -1900,7 +1900,7 @@ impl Parser {
             if needarr && kt.asize() < narr {
                 kt.reasize(narr - 1);
             }
-            self.cur_mut().kgc[kidx as usize] = KGc::Table(kt);
+            self.cur_mut().kgc[kidx as usize] = KGc::Table(Box::new(kt));
         } else {
             let mut narr = narr;
             if !needarr {
