@@ -20,6 +20,7 @@ pub use reg::{LibBuilder, LibTarget};
 
 use crate::state::LuaState;
 use crate::value::LuaValue;
+use crate::err::LuaResult;
 
 /// `lua_push` a single result value.
 #[inline]
@@ -79,6 +80,31 @@ pub fn tostring_bytes(l: &mut LuaState, v: LuaValue) -> Vec<u8> {
         "userdata"
     };
     format!("{}: {:#x}", kind, v.gc_addr()).into_bytes()
+}
+
+/// Convert a value to its display bytes, checking `__tostring` first
+/// (lj_meta_tostring). Falls back to the raw `tostring_bytes`.
+pub fn tostring_meta(l: &mut LuaState, v: LuaValue) -> LuaResult<Vec<u8>> {
+    use crate::meta::{MM, meta_lookup};
+    let mo = meta_lookup(l.global(), v, MM::Tostring);
+    if mo.is_nil() {
+        return Ok(tostring_bytes(l, v));
+    }
+    // mmcall: place the metamethod and arg above the current frame.
+    let saved_top = l.top;
+    let fs = l.top + 16;
+    assert!(fs + 16 < crate::state::STACK_MAX, "stack overflow in __tostring");
+    l.stack[fs] = mo;
+    // Args start at func_slot + 2.
+    l.stack[fs + 2] = v;
+    crate::vm::execute(l, fs, 1, 1)?;
+    let r = l.stack[fs];
+    l.top = saved_top;
+    if let Some(sid) = r.as_string_id() {
+        Ok(l.str_static(sid).to_vec())
+    } else {
+        Err(l.runtime_error(b"'__tostring' must return a string"))
+    }
 }
 
 /// Builtin error: `bad argument #N to 'func' (expected, got)`.

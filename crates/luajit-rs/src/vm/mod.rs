@@ -19,11 +19,14 @@
 
 use crate::bc::*;
 
+pub mod meta;
+
 pub mod err;
-use crate::err::{LuaError, LuaResult};
+use crate::err::{LuaResult};
 use crate::func::{GcFunc, LuaClosure, Upval, UpvalState};
 use crate::gc::GcPtr;
 use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto};
+use crate::runtime::meta::MM;
 use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::*;
@@ -65,10 +68,16 @@ pub fn call(l: &mut LuaState, func: LuaValue, args: &[LuaValue]) -> LuaResult<Ve
 /// already placed at `func_slot + 2 ..`. Leaves the results at `func_slot`
 /// and returns their count.
 pub fn execute(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
+    let mut nargs = nargs;
     let f = l.stack[func_slot];
     let gf = match f.as_func() {
         Some(p) => p,
-        None => return Err(l.runtime_error(b"attempt to call a non-function value")),
+        None => {
+            // lj_meta_call: try __call metamethod.
+            nargs = meta::meta_call(l, func_slot, nargs)?;
+            let f = l.stack[func_slot];
+            f.as_func().expect("__call did not produce a function")
+        }
     };
     if let GcFunc::C(cc) = gf.as_ref() {
         return call_c(l, cc.f, func_slot, nargs, want);
@@ -96,7 +105,17 @@ fn call_c(
     if l.global().heap.should_collect() {
         crate::gc::full_gc(l.global());
     }
-    let n = f(l)? as usize;
+    let r = f(l);
+    let n = match r {
+        Ok(n) => n as usize,
+        Err(e) => {
+            // Restore the frame even on error, so protected callers
+            // (pcall) see a consistent base/top.
+            l.base = saved_base;
+            l.top = saved_top;
+            return Err(e);
+        }
+    };
     for i in 0..n {
         l.stack[func_slot + i] = l.stack[args_base + i];
     }
@@ -316,9 +335,10 @@ impl Interp {
                 ip = unsafe { self.bcp.add(self.pc) };
             }};
         }
-        // Numeric binary op fast path; falls to the arithmetic slow error.
+        // Numeric binary op fast path; slow path calls meta_arith for
+        // string coercion and metamethods (lj_meta_arith).
         macro_rules! arith {
-            ($a:expr, $xv:expr, $yv:expr, $x:ident, $y:ident, $body:expr) => {{
+            ($a:expr, $xv:expr, $yv:expr, $mm:expr, $x:ident, $y:ident, $body:expr) => {{
                 let xv = $xv;
                 let yv = $yv;
                 if xv.is_number() && yv.is_number() {
@@ -327,14 +347,15 @@ impl Interp {
                     setreg!($a, LuaValue::number_raw($body));
                 } else {
                     sync!();
-                    return Err(self.arith_err());
+                    let r = self.meta_arith($mm, xv, yv)?;
+                    setreg!($a, r);
                 }
             }};
         }
-        // reg `op` constant (*VN) / constant `op` reg (*NV): number constants
-        // need no type check, only the register operand does.
-        macro_rules! arith_k {
-            ($a:expr, $ins:expr, $x:ident, $y:ident, $body:expr) => {{
+        // reg `op` constant (VN form): check the register, constant is
+        // always numeric.
+        macro_rules! arith_vn {
+            ($a:expr, $ins:expr, $mm:expr, $x:ident, $y:ident, $body:expr) => {{
                 let xv = reg!(bc_b($ins));
                 if xv.is_number() {
                     let $x = xv.num();
@@ -342,22 +363,48 @@ impl Interp {
                     setreg!($a, LuaValue::number_raw($body));
                 } else {
                     sync!();
-                    return Err(self.arith_err());
+                    let r = self.meta_arith($mm, xv, kslot!(bc_c($ins)))?;
+                    setreg!($a, r);
                 }
             }};
         }
-        // Comparison + fused following JMP.
+        // constant `op` reg (NV form): swap — constant is first argument
+        // but LL semantics require it to be the *second* for ADD/NV (A=B+C
+        // where B is reg, C is const). The macro body must do `y + x` etc.
+        macro_rules! arith_nv {
+            ($a:expr, $ins:expr, $mm:expr, $x:ident, $y:ident, $body:expr) => {{
+                let $x = kslot!(bc_c($ins));
+                let yv = reg!(bc_b($ins));
+                if yv.is_number() {
+                    let $y = yv.num();
+                    setreg!($a, LuaValue::number_raw($body));
+                } else {
+                    sync!();
+                    let r = self.meta_arith($mm, $x, yv)?;
+                    setreg!($a, r);
+                }
+            }};
+        }
+        // Comparison + fused following JMP. `op` is the bytecode ordinal
+        // (ISLT=0, ISGE=1, ISLE=2, ISGT=3), matching lj_meta_comp's
+        // encoding.
         macro_rules! cmp {
-            ($op:expr, $xv:expr, $yv:expr, $x:ident, $y:ident, $fast:expr) => {{
+            ($op:expr, $xv:expr, $yv:expr) => {{
                 let xv = $xv;
                 let yv = $yv;
                 let cond = if xv.is_number() && yv.is_number() {
-                    let $x = xv.num();
-                    let $y = yv.num();
-                    $fast
+                    let x = xv.num();
+                    let y = yv.num();
+                    match $op {
+                        0 => x < y,
+                        1 => x >= y,
+                        2 => x <= y,
+                        3 => x > y,
+                        _ => unreachable!(),
+                    }
                 } else {
                     sync!();
-                    self.cmp_slow($op, xv, yv)?
+                    self.meta_comp(xv, yv, $op)?
                 };
                 let jmp = unsafe { *ip };
                 ip = unsafe { ip.add(1) };
@@ -382,17 +429,29 @@ impl Interp {
             let a = bc_a(ins);
             match bc_op(ins) {
                 // -- Comparisons (ORDER matters; see bc.rs) --
-                BCOp::ISLT => cmp!(BCOp::ISLT, reg!(a), reg!(bc_d(ins)), x, y, x < y),
-                BCOp::ISGE => cmp!(BCOp::ISGE, reg!(a), reg!(bc_d(ins)), x, y, x >= y),
-                BCOp::ISLE => cmp!(BCOp::ISLE, reg!(a), reg!(bc_d(ins)), x, y, x <= y),
-                BCOp::ISGT => cmp!(BCOp::ISGT, reg!(a), reg!(bc_d(ins)), x, y, x > y),
+                BCOp::ISLT => cmp!(0u32, reg!(a), reg!(bc_d(ins))),
+                BCOp::ISGE => cmp!(1u32, reg!(a), reg!(bc_d(ins))),
+                BCOp::ISLE => cmp!(2u32, reg!(a), reg!(bc_d(ins))),
+                BCOp::ISGT => cmp!(3u32, reg!(a), reg!(bc_d(ins))),
                 BCOp::ISEQV => {
-                    let cond = val_eq(reg!(a), reg!(bc_d(ins)));
+                    let x = reg!(a);
+                    let y = reg!(bc_d(ins));
+                    let mut cond = val_eq(x, y);
+                    if !cond && x.is_table() && y.is_table() {
+                        sync!();
+                        cond = self.meta_equal(x, y)?;
+                    }
                     branch!(cond);
                 }
                 BCOp::ISNEV => {
-                    let cond = !val_eq(reg!(a), reg!(bc_d(ins)));
-                    branch!(cond);
+                    let x = reg!(a);
+                    let y = reg!(bc_d(ins));
+                    let mut cond = val_eq(x, y);
+                    if !cond && x.is_table() && y.is_table() {
+                        sync!();
+                        cond = self.meta_equal(x, y)?;
+                    }
+                    branch!(!cond);
                 }
                 BCOp::ISEQS => {
                     let cond = val_eq(reg!(a), self.kstr_at(bc_d(ins)));
@@ -452,48 +511,70 @@ impl Interp {
                         setreg!(a, LuaValue::number_raw(-v.num()));
                     } else {
                         sync!();
-                        return Err(self.arith_err());
+                        let r = self.meta_arith(MM::Unm, v, v)?;
+                        setreg!(a, r);
                     }
                 }
                 BCOp::LEN => {
                     let v = reg!(bc_d(ins));
-                    sync!();
-                    let r = self.len_op(v)?;
-                    setreg!(a, r);
+                    if let Some(sid) = v.as_string_id() {
+                        let n = self.l().heap().strings.get(sid).len();
+                        setreg!(a, LuaValue::number(n as f64));
+                    } else if let Some(t) = v.as_table() {
+                        setreg!(a, LuaValue::number(t.as_ref().len() as f64));
+                    } else {
+                        sync!();
+                        let r = self.meta_len(v)?;
+                        setreg!(a, r);
+                    }
                 }
 
                 // -- Arithmetic --
-                BCOp::ADDVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x + y),
-                BCOp::SUBVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x - y),
-                BCOp::MULVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x * y),
-                BCOp::DIVVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x / y),
+                BCOp::ADDVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), MM::Add, x, y, x + y),
+                BCOp::SUBVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), MM::Sub, x, y, x - y),
+                BCOp::MULVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), MM::Mul, x, y, x * y),
+                BCOp::DIVVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), MM::Div, x, y, x / y),
                 BCOp::MODVV => {
                     arith!(
                         a,
                         reg!(bc_b(ins)),
                         reg!(bc_c(ins)),
+                        MM::Mod,
                         x,
                         y,
                         x - (x / y).floor() * y
                     )
                 }
-                BCOp::ADDVN => arith_k!(a, ins, x, y, x + y),
-                BCOp::SUBVN => arith_k!(a, ins, x, y, x - y),
-                BCOp::MULVN => arith_k!(a, ins, x, y, x * y),
-                BCOp::DIVVN => arith_k!(a, ins, x, y, x / y),
-                BCOp::MODVN => arith_k!(a, ins, x, y, x - (x / y).floor() * y),
-                BCOp::ADDNV => arith_k!(a, ins, y, x, x + y),
-                BCOp::SUBNV => arith_k!(a, ins, y, x, x - y),
-                BCOp::MULNV => arith_k!(a, ins, y, x, x * y),
-                BCOp::DIVNV => arith_k!(a, ins, y, x, x / y),
-                BCOp::MODNV => arith_k!(a, ins, y, x, x - (x / y).floor() * y),
+                BCOp::ADDVN => arith_vn!(a, ins, MM::Add, x, y, x + y),
+                BCOp::SUBVN => arith_vn!(a, ins, MM::Sub, x, y, x - y),
+                BCOp::MULVN => arith_vn!(a, ins, MM::Mul, x, y, x * y),
+                BCOp::DIVVN => arith_vn!(a, ins, MM::Div, x, y, x / y),
+                BCOp::MODVN => arith_vn!(a, ins, MM::Mod, x, y, x - (x / y).floor() * y),
+                BCOp::ADDNV => arith_nv!(a, ins, MM::Add, kv, y, kv.num() + y),
+                BCOp::SUBNV => arith_nv!(a, ins, MM::Sub, kv, y, kv.num() - y),
+                BCOp::MULNV => arith_nv!(a, ins, MM::Mul, kv, y, kv.num() * y),
+                BCOp::DIVNV => arith_nv!(a, ins, MM::Div, kv, y, kv.num() / y),
+                BCOp::MODNV => {
+                    arith_nv!(a, ins, MM::Mod, kv, y, {
+                        let x = kv.num();
+                        x - (x / y).floor() * y
+                    })
+                }
                 BCOp::POW => {
-                    arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), x, y, x.powf(y))
+                    arith!(
+                        a,
+                        reg!(bc_b(ins)),
+                        reg!(bc_c(ins)),
+                        MM::Pow,
+                        x,
+                        y,
+                        x.powf(y)
+                    )
                 }
                 BCOp::CAT => {
                     sync!();
                     self.gc_check();
-                    let r = self.concat(bc_b(ins), bc_c(ins))?;
+                    let r = self.meta_cat(bc_b(ins), bc_c(ins))?;
                     setreg!(a, r);
                 }
 
@@ -566,32 +647,52 @@ impl Interp {
                 BCOp::GGET => {
                     let env = self.lua_cl().env;
                     let key = self.kstr_at(bc_d(ins));
-                    setreg!(a, env.as_ref().get_str(key));
+                    let v = env.as_ref().get_str(key);
+                    if !v.is_nil() || env.as_ref().metatable.is_none() {
+                        setreg!(a, v);
+                    } else {
+                        sync!();
+                        let v = self.meta_tget(LuaValue::table(env), key)?;
+                        setreg!(a, v);
+                    }
                 }
                 BCOp::GSET => {
                     let env = self.lua_cl().env;
                     let key = self.kstr_at(bc_d(ins));
-                    env.as_mut().set_str(key, reg!(a));
+                    let mt = env.as_ref().metatable;
+                    if mt.is_none() || !env.as_ref().get_str(key).is_nil() {
+                        env.as_mut().set_str(key, reg!(a));
+                    } else {
+                        sync!();
+                        self.meta_tset(LuaValue::table(env), key, reg!(a))?;
+                    }
                 }
                 BCOp::TGETV => {
                     let t = reg!(bc_b(ins));
                     let k = reg!(bc_c(ins));
                     if let Some(tab) = t.as_table() {
-                        if k.is_string() {
-                            setreg!(a, tab.as_ref().get_str(k));
+                        let v = if k.is_string() {
+                            tab.as_ref().get_str(k)
                         } else if k.is_number() {
                             let ki = k.num() as i32;
                             if ki as f64 == k.num() && ki >= 0 {
-                                setreg!(a, tab.as_ref().get_int(ki));
+                                tab.as_ref().get_int(ki)
                             } else {
-                                setreg!(a, tab.as_ref().get(k));
+                                tab.as_ref().get(k)
                             }
                         } else {
-                            setreg!(a, tab.as_ref().get(k));
+                            tab.as_ref().get(k)
+                        };
+                        if !v.is_nil() || tab.as_ref().metatable.is_none() {
+                            setreg!(a, v);
+                        } else {
+                            sync!();
+                            let v = self.meta_tget(t, k)?;
+                            setreg!(a, v);
                         }
                     } else {
                         sync!();
-                        let v = self.index_get(t, k)?;
+                        let v = self.meta_tget(t, k)?;
                         setreg!(a, v);
                     }
                 }
@@ -599,10 +700,17 @@ impl Interp {
                     let t = reg!(bc_b(ins));
                     if let Some(tab) = t.as_table() {
                         let k = self.kstr_at(bc_c(ins));
-                        setreg!(a, tab.as_ref().get_str(k));
+                        let v = tab.as_ref().get_str(k);
+                        if !v.is_nil() || tab.as_ref().metatable.is_none() {
+                            setreg!(a, v);
+                        } else {
+                            sync!();
+                            let v = self.meta_tget(t, k)?;
+                            setreg!(a, v);
+                        }
                     } else {
                         sync!();
-                        let v = self.index_get(t, self.kstr_at(bc_c(ins)))?;
+                        let v = self.meta_tget(t, self.kstr_at(bc_c(ins)))?;
                         setreg!(a, v);
                     }
                 }
@@ -611,10 +719,16 @@ impl Interp {
                     if let Some(tab) = t.as_table() {
                         let k = bc_c(ins) as i32;
                         let v = tab.as_ref().get_int(k);
-                        setreg!(a, v);
+                        if !v.is_nil() || tab.as_ref().metatable.is_none() {
+                            setreg!(a, v);
+                        } else {
+                            sync!();
+                            let v = self.meta_tget(t, LuaValue::number(k as f64))?;
+                            setreg!(a, v);
+                        }
                     } else {
                         sync!();
-                        let v = self.index_get(t, LuaValue::number(bc_c(ins) as f64))?;
+                        let v = self.meta_tget(t, LuaValue::number(bc_c(ins) as f64))?;
                         setreg!(a, v);
                     }
                 }
@@ -622,7 +736,9 @@ impl Interp {
                     let t = reg!(bc_b(ins));
                     let k = reg!(bc_c(ins));
                     let v = reg!(a);
-                    if let Some(tab) = t.as_table() {
+                    if let Some(tab) = t.as_table()
+                        && tab.as_ref().metatable.is_none()
+                    {
                         if k.is_string() {
                             tab.as_mut().set_str(k, v);
                         } else if k.is_number() {
@@ -632,33 +748,40 @@ impl Interp {
                             } else {
                                 tab.as_mut().set(k, v);
                             }
+                        } else if k.is_nil() {
+                            sync!();
+                            return Err(self.l().runtime_error(b"table index is nil"));
                         } else {
                             tab.as_mut().set(k, v);
                         }
                     } else {
                         sync!();
-                        self.index_set(t, k, v)?;
+                        self.meta_tset(t, k, v)?;
                     }
                 }
                 BCOp::TSETS => {
                     let t = reg!(bc_b(ins));
                     let v = reg!(a);
-                    if let Some(tab) = t.as_table() {
+                    if let Some(tab) = t.as_table()
+                        && tab.as_ref().metatable.is_none()
+                    {
                         let k = self.kstr_at(bc_c(ins));
                         tab.as_mut().set_str(k, v);
                     } else {
                         sync!();
-                        self.index_set(t, self.kstr_at(bc_c(ins)), v)?;
+                        self.meta_tset(t, self.kstr_at(bc_c(ins)), v)?;
                     }
                 }
                 BCOp::TSETB => {
                     let t = reg!(bc_b(ins));
                     let v = reg!(a);
-                    if let Some(tab) = t.as_table() {
+                    if let Some(tab) = t.as_table()
+                        && tab.as_ref().metatable.is_none()
+                    {
                         tab.as_mut().set_int(bc_c(ins) as i32, v);
                     } else {
                         sync!();
-                        self.index_set(t, LuaValue::number(bc_c(ins) as f64), v)?;
+                        self.meta_tset(t, LuaValue::number(bc_c(ins) as f64), v)?;
                     }
                 }
                 BCOp::TSETM => {
@@ -986,33 +1109,6 @@ impl Interp {
     }
 
     #[cold]
-    fn arith_err(&self) -> LuaError {
-        self.l()
-            .runtime_error(b"attempt to perform arithmetic on a non-number value")
-    }
-
-    #[cold]
-    fn cmp_slow(&self, op: BCOp, x: LuaValue, y: LuaValue) -> LuaResult<bool> {
-        if let (Some(a), Some(b)) = (self.as_bytes(x), self.as_bytes(y)) {
-            return Ok(match op {
-                BCOp::ISLT => a < b,
-                BCOp::ISGE => a >= b,
-                BCOp::ISLE => a <= b,
-                BCOp::ISGT => a > b,
-                _ => unreachable!(),
-            });
-        }
-        Err(self
-            .l()
-            .runtime_error(b"attempt to compare incompatible values"))
-    }
-
-    fn as_bytes(&self, v: LuaValue) -> Option<Vec<u8>> {
-        v.as_string_id()
-            .map(|sid| self.l().heap().strings.get(sid).to_vec())
-    }
-
-    #[cold]
     fn len_op(&self, v: LuaValue) -> LuaResult<LuaValue> {
         if let Some(sid) = v.as_string_id() {
             let n = self.l().heap().strings.get(sid).len();
@@ -1024,49 +1120,6 @@ impl Interp {
         Err(self
             .l()
             .runtime_error(b"attempt to get length of a non-table value"))
-    }
-
-    #[cold]
-    fn concat(&mut self, from: u32, to: u32) -> LuaResult<LuaValue> {
-        let mut buf = Vec::new();
-        for i in from..=to {
-            let v = self.at(self.base + i as usize);
-            if let Some(sid) = v.as_string_id() {
-                buf.extend_from_slice(self.l().heap().strings.get(sid));
-            } else if let Some(n) = v.as_number() {
-                buf.extend_from_slice(crate::strfmt::g14(n).as_bytes());
-            } else {
-                return Err(self
-                    .l()
-                    .runtime_error(b"attempt to concatenate a non-string value"));
-            }
-        }
-        let sid = self.l().heap().intern(&buf);
-        Ok(self.l().heap().str_value(sid))
-    }
-
-    fn index_get(&self, t: LuaValue, k: LuaValue) -> LuaResult<LuaValue> {
-        match t.as_table() {
-            Some(tab) => Ok(tab.as_ref().get(k)),
-            None => Err(self
-                .l()
-                .runtime_error(b"attempt to index a non-table value")),
-        }
-    }
-
-    fn index_set(&self, t: LuaValue, k: LuaValue, v: LuaValue) -> LuaResult<()> {
-        match t.as_table() {
-            Some(tab) => {
-                if k.is_nil() {
-                    return Err(self.l().runtime_error(b"table index is nil"));
-                }
-                tab.as_mut().set(k, v);
-                Ok(())
-            }
-            None => Err(self
-                .l()
-                .runtime_error(b"attempt to index a non-table value")),
-        }
     }
 
     #[cold]
@@ -1103,13 +1156,15 @@ impl Interp {
 
     fn do_call(&mut self, a: u32, nargs: usize, want: i32) -> LuaResult<()> {
         let func_slot = self.base + a as usize;
+        let mut nargs = nargs;
         let f = self.at(func_slot);
         let gf = match f.as_func() {
             Some(p) => p,
             None => {
-                return Err(self
-                    .l()
-                    .runtime_error(b"attempt to call a non-function value"));
+                // lj_meta_call: inject __call metamethod.
+                nargs = meta::meta_call(self.l(), func_slot, nargs)?;
+                let f = self.at(func_slot);
+                f.as_func().expect("__call did not produce a function")
             }
         };
         match gf.as_ref() {
@@ -1152,7 +1207,15 @@ impl Interp {
         if l.global().heap.should_collect() {
             crate::gc::full_gc(l.global());
         }
-        let n = f(l)? as usize;
+        let r = f(l);
+        let n = match r {
+            Ok(n) => n as usize,
+            Err(e) => {
+                l.base = saved_base;
+                l.top = saved_top;
+                return Err(e);
+            }
+        };
         for i in 0..n {
             l.stack[func_slot + i] = l.stack[args_base + i];
         }
@@ -1170,15 +1233,23 @@ impl Interp {
     /// (`FRAME_C`) frame.
     fn do_tailcall(&mut self, a: u32, nargs: usize) -> LuaResult<Option<usize>> {
         let func_slot = self.base + a as usize;
-        let f = self.at(func_slot);
+        let mut nargs = nargs;
+        let mut f = self.at(func_slot);
         let gf = match f.as_func() {
             Some(p) => p,
             None => {
-                return Err(self
-                    .l()
-                    .runtime_error(b"attempt to call a non-function value"));
+                nargs = meta::meta_call(self.l(), func_slot, nargs)?;
+                f = self.at(func_slot);
+                f.as_func().expect("__call did not produce a function")
             }
         };
+
+        // C callee: execute directly (no arg relocation — the overlap
+        // with func_slot is destructive for non-C lua frames).
+        if let GcFunc::C(_cc) = gf.as_ref() {
+            let n = execute(self.l(), func_slot, nargs, -1)?;
+            return Ok(self.do_return(func_slot, n));
+        }
 
         let mut base = self.base;
         let link = self.at(base - 1).to_bits();
@@ -1186,31 +1257,23 @@ impl Interp {
             let delta = (link >> 3) as usize;
             if base >= delta + 2 {
                 base -= delta;
-            }
-            // Else: base would underflow — the caller is so shallow that
-            // dropping the vararg frame puts us past the stack origin.
-            // Fall back to a regular (recursive) call: stack frame reuse
-            // for a vararg tail call is incorrect when the delta pushes
-            // past the stack origin.
-            else if let GcFunc::C(_cc) = gf.as_ref() {
+            } else {
+                // Underflow: fall back.
                 let n = execute(self.l(), func_slot, nargs, -1)?;
                 return Ok(self.do_return(func_slot, n));
             }
         }
-        // Move func and args down into the (possibly relocated) frame.
-        // Must copy args in reverse order: when func_slot + 2 > base,
-        // the ranges overlap and a forward copy corrupts later arguments.
-        self.set_at(base - 2, f);
+        // Move func and args down into the (possibly relocated) frame,
+        // in reverse to avoid overlapping corruption.
         for i in (0..nargs).rev() {
             self.set_at(base + i, self.at(func_slot + 2 + i));
         }
+        self.set_at(base - 2, f);
 
         match gf.as_ref() {
             GcFunc::Lua(cl) => {
                 let pt = cl.proto.as_ref();
                 if (pt.flags & PROTO_VARARG) != 0 {
-                    // FUNCV builds its own vararg frame on top, chained to
-                    // the link already sitting at `base - 1`.
                     let link = self.at(base - 1).to_bits();
                     self.enter_lua(gf, base - 2, nargs, link);
                 } else {
@@ -1222,19 +1285,12 @@ impl Interp {
                     self.bcp = pt.bc.as_ptr();
                     self.knp = pt.kn.as_ptr();
                     self.ksp = pt.kstrv.as_ptr();
-                    self.pc = 1; // skip the FUNCF header
+                    self.pc = 1;
                     self.l().top = base + pt.framesize as usize;
                 }
                 Ok(None)
             }
-            GcFunc::C(_cc) => {
-                // Tail call to a C function: run it as a regular
-                // execute and return. True TCO for C callees is a
-                // much narrower win (they're leaf calls) and the
-                // frame-reuse path has subtle edge cases.
-                let n = execute(self.l(), func_slot, nargs, -1)?;
-                return Ok(self.do_return(func_slot, n));
-            }
+            GcFunc::C(_cc) => unreachable!("C path handled above"),
         }
     }
 

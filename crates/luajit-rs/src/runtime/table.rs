@@ -55,6 +55,10 @@ pub struct LuaTable {
     hmask: u32,
     /// Top of the free-node search (index just past the last free node).
     freetop: u32,
+    /// Negative metamethod cache (LuaJIT's `GCtab.nomm`): bit `mm` set means
+    /// "this table, used as a metatable, has no metamethod `mm`". `!0` for
+    /// fresh tables; cleared by any string-key write.
+    pub nomm: u8,
     pub metatable: Option<GcPtr<LuaTable>>,
 }
 
@@ -77,6 +81,7 @@ impl LuaTable {
             asize,
             hmask: 0,
             freetop: 0,
+            nomm: !0,
             metatable: None,
         };
         if hbits != 0 {
@@ -218,6 +223,7 @@ impl LuaTable {
     #[inline]
     pub fn set_str(&mut self, key: LuaValue, val: LuaValue) {
         debug_assert!(key.is_string());
+        self.nomm = 0; // Clear metamethod cache (BC_TSETS does the same).
         let mut n = self.hash_slot(key);
         loop {
             let node = &mut self.node[n as usize];
@@ -364,6 +370,7 @@ impl LuaTable {
             asize: self.asize,
             hmask: self.hmask,
             freetop: self.freetop,
+            nomm: 0, // Keys with metamethod names may be present (lj_tab_dup).
             metatable: None,
         };
         for v in t.array.iter_mut() {
@@ -386,6 +393,9 @@ impl LuaTable {
     /// does this via `lj_tab_newkey` -> `lj_tab_set` recursion).
     pub fn set(&mut self, key: LuaValue, val: LuaValue) {
         debug_assert!(!key.is_nil());
+        if key.is_string() {
+            self.nomm = 0; // Invalidate negative metamethod cache.
+        }
         loop {
             if let Some(i) = LuaTable::array_key(key)
                 && i < self.asize
@@ -421,6 +431,7 @@ impl LuaTable {
     /// rehashing the table (caller must retry). Uses Brent's variation to
     /// keep chains short, ported from `lj_tab_newkey`.
     fn try_new_key(&mut self, key: LuaValue) -> Option<u32> {
+        self.nomm = 0; // Keys with metamethod names may be added (lj_tab_newkey).
         if !self.has_hpart() {
             self.rehash(key);
             return None;

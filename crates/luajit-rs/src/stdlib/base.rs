@@ -3,10 +3,11 @@
 //! `error`, `pcall`, `xpcall`, `rawequal`, `rawget`, `rawset`, `getmetatable`.
 
 use crate::err::{LuaError, LuaResult};
+use crate::runtime::meta::MM;
 use crate::state::LuaState;
 use crate::value::{LJ_TNIL, LuaValue};
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv, tostring_bytes};
+use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv, tostring_meta};
 use crate::lual_reg;
 
 fn lib_print(l: &mut LuaState) -> LuaResult<i32> {
@@ -18,7 +19,7 @@ fn lib_print(l: &mut LuaState) -> LuaResult<i32> {
             out.push(b'\t');
         }
         let v = arg(l, i);
-        out.extend_from_slice(&tostring_bytes(l, v));
+        out.extend_from_slice(&tostring_meta(l, v)?);
     }
     out.push(b'\n');
     let _ = std::io::stdout().lock().write_all(&out);
@@ -49,7 +50,7 @@ fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
 
 fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
-    let bytes = tostring_bytes(l, v);
+    let bytes = tostring_meta(l, v)?;
     let sid = l.heap().intern(&bytes);
     push(l, l.heap().str_value(sid));
     Ok(1)
@@ -149,6 +150,19 @@ fn lib_ipairs(l: &mut LuaState) -> LuaResult<i32> {
 
 fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
+    let mt = arg(l, 1);
+    let tab = match t.as_table() {
+        Some(t) => t,
+        None => return Err(err_bad_arg(l, 1, "setmetatable", "table", "")),
+    };
+    if !mt.is_table() && !mt.is_nil() {
+        return Err(err_bad_arg(l, 2, "setmetatable", "nil or table", ""));
+    }
+    // Protected metatable check (lj_meta_lookup(o, MM_metatable)).
+    if !crate::meta::meta_lookup(l.global(), t, MM::Metatable).is_nil() {
+        return Err(l.runtime_error(b"cannot change a protected metatable"));
+    }
+    tab.as_mut().metatable = mt.as_table();
     push(l, t);
     Ok(1)
 }
@@ -229,16 +243,13 @@ fn lib_error(l: &mut LuaState) -> LuaResult<i32> {
     Err(LuaError::Runtime)
 }
 
-/// `pcall(f [, arg...])` — protected call.
+/// `pcall(f [, arg...])` — protected call. The callee may be any value:
+/// `__call` resolution (or the call-type error) happens inside `execute`.
 fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
-    let fv = arg(l, 0);
-    let _gf = match fv.as_func() {
-        Some(p) => p,
-        None => return Err(err_bad_arg(l, 1, "pcall", "function", "")),
-    };
     let n = nargs(l).saturating_sub(1);
     // Move `n` trailing args into call position right after `f`.
-    for i in 0..n {
+    // Reverse order: dest overlaps src (dest = src + 1).
+    for i in (0..n).rev() {
         l.stack[l.base + 2 + i] = arg(l, i + 1);
     }
     match crate::vm::execute(l, l.base, n, -1) {
@@ -262,11 +273,6 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
 /// `xpcall(f, msgh [, arg...])` — protected call with error handler.
 fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
     let _msgh = arg(l, 1); // error handler (NYI: not invoked on error)
-    let fv = arg(l, 0);
-    let _gf = match fv.as_func() {
-        Some(p) => p,
-        None => return Err(err_bad_arg(l, 1, "xpcall", "function", "")),
-    };
     let n = nargs(l).saturating_sub(2);
     for i in 0..n {
         l.stack[l.base + 2 + i] = arg(l, i + 2);
@@ -289,9 +295,19 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn lib_getmetatable(l: &mut LuaState) -> LuaResult<i32> {
-    let _v = arg(l, 0);
-    // Metatables not yet implemented; return nil.
-    push(l, LuaValue::NIL);
+    let v = arg(l, 0);
+    let mt = crate::meta::metatable_of(l.global(), v);
+    match mt {
+        Some(m) => {
+            let mm = crate::meta::meta_lookup(l.global(), v, crate::runtime::meta::MM::Metatable);
+            if mm.is_nil() {
+                push(l, LuaValue::table(m));
+            } else {
+                push(l, mm);
+            }
+        }
+        None => push(l, LuaValue::NIL),
+    }
     Ok(1)
 }
 

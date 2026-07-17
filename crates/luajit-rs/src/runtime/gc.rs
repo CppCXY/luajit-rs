@@ -403,6 +403,10 @@ pub fn full_gc(g: &mut GlobalState) {
     for mt in g.basemt.iter().flatten() {
         m.mark_table(*mt);
     }
+    // GCROOT_MMNAME: the interned metamethod name strings.
+    for &v in g.mmname.iter() {
+        m.mark_value(v);
+    }
     // gc_traverse_thread for every thread: the whole used stack is marked
     // (frame-link slots decode as harmless numbers), plus the error value
     // and the open-upvalue list. Afterwards every slot above `top` is

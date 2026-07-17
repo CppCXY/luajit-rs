@@ -95,6 +95,9 @@ pub struct GlobalState {
     pub registry: GcPtr<LuaTable>,
     /// Per-type base metatables, indexed by `~itype`.
     pub basemt: [Option<GcPtr<LuaTable>>; ITYPE_COUNT],
+    /// Interned metamethod name strings, indexed by `MM` (LuaJIT's
+    /// `GCROOT_MMNAME` roots, filled by `lj_meta_init`).
+    pub mmname: [LuaValue; crate::runtime::meta::MM_MAX],
     /// Every thread of this universe: the GC's stack roots.
     pub threads: Vec<StateRef>,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
@@ -117,11 +120,18 @@ impl GlobalState {
         let mut heap = GcHeap::default();
         let globals = heap.alloc_table(LuaTable::new(0, 1));
         let registry = heap.alloc_table(LuaTable::new(0, 1));
+        // lj_meta_init: intern the metamethod names once.
+        let mut mmname = [LuaValue::NIL; crate::runtime::meta::MM_MAX];
+        for (i, name) in crate::runtime::meta::MM_NAMES.iter().enumerate() {
+            let sid = heap.intern(name);
+            mmname[i] = heap.str_value(sid);
+        }
         GlobalState {
             heap,
             globals,
             registry,
             basemt: [None; ITYPE_COUNT],
+            mmname,
             threads: Vec::new(),
             boot_time: boot,
             main: None,

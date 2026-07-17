@@ -390,7 +390,7 @@ fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn open(l: &mut LuaState) {
-    lual_reg!(l, b"string", LibTarget::Global)
+    let strtab = lual_reg!(l, b"string", LibTarget::Global)
         .func(b"byte", str_byte)
         .func(b"char", str_char)
         .func(b"dump", str_dump)
@@ -406,4 +406,17 @@ pub fn open(l: &mut LuaState) {
         .func(b"sub", str_sub)
         .func(b"upper", str_upper)
         .build();
+
+    // Base metatable for strings: __index = string table (lib_string.c's
+    // LJLIB_MODULE mt setup: `s:upper()` etc. resolve through it).
+    use crate::meta::MM;
+    use crate::table::LuaTable;
+    use crate::value::LJ_TSTR;
+    let g = l.global();
+    let mt = g.heap.alloc_table(LuaTable::new(0, 1));
+    let key = g.mmname[MM::Index as usize];
+    mt.as_mut().set_str(key, LuaValue::table(strtab));
+    // Negative-cache everything except __index (lib_string.c does the same).
+    mt.as_mut().nomm = !(1u8 << (MM::Index as u8));
+    g.set_basemt(LJ_TSTR, Some(mt));
 }
