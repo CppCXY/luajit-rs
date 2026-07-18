@@ -8,11 +8,9 @@
 //! * `opt_fold`: FOLD/CSE engine (lj_opt_fold.c subset),
 //! * `record`: the bytecode recorder for numeric single-frame traces
 //!   (lj_record.c + lj_snap.c subsets),
-//! * `trace`: the trace compiler state machine (lj_trace.c).
-//!
-//! Completed traces are stored in the registry but not yet executed: the
-//! machine-code backend (lj_asm/lj_mcode) is the next phase, and with it
-//! bytecode patching to the J* opcodes.
+//! * `trace`: the trace compiler state machine (lj_trace.c),
+//! * `asm_x64`: the x86-64 machine code backend (lj_asm subset); traces
+//!   it cannot assemble run on the portable IR executor in `exec`.
 //!
 //! Differences from LuaJIT, by design:
 //! * The hotcount table lives in `JitState` (LuaJIT puts it in `GG_State`
@@ -26,10 +24,14 @@
 //!   bytecode to the non-counting I* variants, which removes the check
 //!   from the hot path for good.
 
+pub mod exec;
 pub mod ir;
+pub mod mcode;
 pub mod opt_fold;
 pub mod record;
 pub mod trace;
+#[cfg(target_arch = "x86_64")]
+pub mod asm_x64;
 
 use crate::bc::BCIns;
 use crate::gc::GcPtr;
@@ -170,13 +172,14 @@ pub fn snap_ref(sn: SnapEntry) -> ir::IRRef {
     sn & 0xffff
 }
 
-/// A completed (or in-progress) trace: LuaJIT's `GCtrace`, minus machine
-/// code until the backend exists.
+/// A completed (or in-progress) trace: LuaJIT's `GCtrace`.
 pub struct GCtrace {
     pub traceno: TraceNo,
     pub ir: ir::IrBuf,
     pub snap: Vec<SnapShot>,
     pub snapmap: Vec<SnapEntry>,
+    /// Assembled machine code (None: run on the portable IR executor).
+    pub mcode: Option<mcode::McodeArea>,
     /// Starting prototype and bytecode index.
     pub startpt: GcPtr<Proto>,
     pub startpc: usize,
@@ -327,6 +330,8 @@ pub struct JitState {
     pub rec: Option<Box<record::Record>>,
     /// Completed traces, indexed by trace number (slot 0 unused).
     pub trace: Vec<Option<Box<GCtrace>>>,
+    /// Scratch value environment of the portable trace executor.
+    pub exec_env: Vec<u64>,
     /// Engine parameters (JIT_P_*).
     pub param: [i32; JIT_P_MAX],
     /// Hot counter hash table (GG_State.hotcount).
@@ -352,6 +357,7 @@ impl JitState {
             err: TraceError::RECERR,
             rec: None,
             trace: vec![None],
+            exec_env: Vec::new(),
             param: JIT_PARAM_DEFAULT,
             hotcount: [0; HOTCOUNT_SIZE],
             penalty: [HotPenalty::default(); PENALTY_SLOTS],

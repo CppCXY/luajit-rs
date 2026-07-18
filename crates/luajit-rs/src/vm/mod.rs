@@ -593,7 +593,9 @@ impl Interp {
         }
         // Comparison + fused following JMP. `op` is the bytecode ordinal
         // (ISLT=0, ISGE=1, ISLE=2, ISGT=3), matching lj_meta_comp's
-        // encoding.
+        // encoding. ISGE/ISGT are the *unordered* comparisons (NaN takes
+        // the jump), because the parser emits them as the negation of
+        // ISLT/ISLE — same as the dasc VMs and rec_comp.
         macro_rules! cmp {
             ($op:expr, $xv:expr, $yv:expr) => {{
                 let xv = $xv;
@@ -602,7 +604,7 @@ impl Interp {
                     let x = xv.num();
                     let y = yv.num();
                     let cond = match $op {
-                        0 => x < y, 1 => x >= y, 2 => x <= y, 3 => x > y,
+                        0 => x < y, 1 => !(x < y), 2 => x <= y, 3 => !(x <= y),
                         _ => unreachable!(),
                     };
                     let jmp = unsafe { *ip };
@@ -1298,6 +1300,33 @@ impl Interp {
                             .runtime_error(b"'for' initial value must be a number"));
                     }
                 }
+                BCOp::JFORI => {
+                    // FORI semantics; on loop entry go straight into the
+                    // trace whose number sits in the JFORL at the target.
+                    let idx = reg!(a + FORL_IDX);
+                    let stop = reg!(a + FORL_STOP);
+                    let step = reg!(a + FORL_STEP);
+                    if idx.is_number() && stop.is_number() && step.is_number() {
+                        let (i, s, st) = (idx.num(), stop.num(), step.num());
+                        setreg!(a + FORL_EXT, LuaValue::number_raw(i));
+                        let enter = if st >= 0.0 { i <= s } else { i >= s };
+                        if enter {
+                            sync!();
+                            let jforl = (self.pc as i64 - 1 + bc_j(ins)) as usize;
+                            let tno = bc_d(self.proto().bc[jforl]);
+                            let r = crate::jit::exec::trace_exec(self.l(), self.base, tno);
+                            self.pc = r.pc;
+                            resync!();
+                        } else {
+                            jump!(ins);
+                        }
+                    } else {
+                        sync!();
+                        return Err(self
+                            .l()
+                            .runtime_error(b"'for' initial value must be a number"));
+                    }
+                }
                 BCOp::FORL | BCOp::IFORL => {
                     // FORL is the hot-counting variant (lj_vm's `hotloop`
                     // macro); IFORL is the blacklisted/non-counting one.
@@ -1319,6 +1348,24 @@ impl Interp {
                     }
                     forl_body!(ins, a);
                 }
+                BCOp::JFORL => {
+                    // IFORL semantics; on loop-taken enter the compiled
+                    // trace (the dasc VMs dispatch to BC_JLOOP).
+                    let i = reg!(a + FORL_IDX).num();
+                    let s = reg!(a + FORL_STOP).num();
+                    let st = reg!(a + FORL_STEP).num();
+                    let ni = i + st;
+                    let cont = if st >= 0.0 { ni <= s } else { ni >= s };
+                    if cont {
+                        let nv = LuaValue::number_raw(ni);
+                        setreg!(a + FORL_IDX, nv);
+                        setreg!(a + FORL_EXT, nv);
+                        sync!();
+                        let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                        self.pc = r.pc;
+                        resync!();
+                    }
+                }
                 BCOp::LOOP | BCOp::ILOOP => {
                     // No-op apart from hot counting (ILOOP: not even that).
                     if !REC
@@ -1331,6 +1378,14 @@ impl Interp {
                         }
                         resync!();
                     }
+                }
+                BCOp::JLOOP => {
+                    // Enter the compiled trace; the interpreter resumes at
+                    // whatever snapshot the trace exits through.
+                    sync!();
+                    let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                    self.pc = r.pc;
+                    resync!();
                 }
                 BCOp::JMP => jump!(ins),
                 BCOp::ISNEXT => jump!(ins),
@@ -1428,10 +1483,7 @@ impl Interp {
                 | BCOp::KCDATA
                 | BCOp::TGETR
                 | BCOp::TSETR
-                | BCOp::JFORI
-                | BCOp::JFORL
                 | BCOp::JITERL
-                | BCOp::JLOOP
                 | BCOp::FUNCF
                 | BCOp::IFUNCF
                 | BCOp::JFUNCF

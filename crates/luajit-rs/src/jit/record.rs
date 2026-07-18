@@ -115,6 +115,7 @@ impl Record {
                 ir: IrBuf::new(parent, exitno),
                 snap: Vec::with_capacity(4),
                 snapmap: Vec::with_capacity(32),
+                mcode: None,
                 startpt: pt,
                 startpc: pc,
                 startins: pt.as_ref().bc[pc],
@@ -778,6 +779,11 @@ impl Record {
             }
             BCOp::IFORL | BCOp::IITERL | BCOp::ILOOP | BCOp::IFUNCF | BCOp::IFUNCV => {
                 return Err(TraceError::BLACKL);
+            }
+            BCOp::JFORI | BCOp::JFORL | BCOp::JITERL | BCOp::JLOOP => {
+                // rec_loop_jit: a root trace hit an inner compiled loop —
+                // better let the inner loop spawn a side trace back here.
+                return Err(TraceError::LINNER);
             }
 
             // Everything else is NYI in Phase 2: calls, returns, tables,
