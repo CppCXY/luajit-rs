@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: windows-x64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.name }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Test (debug, assertions on)
+        run: cargo test --workspace
+
+      - name: Test (release)
+        run: cargo test --release --workspace
+
+      - name: Benchmark smoke test
+        shell: bash
+        run: |
+          set -e
+          check() {
+            got=$(./target/release/luajit-rs "lua_benchmarks/$1" "$2")
+            if [ "$got" != "$3" ]; then
+              echo "MISMATCH in $1: got '$got', want '$3'"
+              exit 1
+            fi
+            echo "$1 ok: $got"
+          }
+          check fannkuch_redux.lua 8 "checksum=1616 max_flips=22 n=8"
+          check spectral_norm.lua 100 "spectral_norm=1.274219991 n=100"
+          check mandelbrot.lua 300 "mandelbrot_sum=1142227 bytes=11400 size=300"
+
+      - name: Benchmark smoke test (portable IR executor)
+        shell: bash
+        run: |
+          set -e
+          export LUAJIT_RS_NOASM=1
+          got=$(./target/release/luajit-rs lua_benchmarks/fannkuch_redux.lua 8)
+          test "$got" = "checksum=1616 max_flips=22 n=8" || { echo "MISMATCH: $got"; exit 1; }
+          echo "portable executor ok: $got"
+
+  cross-check:
+    name: cross-check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - aarch64-pc-windows-msvc
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Check
+        run: cargo check --workspace --all-targets --target ${{ matrix.target }}
