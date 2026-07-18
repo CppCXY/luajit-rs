@@ -94,7 +94,9 @@ fn lib_select(l: &mut LuaState) -> LuaResult<i32> {
     Ok(cnt as i32)
 }
 
-fn lib_next(l: &mut LuaState) -> LuaResult<i32> {
+/// (pub: the JIT's fast-function recorder identifies builtins by their
+/// function pointer.)
+pub fn lib_next(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
     let k = arg(l, 1);
     let tab = match t.as_table() {
@@ -122,7 +124,9 @@ fn lib_pairs(l: &mut LuaState) -> LuaResult<i32> {
     Ok(3)
 }
 
-fn lib_ipairs_iter(l: &mut LuaState) -> LuaResult<i32> {
+/// (pub: the JIT's fast-function recorder identifies builtins by their
+/// function pointer.)
+pub fn lib_ipairs_iter(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
     let i = arg(l, 1).as_number().unwrap_or(0.0) + 1.0;
     let tab = match t.as_table() {

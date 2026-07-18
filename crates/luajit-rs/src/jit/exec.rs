@@ -37,6 +37,10 @@ pub struct ExitResult {
     /// interpreter must shift its base by `baseslot - 2` and reload the
     /// frame's closure before resuming.
     pub baseslot: usize,
+    /// GC-debt exit (IR_GCSTEP): skip exit accounting and side traces —
+    /// the caller must reach a collection point. These exits must never
+    /// be patched over.
+    pub gcexit: bool,
 }
 
 /// Execute trace `traceno` for the frame at `base` and follow the trace
@@ -77,7 +81,7 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
         // from a different trace than it entered: the exit code is
         // `(traceno << 16) | snapidx`. The portable tier restores
         // eagerly.
-        let (exitno, restored) = if let Some(mc) = &tr.mcode {
+        let (exitno, restored, gcexit) = if let Some(mc) = &tr.mcode {
             let entry: extern "C" fn(*mut LuaValue, *mut u64) -> u32 =
                 unsafe { std::mem::transmute(mc.ptr()) };
             let code = entry(
@@ -95,10 +99,25 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
                     &mut *p
                 };
             }
-            (code & 0xffff, false)
+            (code & 0x7fff, false, code & 0x8000 != 0)
         } else {
-            (run_ir(l, base, tr, &mut env).exitno, true)
+            let r = run_ir(l, base, tr, &mut env);
+            (r.exitno, true, r.gcexit)
         };
+
+        if gcexit {
+            // GC-debt exit: no accounting, no side traces — return to
+            // the interpreter, whose boundary check collects.
+            if !restored {
+                restore_snapshot(l, base, tr, &env, exitno);
+            }
+            break ExitResult {
+                pc: tr.snap[exitno].pc as usize,
+                exitno,
+                baseslot: tr.snap[exitno].baseslot as usize,
+                gcexit: true,
+            };
+        }
 
         let (nsnap, linktype, link) = (tr.snap.len(), tr.linktype, tr.link);
         // Follow a side trace linked to this exit. (Machine-code parents
@@ -143,6 +162,7 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             pc: tr.snap[exitno].pc as usize,
             exitno,
             baseslot: tr.snap[exitno].baseslot as usize,
+            gcexit: false,
         };
     };
     let g = l.global();
@@ -224,7 +244,45 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
                 }
-                IROp::CARG => {} // Consumed by HSTORE.
+                IROp::ALOAD => {
+                    // Inlined array-part load: guard the key is an exact
+                    // int inside the array, then read through aptr.
+                    let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
+                    let t = tv.as_table().expect("ALOAD on a non-table");
+                    let kn = f64::from_bits(val(env, ins.op2 as IRRef));
+                    let ki = kn as i32;
+                    if ki as f64 != kn || ki < 0 || (ki as u32) >= t.as_ref().asize {
+                        return exit_snapshot(l, base, tr, env, snapidx);
+                    }
+                    let v = unsafe { *t.as_ref().aptr.add(ki as usize) };
+                    if !typecheck(v, ins.t()) {
+                        return exit_snapshot(l, base, tr, env, snapidx);
+                    }
+                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                }
+                IROp::ASTORE => {
+                    let carg = *ir.ir(ins.op2 as IRRef);
+                    debug_assert_eq!(carg.op(), IROp::CARG);
+                    let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
+                    let t = tv.as_table().expect("ASTORE on a non-table");
+                    let kn = f64::from_bits(val(env, carg.op1 as IRRef));
+                    let ki = kn as i32;
+                    if ki as f64 != kn || ki <= 0 || (ki as u32) >= t.as_ref().asize {
+                        return exit_snapshot(l, base, tr, env, snapidx);
+                    }
+                    let v = LuaValue::from_bits(val(env, carg.op2 as IRRef));
+                    unsafe { *t.as_ref().aptr.add(ki as usize) = v };
+                }
+                IROp::GCSTEP => {
+                    // GC-debt guard: leave the trace when a collection
+                    // is due (the boundary check then collects).
+                    if l.global().heap.should_collect() {
+                        let mut r = exit_snapshot(l, base, tr, env, snapidx);
+                        r.gcexit = true;
+                        return r;
+                    }
+                }
+                IROp::CARG => {} // Consumed by HSTORE/CALLL.
                 IROp::HSTORE => {
                     let carg = *ir.ir(ins.op2 as IRRef);
                     debug_assert_eq!(carg.op(), IROp::CARG);
@@ -233,6 +291,62 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         val(env, carg.op1 as IRRef),
                         val(env, carg.op2 as IRRef),
                     );
+                }
+                IROp::CALLL => {
+                    let carg = *ir.ir(ins.op1 as IRRef);
+                    debug_assert_eq!(carg.op(), IROp::CARG);
+                    let (x, y) =
+                        (val(env, carg.op1 as IRRef), val(env, carg.op2 as IRRef));
+                    let bits = match ins.op2 as u32 {
+                        super::record::IRCALL_TAB_NEXTK => jit_tnextk(x, y),
+                        super::record::IRCALL_FMOD => jit_fmod(x, y),
+                        _ => unreachable!("bad IRCALL index"),
+                    };
+                    let v = LuaValue::from_bits(bits);
+                    if ins.is_guard() && !typecheck(v, ins.t()) {
+                        return exit_snapshot(l, base, tr, env, snapidx);
+                    }
+                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                }
+                IROp::TOBIT => {
+                    // Wrapping num -> int32 (num2bit); the recorder's
+                    // range guards keep this inside the exact window.
+                    let x = f64::from_bits(val(env, ins.op1 as IRRef));
+                    let z = crate::stdlib::bit::num2bit(x) as f64;
+                    env[(r - REF_BIAS) as usize] = z.to_bits();
+                }
+                IROp::BSWAP => {
+                    let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
+                    env[(r - REF_BIAS) as usize] = ((x.swap_bytes()) as f64).to_bits();
+                }
+                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
+                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT => {
+                    // Fused num -> int32 -> op -> num, mirroring the
+                    // interpreter's coercions (operands are range-guarded).
+                    let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
+                    let z: f64 = match op {
+                        IROp::BNOT => (!x) as f64,
+                        IROp::BAND => {
+                            (x & f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64
+                        }
+                        IROp::BOR => {
+                            (x | f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64
+                        }
+                        IROp::BXOR => {
+                            (x ^ f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64
+                        }
+                        _ => {
+                            let sh = (f64::from_bits(val(env, ins.op2 as IRRef)) as u32) & 31;
+                            match op {
+                                IROp::BSHL => (x << sh) as f64,
+                                IROp::BSHR => ((x as u32) >> sh) as f64,
+                                IROp::BROL => ((x as u32).rotate_left(sh) as i32) as f64,
+                                IROp::BROR => ((x as u32).rotate_right(sh) as i32) as f64,
+                                _ => (x >> sh) as f64,
+                            }
+                        }
+                    };
+                    env[(r - REF_BIAS) as usize] = z.to_bits();
                 }
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::POW
                 | IROp::MIN | IROp::MAX => {
@@ -376,6 +490,7 @@ fn exit_snapshot(
         pc: tr.snap[snapidx].pc as usize,
         exitno: snapidx,
         baseslot: tr.snap[snapidx].baseslot as usize,
+        gcexit: false,
     }
 }
 
@@ -437,4 +552,26 @@ pub extern "C" fn jit_tset(tab_bits: u64, key_bits: u64, val_bits: u64) {
     } else {
         t.as_mut().set(k, v);
     }
+}
+
+/// Table-traversal step (`lj_tab_next`'s key half): the next key after
+/// `key`, or nil at the end. The value is re-fetched with a plain HLOAD
+/// of the returned key.
+pub extern "C" fn jit_tnextk(tab_bits: u64, key_bits: u64) -> u64 {
+    let t = LuaValue::from_bits(tab_bits).as_table().expect("NEXTK on a non-table");
+    match t.as_ref().next(LuaValue::from_bits(key_bits)) {
+        Some((k, _)) => k.to_bits(),
+        None => LuaValue::NIL.to_bits(),
+    }
+}
+
+/// `x ^ y` with the interpreter's vm_pow semantics (raw result bits).
+pub extern "C" fn jit_pow(a_bits: u64, b_bits: u64) -> u64 {
+    crate::vm::vm_pow(f64::from_bits(a_bits), f64::from_bits(b_bits)).to_bits()
+}
+
+/// math.fmod: `x % y` pushed through LuaValue::number (normalizes -0.0
+/// and NaN), mirroring the builtin bit for bit.
+pub extern "C" fn jit_fmod(a_bits: u64, b_bits: u64) -> u64 {
+    LuaValue::number(f64::from_bits(a_bits) % f64::from_bits(b_bits)).to_bits()
 }

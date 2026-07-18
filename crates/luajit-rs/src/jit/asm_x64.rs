@@ -46,7 +46,6 @@ const FRAME_SIZE: u32 = 160;
 /// Fixed-role GPRs, volatile in both ABIs.
 const RAX: u8 = 0;
 const RCX: u8 = 1;
-#[cfg(windows)]
 const RDX: u8 = 2;
 #[cfg(not(windows))]
 const RDI: u8 = 7;
@@ -168,6 +167,9 @@ struct Asm<'a> {
 struct Stub {
     snapidx: usize,
     flush: Vec<(u8, IRRef)>,
+    /// GC-debt exit (IR_GCSTEP): flagged in the exit code and never
+    /// patched over by side traces.
+    gc: bool,
 }
 
 impl<'a> Asm<'a> {
@@ -229,6 +231,28 @@ impl<'a> Asm<'a> {
                         a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
                     }
                 }
+                IROp::CALLL => {} // Arguments are marked by the CARG arm.
+                IROp::ALOAD => {
+                    // Table via env/GPR, key via xmm.
+                    if ins.op1 as IRRef >= REF_BIAS {
+                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                    }
+                    a.mark_use(ins.op2 as IRRef, r);
+                }
+                IROp::ASTORE => {
+                    if ins.op1 as IRRef >= REF_BIAS {
+                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                    }
+                    // Key/value are marked (and env-pinned) by the CARG arm.
+                }
+                IROp::GCSTEP => {} // Both operands are address constants.
+                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
+                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT => {
+                    a.mark_use(ins.op1 as IRRef, r);
+                    if ins.op2 != 0 {
+                        a.mark_use(ins.op2 as IRRef, r);
+                    }
+                }
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX
                 | IROp::NEG => {
                     a.mark_use(ins.op1 as IRRef, r);
@@ -246,6 +270,17 @@ impl<'a> Asm<'a> {
                     a.mark_use(ins.op1 as IRRef, r);
                     a.mark_use(ins.op2 as IRRef, r);
                 }
+                IROp::POW => {
+                    // Helper call: both operands are passed as env bits.
+                    for op in [ins.op1 as IRRef, ins.op2 as IRRef] {
+                        a.mark_use(op, r);
+                        if op >= REF_BIAS {
+                            a.needs_env[Self::iidx(op)] = true;
+                        }
+                    }
+                }
+                IROp::TOBIT => a.mark_use(ins.op1 as IRRef, r),
+                IROp::BSWAP => a.mark_use(ins.op1 as IRRef, r),
                 IROp::EQ | IROp::NE => {
                     a.mark_use(ins.op1 as IRRef, r);
                     a.mark_use(ins.op2 as IRRef, r);
@@ -349,6 +384,7 @@ impl<'a> Asm<'a> {
         let head = self.code.len();
 
         let nins = self.tr.ir.nins();
+        let trdump = std::env::var("LUAJIT_RS_TRDUMP").is_ok();
         let mut r = REF_FIRST;
         while r < nins {
             // Same covering-snapshot rule as the portable executor.
@@ -359,6 +395,18 @@ impl<'a> Asm<'a> {
             }
             self.cur = r;
             let ins = *self.tr.ir.ir(r);
+            if trdump {
+                eprintln!(
+                    "  tr{} {:#05x} {:04} {:?} {} {} t={}",
+                    self.tr.traceno,
+                    self.code.len(),
+                    r - REF_BIAS,
+                    ins.op(),
+                    ins.op1 as i32 - REF_BIAS as i32,
+                    ins.op2 as i32 - REF_BIAS as i32,
+                    ins.t(),
+                );
+            }
             match ins.op() {
                 IROp::NOP | IROp::BASE => {}
                 IROp::LOOP => self.asm_loop_head(),
@@ -367,8 +415,18 @@ impl<'a> Asm<'a> {
                 IROp::ULOAD => self.asm_uload(&ins)?,
                 IROp::FLOAD => self.asm_meta_guard(&ins),
                 IROp::HLOAD => self.asm_hload(&ins)?,
-                IROp::CARG => {} // Consumed by HSTORE.
+                IROp::CARG => {} // Consumed by HSTORE/CALLL/ASTORE.
                 IROp::HSTORE => self.asm_hstore(&ins),
+                IROp::CALLL => self.asm_calll(&ins)?,
+                IROp::ALOAD => self.asm_aload(&ins)?,
+                IROp::ASTORE => self.asm_astore(&ins)?,
+                IROp::GCSTEP => self.asm_gcstep(&ins),
+                IROp::POW => self.asm_pow(&ins)?,
+                IROp::TOBIT => self.asm_tobit(&ins)?,
+                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
+                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT | IROp::BSWAP => {
+                    self.asm_bitop(&ins)?
+                }
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX => {
                     self.asm_arith(&ins)?
                 }
@@ -451,8 +509,13 @@ impl<'a> Asm<'a> {
                 self.movsd_store(RENV, Self::env_disp(fr), rg);
             }
             let tail = self.code.len();
-            self.stub_tails.push((st.snapidx as u32, tail as u32));
-            self.mov_eax_imm(self.exit_code(st.snapidx));
+            let mut code = self.exit_code(st.snapidx);
+            if st.gc {
+                code |= 0x8000; // GC exits are flagged and never patched.
+            } else {
+                self.stub_tails.push((st.snapidx as u32, tail as u32));
+            }
+            self.mov_eax_imm(code);
             self.code.push(0xE9);
             let rel = epilogue as i64 - (self.code.len() as i64 + 4);
             self.emit_u32(rel as i32 as u32);
@@ -634,6 +697,27 @@ impl<'a> Asm<'a> {
     fn asm_hload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let addr = super::exec::jit_tget as usize as u64;
         self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
+        self.ff_result(ins)
+    }
+
+    /// CALLL: guarded helper calls with a CARG argument tuple, selected
+    /// by the IRCALL index in op2.
+    fn asm_calll(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let carg = *self.tr.ir.ir(ins.op1 as IRRef);
+        debug_assert_eq!(carg.op(), IROp::CARG);
+        let addr = match ins.op2 as u32 {
+            super::record::IRCALL_TAB_NEXTK => super::exec::jit_tnextk as usize as u64,
+            super::record::IRCALL_FMOD => super::exec::jit_fmod as usize as u64,
+            _ => unreachable!("bad IRCALL index"),
+        };
+        self.helper_call(addr, &[carg.op1 as IRRef, carg.op2 as IRRef]);
+        self.ff_result(ins)
+    }
+
+    /// Shared tail of the helper-returning ops: typecheck the value bits
+    /// in rax against the instruction's guarded type, then land the
+    /// result (xmm for numbers, env for GC bits).
+    fn ff_result(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let t = ins.t();
         let i = Self::iidx(self.cur);
         if irt_isnum(t) {
@@ -674,6 +758,67 @@ impl<'a> Asm<'a> {
             self.sar_r64_imm(RCX, 47);
             self.cmp_r32_imm8(RCX, !(ty as u32) as i8);
             self.guard(CC_NE);
+        }
+        Ok(())
+    }
+
+    /// Fused bit ops: convert the (range-guarded) operands with
+    /// cvttsd2si, run the 32-bit ALU op, convert back.
+    fn asm_bitop(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let op = ins.op();
+        // Fetch both operands before the rax conversion: materializing
+        // an xmm constant goes through rax.
+        let sx = self.fetch_xmm(ins.op1 as IRRef, 0)?;
+        if !matches!(op, IROp::BNOT | IROp::BSWAP) {
+            let sy = if ins.op2 == ins.op1 {
+                sx
+            } else {
+                self.fetch_xmm(ins.op2 as IRRef, pin(sx))?
+            };
+            self.cvttsd2si_r32(RAX, sx);
+            self.cvttsd2si_r32(RCX, sy);
+        } else {
+            self.cvttsd2si_r32(RAX, sx);
+        }
+        match op {
+            IROp::BNOT => self.code.extend_from_slice(&[0xF7, 0xD0]), // not eax
+            IROp::BSWAP => self.code.extend_from_slice(&[0x0F, 0xC8]), // bswap eax
+            IROp::BAND => self.code.extend_from_slice(&[0x21, 0xC8]), // and eax, ecx
+            IROp::BOR => self.code.extend_from_slice(&[0x09, 0xC8]),  // or eax, ecx
+            IROp::BXOR => self.code.extend_from_slice(&[0x31, 0xC8]), // xor eax, ecx
+            IROp::BSHL => self.code.extend_from_slice(&[0xD3, 0xE0]), // shl eax, cl
+            IROp::BSHR => self.code.extend_from_slice(&[0xD3, 0xE8]), // shr eax, cl
+            IROp::BROL => self.code.extend_from_slice(&[0xD3, 0xC0]), // rol eax, cl
+            IROp::BROR => self.code.extend_from_slice(&[0xD3, 0xC8]), // ror eax, cl
+            _ => self.code.extend_from_slice(&[0xD3, 0xF8]),          // sar eax, cl
+        }
+        let d = self.alloc(0)?;
+        self.cvtsi2sd_r32(d, RAX);
+        self.def(d);
+        Ok(())
+    }
+
+    /// TOBIT: wrapping num -> int32 -> num. Inside the recorder's range
+    /// guards, cvtsd2si (round-to-nearest-even) matches num2bit exactly.
+    fn asm_tobit(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let sx = self.fetch_xmm(ins.op1 as IRRef, 0)?;
+        self.cvtsd2si_r32(RAX, sx);
+        let d = self.alloc(0)?;
+        self.cvtsi2sd_r32(d, RAX);
+        self.def(d);
+        Ok(())
+    }
+
+    /// POW: the interpreter's vm_pow via a helper call (raw bits in and
+    /// out; the result is always a number, no guard).
+    fn asm_pow(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let addr = super::exec::jit_pow as usize as u64;
+        self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
+        let i = Self::iidx(self.cur);
+        if self.last_use[i] != 0 || self.needs_env[i] {
+            let d = self.alloc(0)?;
+            self.movq_xmm_gpr(d, RAX);
+            self.def(d);
         }
         Ok(())
     }
@@ -726,6 +871,76 @@ impl<'a> Asm<'a> {
         self.code.extend_from_slice(&[0x48, 0x83, 0xC4, adj]); // add rsp, adj
         // pop r11; pop r10
         self.code.extend_from_slice(&[0x41, 0x5B, 0x41, 0x5A]);
+    }
+
+    /// Load the table pointer (NaN-boxed bits -> masked pointer) into rax
+    /// and the (guarded exact-int) key into ecx. Shared head of the
+    /// inlined array ops: exits when the key is not an exact int32 or
+    /// (unsigned compare, covering negatives) not below tab.asize.
+    fn asm_array_head(&mut self, tab: IRRef, key: IRRef) -> Result<(), TraceError> {
+        const ASIZE_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, asize) as i32;
+        // Fetch the key first: materializing an xmm constant goes
+        // through rax, which must not hold the table pointer yet.
+        let sk = self.fetch_xmm(key, 0)?;
+        self.gpr_load_ref(RAX, tab);
+        self.mov_r64_imm64(RCX, crate::value::LJ_GCVMASK);
+        self.and_rr64(RAX, RCX);
+        self.cvttsd2si_r32(RCX, sk);
+        self.cvtsi2sd_r32(XMM_SCRATCH, RCX);
+        self.sse_rr(0x66, 0x2E, XMM_SCRATCH, sk); // ucomisd: exact int?
+        self.guard(CC_P);
+        self.guard(CC_NE);
+        self.cmp_r32_mem(RCX, RAX, ASIZE_OFF);
+        self.guard(CC_AE);
+        Ok(())
+    }
+
+    /// ALOAD: inlined array-part load (`aptr[key]`) plus the shared
+    /// result typecheck.
+    fn asm_aload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
+        self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
+        self.mov_r64_mem(RAX, RAX, APTR_OFF);
+        self.mov_r64_sib(RAX, RAX, RCX); // value bits
+        self.ff_result(ins)
+    }
+
+    /// ASTORE: inlined array-part store (set_int's `k > 0 && k < asize`
+    /// fast path — never allocates).
+    fn asm_astore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
+        let carg = *self.tr.ir.ir(ins.op2 as IRRef);
+        debug_assert_eq!(carg.op(), IROp::CARG);
+        self.asm_array_head(ins.op1 as IRRef, carg.op1 as IRRef)?;
+        // set_int additionally requires k > 0.
+        self.code.extend_from_slice(&[0x85, 0xC9]); // test ecx, ecx
+        self.guard(CC_E);
+        self.mov_r64_mem(RAX, RAX, APTR_OFF);
+        let val = carg.op2 as IRRef;
+        if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
+            self.movsd_store_sib(RAX, RCX, sv);
+        } else {
+            self.gpr_load_ref(RDX, val);
+            self.mov_sib_r64(RAX, RCX, RDX);
+        }
+        Ok(())
+    }
+
+    /// IR_GCSTEP: exit when a collection is due. Mirrors the trigger sum
+    /// minus the string bytes (strings never grow on-trace):
+    /// `heap.total + TABLE_EXTRA >= heap.threshold`.
+    fn asm_gcstep(&mut self, ins: &IRIns) {
+        let total_addr = super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let thres_addr = super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
+        // Thread-local cell: the trace is bound to this VM thread.
+        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
+        self.mov_r64_imm64(RAX, total_addr);
+        self.mov_r64_mem(RAX, RAX, 0);
+        self.mov_r64_imm64(RCX, extra_addr);
+        self.add_r64_mem(RAX, RCX, 0);
+        self.mov_r64_imm64(RCX, thres_addr);
+        self.cmp_r64_mem(RAX, RCX, 0);
+        self.guard_gc(CC_AE);
     }
 
     fn asm_arith(&mut self, ins: &IRIns) -> Result<(), TraceError> {
@@ -1292,6 +1507,42 @@ impl<'a> Asm<'a> {
         self.modrm(3, dst, src);
     }
 
+    /// cvttsd2si r32, xmm (F2 0F 2C /r): f64 -> i32, truncating.
+    fn cvttsd2si_r32(&mut self, dst: u8, src: u8) {
+        self.code.push(0xF2);
+        let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code.push(0x0F);
+        self.code.push(0x2C);
+        self.modrm(3, dst, src);
+    }
+
+    /// cvtsd2si r32, xmm (F2 0F 2D /r): f64 -> i32, round-to-nearest.
+    fn cvtsd2si_r32(&mut self, dst: u8, src: u8) {
+        self.code.push(0xF2);
+        let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code.push(0x0F);
+        self.code.push(0x2D);
+        self.modrm(3, dst, src);
+    }
+
+    /// cvtsi2sd xmm, r32 (F2 0F 2A /r): i32 -> f64 (always exact).
+    fn cvtsi2sd_r32(&mut self, dst: u8, src: u8) {
+        self.code.push(0xF2);
+        let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code.push(0x0F);
+        self.code.push(0x2A);
+        self.modrm(3, dst, src);
+    }
+
     fn mov_rr64(&mut self, dst: u8, src: u8) {
         self.code.push(0x48 | (((src >> 3) & 1) << 2) | ((dst >> 3) & 1));
         self.code.push(0x89);
@@ -1369,21 +1620,80 @@ impl<'a> Asm<'a> {
         self.mem(7, base, disp);
         self.code.push(imm as u8);
     }
+    /// cmp r32, dword [base+disp] (3B /r).
+    fn cmp_r32_mem(&mut self, reg: u8, base: u8, disp: i32) {
+        let rex = 0x40 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code.push(0x3B);
+        self.mem(reg, base, disp);
+    }
+    /// cmp r64, qword [base+disp] (REX.W 3B /r).
+    fn cmp_r64_mem(&mut self, reg: u8, base: u8, disp: i32) {
+        self.code.push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
+        self.code.push(0x3B);
+        self.mem(reg, base, disp);
+    }
+    /// add r64, qword [base+disp] (REX.W 03 /r).
+    fn add_r64_mem(&mut self, reg: u8, base: u8, disp: i32) {
+        self.code.push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
+        self.code.push(0x03);
+        self.mem(reg, base, disp);
+    }
+    /// ModRM+SIB for [base + index*8] (both registers below r8, disp 0).
+    fn sib8(&mut self, reg: u8, base: u8, index: u8) {
+        debug_assert!(base < 8 && index < 8 && base & 7 != 5);
+        self.modrm(0, reg, 4);
+        self.code.push((3 << 6) | ((index & 7) << 3) | (base & 7));
+    }
+    /// mov r64, [base + index*8] (REX.W 8B /r + SIB).
+    fn mov_r64_sib(&mut self, dst: u8, base: u8, index: u8) {
+        self.code.push(0x48 | ((dst >> 3) << 2));
+        self.code.push(0x8B);
+        self.sib8(dst, base, index);
+    }
+    /// mov [base + index*8], r64 (REX.W 89 /r + SIB).
+    fn mov_sib_r64(&mut self, base: u8, index: u8, src: u8) {
+        self.code.push(0x48 | ((src >> 3) << 2));
+        self.code.push(0x89);
+        self.sib8(src, base, index);
+    }
+    /// movsd [base + index*8], xmm (F2 0F 11 /r + SIB).
+    fn movsd_store_sib(&mut self, base: u8, index: u8, src: u8) {
+        self.code.push(0xF2);
+        if src >= 8 {
+            self.code.push(0x44); // REX.R
+        }
+        self.code.push(0x0F);
+        self.code.push(0x11);
+        self.sib8(src, base, index);
+    }
 
     /// Emit a guard branch to a fresh exit stub for the covering
     /// snapshot, capturing which snapshot values must be flushed from
     /// registers to env when this exact exit is taken.
     fn guard(&mut self, cc: u8) {
-        let stub = self.make_stub();
+        let stub = self.make_stub(false);
         self.code.push(0x0F);
         self.code.push(0x80 | cc);
         self.fixups.push((self.code.len(), stub));
         self.emit_u32(0);
     }
 
-    fn make_stub(&mut self) -> usize {
+    /// Like `guard`, but for GC-debt exits: the exit code carries the GC
+    /// flag and the stub is never patched over by side traces.
+    fn guard_gc(&mut self, cc: u8) {
+        let stub = self.make_stub(true);
+        self.code.push(0x0F);
+        self.code.push(0x80 | cc);
+        self.fixups.push((self.code.len(), stub));
+        self.emit_u32(0);
+    }
+
+    fn make_stub(&mut self, gc: bool) -> usize {
         let flush = self.exit_flush_set(self.snapidx);
-        self.stubs.push(Stub { snapidx: self.snapidx, flush });
+        self.stubs.push(Stub { snapidx: self.snapidx, flush, gc });
         self.stubs.len() - 1
     }
 

@@ -51,7 +51,12 @@ pub struct LuaTable {
     array: Vec<LuaValue>,
     /// Hash part; length is `hmask + 1` (or `1` when empty).
     node: Vec<Node>,
-    asize: u32,
+    /// (pub(crate): the JIT's inlined array path reads this field at a
+    /// fixed offset.)
+    pub(crate) asize: u32,
+    /// JIT mirror of `array.as_ptr()` (the machine code cannot see into
+    /// `Vec`); kept in sync by `sync_aptr` at every reallocation point.
+    pub(crate) aptr: *mut LuaValue,
     hmask: u32,
     /// Top of the free-node search (index just past the last free node).
     freetop: u32,
@@ -60,6 +65,17 @@ pub struct LuaTable {
     /// fresh tables; cleared by any string-key write.
     pub nomm: u8,
     pub metatable: Option<GcPtr<LuaTable>>,
+}
+
+thread_local! {
+    /// Bytes of table array/hash growth since the last full GC. Growth
+    /// happens without heap access (plain `Vec` reallocation), so the
+    /// debt is tracked per VM thread and folded into `should_collect`;
+    /// `full_gc` resets it after re-estimating the live total (which
+    /// includes the grown capacities via `gc_size`). Thread-local: each
+    /// `Lua` instance is thread-bound, and compiled traces bake the
+    /// counter's address in.
+    pub static TABLE_EXTRA: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Default for LuaTable {
@@ -79,6 +95,7 @@ impl LuaTable {
             array: vec![LuaValue::NIL; asize as usize],
             node: Vec::new(),
             asize,
+            aptr: std::ptr::null_mut(),
             hmask: 0,
             freetop: 0,
             nomm: !0,
@@ -89,7 +106,16 @@ impl LuaTable {
         } else {
             t.node = vec![Node::EMPTY]; // shared nil node
         }
+        t.sync_aptr();
         t
+    }
+
+    /// Refresh the JIT mirror of the array data pointer. Must run after
+    /// anything that may reallocate `array` (the heap buffer address is
+    /// stable across moves of the `LuaTable` value itself).
+    #[inline]
+    fn sync_aptr(&mut self) {
+        self.aptr = self.array.as_ptr() as *mut LuaValue;
     }
 
     pub fn asize(&self) -> u32 {
@@ -194,6 +220,7 @@ impl LuaTable {
     #[inline]
     pub fn get_int(&self, k: i32) -> LuaValue {
         if k >= 0 && (k as u32) < self.asize {
+            debug_assert!(std::ptr::eq(self.aptr, self.array.as_ptr() as *mut _));
             return self.array[k as usize];
         }
         self.get(LuaValue::number(k as f64))
@@ -246,6 +273,7 @@ impl LuaTable {
     #[inline]
     pub fn set_int(&mut self, k: i32, v: LuaValue) {
         if k > 0 && (k as u32) < self.asize {
+            debug_assert!(std::ptr::eq(self.aptr, self.array.as_ptr() as *mut _));
             self.array[k as usize] = v;
             return;
         }
@@ -368,6 +396,7 @@ impl LuaTable {
             array: self.array.clone(),
             node: self.node.clone(),
             asize: self.asize,
+            aptr: std::ptr::null_mut(),
             hmask: self.hmask,
             freetop: self.freetop,
             nomm: 0, // Keys with metamethod names may be present (lj_tab_dup).
@@ -383,6 +412,7 @@ impl LuaTable {
                 nd.val = LuaValue::NIL;
             }
         }
+        t.sync_aptr();
         t
     }
 
@@ -484,9 +514,13 @@ impl LuaTable {
     // -- Resizing --------------------------------------------------------
 
     /// Resize to the given array/hash sizes, reinserting existing entries.
-    /// Ported from `lj_tab_resize`.
+    /// Ported from `lj_tab_resize`. All array/hash reallocation funnels
+    /// through here: the JIT array-pointer mirror and the GC growth debt
+    /// are maintained at this choke point.
     pub fn resize(&mut self, asize: u32, hbits: u32) {
         assert!(asize <= LJ_MAX_ASIZE, "table overflow");
+        let oldcap = self.array.capacity() * std::mem::size_of::<LuaValue>()
+            + self.node.capacity() * std::mem::size_of::<Node>();
         let oldasize = self.asize;
         let oldnode = std::mem::take(&mut self.node);
         let oldhmask = self.hmask;
@@ -524,6 +558,13 @@ impl LuaTable {
                     self.set(nd.key, nd.val);
                 }
             }
+        }
+
+        self.sync_aptr();
+        let newcap = self.array.capacity() * std::mem::size_of::<LuaValue>()
+            + self.node.capacity() * std::mem::size_of::<Node>();
+        if newcap > oldcap {
+            TABLE_EXTRA.with(|c| c.set(c.get() + (newcap - oldcap)));
         }
     }
 

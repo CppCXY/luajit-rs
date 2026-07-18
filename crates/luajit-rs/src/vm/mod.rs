@@ -1322,6 +1322,7 @@ impl Interp {
                             if self.rec_started() {
                                 return Ok(Flow::Rec); // Hot exit: record a side trace.
                             }
+                            self.gc_check();
                             resync!();
                             continue;
                         } else {
@@ -1376,6 +1377,7 @@ impl Interp {
                         if self.rec_started() {
                             return Ok(Flow::Rec); // Hot exit: record a side trace.
                         }
+                        self.gc_check();
                         resync!();
                     }
                 }
@@ -1404,6 +1406,7 @@ impl Interp {
                     if self.rec_started() {
                         return Ok(Flow::Rec); // Hot exit: record a side trace.
                     }
+                    self.gc_check();
                     resync!();
                 }
                 BCOp::JMP => jump!(ins),
@@ -1428,6 +1431,25 @@ impl Interp {
                         resync!();
                     }
                     iterl_body!(ins, a);
+                }
+                BCOp::JITERL => {
+                    // ITERL semantics; on loop-back enter the compiled
+                    // trace (D holds the trace number, not a jump).
+                    let first = reg!(a);
+                    if !first.is_nil() {
+                        setreg!(a - 1, first);
+                        sync!();
+                        let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                        self.pc = r.pc;
+                        if r.baseslot != 2 {
+                            self.trace_exit_frame(r.baseslot);
+                        }
+                        if self.rec_started() {
+                            return Ok(Flow::Rec); // Hot exit: record a side trace.
+                        }
+                        self.gc_check();
+                        resync!();
+                    }
                 }
                 BCOp::VARG => {
                     let link = unsafe { (*bp.sub(1)).to_bits() };
@@ -1459,7 +1481,7 @@ impl Interp {
                 BCOp::BNOT => {
                     let v = reg!(bc_d(ins));
                     let n = if v.is_number() { v.num() as i32 } else { 0 };
-                    setreg!(a, LuaValue::number(n as f64));
+                    setreg!(a, LuaValue::number(!n as f64));
                 }
                 BCOp::BAND => {
                     let xv = reg!(bc_b(ins));
@@ -1502,7 +1524,6 @@ impl Interp {
                 | BCOp::KCDATA
                 | BCOp::TGETR
                 | BCOp::TSETR
-                | BCOp::JITERL
                 | BCOp::FUNCF
                 | BCOp::IFUNCF
                 | BCOp::JFUNCF

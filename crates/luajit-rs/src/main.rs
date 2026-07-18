@@ -238,8 +238,55 @@ fn run_args(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) -> i3
     0
 }
 
-fn handle_script(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) -> i32 {
-    if argn >= argv.len() { return 0; }
+#[cfg(windows)]
+fn install_crash_handler() {
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut ExceptionRecord,
+        address: *mut u8,
+        num_params: u32,
+        info: [usize; 15],
+    }
+    #[repr(C)]
+    struct ExceptionPointers {
+        record: *mut ExceptionRecord,
+        context: *mut u8,
+    }
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            f: extern "system" fn(*mut ExceptionPointers) -> i32,
+        ) -> usize;
+    }
+    extern "system" fn filter(ep: *mut ExceptionPointers) -> i32 {
+        unsafe {
+            let rec = &*(*ep).record;
+            if rec.code != 0xC0000005 {
+                return 0; // EXCEPTION_CONTINUE_SEARCH
+            }
+            // CONTEXT.Rip is at offset 0xF8 on x64.
+            let rip = *((*ep).context.add(0xF8) as *const u64);
+            let rsp = *((*ep).context.add(0x98) as *const u64);
+            let fault = if rec.num_params >= 2 { rec.info[1] } else { 0 };
+            eprintln!(
+                "CRASH code={:#x} rip={:#x} rsp={:#x} access={} fault_addr={:#x}",
+                rec.code,
+                rip,
+                rsp,
+                if rec.num_params >= 1 { rec.info[0] } else { 99 },
+                fault,
+            );
+            std::process::exit(3);
+        }
+    }
+    unsafe {
+        AddVectoredExceptionHandler(1, filter);
+    }
+}
+
+fn handle_script(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) -> i32 {    if argn >= argv.len() { return 0; }
     let name = argv[argn].as_str();
     if name == "-" {
         let mut src = Vec::new();
@@ -253,6 +300,8 @@ fn handle_script(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) 
 }
 
 fn main() {
+    #[cfg(windows)]
+    install_crash_handler();
     let args: Vec<String> = std::env::args().collect();
 
     let flags = match collectargs(&args) {
@@ -266,6 +315,9 @@ fn main() {
 
     let mut lua = luajit_rs::state::Lua::new();
     luajit_rs::open_libs(lua.main());
+    if std::env::var("LUAJIT_RS_JIT").as_deref() == Ok("off") {
+        lua.global().jit.set_on(false);
+    }
 
     if !flags.noenv {
         if let Ok(init) = std::env::var("LUA_INIT") {

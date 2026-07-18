@@ -66,7 +66,7 @@ fn math_atan2(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn math_fmod(l: &mut LuaState) -> LuaResult<i32> {
+pub fn math_fmod(l: &mut LuaState) -> LuaResult<i32> {
     let x = match arg(l, 0).as_number() {
         Some(n) => n,
         None => return Err(err_bad_arg(l, 1, "math.fmod", "number", "")),
@@ -126,7 +126,7 @@ fn math_logx(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn math_max(l: &mut LuaState) -> LuaResult<i32> {
+pub fn math_max(l: &mut LuaState) -> LuaResult<i32> {
     let n = nargs(l);
     if n == 0 {
         push(l, LuaValue::number(f64::NEG_INFINITY));
@@ -147,7 +147,7 @@ fn math_max(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn math_min(l: &mut LuaState) -> LuaResult<i32> {
+pub fn math_min(l: &mut LuaState) -> LuaResult<i32> {
     let n = nargs(l);
     if n == 0 {
         push(l, LuaValue::number(f64::INFINITY));

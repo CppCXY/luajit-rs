@@ -8,6 +8,7 @@
 //! so C functions never need to clone read-only string data.
 
 pub mod base;
+pub mod bit;
 pub mod coroutine;
 pub mod math;
 pub mod os;
@@ -158,5 +159,6 @@ pub fn open_libs(l: &mut LuaState) {
     string::open(l);
     table::open(l);
     math::open(l);
+    bit::open(l);
     os::open(l);
 }

@@ -402,6 +402,10 @@ pub fn tref_isnum(tr: TRef) -> bool {
     tref_type(tr) == IRT_NUM
 }
 #[inline]
+pub fn tref_isnil(tr: TRef) -> bool {
+    tref_type(tr) == IRT_NIL
+}
+#[inline]
 pub fn tref_isint(tr: TRef) -> bool {
     tref_type(tr) == IRT_INT
 }

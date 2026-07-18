@@ -107,10 +107,10 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
     js.startpc = pc;
     js.startins = startins;
 
-    // Phase 2 recorder handles FORL/LOOP/FUNCF roots; penalize the rest
-    // (ITERL/ITERN roots arrive with iterator recording). Side traces
+    // Phase 2 recorder handles FORL/LOOP/ITERL/FUNCF roots; penalize the
+    // rest (ITERN roots arrive with pairs() recording). Side traces
     // start at an arbitrary bytecode.
-    if js.parent == 0 && !matches!(op, BCOp::FORL | BCOp::LOOP | BCOp::FUNCF) {
+    if js.parent == 0 && !matches!(op, BCOp::FORL | BCOp::LOOP | BCOp::FUNCF | BCOp::ITERL) {
         js.err = TraceError::NYIBC;
         js.state = TraceState::Err;
         trace_abort(g);
@@ -174,6 +174,25 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         // rec_setup_root: determine the next PC and the loop bytecode range.
         match op {
             BCOp::FORL => {
+                rec.bc_extent = (-bc_j(startins)) as usize;
+                rec.bc_min = (pc as i64 + 1 + bc_j(startins)) as usize;
+                rec.pc = rec.bc_min;
+            }
+            BCOp::ITERL => {
+                // The paired ITERC/ITERN sits right before (this VM's
+                // ITERN is a plain generic iterator call).
+                let prev = pt.as_ref().bc[pc - 1];
+                if !matches!(bc_op(prev), BCOp::ITERC | BCOp::ITERN) {
+                    js.err = if bc_op(prev) == BCOp::JLOOP {
+                        TraceError::LINNER
+                    } else {
+                        TraceError::NYIBC
+                    };
+                    js.state = TraceState::Err;
+                    trace_abort(g);
+                    return;
+                }
+                rec.maxslot = crate::bc::bc_a(startins) + crate::bc::bc_b(prev) - 1;
                 rec.bc_extent = (-bc_j(startins)) as usize;
                 rec.bc_min = (pc as i64 + 1 + bc_j(startins)) as usize;
                 rec.pc = rec.bc_min;
@@ -361,7 +380,21 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             } else {
                 None
             };
-        if let Ok((mc, inner, tails)) = super::asm_x64::assemble(&trace, link_target) {
+        let no_asm = std::env::var("LUAJIT_RS_NOASM").is_ok();
+        if !no_asm && let Ok((mc, inner, tails)) = super::asm_x64::assemble(&trace, link_target) {
+            if std::env::var("LUAJIT_RS_TRDUMP").is_ok() {
+                eprintln!(
+                    "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",
+                    trace.traceno,
+                    mc.ptr(),
+                    mc.len(),
+                    inner,
+                    trace.startpt.as_ref().lines.get(trace.startpc).copied().unwrap_or(0),
+                    trace.root,
+                    trace.link,
+                    trace.linktype,
+                );
+            }
             trace.mcode = Some(mc);
             trace.inner_ofs = inner;
             trace.stub_tails = tails;
@@ -1150,6 +1183,166 @@ mod tests {
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn ipairs_loop_compiles_via_iterc() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // The ITERL root records the ITERC call to the builtin ipairs
+        // iterator (recff_ipairs_aux: ctrl+1 + guarded array load).
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local t = {} \
+             for i = 1, 2000 do t[i] = i * 3 end \
+             local s = 0 \
+             for n = 1, 200 do \
+               for k, v in ipairs(t) do s = s + v - k end \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        // Each inner pass: sum of 2k over k=1..2000.
+        assert_eq!(r[0].as_number(), Some(200.0 * (2000.0 * 2001.0)));
+        assert!(find_op(pt, BCOp::JITERL).is_some(), "ipairs loop not compiled");
+        let g = lua.global();
+        let jiterl = pt.as_ref().bc[find_op(pt, BCOp::JITERL).unwrap()];
+        let tr = g.jit.trace[crate::bc::bc_d(jiterl) as usize].as_deref().unwrap();
+        assert_eq!(tr.linktype, TraceLink::Loop);
+        assert_eq!(bc_op(tr.startins), BCOp::ITERL);
+        #[cfg(target_arch = "x86_64")]
+        assert!(tr.mcode.is_some(), "ipairs trace not assembled");
+    }
+
+    #[test]
+    fn ipairs_type_change_exits_cleanly() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // Element 1500 is a string: the HLOAD type guard exits and the
+        // interpreter finishes the traversal (including the string).
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local t = {} \
+             for i = 1, 2000 do t[i] = 1 end \
+             t[1500] = 'x' \
+             local s = 0 \
+             for n = 1, 120 do \
+               for k, v in ipairs(t) do \
+                 if v == 'x' then s = s + 100 else s = s + v end \
+               end \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(120.0 * (1999.0 + 100.0)));
+    }
+
+    #[test]
+    fn lua_iterator_function_inlines() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // A plain Lua iterator goes through rec_call_lua from ITERC.
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local function iter(t, i) \
+               i = i + 1 \
+               local v = t[i] \
+               if v ~= nil then return i, v end \
+             end \
+             local t = {} \
+             for i = 1, 1000 do t[i] = i end \
+             local s = 0 \
+             for n = 1, 200 do \
+               for k, v in iter, t, 0 do s = s + v end \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(200.0 * (1000.0 * 1001.0 / 2.0)));
+        assert!(find_op(pt, BCOp::JITERL).is_some(), "Lua-iterator loop not compiled");
+    }
+
+    #[test]
+    fn pairs_loop_compiles_with_hash_phase_side_trace() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // pairs() traverses the array part (number keys) then the hash
+        // part (string keys): the key-type guard exit at the phase
+        // switch turns hot and grows a side trace, keeping the whole
+        // traversal compiled.
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local t = {} \
+             for i = 1, 500 do t[i] = i end \
+             t.x = 1000 t.y = 2000 \
+             local s = 0 \
+             for n = 1, 300 do \
+               for k, v in pairs(t) do s = s + v end \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(300.0 * (500.0 * 501.0 / 2.0 + 3000.0)));
+        let jiterl_pc = find_op(pt, BCOp::JITERL).expect("pairs loop not compiled");
+        let g = lua.global();
+        let rootno = crate::bc::bc_d(pt.as_ref().bc[jiterl_pc]);
+        let root = g.jit.trace[rootno as usize].as_deref().unwrap();
+        assert_eq!(bc_op(root.startins), BCOp::ITERL);
+        assert!(root.nchild >= 1, "no side trace for the hash phase");
+    }
+
+    #[test]
+    fn bit_ops_compile_with_range_guards() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // A hash-mix loop: shifts, or, xor, and. Element 150000 pushes an
+        // out-of-range operand through the guard exit (the interpreter's
+        // saturating cast takes over there).
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local h = 0 \
+             local big = 2 ^ 40 \
+             for i = 1, 200000 do \
+               local x = i \
+               if i == 150000 then x = big end \
+               h = ((h << 5) | (h >> 27)) ~ x \
+               h = h & 2147483647 \
+             end return h + ~h",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        // Mirror the interpreter's fused semantics in Rust.
+        let mut h: i32 = 0;
+        for i in 1..=200000i64 {
+            let x: f64 = if i == 150000 { (2.0f64).powi(40) } else { i as f64 };
+            let mixed = ((h << 5) | ((h as u32) >> 27) as i32) ^ (x as i32);
+            h = mixed & 2147483647;
+        }
+        let want = h as f64 + (!h) as f64;
+        assert_eq!(r[0].as_number(), Some(want));
+        assert!(find_op(pt, BCOp::JFORL).is_some(), "bit loop not compiled");
+    }
+
+    #[test]
+    fn allocating_trace_reaches_gc_safe_points() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // A compiled append loop grows the table by megabytes: the
+        // IR_GCSTEP guard must leave the trace so the boundary check can
+        // collect (observable via the recomputed threshold).
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local t = {} \
+             local s = 0 \
+             for i = 1, 300000 do t[i] = i s = s + 1 end \
+             return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(300000.0));
+        let g = lua.global();
+        // A full GC ran mid-loop: the threshold was re-derived from the
+        // multi-megabyte live table, far above the 64 KiB minimum.
+        assert!(
+            g.heap.threshold > 1024 * 1024,
+            "no collection happened during the compiled loop (threshold = {})",
+            g.heap.threshold
+        );
+        assert_eq!(g.jit.state, TraceState::Idle);
     }
 
     #[test]

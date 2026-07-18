@@ -88,7 +88,8 @@ impl GcHeap {
     /// `lj_gc_check`'s condition: is a collection due?
     #[inline]
     pub fn should_collect(&self) -> bool {
-        self.total + self.strings.bytes() >= self.threshold
+        self.total + self.strings.bytes() + crate::table::TABLE_EXTRA.with(|c| c.get())
+            >= self.threshold
     }
 }
 

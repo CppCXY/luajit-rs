@@ -140,6 +140,28 @@ fn kfold_intop(k1: i32, k2: i32, op: IROp) -> i32 {
 fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
     let nk = buf.nk();
     let op = fins.op();
+    // Number-typed bit ops carry fused num->int32->op->num semantics
+    // (the interpreter's coercing operators): the integer fold rules
+    // below (comm_dup, kfold_intop on KINT payloads) would be wrong for
+    // them, so they go straight to CSE.
+    if irt_isnum(fins.t())
+        && matches!(
+            op,
+            IROp::BNOT
+                | IROp::BSWAP
+                | IROp::BAND
+                | IROp::BOR
+                | IROp::BXOR
+                | IROp::BSHL
+                | IROp::BSHR
+                | IROp::BSAR
+                | IROp::BROL
+                | IROp::BROR
+                | IROp::TOBIT
+        )
+    {
+        return Ok(Step::Cse);
+    }
     // Operand instruction copies (fleft/fright); None for literals/none.
     let fleft = if fins.op1 as IRRef >= nk { Some(*buf.ir(fins.op1 as IRRef)) } else { None };
     let fright = if fins.op2 as IRRef >= nk { Some(*buf.ir(fins.op2 as IRRef)) } else { None };
@@ -496,6 +518,30 @@ fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
             }
             if op == IROp::UGE && rop == Some(IROp::KINT) && fright.unwrap().i() == 0 {
                 return Ok(Step::Drop); // kfold_intcomp0: x >=u 0 is always true.
+            }
+            // Bit-op results are exact int32s: the recorder's i32 range
+            // guards are always true for them (this elides the copies
+            // that loop unrolling re-emits in the variant part).
+            if irt_isnum(fins.t())
+                && rop == Some(IROp::KNUM)
+                && matches!(
+                    lop,
+                    Some(
+                        IROp::BAND
+                            | IROp::BOR
+                            | IROp::BXOR
+                            | IROp::BSHL
+                            | IROp::BSHR
+                            | IROp::BSAR
+                            | IROp::BNOT
+                    )
+                )
+            {
+                let k = knumright(buf);
+                if (op == IROp::GE && k <= -2147483648.0) || (op == IROp::LE && k >= 2147483647.0)
+                {
+                    return Ok(Step::Drop);
+                }
             }
             // comm_comp: for non-numbers x <=> x ==> drop, x <> x ==> fail.
             if fins.op1 == fins.op2 && !irt_isnum(fins.t()) {
