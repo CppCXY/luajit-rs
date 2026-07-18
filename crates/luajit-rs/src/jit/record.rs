@@ -134,6 +134,7 @@ impl Record {
                 linktype: TraceLink::None,
                 root: 0,
                 nchild: 0,
+                parentmap: Vec::new(),
             },
             parent: parent as TraceNo,
             exitno: exitno as u32,
@@ -332,7 +333,11 @@ impl Record {
                     if ir.op() == IROp::SLOAD {
                         mode |= ir.op2 as u32 & IRSLOAD_READONLY;
                     }
-                    self.cur.ir.emit_ins(IRIns::new(irt(IROp::SLOAD, ty), s, mode))
+                    let tr = self.cur.ir.emit_ins(IRIns::new(irt(IROp::SLOAD, ty), s, mode));
+                    // The executor pre-fills env[own] from the parent's
+                    // env[r] on a linked exit (register-free hand-over).
+                    self.cur.parentmap.push((tref_ref(tr) as IRRef1, r as IRRef1));
+                    tr
                 };
                 seen.push((r, tr));
                 tr

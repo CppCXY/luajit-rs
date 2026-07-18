@@ -28,7 +28,7 @@
 
 use super::ir::*;
 use super::mcode::McodeArea;
-use super::record::{IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC};
+use super::record::{IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC, IRSLOAD_PARENT};
 use super::{GCtrace, SNAP_NORESTORE, TraceError, TraceLink, snap_ref, snap_slot};
 
 /// Allocatable FP registers, in preference order: the always-volatile
@@ -103,16 +103,20 @@ struct Asm<'a> {
     last_use: Vec<IRRef>,
     /// Last use site per constant (index REF_BIAS-1-ref).
     klast_use: Vec<IRRef>,
-    /// Ref is referenced by a snapshot (or a GC-identity compare): its
-    /// value must be in `env` from definition on.
+    /// Ref must be in `env` from definition on: non-FP values (GC bits
+    /// never live in xmm) referenced by snapshots, GC-identity compares
+    /// or env-carried PHIs. FP snapshot values are flushed to env by the
+    /// exit stubs instead (the ExitState equivalent).
     needs_env: Vec<bool>,
     /// The env slot currently holds the value (spilled or stored-on-def).
     env_valid: Vec<bool>,
     /// Register currently holding the instruction value.
     loc: Vec<Option<u8>>,
     owner: [Owner; NREG],
-    /// (position of rel32, target snapshot index).
+    /// (position of rel32, target exit stub index).
     fixups: Vec<(usize, usize)>,
+    /// Per-guard exit stubs: register flushes + snapshot number.
+    stubs: Vec<Stub>,
     /// Loop-carried values (PHIs at the trace tail).
     phis: Vec<PhiInfo>,
     /// Code offset of the loop re-entry point (right after IR_LOOP).
@@ -122,6 +126,15 @@ struct Asm<'a> {
     /// Bitmask of callee-saved xmm registers handed out by the allocator
     /// (Win64: xmm6-xmm15); only these are saved in the prologue.
     used_csr: u16,
+}
+
+/// One exit: flush the snapshot values still held in registers at the
+/// guard into their env slots, then leave with the snapshot number. This
+/// replaces LuaJIT's ExitState + per-snapshot RegSP maps: after the
+/// flush, the Rust-side `restore_snapshot` finds everything in env.
+struct Stub {
+    snapidx: usize,
+    flush: Vec<(u8, IRRef)>,
 }
 
 impl<'a> Asm<'a> {
@@ -155,6 +168,7 @@ impl<'a> Asm<'a> {
             loc: vec![None; nins],
             owner: [Owner::None; NREG],
             fixups: Vec::new(),
+            stubs: Vec::new(),
             phis: Vec::new(),
             loop_pos: None,
             s0: [Owner::None; NREG],
@@ -215,16 +229,36 @@ impl<'a> Asm<'a> {
                 _ => return Err(TraceError::NYIIR), // POW and later-phase IR.
             }
         }
-        for sn in &tr.snapmap {
-            let rref = snap_ref(*sn);
-            if rref >= REF_BIAS {
-                a.needs_env[Self::iidx(rref)] = true;
+        // Snapshot references: a value must stay recoverable while any
+        // guard covered by the snapshot can exit, i.e. until the next
+        // snapshot begins. FP values are kept alive in registers (the
+        // exit stub flushes them); non-FP values must live in env. Note:
+        // NORESTORE entries are never written back to the Lua stack, but
+        // the env hand-over to side traces still reads them.
+        for (i, snap) in tr.snap.iter().enumerate() {
+            let live_until =
+                if i + 1 < tr.snap.len() { tr.snap[i + 1].iref } else { tr.ir.nins() };
+            let ofs = snap.mapofs as usize;
+            for sn in &tr.snapmap[ofs..ofs + snap.nent as usize] {
+                let rref = snap_ref(*sn);
+                if rref >= REF_BIAS {
+                    a.mark_use(rref, live_until);
+                    if !irt_isnum(tr.ir.ir(rref).t()) {
+                        a.needs_env[Self::iidx(rref)] = true;
+                    }
+                }
             }
+        }
+        // Side traces: the inherited SLOADs are pre-filled env inputs
+        // (the executor copies them from the parent's env slots), so no
+        // load code is emitted for them at all.
+        for &(own, _) in &tr.parentmap {
+            a.env_valid[Self::iidx(own as IRRef)] = true;
         }
         // The PHI's own env slot is the back-edge scratch buffer: it must
         // not double as a snapshot value.
         for p in &a.phis {
-            if a.needs_env[Self::iidx(p.phi)] {
+            if a.last_use[Self::iidx(p.phi)] != 0 {
                 return Err(TraceError::NYIIR);
             }
         }
@@ -296,8 +330,12 @@ impl<'a> Asm<'a> {
                 self.emit_u32(rel as i32 as u32);
             }
         } else {
+            // Leave through the final snapshot: flush its register-held
+            // values inline, then fall through into the epilogue.
+            for (rg, fr) in self.exit_flush_set(lastsnap) {
+                self.movsd_store(RENV, Self::env_disp(fr), rg);
+            }
             self.mov_eax_imm(lastsnap as u32);
-            // Falls through into the epilogue.
         }
 
         // Common epilogue: restore the used callee-saved xmm (Win64),
@@ -317,17 +355,22 @@ impl<'a> Asm<'a> {
         }
         self.code.push(0xC3);
 
-        // Exit stubs: mov eax, snapidx; jmp ->epilogue.
-        let mut stubs = Vec::with_capacity(self.tr.snap.len());
-        for i in 0..self.tr.snap.len() {
-            stubs.push(self.code.len());
-            self.mov_eax_imm(i as u32);
+        // Per-guard exit stubs: flush the live snapshot registers to env
+        // (the ExitState equivalent), then leave with the snapshot index.
+        let stubs = std::mem::take(&mut self.stubs);
+        let mut stubpos = Vec::with_capacity(stubs.len());
+        for st in &stubs {
+            stubpos.push(self.code.len());
+            for &(rg, fr) in &st.flush {
+                self.movsd_store(RENV, Self::env_disp(fr), rg);
+            }
+            self.mov_eax_imm(st.snapidx as u32);
             self.code.push(0xE9);
             let rel = epilogue as i64 - (self.code.len() as i64 + 4);
             self.emit_u32(rel as i32 as u32);
         }
         for (pos, si) in std::mem::take(&mut self.fixups) {
-            let rel = (stubs[si] as i64 - (pos as i64 + 4)) as i32;
+            let rel = (stubpos[si] as i64 - (pos as i64 + 4)) as i32;
             self.code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
         }
 
@@ -366,6 +409,12 @@ impl<'a> Asm<'a> {
 
     /// SLOAD: optional typecheck guard + load from the Lua stack.
     fn asm_sload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        if ins.op2 as u32 & IRSLOAD_PARENT != 0 {
+            // Inherited from the parent trace: the value sits in this
+            // ref's env slot (pre-filled by the executor on the linked
+            // exit); it is fetched lazily on first use.
+            return Ok(());
+        }
         let disp = (ins.op1 as i32 - 2) * 8;
         let t = ins.t();
         let i = Self::iidx(self.cur);
@@ -546,10 +595,15 @@ impl<'a> Asm<'a> {
         }
     }
 
-    /// IR_LOOP: park every live value in env (their registers stay
-    /// valid), then snapshot the register state — the back edge restores
-    /// exactly this state, so the loop body can be entered from both the
-    /// pre-roll fall-through and the back-edge jump.
+    /// IR_LOOP: park the live *invariant* values in env (their registers
+    /// stay valid), then snapshot the register state — the back edge
+    /// restores exactly this state, so the loop body can be entered from
+    /// both the pre-roll fall-through and the back-edge jump.
+    ///
+    /// Register-homed loop-carried values (PHI lrefs) are *not* parked:
+    /// their env slot would go stale after one iteration. Their env_valid
+    /// is reset instead, so guards flush them from the register and body
+    /// evictions store the current iteration's value.
     fn asm_loop_head(&mut self) {
         for rg in 0..NREG as u8 {
             let dead = match self.owner[rg as usize] {
@@ -563,11 +617,22 @@ impl<'a> Asm<'a> {
         }
         for rg in 0..NREG as u8 {
             if let Owner::Ins(o) = self.owner[rg as usize] {
+                if self.phis.iter().any(|p| p.num && p.lref == o) {
+                    continue; // Loop-carried: handled below.
+                }
                 let i = Self::iidx(o);
                 if !self.env_valid[i] {
                     self.movsd_store(RENV, Self::env_disp(o), rg);
                     self.env_valid[i] = true;
                 }
+            }
+        }
+        for pi in 0..self.phis.len() {
+            let p = self.phis[pi];
+            if p.num && self.loc[Self::iidx(p.lref)].is_some() {
+                // A pre-roll env copy (def store or eviction) is stale
+                // from the second iteration on.
+                self.env_valid[Self::iidx(p.lref)] = false;
             }
         }
         self.s0 = self.owner;
@@ -576,8 +641,9 @@ impl<'a> Asm<'a> {
 
     /// The back edge of a loop-optimized trace: carry the PHI values
     /// (rref -> lref home), restore the IR_LOOP register state and jump
-    /// back. env[lref] is always refreshed, since body code and exits
-    /// read the carried value through it.
+    /// back. Register-homed FP values are carried in registers only;
+    /// env[lref] is refreshed just for env-carried (homeless or non-FP)
+    /// PHIs, whose readers go through env.
     fn asm_loop_back(&mut self, loop_pos: usize) {
         let s0 = self.s0;
         let phis = std::mem::take(&mut self.phis);
@@ -624,7 +690,6 @@ impl<'a> Asm<'a> {
             for (p, home) in phis.iter().zip(homes.iter()) {
                 if p.num && let Some(rg) = *home {
                     self.movsd_load(rg, RENV, Self::env_disp(p.phi));
-                    self.movsd_store(RENV, Self::env_disp(p.lref), rg);
                 } else {
                     self.mov_r64_mem(RAX, RENV, Self::env_disp(p.phi));
                     self.mov_mem_r64(RENV, Self::env_disp(p.lref), RAX);
@@ -660,7 +725,7 @@ impl<'a> Asm<'a> {
     }
 
     /// One direct PHI move: load the right value into the lref home
-    /// register (if any) and refresh env[lref].
+    /// register, or refresh env[lref] for env-carried PHIs.
     fn phi_move(&mut self, p: &PhiInfo, home: Option<u8>) {
         if p.num && let Some(rg) = home {
             if p.rref >= REF_BIAS {
@@ -676,7 +741,6 @@ impl<'a> Asm<'a> {
                 self.mov_r64_imm64(RAX, super::exec::const_bits(&self.tr.ir, p.rref));
                 self.movq_xmm_gpr(rg, RAX);
             }
-            self.movsd_store(RENV, Self::env_disp(p.lref), rg);
         } else if p.rref >= REF_BIAS {
             if p.num && let Some(src) = self.reg_of(p.rref) {
                 self.movsd_store(RENV, Self::env_disp(p.lref), src);
@@ -699,9 +763,11 @@ impl<'a> Asm<'a> {
 
     fn mark_use(&mut self, opr: IRRef, at: IRRef) {
         if opr >= REF_BIAS {
-            self.last_use[Self::iidx(opr)] = at;
+            let i = Self::iidx(opr);
+            self.last_use[i] = self.last_use[i].max(at);
         } else {
-            self.klast_use[Self::kidx(opr)] = at;
+            let k = Self::kidx(opr);
+            self.klast_use[k] = self.klast_use[k].max(at);
         }
     }
 
@@ -822,16 +888,12 @@ impl<'a> Asm<'a> {
         }
     }
 
-    /// Bind the current instruction's result and store it to env if any
-    /// snapshot needs it.
+    /// Bind the current instruction's result. Snapshot values stay in
+    /// registers; the exit stubs flush them (no store-on-def).
     fn def(&mut self, d: u8) {
         let i = Self::iidx(self.cur);
         self.owner[d as usize] = Owner::Ins(self.cur);
         self.loc[i] = Some(d);
-        if self.needs_env[i] {
-            self.movsd_store(RENV, Self::env_disp(self.cur), d);
-            self.env_valid[i] = true;
-        }
     }
 
     /// Raw 64-bit value of an operand into a GPR (GC-identity compares).
@@ -1014,12 +1076,44 @@ impl<'a> Asm<'a> {
         self.code.push(imm as u8);
     }
 
-    /// Emit a guard branch to the covering snapshot's exit stub.
+    /// Emit a guard branch to a fresh exit stub for the covering
+    /// snapshot, capturing which snapshot values must be flushed from
+    /// registers to env when this exact exit is taken.
     fn guard(&mut self, cc: u8) {
+        let stub = self.make_stub();
         self.code.push(0x0F);
         self.code.push(0x80 | cc);
-        self.fixups.push((self.code.len(), self.snapidx));
+        self.fixups.push((self.code.len(), stub));
         self.emit_u32(0);
+    }
+
+    fn make_stub(&mut self) -> usize {
+        let flush = self.exit_flush_set(self.snapidx);
+        self.stubs.push(Stub { snapidx: self.snapidx, flush });
+        self.stubs.len() - 1
+    }
+
+    /// The register flush set of an exit through snapshot `snapidx` at
+    /// the current emission position: every entry whose value lives in a
+    /// register and has no valid env copy. NORESTORE entries are flushed
+    /// too — the side-trace hand-over reads them from env.
+    fn exit_flush_set(&self, snapidx: usize) -> Vec<(u8, IRRef)> {
+        let snap = &self.tr.snap[snapidx];
+        let ofs = snap.mapofs as usize;
+        let mut flush: Vec<(u8, IRRef)> = Vec::new();
+        for sn in &self.tr.snapmap[ofs..ofs + snap.nent as usize] {
+            let r = snap_ref(*sn);
+            if r < REF_BIAS {
+                continue; // Constants are materialized by the restorer.
+            }
+            let i = Self::iidx(r);
+            if self.env_valid[i] || flush.iter().any(|&(_, fr)| fr == r) {
+                continue;
+            }
+            let rg = self.loc[i].expect("snapshot value neither in reg nor env");
+            flush.push((rg, r));
+        }
+        flush
     }
 }
 

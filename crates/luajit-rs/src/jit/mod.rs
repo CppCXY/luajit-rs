@@ -199,6 +199,11 @@ pub struct GCtrace {
     pub root: TraceNo,
     /// Number of child traces (root trace only).
     pub nchild: u16,
+    /// Side traces: pairs of (own inherited-SLOAD ref, parent snapshot
+    /// ref). The executor pre-fills the own env slots from the parent's
+    /// env on a linked exit, so the machine code consumes the parent's
+    /// values without a Lua-stack round trip.
+    pub parentmap: Vec<(ir::IRRef1, ir::IRRef1)>,
 }
 
 /// Trace compiler error reasons (lj_traceerr.h).

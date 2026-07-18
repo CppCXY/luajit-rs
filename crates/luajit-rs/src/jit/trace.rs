@@ -333,6 +333,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             linktype: TraceLink::None,
             root: 0,
             nchild: 0,
+            parentmap: Vec::new(),
         },
     );
     #[cfg(target_arch = "x86_64")]
@@ -709,6 +710,32 @@ mod tests {
             );
         }
         assert_eq!(g.jit.state, TraceState::Idle);
+    }
+
+    #[test]
+    fn side_trace_handover_keeps_norestore_slots() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // A variable loop bound is a READONLY/NORESTORE snapshot entry:
+        // it is never written back to the Lua stack, but the env
+        // hand-over to side traces must still see it (exit stubs flush
+        // NORESTORE entries too). Regression: the side trace previously
+        // read garbage as the loop bound and exited after ~92 iterations.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local n = 200000 \
+             local a, b, c = 0, 0, 0 \
+             for i = 1, n do \
+               local m = i % 3 \
+               if m == 0 then a = a + 1 elseif m == 1 then b = b + 1 else c = c + 1 end \
+             end return a * 1000000 + b * 1000 + c",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        // 200000 = 3*66666+2: m cycles 1,2,0,... -> a=66666, b=66667, c=66667.
+        assert_eq!(
+            r[0].as_number(),
+            Some(66666.0 * 1000000.0 + 66667.0 * 1000.0 + 66667.0)
+        );
     }
 
     #[test]
