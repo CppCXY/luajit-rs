@@ -59,14 +59,49 @@ mod lowmem {
         }
     }
 
-    /// Pseudo-random probe hints in [2^38, 2^46], 64K aligned: high
-    /// enough to dodge the program segments, low enough for the payload.
-    fn probe_hints() -> impl Iterator<Item = u64> {
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(std::process::id() as u64 | 1);
-        (0..128).map(move |_| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((1u64 << 38) + (seed % ((1u64 << 46) - (1u64 << 38)))) & !0xFFFF
-        })
+    /// Pseudo-random probe hints in [2^38, 2^46], 64K aligned. The seed
+    /// is global so successive allocations never replay the same hint
+    /// sequence (a page already mapped at a hint would fail every later
+    /// probe otherwise).
+    fn next_random_hint() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+        let s = SEED
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+                Some(s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+            })
+            .unwrap();
+        ((1u64 << 38) + (s % ((1u64 << 46) - (1u64 << 38)))) & !0xFFFF
+    }
+
+    /// Bump pointer past the last successful mapping: consecutive pages
+    /// pack into one region instead of burning fresh probe hints.
+    fn hint_state() -> &'static std::sync::atomic::AtomicU64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        &NEXT
+    }
+
+    /// Probe loop shared by the OS backends: `map(hint, size)` returns a
+    /// mapping (kernel-placed anywhere on some systems) or null.
+    fn probe<F: Fn(u64, usize) -> *mut u8>(size: usize, map: F, unmap: fn(*mut u8, usize)) -> Option<NonNull<u8>> {
+        use std::sync::atomic::Ordering;
+        let mut hint = hint_state().load(Ordering::Relaxed);
+        for _ in 0..1024 {
+            if hint == 0 || hint.saturating_add(size as u64) > LIMIT {
+                hint = next_random_hint();
+            }
+            let p = map(hint, size);
+            if !p.is_null() && p as isize != -1 {
+                if (p as u64).saturating_add(size as u64) <= LIMIT {
+                    let end = (p as u64 + size as u64 + 0xFFFF) & !0xFFFF;
+                    hint_state().store(end, Ordering::Relaxed);
+                    return NonNull::new(p);
+                }
+                unmap(p, size);
+            }
+            hint = next_random_hint();
+        }
+        None
     }
 
     #[cfg(unix)]
@@ -87,10 +122,10 @@ mod lowmem {
 
         unsafe extern "C" {
             fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-            fn munmap(addr: *mut u8, len: usize) -> i32;
         }
-        for hint in probe_hints() {
-            let p = unsafe {
+        probe(
+            size,
+            |hint, size| unsafe {
                 mmap(
                     hint as *mut u8,
                     size,
@@ -99,16 +134,9 @@ mod lowmem {
                     -1,
                     0,
                 )
-            };
-            if p as isize == -1 || p.is_null() {
-                continue;
-            }
-            if (p as u64).saturating_add(size as u64) <= LIMIT {
-                return NonNull::new(p);
-            }
-            unsafe { munmap(p, size) };
-        }
-        None
+            },
+            os_free,
+        )
     }
 
     #[cfg(unix)]
@@ -129,19 +157,13 @@ mod lowmem {
         unsafe extern "system" {
             fn VirtualAlloc(addr: *mut u8, size: usize, ty: u32, prot: u32) -> *mut u8;
         }
-        for hint in probe_hints() {
-            let p = unsafe {
+        probe(
+            size,
+            |hint, size| unsafe {
                 VirtualAlloc(hint as *mut u8, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-            };
-            if p.is_null() {
-                continue;
-            }
-            if (p as u64).saturating_add(size as u64) <= LIMIT {
-                return NonNull::new(p);
-            }
-            os_free(p, size);
-        }
-        None
+            },
+            os_free,
+        )
     }
 
     #[cfg(windows)]
@@ -178,6 +200,23 @@ mod lowmem {
             unsafe {
                 p.as_ptr().write_bytes(0x5A, 4096);
                 dealloc(p, layout, mapped);
+            }
+        }
+
+        #[test]
+        fn os_probe_survives_hundreds_of_pages() {
+            // Regression: the hint sequence must not replay (a replayed
+            // hint hits its own earlier mapping and fails forever).
+            let size = 1 << 16;
+            let mut pages = Vec::new();
+            for i in 0..300 {
+                let p = os_alloc_low(size).expect("probe failed mid-run");
+                assert!((p.as_ptr() as u64) + size as u64 <= LIMIT, "page {i} too high");
+                unsafe { p.as_ptr().write_bytes(0x77, size) };
+                pages.push(p);
+            }
+            for p in pages {
+                os_free(p.as_ptr(), size);
             }
         }
     }
