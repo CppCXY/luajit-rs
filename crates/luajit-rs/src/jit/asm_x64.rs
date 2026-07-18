@@ -20,24 +20,28 @@
 //!
 //! ABI of the emitted code:
 //! `extern "C" fn(base: *mut LuaValue, env: *mut u64) -> u32` returning
-//! the exit snapshot index. GPRs used are volatile in both the Win64 and
-//! SysV ABIs (rax/rcx/rdx, r10/r11). The FP allocator prefers the
-//! volatile xmm0-xmm4 and only then the Win64 callee-saved xmm6-xmm15;
-//! the prologue/epilogue save exactly the callee-saved registers the
-//! trace touches (usually none for short side traces).
+//! the exit snapshot index. Every trace sets up the same outer frame
+//! (Win64: 160 bytes with all of xmm6-xmm15 saved) so that linked traces
+//! can `jmp` between each other's *inner* entries while staying inside
+//! the frame of whichever trace was entered from Rust — the machine-code
+//! equivalent of LuaJIT's trace linking. Exit stubs reserve a patchable
+//! tail: once a side trace is compiled, `patch_exit` retargets them
+//! straight into it (lj_asm_patchexit).
 
 use super::ir::*;
 use super::mcode::McodeArea;
 use super::record::{IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC, IRSLOAD_PARENT};
 use super::{GCtrace, SNAP_NORESTORE, TraceError, TraceLink, snap_ref, snap_slot};
 
-/// Allocatable FP registers, in preference order: the always-volatile
-/// xmm0-xmm4 first, then xmm6-xmm15 (Win64 callee-saved, spilled only
-/// when used). xmm5 is the constant/mask scratch.
+/// Allocatable FP registers: xmm0-xmm4 and xmm6-xmm15 (callee-saved on
+/// Win64; the uniform outer frame always saves them). xmm5 is the
+/// constant/mask/cycle scratch.
 const ALLOC_REGS: [u8; 15] = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 const XMM_SCRATCH: u8 = 5;
 /// Register state arrays are indexed by the xmm number.
 const NREG: usize = 16;
+/// Outer frame size: 10 saved xmm registers (Win64).
+const FRAME_SIZE: u32 = 160;
 
 /// Fixed-role GPRs, volatile in both ABIs.
 const RAX: u8 = 0;
@@ -87,10 +91,38 @@ struct PhiInfo {
     num: bool,
 }
 
-/// Assemble a completed trace. On error the caller keeps `mcode = None`
-/// and the portable executor runs the trace.
-pub fn assemble(tr: &GCtrace) -> Result<McodeArea, TraceError> {
-    Asm::new(tr)?.emit()
+/// Assemble a completed trace. `link` is the absolute address of the
+/// linked trace's inner entry for TRLINK_ROOT tails (root already
+/// compiled). On error the caller keeps `mcode = None` and the portable
+/// executor runs the trace. Returns the code area, the inner entry
+/// offset and the patchable exit-stub tail offsets.
+pub fn assemble(
+    tr: &GCtrace,
+    link: Option<*const u8>,
+) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
+    Asm::new(tr, link)?.emit()
+}
+
+/// `lj_asm_patchexit`: retarget every exit stub of `exitno` to jump
+/// straight to `target` (a side trace's inner entry). The stub's flush
+/// section stays; only the `mov eax; jmp epilogue` tail is rewritten to
+/// `movabs rax, target; jmp rax`.
+pub fn patch_exit(area: &mut McodeArea, stub_tails: &[(u32, u32)], exitno: u32, target: *const u8) {
+    if !area.protect_rw() {
+        return;
+    }
+    let code = area.as_mut_slice();
+    for &(si, ofs) in stub_tails {
+        if si == exitno {
+            let p = ofs as usize;
+            code[p] = 0x48;
+            code[p + 1] = 0xB8; // movabs rax, target
+            code[p + 2..p + 10].copy_from_slice(&(target as u64).to_le_bytes());
+            code[p + 10] = 0xFF;
+            code[p + 11] = 0xE0; // jmp rax
+        }
+    }
+    area.protect_exec();
 }
 
 struct Asm<'a> {
@@ -123,9 +155,10 @@ struct Asm<'a> {
     loop_pos: Option<usize>,
     /// Register state at IR_LOOP; the back edge restores exactly this.
     s0: [Owner; NREG],
-    /// Bitmask of callee-saved xmm registers handed out by the allocator
-    /// (Win64: xmm6-xmm15); only these are saved in the prologue.
-    used_csr: u16,
+    /// Absolute inner-entry address of the linked trace (Root tails).
+    link: Option<*const u8>,
+    /// Patchable stub tail offsets: (snapshot index, code offset).
+    stub_tails: Vec<(u32, u32)>,
 }
 
 /// One exit: flush the snapshot values still held in registers at the
@@ -153,7 +186,7 @@ impl<'a> Asm<'a> {
 
     /// Scan the IR: reject NYI opcodes, record last-use positions and the
     /// set of refs that must live in `env` for exits.
-    fn new(tr: &'a GCtrace) -> Result<Asm<'a>, TraceError> {
+    fn new(tr: &'a GCtrace, link: Option<*const u8>) -> Result<Asm<'a>, TraceError> {
         let nins = Self::iidx(tr.ir.nins());
         let nk = (REF_BIAS - tr.ir.nk()) as usize;
         let mut a = Asm {
@@ -172,7 +205,8 @@ impl<'a> Asm<'a> {
             phis: Vec::new(),
             loop_pos: None,
             s0: [Owner::None; NREG],
-            used_csr: 0,
+            link,
+            stub_tails: Vec::new(),
         };
         let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
         for r in REF_FIRST..tr.ir.nins() {
@@ -267,11 +301,36 @@ impl<'a> Asm<'a> {
 
     // -- Main emission loop -------------------------------------------------
 
-    fn emit(mut self) -> Result<McodeArea, TraceError> {
-        // The body is emitted first; the prologue is prepended at the end
-        // when the set of used callee-saved registers is known. All
-        // branches are relative, so prepending is offset-neutral.
-        let head = 0usize;
+    fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
+        // Uniform outer frame: capture the two arguments in r10/r11 and
+        // (Win64) save all callee-saved xmm registers. Every trace uses
+        // the identical frame, so linked traces jump between their inner
+        // entries while reusing the frame of the Rust-entered trace; the
+        // save cost is paid once per Rust entry, not per link.
+        #[cfg(windows)]
+        {
+            self.mov_rr64(RBASE, RCX);
+            self.mov_rr64(RENV, RDX);
+            self.code.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, n
+            self.emit_u32(FRAME_SIZE);
+            for k in 0..10u8 {
+                self.movups_spill(6 + k, (k as i32) * 16, true);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.mov_rr64(RBASE, RDI);
+            self.mov_rr64(RENV, RSI);
+        }
+        let inner = self.code.len() as u32;
+
+        // Side traces: the in-mcode hand-over prelude copies the
+        // inherited values from the parent's env slots to the own ones
+        // (a parallel move: ranges may overlap, even cyclically).
+        if !self.tr.parentmap.is_empty() {
+            self.emit_handover();
+        }
+        let head = self.code.len();
 
         let nins = self.tr.ir.nins();
         let mut r = REF_FIRST;
@@ -316,8 +375,9 @@ impl<'a> Asm<'a> {
 
         // Tail: loop-optimized traces jump back to IR_LOOP with the PHI
         // values moved into place; legacy loops re-materialize the final
-        // snapshot and restart at the head; others leave through the
-        // final snapshot.
+        // snapshot and restart at the head; Root-linked side traces sync
+        // the stack and jump straight into the root trace's inner entry;
+        // everything else leaves through the final snapshot.
         let lastsnap = self.tr.snap.len() - 1;
         let looping = self.tr.linktype == TraceLink::Loop && self.tr.link == self.tr.traceno;
         if looping {
@@ -329,34 +389,39 @@ impl<'a> Asm<'a> {
                 let rel = head as i64 - (self.code.len() as i64 + 4);
                 self.emit_u32(rel as i32 as u32);
             }
+        } else if self.tr.linktype == TraceLink::Root && let Some(target) = self.link {
+            // asm_tail_link: materialize the final snapshot into the Lua
+            // stack (the root re-reads it through its SLOADs), then jump
+            // to the root's inner entry — no Rust round trip.
+            self.tail_restore(lastsnap);
+            self.mov_r64_imm64(RAX, target as u64);
+            self.code.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
         } else {
             // Leave through the final snapshot: flush its register-held
             // values inline, then fall through into the epilogue.
             for (rg, fr) in self.exit_flush_set(lastsnap) {
                 self.movsd_store(RENV, Self::env_disp(fr), rg);
             }
-            self.mov_eax_imm(lastsnap as u32);
+            self.mov_eax_imm(self.exit_code(lastsnap));
         }
 
-        // Common epilogue: restore the used callee-saved xmm (Win64),
-        // return eax.
-        let saves: Vec<u8> = (6..16u8).filter(|&r| self.used_csr & (1 << r) != 0).collect();
-        let framesz = (saves.len() * 16) as i32;
+        // Common epilogue: restore the callee-saved xmm (Win64), return
+        // eax.
         let epilogue = self.code.len();
         #[cfg(windows)]
         {
-            for (k, &r) in saves.iter().enumerate() {
-                self.movups_spill(r, (k as i32) * 16, false);
+            for k in 0..10u8 {
+                self.movups_spill(6 + k, (k as i32) * 16, false);
             }
-            if framesz > 0 {
-                self.code.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, n
-                self.emit_u32(framesz as u32);
-            }
+            self.code.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, n
+            self.emit_u32(FRAME_SIZE);
         }
         self.code.push(0xC3);
 
         // Per-guard exit stubs: flush the live snapshot registers to env
         // (the ExitState equivalent), then leave with the snapshot index.
+        // The `mov eax; jmp` tail is padded to 12 bytes so `patch_exit`
+        // can later retarget it into a compiled side trace.
         let stubs = std::mem::take(&mut self.stubs);
         let mut stubpos = Vec::with_capacity(stubs.len());
         for st in &stubs {
@@ -364,45 +429,72 @@ impl<'a> Asm<'a> {
             for &(rg, fr) in &st.flush {
                 self.movsd_store(RENV, Self::env_disp(fr), rg);
             }
-            self.mov_eax_imm(st.snapidx as u32);
+            let tail = self.code.len();
+            self.stub_tails.push((st.snapidx as u32, tail as u32));
+            self.mov_eax_imm(self.exit_code(st.snapidx));
             self.code.push(0xE9);
             let rel = epilogue as i64 - (self.code.len() as i64 + 4);
             self.emit_u32(rel as i32 as u32);
+            while self.code.len() < tail + 12 {
+                self.code.push(0xCC); // Patch space (movabs rax; jmp rax).
+            }
         }
         for (pos, si) in std::mem::take(&mut self.fixups) {
             let rel = (stubpos[si] as i64 - (pos as i64 + 4)) as i32;
             self.code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
         }
 
-        // Prepend the prologue: capture the two arguments in r10/r11 and
-        // save the callee-saved xmm registers this trace actually uses.
-        let body = std::mem::take(&mut self.code);
-        #[cfg(windows)]
-        {
-            self.mov_rr64(RBASE, RCX);
-            self.mov_rr64(RENV, RDX);
-            if framesz > 0 {
-                self.code.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, n
-                self.emit_u32(framesz as u32);
-                for (k, &r) in saves.iter().enumerate() {
-                    self.movups_spill(r, (k as i32) * 16, true);
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (&saves, framesz);
-            self.mov_rr64(RBASE, RDI);
-            self.mov_rr64(RENV, RSI);
-        }
-        self.code.extend_from_slice(&body);
-
         let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
         area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code);
         if !area.protect_exec() {
             return Err(TraceError::MCODEAL);
         }
-        Ok(area)
+        Ok((area, inner, std::mem::take(&mut self.stub_tails)))
+    }
+
+    /// Exit return value: `(traceno << 16) | snapidx`. With patched exit
+    /// chains, the trace that finally returns to Rust may not be the one
+    /// entered, so the exit identifies itself.
+    fn exit_code(&self, snapidx: usize) -> u32 {
+        (self.tr.traceno << 16) | snapidx as u32
+    }
+
+    /// The hand-over prelude of a side trace: a parallel move of the
+    /// parent env slots into the own (inherited SLOAD) slots. Emitted at
+    /// the inner entry, so both the patched parent exits and the Rust
+    /// executor path run it. Cycles are broken via the xmm scratch.
+    fn emit_handover(&mut self) {
+        let mut pending: Vec<(IRRef, IRRef)> = self
+            .tr
+            .parentmap
+            .iter()
+            .map(|&(o, p)| (o as IRRef, p as IRRef))
+            .filter(|&(o, p)| o != p) // Same slot: already in place.
+            .collect();
+        let mut parked: Option<IRRef> = None; // Slot value held in xmm scratch.
+        while !pending.is_empty() {
+            let ready = pending.iter().position(|&(d, _)| {
+                !pending.iter().any(|&(_, s)| s == d && parked != Some(s))
+            });
+            if let Some(i) = ready {
+                let (d, s) = pending.remove(i);
+                if parked == Some(s) {
+                    self.movsd_store(RENV, Self::env_disp(d), XMM_SCRATCH);
+                } else {
+                    self.mov_r64_mem(RAX, RENV, Self::env_disp(s));
+                    self.mov_mem_r64(RENV, Self::env_disp(d), RAX);
+                }
+                if parked == Some(s) && !pending.iter().any(|&(_, s2)| s2 == s) {
+                    parked = None; // Last reader of the parked value.
+                }
+            } else {
+                // Cycle: park the first destination's current value.
+                debug_assert!(parked.is_none(), "one scratch, one cycle at a time");
+                let d0 = pending[0].0;
+                self.movsd_load(XMM_SCRATCH, RENV, Self::env_disp(d0));
+                parked = Some(d0);
+            }
+        }
     }
 
     // -- Instruction emitters ------------------------------------------------
@@ -794,17 +886,7 @@ impl<'a> Asm<'a> {
 
     /// Allocate a register, evicting the least useful value if needed.
     /// `pinned` is a bitmask of registers that must not be touched.
-    /// Volatile registers are preferred; handing out a callee-saved one
-    /// is recorded for the prologue/epilogue.
     fn alloc(&mut self, pinned: u16) -> Result<u8, TraceError> {
-        let rg = self.alloc_pick(pinned)?;
-        if rg >= 6 {
-            self.used_csr |= 1 << rg;
-        }
-        Ok(rg)
-    }
-
-    fn alloc_pick(&mut self, pinned: u16) -> Result<u8, TraceError> {
         // Free register first.
         for &rg in ALLOC_REGS.iter() {
             if pinned & pin(rg) == 0 && self.owner[rg as usize] == Owner::None {

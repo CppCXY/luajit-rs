@@ -200,10 +200,18 @@ pub struct GCtrace {
     /// Number of child traces (root trace only).
     pub nchild: u16,
     /// Side traces: pairs of (own inherited-SLOAD ref, parent snapshot
-    /// ref). The executor pre-fills the own env slots from the parent's
-    /// env on a linked exit, so the machine code consumes the parent's
-    /// values without a Lua-stack round trip.
+    /// ref). The machine-code prelude at `inner_ofs` copies the own env
+    /// slots from the parent's, so a linked exit hands its values over
+    /// without a Lua-stack round trip.
     pub parentmap: Vec<(ir::IRRef1, ir::IRRef1)>,
+    /// Machine-code offset of the inner entry (after the outer-frame
+    /// prologue). Patched exits and tail links jump here, staying inside
+    /// the frame set up by the first trace of the chain.
+    pub inner_ofs: u32,
+    /// Machine-code offsets of the patchable exit-stub tails, per
+    /// snapshot: (snapshot index, code offset). `lj_asm_patchexit`
+    /// rewrites these to jump straight into a compiled side trace.
+    pub stub_tails: Vec<(u32, u32)>,
 }
 
 /// Trace compiler error reasons (lj_traceerr.h).
@@ -342,8 +350,12 @@ pub struct JitState {
     pub rec: Option<Box<record::Record>>,
     /// Completed traces, indexed by trace number (slot 0 unused).
     pub trace: Vec<Option<Box<GCtrace>>>,
-    /// Scratch value environment of the portable trace executor.
+    /// Scratch value environment of the trace executors.
     pub exec_env: Vec<u64>,
+    /// Required env size: the maximum instruction count over all stored
+    /// traces. Machine-code chains switch traces without returning to
+    /// Rust, so the buffer must cover the whole tree up front.
+    pub env_need: usize,
     /// Engine parameters (JIT_P_*).
     pub param: [i32; JIT_P_MAX],
     /// Hot counter hash table (GG_State.hotcount).
@@ -370,6 +382,7 @@ impl JitState {
             rec: None,
             trace: vec![None],
             exec_env: Vec::new(),
+            env_need: 0,
             param: JIT_PARAM_DEFAULT,
             hotcount: [0; HOTCOUNT_SIZE],
             penalty: [HotPenalty::default(); PENALTY_SLOTS],

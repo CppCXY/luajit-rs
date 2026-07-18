@@ -44,10 +44,14 @@ pub struct ExitResult {
 pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult {
     let g = l.global();
     let mut env = std::mem::take(&mut g.jit.exec_env);
+    if env.len() < g.jit.env_need {
+        // Machine-code chains switch traces without returning to Rust:
+        // size the buffer for the largest stored trace up front. Stale
+        // contents are harmless (defs precede uses).
+        env.resize(g.jit.env_need, 0u64);
+    }
     let hotexit = g.jit.param(JitParam::HotExit) as u8;
     let mut current = traceno;
-    // Buffer for the parallel env-to-env hand-over on linked exits.
-    let mut handover: Vec<u64> = Vec::new();
     let r = loop {
         // The traces are owned by the registry inside GlobalState; the
         // executor additionally mutates the Lua stack. Split the borrows
@@ -59,57 +63,54 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
                 .expect("executing a freed trace");
             &mut *p
         };
-        let nins = (tr.ir.nins() - REF_BIAS) as usize;
-        if env.len() < nins {
-            // Stale contents are harmless: every slot is written before
-            // any read (defs precede uses; snapshots only reference
-            // prior defs).
-            env.resize(nins, 0u64);
-        }
+        let mut tr = tr;
 
         // Run the trace. The native tier leaves all snapshot values in
         // env (exit-stub register flush) and defers the Lua stack
         // restore: linked exits may hand the values straight to the next
-        // trace. The portable tier restores eagerly.
+        // trace. With patched exit chains the machine code may leave
+        // from a different trace than it entered: the exit code is
+        // `(traceno << 16) | snapidx`. The portable tier restores
+        // eagerly.
         let (exitno, restored) = if let Some(mc) = &tr.mcode {
             let entry: extern "C" fn(*mut LuaValue, *mut u64) -> u32 =
                 unsafe { std::mem::transmute(mc.ptr()) };
-            let exitno = entry(
+            let code = entry(
                 unsafe { l.stack.as_mut_ptr().add(base) },
                 env.as_mut_ptr(),
             ) as usize;
-            (exitno, false)
+            let exit_trace = (code >> 16) as TraceNo;
+            if exit_trace != current {
+                // The chain left from a linked trace: re-resolve.
+                current = exit_trace;
+                tr = unsafe {
+                    let p: *mut GCtrace = &mut **l.global().jit.trace[current as usize]
+                        .as_mut()
+                        .expect("exit from a freed trace");
+                    &mut *p
+                };
+            }
+            (code & 0xffff, false)
         } else {
             (run_ir(l, base, tr, &mut env).exitno, true)
         };
 
         let (nsnap, linktype, link) = (tr.snap.len(), tr.linktype, tr.link);
-        // Follow a previously compiled side trace for this exit.
+        // Follow a side trace linked to this exit. (Machine-code parents
+        // jump to machine-code sides directly through the patched stubs;
+        // this path covers the portable tiers and mixed pairs. The side
+        // trace's own prelude performs the env hand-over.)
         let sidetrace = tr.snap[exitno].sidetrace;
         if sidetrace != 0 {
-            let side: &GCtrace = unsafe {
-                let p: *const GCtrace = &**l.global().jit.trace[sidetrace as usize]
+            let side_native = unsafe {
+                l.global().jit.trace[sidetrace as usize]
                     .as_ref()
-                    .expect("linked exit to a freed trace");
-                &*p
+                    .expect("linked exit to a freed trace")
+                    .mcode
+                    .is_some()
             };
-            if side.mcode.is_some() {
-                // Fast hand-over: pre-fill the side trace's inherited
-                // env slots from the parent's (buffered: the slot ranges
-                // may overlap). No Lua-stack round trip at all.
-                let side_nins = (side.ir.nins() - REF_BIAS) as usize;
-                if env.len() < side_nins {
-                    env.resize(side_nins, 0u64);
-                }
-                handover.clear();
-                handover.extend(
-                    side.parentmap.iter().map(|&(_, p)| env[(p as IRRef - REF_BIAS) as usize]),
-                );
-                for (&(own, _), &v) in side.parentmap.iter().zip(handover.iter()) {
-                    env[(own as IRRef - REF_BIAS) as usize] = v;
-                }
-            } else if !restored {
-                // Portable side tier reads the Lua stack: materialize it.
+            if !side_native && !restored {
+                // The portable side tier reads the Lua stack: materialize.
                 restore_snapshot(l, base, tr, &env, exitno);
             }
             current = sidetrace;

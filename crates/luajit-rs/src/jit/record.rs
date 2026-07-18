@@ -135,6 +135,8 @@ impl Record {
                 root: 0,
                 nchild: 0,
                 parentmap: Vec::new(),
+                inner_ofs: 0,
+                stub_tails: Vec::new(),
             },
             parent: parent as TraceNo,
             exitno: exitno as u32,

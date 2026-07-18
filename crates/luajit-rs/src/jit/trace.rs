@@ -334,16 +334,34 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             root: 0,
             nchild: 0,
             parentmap: Vec::new(),
+            inner_ofs: 0,
+            stub_tails: Vec::new(),
         },
     );
     #[cfg(target_arch = "x86_64")]
     let trace = {
         // `lj_asm_trace`: assemble the IR to machine code. On NYI/OOM the
-        // trace stays on the portable IR executor (mcode = None).
+        // trace stays on the portable IR executor (mcode = None). Root
+        // links get the target's inner-entry address for a direct jump.
         let mut trace = trace;
-        trace.mcode = super::asm_x64::assemble(&trace).ok();
+        let link_target: Option<*const u8> =
+            if trace.linktype == TraceLink::Root && trace.link != 0 {
+                js.trace[trace.link as usize].as_ref().and_then(|t| {
+                    t.mcode.as_ref().map(|m| unsafe { m.ptr().add(t.inner_ofs as usize) })
+                })
+            } else {
+                None
+            };
+        if let Ok((mc, inner, tails)) = super::asm_x64::assemble(&trace, link_target) {
+            trace.mcode = Some(mc);
+            trace.inner_ofs = inner;
+            trace.stub_tails = tails;
+        }
         trace
     };
+    // Machine-code chains switch traces without resizing env in Rust:
+    // keep the high-water mark over all stored traces.
+    js.env_need = js.env_need.max((trace.ir.nins() - super::ir::REF_BIAS) as usize);
 
     // Patch the bytecode of the starting instruction in a root trace.
     let pt = trace.startpt;
@@ -365,10 +383,26 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             setbc_d(ins, traceno);
         }
         BCOp::JMP => {
-            // Side trace: link the parent exit (lj_asm_patchexit stands
-            // in for our executor-followed field) and avoid compiling it
-            // twice.
+            // Side trace: link the parent exit and avoid compiling it
+            // twice. If both sides are machine code, patch the parent's
+            // exit stubs to jump straight into the side trace's inner
+            // entry (lj_asm_patchexit) — the whole tree then runs in
+            // machine code without Rust round trips.
             debug_assert!(parent != 0 && root != 0, "not a side trace");
+            #[cfg(target_arch = "x86_64")]
+            {
+                let target = js.trace[traceno as usize].as_ref().and_then(|t| {
+                    t.mcode.as_ref().map(|m| unsafe { m.ptr().add(t.inner_ofs as usize) })
+                });
+                if let Some(target) = target {
+                    let pt_ = js.trace[parent as usize].as_mut().unwrap();
+                    let tails = std::mem::take(&mut pt_.stub_tails);
+                    if let Some(area) = &mut pt_.mcode {
+                        super::asm_x64::patch_exit(area, &tails, exitno as u32, target);
+                    }
+                    pt_.stub_tails = tails;
+                }
+            }
             let psnap = &mut js.trace[parent as usize].as_mut().unwrap().snap[exitno];
             psnap.count = SNAPCOUNT_DONE;
             psnap.sidetrace = traceno;
