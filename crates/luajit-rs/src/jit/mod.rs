@@ -145,6 +145,10 @@ pub struct SnapShot {
     /// Side trace linked to this exit (0 = none). Stands in for LuaJIT's
     /// `lj_asm_patchexit` mcode patching: the executor follows it.
     pub sidetrace: TraceNo,
+    /// Recorder base slot at the snapshot: 2 = the entry frame, higher
+    /// values lie inside inlined call frames (the exit must re-enter the
+    /// innermost frame before resuming).
+    pub baseslot: u8,
     /// Number of valid slots.
     pub nslots: u8,
     /// Maximum frame extent.

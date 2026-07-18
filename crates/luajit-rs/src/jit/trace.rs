@@ -55,6 +55,8 @@ pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: us
         return;
     }
     let t = js.trace[parent as usize].as_ref().expect("hot exit of a freed trace");
+    // Deep exits record from within the inlined frame: snap_replay
+    // rebuilds the frame stack and rec.pt from the snapshot constants.
     let (pt, pc) = (t.startpt, t.snap[exitno].pc as usize);
     js.parent = parent;
     js.exitno = exitno as u32;
@@ -67,7 +69,13 @@ pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: us
 fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
     let g = l.global();
     let js = &mut g.jit;
-    let startins = pt.as_ref().bc[pc];
+    // Side traces start as a pseudo-JMP: `pc` may lie inside an inlined
+    // callee, so the root proto's bytecode must not be indexed with it.
+    let startins = if js.parent != 0 {
+        crate::bc::bcins_ad(BCOp::JMP, 0, 0)
+    } else {
+        pt.as_ref().bc[pc]
+    };
     let op = bc_op(startins);
 
     if pt.as_ref().flags & PROTO_NOJIT != 0 {
@@ -124,6 +132,7 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         js.exitno as u16,
         js.param(JitParam::LoopUnroll),
         js.param(JitParam::InstUnroll),
+        js.param(JitParam::CallUnroll),
     );
 
     if js.parent != 0 {
@@ -849,11 +858,12 @@ mod tests {
     }
 
     #[test]
-    fn hot_call_penalizes_funcf_header() {
+    fn hot_loop_inlines_lua_call() {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
-        // Function bodies end in RET*: call recording is NYI, so hot
-        // functions get penalized and blacklisted at the FUNCF header.
+        // The hot loop records straight through g(): the callee identity
+        // is guarded (EQ FUNC) and the body inlined — no call frame at
+        // loop close, no FUNCF blacklisting.
         let (f, pt) = load_proto(
             &mut lua,
             "local function g(x) return x + 1 end \
@@ -861,6 +871,14 @@ mod tests {
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(2000000.0));
+        let forl_pc = find_op(pt, BCOp::JFORL).expect("loop not compiled");
+        let g = lua.global();
+        let tno = crate::bc::bc_d(pt.as_ref().bc[forl_pc]);
+        let tr = g.jit.trace[tno as usize].as_deref().unwrap();
+        assert_eq!(tr.linktype, TraceLink::Loop);
+        #[cfg(target_arch = "x86_64")]
+        assert!(tr.mcode.is_some(), "inlined-call loop not assembled");
+        // The callee's FUNCF header stays untouched (not blacklisted).
         let child = pt
             .as_ref()
             .kgc
@@ -870,7 +888,162 @@ mod tests {
                 _ => None,
             })
             .expect("child proto");
-        assert_eq!(bc_op(child.as_ref().bc[0]), BCOp::IFUNCF);
+        assert_eq!(bc_op(child.as_ref().bc[0]), BCOp::FUNCF);
+    }
+
+    #[test]
+    fn inlined_call_branch_exits_inside_callee_frame() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // The branch in f() flips at i > 150000: the compiled trace's
+        // guard fails *inside the inlined frame*, so the exit restores
+        // the call frame (KFUNC + frame link constants) and the
+        // interpreter resumes within f's bytecode.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local function f(x, i) \
+               if i > 150000 then return x + 2 end \
+               return x + 1 \
+             end \
+             local s = 0 \
+             for i = 1, 200000 do s = f(s, i) end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(150000.0 + 50000.0 * 2.0));
+    }
+
+    #[test]
+    fn inlined_calls_nest_and_return_pairs() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local function two(x) return x, x + 0.5 end \
+             local function inc(x) return x + 1 end \
+             local function nop() end \
+             local s = 0 \
+             for i = 1, 200000 do \
+               local a, b = two(inc(i)) \
+               nop() \
+               s = s + (b - a) \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(100000.0));
+    }
+
+    #[test]
+    fn recursion_hits_call_unroll_limit() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // Non-tail recursion exceeds JIT_P_callunroll during recording;
+        // the trace aborts and the loop is eventually blacklisted, but
+        // the semantics stay intact.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local function r(n) if n <= 0 then return 0 end return 1 + r(n - 1) end \
+             local s = 0 \
+             for i = 1, 30000 do s = s + r(8) end return s",
+        );
+        let res = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(res[0].as_number(), Some(240000.0));
+        assert_eq!(lua.global().jit.state, TraceState::Idle);
+    }
+
+    #[test]
+    fn deep_exit_seeds_side_trace_inside_callee() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // The parity branch flips inside f(): the hot exit lies in the
+        // inlined frame, so the side trace replays the KFUNC/frame-link
+        // constants, rebuilds the frame stack and records from within
+        // the callee back to the loop.
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local function f(x, i) \
+               if i % 2 == 0 then return x + 2 end \
+               return x + 1 \
+             end \
+             local s = 0 \
+             for i = 1, 200000 do s = f(s, i) end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(300000.0));
+        let g = lua.global();
+        let forl_pc = find_op(pt, BCOp::JFORL).expect("root not compiled");
+        let rootno = crate::bc::bc_d(pt.as_ref().bc[forl_pc]);
+        let root = g.jit.trace[rootno as usize].as_deref().unwrap();
+        assert!(root.nchild >= 1, "no side trace from the deep exit");
+        let (exitno, side) = root
+            .snap
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| (s.sidetrace != 0).then_some((i, s.sidetrace)))
+            .expect("deep exit not linked");
+        assert!(root.snap[exitno].baseslot > 2, "exit is not inside a frame");
+        let st = g.jit.trace[side as usize].as_deref().unwrap();
+        assert_eq!(st.linktype, TraceLink::Root);
+        #[cfg(target_arch = "x86_64")]
+        assert!(st.mcode.is_some(), "deep side trace not assembled");
+    }
+
+    #[test]
+    fn tailcall_wrapper_is_inlined() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // wrap() forwards via CALLT: the frame is replaced in place and
+        // the pending return still lands in the original caller.
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local function base(x) return x + 1 end \
+             local function wrap(x) return base(x) end \
+             local s = 0 \
+             for i = 1, 200000 do s = wrap(s) end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(200000.0));
+        assert!(find_op(pt, BCOp::JFORL).is_some(), "tailcall loop not compiled");
+    }
+
+    #[test]
+    fn closed_mutable_upvalue_loads_through_cell() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // k is assigned after capture (mutable) and mk has returned
+        // (closed): the load compiles to a ULOAD of the constant cell
+        // address with a type guard.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local function mk() \
+               local k = 0 \
+               local g = function(x) return x + k end \
+               k = 7 \
+               return g \
+             end \
+             local g = mk() \
+             local s = 0 \
+             for i = 1, 200000 do s = g(s) end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(1400000.0));
+    }
+
+    #[test]
+    fn open_upvalue_aliases_recorded_slot() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // t is mutable and its upvalue is open (the chunk is running):
+        // the load forwards to the aliased frame-0 slot under the
+        // closure-identity guard.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local t = 0 \
+             local function get() return t end \
+             local s = 0 \
+             for i = 1, 200000 do t = i s = s + get() end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(200000.0 * 200001.0 / 2.0));
     }
 
     #[test]

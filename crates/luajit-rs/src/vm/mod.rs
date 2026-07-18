@@ -49,9 +49,9 @@ use crate::value::*;
 ///   carries the real link; varargs live between the two frames.
 const FRAME_LUA: u64 = 0;
 const FRAME_C: u64 = 1;
-const FRAME_VARG: u64 = 3;
+pub const FRAME_VARG: u64 = 3;
 const FRAME_CONT: u64 = 2;
-const FRAME_TYPE_MASK: u64 = 3;
+pub const FRAME_TYPE_MASK: u64 = 3;
 
 /// Continuation IDs stored in the cont-slot of a FRAME_CONT frame.
 #[repr(u8)]
@@ -1316,10 +1316,14 @@ impl Interp {
                             let tno = bc_d(self.proto().bc[jforl]);
                             let r = crate::jit::exec::trace_exec(self.l(), self.base, tno);
                             self.pc = r.pc;
+                            if r.baseslot != 2 {
+                                self.trace_exit_frame(r.baseslot);
+                            }
                             if self.rec_started() {
                                 return Ok(Flow::Rec); // Hot exit: record a side trace.
                             }
                             resync!();
+                            continue;
                         } else {
                             jump!(ins);
                         }
@@ -1366,6 +1370,9 @@ impl Interp {
                         sync!();
                         let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
                         self.pc = r.pc;
+                        if r.baseslot != 2 {
+                            self.trace_exit_frame(r.baseslot);
+                        }
                         if self.rec_started() {
                             return Ok(Flow::Rec); // Hot exit: record a side trace.
                         }
@@ -1391,6 +1398,9 @@ impl Interp {
                     sync!();
                     let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
                     self.pc = r.pc;
+                    if r.baseslot != 2 {
+                        self.trace_exit_frame(r.baseslot);
+                    }
                     if self.rec_started() {
                         return Ok(Flow::Rec); // Hot exit: record a side trace.
                     }
@@ -1551,6 +1561,18 @@ impl Interp {
     #[inline]
     fn rec_started(&mut self) -> bool {
         self.l().global().jit.state == crate::jit::TraceState::Record
+    }
+
+    /// A trace exited inside an inlined call frame: shift the base to
+    /// the innermost frame (its slots — including the function and the
+    /// frame link — were restored from the snapshot) and reload the
+    /// interpreter for that frame's closure.
+    #[cold]
+    fn trace_exit_frame(&mut self, baseslot: usize) {
+        self.base += baseslot - 2;
+        let bp = unsafe { self.sp.add(self.base) };
+        self.reload_at(bp);
+        self.l().top = self.base + self.proto().framesize as usize;
     }
 
     /// `lj_gc_check` + `lj_gc_step_fixtop`: run a collection if the

@@ -69,6 +69,21 @@ impl Default for ScEv {
 /// The three canonical primitive values, indexed by the ~itype operand.
 const PRI_VALUES: [LuaValue; 3] = [LuaValue::NIL, LuaValue::FALSE, LuaValue::TRUE];
 
+/// One inlined call frame of the recorder (the parts of LuaJIT's slot
+/// bookkeeping that `lj_record_call`/`lj_record_ret` juggle).
+struct FrameInfo {
+    /// Caller prototype (recording continues there after the return).
+    pt: GcPtr<Proto>,
+    /// Callee prototype (for the recursion-unroll limit).
+    callee: GcPtr<Proto>,
+    /// The CALL's base slot A, relative to the caller frame.
+    cbase: u32,
+    /// Results wanted by the CALL (B-1; fixed, multres calls are NYI).
+    want: u32,
+    /// Caller's baseslot, restored on return.
+    prev_baseslot: usize,
+}
+
 /// The recording context: the parts of `jit_State` that only live while
 /// the recorder runs, plus the trace under construction (`J->cur`).
 pub struct Record {
@@ -87,6 +102,8 @@ pub struct Record {
     pub maxslot: u32,
     pub framedepth: i32,
     pub retdepth: i32,
+    /// Inlined call frames (parallel to framedepth).
+    frames: Vec<FrameInfo>,
     /// Suppress a new snapshot if no guard was emitted (J->mergesnap).
     pub mergesnap: bool,
     /// Take a snapshot before recording the next bytecode (J->needsnap).
@@ -104,6 +121,10 @@ pub struct Record {
     pub loopunroll: i32,
     /// Remaining unroll attempts for unstable loops (J->instunroll).
     pub instunroll: i32,
+    /// Max. depth of same-function call inlining (JIT_P_callunroll).
+    pub callunroll: i32,
+    /// Number of recorded tailcalls (J->tailcalled).
+    pub tailcalled: i32,
     /// The proto being recorded (single-frame traces: always startpt).
     pub pt: GcPtr<Proto>,
     /// Current bytecode index, updated as recording progresses (J->pc).
@@ -119,6 +140,7 @@ impl Record {
         exitno: u16,
         loopunroll: i32,
         instunroll: i32,
+        callunroll: i32,
     ) -> Box<Record> {
         Box::new(Record {
             cur: GCtrace {
@@ -145,6 +167,7 @@ impl Record {
             maxslot: 0,
             framedepth: 0,
             retdepth: 0,
+            frames: Vec::new(),
             mergesnap: false,
             needsnap: false,
             scev: ScEv::default(),
@@ -154,6 +177,8 @@ impl Record {
             loopref: 0,
             loopunroll,
             instunroll,
+            callunroll,
+            tailcalled: 0,
             pt,
             pc,
         })
@@ -261,6 +286,7 @@ impl Record {
             iref: self.cur.ir.nins(),
             pc: self.pc as u32,
             sidetrace: 0,
+            baseslot: self.baseslot as u8,
             nslots: nslots as u8,
             topslot: self.pt.as_ref().framesize,
             nent: nent as u8,
@@ -306,17 +332,28 @@ impl Record {
 
     /// `lj_snap_replay`: replay a parent snapshot to set up a side trace.
     /// Emits inherited SLOADs (or re-interned constants) for every slot
-    /// of the parent exit and takes snapshot #0.
+    /// of the parent exit, takes snapshot #0 and — for exits inside
+    /// inlined call frames — rebuilds the recorder's frame stack from
+    /// the KFUNC/frame-link constants (LuaJIT reads the real stack; our
+    /// frame slots are compile-time constants, so decoding them is
+    /// equivalent).
     pub fn snap_replay(&mut self, t: &GCtrace, exitno: usize) -> Result<(), TraceError> {
         let snap = t.snap[exitno];
         let ofs = snap.mapofs as usize;
         self.framedepth = 0;
         // Parent ref -> replayed tref, for de-duping aliased slots.
         let mut seen: Vec<(IRRef, TRef)> = Vec::new();
+        // Frame-chain decoding state.
+        let mut cur_pt = t.startpt;
+        let mut prev_baseslot = 2usize;
+        let mut prev_entry: Option<(u32, IRRef)> = None;
         for n in 0..snap.nent as usize {
             let sn = t.snapmap[ofs + n];
             let s = snap_slot(sn);
             let r = snap_ref(sn);
+            if sn & SNAP_CONT != 0 {
+                return Err(TraceError::NYIBC); // Continuation frames NYI.
+            }
             let tr = if let Some(&(_, tr)) = seen.iter().find(|&&(pr, _)| pr == r) {
                 tr
             } else {
@@ -345,12 +382,52 @@ impl Record {
                 tr
             };
             self.slot[s as usize] = tr | (sn & (SNAP_CONT | SNAP_FRAME));
-            if sn & (SNAP_CONT | SNAP_FRAME) != 0 && s != 1 {
+            if sn & SNAP_FRAME != 0 && s != 1 {
+                // An inlined frame's link slot: rebuild the FrameInfo
+                // from the constants (the function sits in the entry at
+                // slot s-1, the link is the caller's return address).
+                if !irref_isk(r) {
+                    return Err(TraceError::NYIBC);
+                }
+                let link_bits = t.ir.k64_val(r);
+                let Some((fs, fref)) = prev_entry else { return Err(TraceError::NYIBC) };
+                if fs != s - 1 || !irref_isk(fref) {
+                    return Err(TraceError::NYIBC);
+                }
+                let fv = LuaValue::from_bits(t.ir.k64_val(fref));
+                let Some(gf) = fv.as_func() else { return Err(TraceError::NYIBC) };
+                let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
+                    return Err(TraceError::NYIBC);
+                };
+                let bcbase = cur_pt.as_ref().bc.as_ptr() as u64;
+                let Some(delta) = link_bits.checked_sub(bcbase) else {
+                    return Err(TraceError::NYIBC);
+                };
+                let ret_pc = (delta / 4) as usize;
+                if delta % 4 != 0 || ret_pc == 0 || ret_pc >= cur_pt.as_ref().bc.len() {
+                    return Err(TraceError::NYIBC);
+                }
+                let call_ins = cur_pt.as_ref().bc[ret_pc - 1];
+                if bc_op(call_ins) != BCOp::CALL || bc_b(call_ins) == 0 {
+                    return Err(TraceError::NYIBC);
+                }
+                self.frames.push(FrameInfo {
+                    pt: cur_pt,
+                    callee: cl.proto,
+                    cbase: bc_a(call_ins),
+                    want: bc_b(call_ins) - 1,
+                    prev_baseslot,
+                });
                 self.framedepth += 1;
-            }
-            if sn & SNAP_FRAME != 0 {
+                cur_pt = cl.proto;
+                prev_baseslot = s as usize + 1;
                 self.baseslot = s as usize + 1;
             }
+            prev_entry = Some((s, r));
+        }
+        self.pt = cur_pt;
+        if 1 + self.baseslot + cur_pt.as_ref().framesize as usize >= MAX_JSLOTS {
+            return Err(TraceError::STACKOV);
         }
         self.maxslot = snap.nslots as u32 - self.baseslot as u32;
         self.pc = snap.pc as usize;
@@ -716,6 +793,282 @@ impl Record {
         self.cur.ir.emitir(irtn(op), tref_ref(rb), tref_ref(rc))
     }
 
+    // -- Calls and returns (lj_record_call / lj_record_ret) -------------------
+
+    /// Record a fixed-result CALL to a plain Lua closure, inlining the
+    /// callee: guard the closure identity, lay down the frame slots
+    /// (KFUNC + frame-link constant) and switch the recorder into the
+    /// callee frame. Everything else (C functions, varargs, metacalls,
+    /// multres) aborts with NYIBC and takes the penalty path.
+    fn rec_call(&mut self, l: &LuaState, base: usize, pc: usize, ins: BCIns) -> Result<(), TraceError> {
+        let a = bc_a(ins);
+        let want = bc_b(ins) as i32 - 1;
+        if want < 0 {
+            return Err(TraceError::NYIBC); // Multres call (CALLM context).
+        }
+        let nargs = (bc_c(ins) as u32).wrapping_sub(1);
+        let fv = self.slot_val(l, base, a);
+        let Some(gf) = fv.as_func() else {
+            return Err(TraceError::NYIBC); // __call metamethod NYI.
+        };
+        let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
+            return Err(TraceError::NYIBC); // Fast functions NYI (recff).
+        };
+        let cpt = cl.proto;
+        if cpt.as_ref().flags & crate::proto::PROTO_VARARG != 0 {
+            return Err(TraceError::NYIBC);
+        }
+        // Bound true recursion (JIT_P_callunroll).
+        if self.frames.iter().filter(|f| f.callee.addr() == cpt.addr()).count()
+            >= self.callunroll as usize
+        {
+            return Err(TraceError::CUNROLL);
+        }
+        let framesize = cpt.as_ref().framesize as usize;
+        let newbase = self.baseslot + a as usize + 2;
+        if 1 + newbase + framesize >= MAX_JSLOTS {
+            return Err(TraceError::STACKOV);
+        }
+        // Guard the callee identity, then specialize the slot to it.
+        let ftr = self.getslot(l, base, a);
+        let kf = self.cur.ir.kgc(fv.to_bits(), IRT_FUNC);
+        if !tref_isk(ftr) {
+            self.cur.ir.emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
+        }
+        self.set_base(a, kf);
+        // The frame link the interpreter stores: the return ins address.
+        let lk = self.cur.ir.kint64(super::bc_addr(self.pt, pc + 1) as u64);
+        self.set_base(a + 1, lk | TREF_FRAME);
+        // Load the arguments in the caller's context.
+        for i in 0..nargs {
+            self.getslot(l, base, a + 2 + i);
+        }
+        self.frames.push(FrameInfo {
+            pt: self.pt,
+            callee: cpt,
+            cbase: a,
+            want: want as u32,
+            prev_baseslot: self.baseslot,
+        });
+        self.framedepth += 1;
+        self.baseslot = newbase;
+        self.pt = cpt;
+        // rec_func_setup: pad missing arguments, clear the frame rest.
+        let numparams = cpt.as_ref().numparams as u32;
+        for s in nargs..numparams {
+            self.set_base(s, TREF_NIL);
+        }
+        for s in numparams..framesize as u32 {
+            self.set_base(s, 0);
+        }
+        self.maxslot = numparams;
+        Ok(())
+    }
+
+    /// Record a tail call (`lj_record_tailcall`): replace the current
+    /// frame in place — the pending return target (FrameInfo) stays.
+    /// Mirrors the interpreter's CALLT fast path conditions.
+    fn rec_callt(&mut self, l: &LuaState, base: usize, ins: BCIns) -> Result<(), TraceError> {
+        let a = bc_a(ins);
+        let nargs = (bc_d(ins) as u32).wrapping_sub(1);
+        let fv = self.slot_val(l, base, a);
+        let Some(gf) = fv.as_func() else {
+            return Err(TraceError::NYIBC);
+        };
+        let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
+            return Err(TraceError::NYIBC);
+        };
+        let cpt = cl.proto;
+        if cpt.as_ref().flags & crate::proto::PROTO_VARARG != 0 {
+            return Err(TraceError::NYIBC);
+        }
+        if self.framedepth == 0 {
+            // Replacing the trace's entry frame would leave exits with a
+            // stale closure context (pc in the new proto, baseslot 2).
+            return Err(TraceError::NYIBC);
+        }
+        // Tailcalls can form a loop: count towards the unroll limit.
+        self.tailcalled += 1;
+        if self.tailcalled > self.loopunroll {
+            return Err(TraceError::LUNROLL);
+        }
+        let framesize = cpt.as_ref().framesize as usize;
+        if 1 + self.baseslot + framesize >= MAX_JSLOTS {
+            return Err(TraceError::STACKOV);
+        }
+        // Guard the callee identity.
+        let ftr = self.getslot(l, base, a);
+        let kf = self.cur.ir.kgc(fv.to_bits(), IRT_FUNC);
+        if !tref_isk(ftr) {
+            self.cur.ir.emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
+        }
+        // Load the arguments, then move func + args down in place.
+        let args: Vec<TRef> = (0..nargs).map(|i| self.getslot(l, base, a + 2 + i)).collect();
+        self.slot[self.baseslot - 2] = kf; // Frame link (baseslot-1) stays.
+        for (i, &tr) in args.iter().enumerate() {
+            self.set_base(i as u32, tr);
+        }
+        let numparams = cpt.as_ref().numparams as u32;
+        for s in nargs..numparams {
+            self.set_base(s, TREF_NIL);
+        }
+        for s in numparams..framesize as u32 {
+            self.set_base(s, 0);
+        }
+        self.maxslot = numparams;
+        self.pt = cpt;
+        if let Some(fr) = self.frames.last_mut() {
+            fr.callee = cpt; // The pending return now belongs to the new callee.
+        }
+        Ok(())
+    }
+
+    /// Record a RET0/RET1/RET from an inlined frame: move the results to
+    /// the caller's call base and pop the frame. Returning past the
+    /// trace's entry frame is NYI (LJ_TRERR_NYIRETL).
+    fn rec_ret(&mut self, l: &LuaState, base: usize, rbase: u32, gotres: u32) -> Result<(), TraceError> {
+        if self.framedepth <= 0 {
+            return Err(TraceError::NYIRETL);
+        }
+        // Load the results while still in the callee frame.
+        let res: Vec<TRef> =
+            (0..gotres).map(|i| self.getslot(l, base, rbase + i)).collect();
+        let callee_top = self.baseslot + self.pt.as_ref().framesize as usize;
+        let fr = self.frames.pop().expect("framedepth/frames mismatch");
+        self.framedepth -= 1;
+        self.baseslot = fr.prev_baseslot;
+        self.pt = fr.pt;
+        for i in 0..fr.want {
+            let tr = if i < gotres { res[i as usize] } else { TREF_NIL };
+            self.set_base(fr.cbase + i, tr);
+        }
+        // Clear the dead frame area (stale KFUNC/link/local trefs).
+        for s in (self.baseslot + (fr.cbase + fr.want) as usize)..callee_top {
+            self.slot[s] = 0;
+        }
+        self.maxslot = fr.cbase + fr.want;
+        Ok(())
+    }
+
+    // -- Upvalues (lj_record.c rec_upvalue) -----------------------------------
+
+    /// Late specialization of the current function (`getcurrf` + the EQ
+    /// guard): required before anything derived from the closure (its
+    /// upvalue cells) can be treated as a constant.
+    fn specialize_curfn(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        fnval: LuaValue,
+    ) -> Result<TRef, TraceError> {
+        let fslot = self.baseslot - 2;
+        let cur = self.slot[fslot];
+        if cur != 0 && tref_isk(cur) {
+            return Ok(cur); // Inlined frames are specialized already.
+        }
+        let kf = self.cur.ir.kgc(fnval.to_bits(), IRT_FUNC);
+        let ftr = if cur != 0 { cur } else { self.getslot_abs(l, base, fslot) };
+        if !tref_isk(ftr) {
+            self.cur.ir.emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
+        }
+        self.slot[fslot] = kf;
+        Ok(kf)
+    }
+
+    /// `getslot` by absolute recorder slot (may lie below the current
+    /// frame, e.g. the frame-0 function slot or an aliased caller local).
+    fn getslot_abs(&mut self, l: &LuaState, base: usize, abs: usize) -> TRef {
+        let tr = self.slot[abs];
+        if tr != 0 {
+            return tr;
+        }
+        let frame0 = base - (self.baseslot - 2);
+        let v = l.stack[frame0 + abs - 2];
+        let t = Self::value_irt(v);
+        let mut tr = self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::SLOAD, IRT_GUARD | t),
+            abs as IRRef,
+            IRSLOAD_TYPECHECK,
+        ));
+        if irt_ispri(t) {
+            tr = tref_pri(t);
+        }
+        self.slot[abs] = tr;
+        tr
+    }
+
+    /// Intern a runtime value as an IR constant (`lj_record_constify`).
+    fn constify(&mut self, v: LuaValue) -> TRef {
+        if v.is_number() {
+            self.cur.ir.knum_u64(v.to_bits())
+        } else {
+            let t = Self::value_irt(v);
+            if irt_ispri(t) { tref_pri(t) } else { self.cur.ir.kgc(v.to_bits(), t) }
+        }
+    }
+
+    /// `rec_upvalue` (loads only): constify immutable upvalues, forward
+    /// open upvalues aliasing recorded slots, and load closed cells
+    /// through their (constant) address with a type guard.
+    fn rec_uget(&mut self, l: &LuaState, base: usize, uvidx: u32) -> Result<TRef, TraceError> {
+        let fnval = l.stack[base - 2];
+        let Some(gf) = fnval.as_func() else { return Err(TraceError::NYIBC) };
+        let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
+            return Err(TraceError::NYIBC);
+        };
+        let Some(&uv) = cl.upvals.get(uvidx as usize) else {
+            return Err(TraceError::NYIBC);
+        };
+        let uvp = uv.as_ref();
+        let val = uvp.get();
+        // rec_upvalue_constify: immutable upvalues become constants under
+        // the closure-identity guard (skip memory-heavy objects).
+        if uvp.immutable
+            && !(val.is_table()
+                || val.is_thread()
+                || val.itype() == crate::value::LJ_TUDATA)
+        {
+            self.specialize_curfn(l, base, fnval)?;
+            return Ok(self.constify(val));
+        }
+        self.specialize_curfn(l, base, fnval)?;
+        if uvp.is_open() {
+            // Open upvalue: if it aliases a slot of the recorded frames,
+            // forward the slot. The closure-identity guard pins the
+            // activation, so the alias is stable for this trace.
+            let sp = l.stack.as_ptr() as usize;
+            let ptr = uvp.value_ptr() as usize;
+            let frame0 = base - (self.baseslot - 2);
+            if ptr >= sp
+                && ptr < sp + l.stack.len() * 8
+                && (ptr - sp) % 8 == 0
+            {
+                let idx = (ptr - sp) / 8;
+                if idx + 2 >= frame0 + 2 && idx - frame0 + 2 < MAX_JSLOTS {
+                    let abs = idx - frame0 + 2;
+                    if abs >= 2 {
+                        return Ok(self.getslot_abs(l, base, abs));
+                    }
+                }
+            }
+            // Below the trace's frames or on another thread: the cell can
+            // close behind our back.
+            return Err(TraceError::NYIBC);
+        }
+        // Closed upvalue: the cell address is a constant (pool slots are
+        // stable and closed cells never reopen); load with a type guard.
+        let t = Self::value_irt(val);
+        let cell = self.cur.ir.kint64(uvp.value_ptr() as u64);
+        let mut tr = self
+            .cur
+            .ir
+            .emit_ins(IRIns::new(irt(IROp::ULOAD, IRT_GUARD | t), tref_ref(cell), 0));
+        if irt_ispri(t) {
+            tr = tref_pri(t);
+        }
+        Ok(tr)
+    }
+
     // -- Main recording entry (lj_record_ins) ---------------------------------------
 
     /// Record the instruction at `pc` *before* it is executed. Returns the
@@ -945,6 +1298,21 @@ impl Record {
                 }
             }
             BCOp::JITERL => return Err(TraceError::NYIBC), // Iterators are NYI.
+
+            // -- Upvalues ----------------------------------------------------------
+            BCOp::UGET => result = self.rec_uget(l, base, bc_d(ins))?,
+
+            // -- Calls and returns -------------------------------------------------
+            BCOp::CALL => self.rec_call(l, base, pc, ins)?,
+            BCOp::CALLT => self.rec_callt(l, base, ins)?,
+            BCOp::RET0 => self.rec_ret(l, base, bc_a(ins), 0)?,
+            BCOp::RET1 => self.rec_ret(l, base, bc_a(ins), 1)?,
+            BCOp::RET => self.rec_ret(l, base, bc_a(ins), bc_d(ins) - 1)?,
+            BCOp::FUNCF => {
+                // Reached only through the slow call paths (the fast path
+                // enters at bc[1]); those shapes are not recorded yet.
+                return Err(TraceError::NYIBC);
+            }
 
             // Everything else is NYI in Phase 2: calls, returns, tables,
             // upvalues, iterators, varargs, concat, bit ops, lengths.

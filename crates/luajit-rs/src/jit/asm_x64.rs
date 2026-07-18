@@ -213,6 +213,7 @@ impl<'a> Asm<'a> {
             let ins = tr.ir.ir(r);
             match ins.op() {
                 IROp::NOP | IROp::BASE | IROp::LOOP | IROp::SLOAD => {}
+                IROp::ULOAD => {} // op1 is a KINT64 address constant.
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX
                 | IROp::NEG => {
                     a.mark_use(ins.op1 as IRRef, r);
@@ -348,6 +349,7 @@ impl<'a> Asm<'a> {
                 IROp::LOOP => self.asm_loop_head(),
                 IROp::PHI => {} // Handled at the back edge.
                 IROp::SLOAD => self.asm_sload(&ins)?,
+                IROp::ULOAD => self.asm_uload(&ins)?,
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX => {
                     self.asm_arith(&ins)?
                 }
@@ -547,6 +549,50 @@ impl<'a> Asm<'a> {
             self.mov_r64_mem(RAX, RBASE, disp);
             self.sar_r64_imm(RAX, 47);
             self.cmp_r32_imm8(RAX, !(ty as u32) as i8);
+            self.guard(CC_NE);
+        }
+        Ok(())
+    }
+
+    /// ULOAD: load a closed upvalue cell through its constant address
+    /// (op1 = KINT64), with the same typecheck shapes as SLOAD.
+    fn asm_uload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let addr = super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let t = ins.t();
+        let i = Self::iidx(self.cur);
+        self.mov_r64_imm64(RAX, addr);
+        if irt_isnum(t) {
+            if ins.is_guard() {
+                self.cmp_mem32_imm32(RAX, 4, TISNUM_HI);
+                self.guard(CC_AE);
+            }
+            if self.last_use[i] != 0 || self.needs_env[i] {
+                let d = self.alloc(0)?;
+                self.movsd_load(d, RAX, 0);
+                self.def(d);
+            }
+            return Ok(());
+        }
+        if self.needs_env[i] {
+            self.mov_r64_mem(RCX, RAX, 0);
+            self.mov_mem_r64(RENV, Self::env_disp(self.cur), RCX);
+            self.env_valid[i] = true;
+        }
+        if !ins.is_guard() {
+            return Ok(());
+        }
+        let ty = irt_type(t);
+        if ty == IRT_NIL {
+            self.cmp_mem64_imm8(RAX, 0, -1);
+            self.guard(CC_NE);
+        } else if ty <= IRT_TRUE {
+            let itype = !(ty as u32);
+            self.cmp_mem32_imm32(RAX, 4, (itype << 15) | 0x7fff);
+            self.guard(CC_NE);
+        } else {
+            self.mov_r64_mem(RCX, RAX, 0);
+            self.sar_r64_imm(RCX, 47);
+            self.cmp_r32_imm8(RCX, !(ty as u32) as i8);
             self.guard(CC_NE);
         }
         Ok(())

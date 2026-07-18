@@ -26,12 +26,17 @@ use crate::value::LuaValue;
 use super::ir::*;
 use super::{GCtrace, JitParam, SNAP_NORESTORE, SNAPCOUNT_DONE, TraceLink, TraceNo, snap_ref, snap_slot};
 
-/// Result of running a trace: the bytecode index (into `startpt.bc`) at
-/// which the interpreter resumes.
+/// Result of running a trace: the bytecode index (into the resume
+/// frame's proto) at which the interpreter resumes.
 pub struct ExitResult {
     pub pc: usize,
     /// Exit (snapshot) number taken, for diagnostics and hot-exit checks.
     pub exitno: usize,
+    /// Recorder base slot of the exit snapshot: 2 = the entry frame;
+    /// higher values mean the exit lies in an inlined call frame and the
+    /// interpreter must shift its base by `baseslot - 2` and reload the
+    /// frame's closure before resuming.
+    pub baseslot: usize,
 }
 
 /// Execute trace `traceno` for the frame at `base` and follow the trace
@@ -134,7 +139,11 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
                 super::trace::trace_hot_side(l, base, current, exitno);
             }
         }
-        break ExitResult { pc: tr.snap[exitno].pc as usize, exitno };
+        break ExitResult {
+            pc: tr.snap[exitno].pc as usize,
+            exitno,
+            baseslot: tr.snap[exitno].baseslot as usize,
+        };
     };
     let g = l.global();
     g.jit.exec_env = env;
@@ -178,9 +187,19 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
             match op {
                 IROp::NOP | IROp::BASE | IROp::LOOP | IROp::PHI => {}
                 IROp::SLOAD => {
-                    // op1 = absolute recorder slot (baseslot-based).
-                    let slot = ins.op1 as usize - 2;
-                    let v = l.stack[base + slot];
+                    // op1 = absolute recorder slot (baseslot-based; 0 is
+                    // the frame-0 function slot at base-2).
+                    let idx = (base as i64 + ins.op1 as i64 - 2) as usize;
+                    let v = l.stack[idx];
+                    if ins.is_guard() && !typecheck(v, ins.t()) {
+                        return exit_snapshot(l, base, tr, env, snapidx);
+                    }
+                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                }
+                IROp::ULOAD => {
+                    // op1 = KINT64 constant holding the closed cell address.
+                    let p = const_bits(ir, ins.op1 as IRRef) as *const LuaValue;
+                    let v = unsafe { *p };
                     if ins.is_guard() && !typecheck(v, ins.t()) {
                         return exit_snapshot(l, base, tr, env, snapidx);
                     }
@@ -309,7 +328,7 @@ fn restore_snapshot(l: &mut LuaState, base: usize, tr: &GCtrace, env: &[u64], sn
             continue;
         }
         let s = snap_slot(sn) as usize;
-        debug_assert!(s >= 2, "frame slots are never restored in phase 3");
+        debug_assert!(s != 1, "the root frame link is never restored");
         let bits = read_ref(&tr.ir, env, snap_ref(sn));
         l.stack[base + s - 2] = LuaValue::from_bits(bits);
     }
@@ -324,7 +343,11 @@ fn exit_snapshot(
     snapidx: usize,
 ) -> ExitResult {
     restore_snapshot(l, base, tr, env, snapidx);
-    ExitResult { pc: tr.snap[snapidx].pc as usize, exitno: snapidx }
+    ExitResult {
+        pc: tr.snap[snapidx].pc as usize,
+        exitno: snapidx,
+        baseslot: tr.snap[snapidx].baseslot as usize,
+    }
 }
 
 /// Runtime type check against a (guarded) IR type — the SLOAD typecheck.
