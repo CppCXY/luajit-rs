@@ -12,7 +12,7 @@
 //!   --         Stop handling options
 //!   -          Execute stdin (non-interactive)
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::exit;
 
@@ -82,19 +82,8 @@ fn create_arg_table(l: &mut luajit_rs::state::LuaState, args: &[String], argn: u
     g.globals.as_mut().set(key, LuaValue::table(t));
 }
 
-#[cfg(windows)]
-unsafe extern "C" { fn _isatty(fd: i32) -> i32; fn _setmode(fd: i32, mode: i32) -> i32; }
-
 fn stdin_is_tty() -> bool {
-    #[cfg(windows)]
-    { unsafe { _isatty(0) != 0 } }
-    #[cfg(not(windows))]
-    { unsafe { extern "C" { fn isatty(fd: i32) -> i32; } isatty(0) != 0 } }
-}
-
-fn set_stdin_binary() {
-    #[cfg(windows)]
-    { unsafe { _setmode(0, 0x8000); } }
+    io::stdin().is_terminal()
 }
 
 fn pushline(prompt: &str) -> Option<String> {
@@ -247,7 +236,6 @@ fn handle_script(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) 
             eprintln!("luajit-rs: cannot read stdin");
             return 1;
         }
-        set_stdin_binary();
         return dostring(lua, &String::from_utf8_lossy(&src), "=stdin");
     }
     dofile(lua, name)
@@ -301,7 +289,6 @@ fn main() {
                 eprintln!("luajit-rs: cannot read stdin");
                 exit(1);
             }
-            set_stdin_binary();
             exit(dostring(&mut lua, &String::from_utf8_lossy(&src), "=stdin"));
         }
     }
