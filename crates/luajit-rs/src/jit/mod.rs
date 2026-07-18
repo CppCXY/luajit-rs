@@ -6,6 +6,7 @@
 //! * hot-path detection: hotcount table + penalties + blacklisting,
 //! * `ir`: the SSA IR format and buffer (lj_ir.h/c),
 //! * `opt_fold`: FOLD/CSE engine (lj_opt_fold.c subset),
+//! * `opt_dce`: dead code elimination (lj_opt_dce.c),
 //! * `opt_loop`: loop unrolling via copy-substitution + PHIs (lj_opt_loop.c),
 //! * `record`: the bytecode recorder for numeric single-frame traces
 //!   (lj_record.c + lj_snap.c subsets),
@@ -28,6 +29,7 @@
 pub mod exec;
 pub mod ir;
 pub mod mcode;
+pub mod opt_dce;
 pub mod opt_fold;
 pub mod opt_loop;
 pub mod record;
@@ -140,6 +142,9 @@ pub struct SnapShot {
     pub iref: ir::IRRef,
     /// Bytecode index to resume at (relative to `startpt.bc`).
     pub pc: u32,
+    /// Side trace linked to this exit (0 = none). Stands in for LuaJIT's
+    /// `lj_asm_patchexit` mcode patching: the executor follows it.
+    pub sidetrace: TraceNo,
     /// Number of valid slots.
     pub nslots: u8,
     /// Maximum frame extent.

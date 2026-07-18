@@ -34,50 +34,77 @@ pub struct ExitResult {
     pub exitno: usize,
 }
 
-/// Execute trace `traceno` for the frame at `base`. Returns the resume pc.
-/// The caller (JFORL/JLOOP dispatch arms) must have synced the frame.
+/// Execute trace `traceno` for the frame at `base` and follow the trace
+/// tree: exits with a linked side trace continue there, Root-linked side
+/// traces re-enter their root — all without returning to the interpreter
+/// (LuaJIT's mcode-to-mcode jumps). Returns the resume pc of the final,
+/// unlinked exit. The caller (JFORL/JLOOP dispatch arms) must have
+/// synced the frame and must switch to the recording dispatch when a
+/// side trace recording was started (jit.state == Record).
 pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult {
     let g = l.global();
-    // The trace is owned by the registry inside GlobalState; the executor
-    // additionally mutates the Lua stack. Split the borrows via a raw
-    // pointer — the registry never drops traces while one is running.
-    let tr: &mut GCtrace = unsafe {
-        let p: *mut GCtrace = &mut **g.jit.trace[traceno as usize]
-            .as_mut()
-            .expect("executing a freed trace");
-        &mut *p
-    };
     let mut env = std::mem::take(&mut g.jit.exec_env);
-    let nins = (tr.ir.nins() - REF_BIAS) as usize;
-    if env.len() < nins {
-        // Stale contents are harmless: every slot is written before any
-        // read (defs precede uses; snapshots only reference prior defs).
-        env.resize(nins, 0u64);
-    }
-
-    let hotexit = g.jit.param(JitParam::HotExit) as u32;
-    let r = if let Some(mc) = &tr.mcode {
-        // Native backend: run the machine code; it returns the exit
-        // snapshot index with all snapshot values parked in `env`.
-        let entry: extern "C" fn(*mut LuaValue, *mut u64) -> u32 =
-            unsafe { std::mem::transmute(mc.ptr()) };
-        let exitno = entry(
-            unsafe { l.stack.as_mut_ptr().add(base) },
-            env.as_mut_ptr(),
-        ) as usize;
-        restore_snapshot(l, base, tr, &env, exitno);
-        ExitResult { pc: tr.snap[exitno].pc as usize, exitno }
-    } else {
-        run_ir(l, base, tr, &mut env)
-    };
-    // Exit accounting (lj_trace_exit -> trace_hotside): count taken exits;
-    // side traces spawn from hot exits in a later phase.
-    if let Some(snap) = tr.snap.get_mut(r.exitno) {
-        if snap.count != SNAPCOUNT_DONE {
-            snap.count = snap.count.saturating_add(1);
-            let _ = hotexit; // Phase 4: >= hotexit starts a side trace.
+    let hotexit = g.jit.param(JitParam::HotExit) as u8;
+    let mut current = traceno;
+    let r = loop {
+        let g = l.global();
+        // The trace is owned by the registry inside GlobalState; the
+        // executor additionally mutates the Lua stack. Split the borrows
+        // via a raw pointer — the registry never drops traces while one
+        // is running.
+        let tr: &mut GCtrace = unsafe {
+            let p: *mut GCtrace = &mut **g.jit.trace[current as usize]
+                .as_mut()
+                .expect("executing a freed trace");
+            &mut *p
+        };
+        let nins = (tr.ir.nins() - REF_BIAS) as usize;
+        if env.len() < nins {
+            // Stale contents are harmless: every slot is written before
+            // any read (defs precede uses; snapshots only reference
+            // prior defs).
+            env.resize(nins, 0u64);
         }
-    }
+
+        let r = if let Some(mc) = &tr.mcode {
+            // Native backend: run the machine code; it returns the exit
+            // snapshot index with all snapshot values parked in `env`.
+            let entry: extern "C" fn(*mut LuaValue, *mut u64) -> u32 =
+                unsafe { std::mem::transmute(mc.ptr()) };
+            let exitno = entry(
+                unsafe { l.stack.as_mut_ptr().add(base) },
+                env.as_mut_ptr(),
+            ) as usize;
+            restore_snapshot(l, base, tr, &env, exitno);
+            ExitResult { pc: tr.snap[exitno].pc as usize, exitno }
+        } else {
+            run_ir(l, base, tr, &mut env)
+        };
+
+        let (nsnap, linktype, link) = (tr.snap.len(), tr.linktype, tr.link);
+        let snap = &mut tr.snap[r.exitno];
+        // Follow a previously compiled side trace for this exit.
+        if snap.sidetrace != 0 {
+            current = snap.sidetrace;
+            continue;
+        }
+        // A Root-linked side trace fell through its tail: re-enter the
+        // root trace (the restored stack is exactly its entry state).
+        if r.exitno == nsnap - 1 && linktype == TraceLink::Root && link != 0 {
+            current = link;
+            continue;
+        }
+        // Exit accounting (lj_trace_exit -> trace_hotside): count taken
+        // exits and start recording a side trace on a hot one.
+        if snap.count != SNAPCOUNT_DONE {
+            snap.count += 1;
+            if snap.count >= hotexit {
+                let (parent, exitno) = (current, r.exitno);
+                super::trace::trace_hot_side(l, base, parent, exitno);
+            }
+        }
+        break r;
+    };
     let g = l.global();
     g.jit.exec_env = env;
     r

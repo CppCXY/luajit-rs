@@ -18,7 +18,7 @@ use crate::state::{GlobalState, LuaState};
 use super::record::Record;
 use super::{
     HOTCOUNT_LOOP, HotCount, JitParam, JitState, PENALTY_MAX, PENALTY_MIN, PENALTY_RNDBITS,
-    PENALTY_SLOTS, TraceError, TraceLink, TraceNo, TraceState, bc_addr,
+    PENALTY_SLOTS, SNAPCOUNT_DONE, TraceError, TraceLink, TraceNo, TraceState, bc_addr,
 };
 
 /// Hot counter value that parks an already-compiled start instruction
@@ -42,6 +42,24 @@ pub fn trace_hot(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         js.state = TraceState::Start;
         trace_start(l, base, pt, pc);
     }
+}
+
+/// `trace_hotside` (the start half): a hot side exit of `parent` was
+/// taken often enough. Start recording a side trace from the exit's
+/// resume point. The caller (the trace executor) has already restored
+/// the snapshot to the Lua stack.
+pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: usize) {
+    let g = l.global();
+    let js = &mut g.jit;
+    if js.state != TraceState::Idle {
+        return;
+    }
+    let t = js.trace[parent as usize].as_ref().expect("hot exit of a freed trace");
+    let (pt, pc) = (t.startpt, t.snap[exitno].pc as usize);
+    js.parent = parent;
+    js.exitno = exitno as u32;
+    js.state = TraceState::Start;
+    trace_start(l, base, pt, pc);
 }
 
 /// `trace_start` + `lj_record_setup` + `rec_setup_root`: begin recording
@@ -82,8 +100,9 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
     js.startins = startins;
 
     // Phase 2 recorder handles FORL/LOOP/FUNCF roots; penalize the rest
-    // (ITERL/ITERN roots arrive with iterator recording).
-    if !matches!(op, BCOp::FORL | BCOp::LOOP | BCOp::FUNCF) {
+    // (ITERL/ITERN roots arrive with iterator recording). Side traces
+    // start at an arbitrary bytecode.
+    if js.parent == 0 && !matches!(op, BCOp::FORL | BCOp::LOOP | BCOp::FUNCF) {
         js.err = TraceError::NYIBC;
         js.state = TraceState::Err;
         trace_abort(g);
@@ -107,44 +126,82 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         js.param(JitParam::InstUnroll),
     );
 
-    // rec_setup_root: determine the next PC and the loop bytecode range.
-    match op {
-        BCOp::FORL => {
-            rec.bc_extent = (-bc_j(startins)) as usize;
-            rec.bc_min = (pc as i64 + 1 + bc_j(startins)) as usize;
-            rec.pc = rec.bc_min;
+    if js.parent != 0 {
+        // lj_record_setup, the side-trace half: inherit the parent exit.
+        let parent = js.parent;
+        let exitno = js.exitno as usize;
+        let (root, exit_count) = {
+            let t = js.trace[parent as usize].as_ref().expect("freed parent trace");
+            (if t.root != 0 { t.root } else { parent }, t.snap[exitno].count)
+        };
+        rec.cur.root = root;
+        rec.cur.startins = crate::bc::bcins_ad(BCOp::JMP, 0, 0);
+        if js.exitno != 0 {
+            rec.startpc = None; // Prevent forming an extra loop.
         }
-        BCOp::LOOP => {
-            // Only check the range for real loops, not "repeat until true".
-            let pcj = (pc as i64 + bc_j(startins)) as usize;
-            let jins = pt.as_ref().bc[pcj];
-            if bc_op(jins) == BCOp::JMP && bc_j(jins) < 0 {
-                rec.bc_min = (pcj as i64 + 1 + bc_j(jins)) as usize;
-                rec.bc_extent = (-bc_j(jins)) as usize;
-            }
-            rec.maxslot = crate::bc::bc_a(startins);
-            rec.pc = pc + 1;
+        // Avoid a hopeless exit: too many side traces or slow progress.
+        let root_children = js.trace[root as usize].as_ref().map_or(0, |r| r.nchild);
+        if root_children >= js.param(JitParam::MaxSide) as u16
+            || exit_count as i32 >= js.param(JitParam::HotExit) + js.param(JitParam::TrySide)
+        {
+            // lj_record_stop(LJ_TRLINK_INTERP): blacklist the exit for
+            // good instead of compiling a stub trace.
+            js.trace[parent as usize].as_mut().unwrap().snap[exitno].count = SNAPCOUNT_DONE;
+            js.startpt = None;
+            js.state = TraceState::Idle;
+            return;
         }
-        BCOp::FUNCF => {
-            // No bytecode range check for root traces started by a hot call.
-            rec.maxslot = pt.as_ref().numparams as u32;
-            rec.pc = pc + 1;
-        }
-        _ => unreachable!(),
-    }
-
-    // Snapshot #0 points at the first instruction to be recorded.
-    rec.snap_add();
-
-    // For FORL roots, record the loop bookkeeping of the paired FORI.
-    if op == BCOp::FORL {
-        let fori = rec.pc - 1;
-        if let Err(e) = rec.for_loop(l, base, fori, true) {
-            let g = l.global();
-            g.jit.err = e;
-            g.jit.state = TraceState::Err;
+        // The registry owns the parent; the borrow is split like in the
+        // executor (traces are never freed while the compiler runs).
+        let t: *const super::GCtrace =
+            &**js.trace[parent as usize].as_ref().expect("freed parent trace");
+        if let Err(e) = rec.snap_replay(unsafe { &*t }, exitno) {
+            js.err = e;
+            js.state = TraceState::Err;
             trace_abort(g);
             return;
+        }
+    } else {
+        // rec_setup_root: determine the next PC and the loop bytecode range.
+        match op {
+            BCOp::FORL => {
+                rec.bc_extent = (-bc_j(startins)) as usize;
+                rec.bc_min = (pc as i64 + 1 + bc_j(startins)) as usize;
+                rec.pc = rec.bc_min;
+            }
+            BCOp::LOOP => {
+                // Only check the range for real loops, not "repeat until true".
+                let pcj = (pc as i64 + bc_j(startins)) as usize;
+                let jins = pt.as_ref().bc[pcj];
+                if bc_op(jins) == BCOp::JMP && bc_j(jins) < 0 {
+                    rec.bc_min = (pcj as i64 + 1 + bc_j(jins)) as usize;
+                    rec.bc_extent = (-bc_j(jins)) as usize;
+                }
+                rec.maxslot = crate::bc::bc_a(startins);
+                rec.pc = pc + 1;
+            }
+            BCOp::FUNCF => {
+                // No bytecode range check for root traces started by a hot call.
+                rec.maxslot = pt.as_ref().numparams as u32;
+                rec.pc = pc + 1;
+            }
+            _ => unreachable!(),
+        }
+        rec.startpc = Some(pc);
+
+        // Snapshot #0 points at the first instruction to be recorded.
+        rec.snap_add();
+
+        // For FORL roots, record the loop bookkeeping of the paired FORI.
+        if op == BCOp::FORL {
+            let fori = rec.pc - 1;
+            if let Err(e) = rec.for_loop(l, base, fori, true) {
+                let g = l.global();
+                g.jit.err = e;
+                g.jit.state = TraceState::Err;
+                trace_abort(g);
+                return;
+            }
         }
     }
     if 1 + pt.as_ref().framesize as usize >= super::record::MAX_JSLOTS {
@@ -195,7 +252,7 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             g.jit.rec = Some(rec);
             true
         }
-        Ok(Some(link)) => {
+        Ok(Some((link, lnk))) => {
             // lj_record_stop: add the loop snapshot. Note: all loop ops
             // set J->pc to the following instruction, which is what this
             // snapshot must describe.
@@ -203,8 +260,12 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             rec.mergesnap = true;
             rec.snap_add();
             rec.mergesnap = true; // In case recording continues below.
-            // LJ_TRACE_END: unroll self-linking loops (lj_opt_loop).
-            if link == TraceLink::Loop && rec.framedepth + rec.retdepth == 0 {
+            // LJ_TRACE_END: DCE + loop unrolling for self-linking loops.
+            if link == TraceLink::Loop
+                && lnk == rec.cur.traceno
+                && rec.framedepth + rec.retdepth == 0
+            {
+                super::opt_dce::opt_dce(&mut rec.cur);
                 match super::opt_loop::opt_loop(&mut rec) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -223,7 +284,7 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
                     }
                 }
             }
-            trace_stop(g, rec, link);
+            trace_stop(g, rec, link, lnk);
             false
         }
         Err(e) => {
@@ -247,12 +308,14 @@ pub fn rec_abort_error(g: &mut GlobalState) {
 
 /// `lj_record_stop` + `trace_stop`: finalize and save a completed trace,
 /// then patch the starting bytecode so the interpreter enters it (FORL ->
-/// JFORL with D = traceno, plus FORI -> JFORI; LOOP -> JLOOP).
-fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink) {
+/// JFORL with D = traceno, plus FORI -> JFORI; LOOP -> JLOOP). Side
+/// traces (startins JMP) instead link the parent exit to the new trace.
+fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, lnk: TraceNo) {
     let js = &mut g.jit;
     let traceno = rec.cur.traceno;
+    let (parent, exitno) = (rec.parent, rec.exitno as usize);
     rec.cur.linktype = linktype;
-    rec.cur.link = if linktype == TraceLink::Loop { traceno } else { 0 };
+    rec.cur.link = lnk;
 
     let trace = std::mem::replace(
         &mut rec.cur,
@@ -284,12 +347,15 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink) {
     // Patch the bytecode of the starting instruction in a root trace.
     let pt = trace.startpt;
     let pc = trace.startpc;
-    let op = bc_op(trace.startins);
+    let startins = trace.startins;
+    let op = bc_op(startins);
+    let root = trace.root;
+    js.trace[traceno as usize] = Some(Box::new(trace));
     match op {
         BCOp::FORL | BCOp::LOOP | BCOp::ITERL | BCOp::FUNCF => {
             if op == BCOp::FORL {
                 // Patch the FORI, too.
-                let fori = (pc as i64 + bc_j(trace.startins)) as usize;
+                let fori = (pc as i64 + bc_j(startins)) as usize;
                 setbc_op(&mut pt.as_mut().bc[fori], BCOp::JFORI as u32);
             }
             let jop = op.offset(BCOp::JLOOP as i32 - BCOp::LOOP as i32);
@@ -297,10 +363,20 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink) {
             setbc_op(ins, jop as u32);
             setbc_d(ins, traceno);
         }
+        BCOp::JMP => {
+            // Side trace: link the parent exit (lj_asm_patchexit stands
+            // in for our executor-followed field) and avoid compiling it
+            // twice.
+            debug_assert!(parent != 0 && root != 0, "not a side trace");
+            let psnap = &mut js.trace[parent as usize].as_mut().unwrap().snap[exitno];
+            psnap.count = SNAPCOUNT_DONE;
+            psnap.sidetrace = traceno;
+            // Add to the side trace count of the root trace.
+            js.trace[root as usize].as_mut().unwrap().nchild += 1;
+        }
         _ => debug_assert!(false, "bad stop bytecode {:?}", op),
     }
 
-    js.trace[traceno as usize] = Some(Box::new(trace));
     js.startpt = None;
     js.state = TraceState::Idle;
 }
@@ -325,9 +401,10 @@ fn trace_abort(g: &mut GlobalState) {
                 penalty_pc(js, startpt, startpc, e);
             }
         }
-        // else: side trace abort — blacklists the exit via a self-link,
-        // once side traces exist.
+        // else: stitching aborts, once those exist.
     }
+    // Aborted side traces are not penalized: the parent exit keeps
+    // counting and retries until hotexit+tryside blacklists it at setup.
 
     js.startpt = None;
     js.startins = 0;
@@ -561,6 +638,96 @@ mod tests {
         assert_eq!(tr.linktype, TraceLink::Loop);
         assert_eq!(bc_op(tr.startins), BCOp::LOOP);
         assert!(tr.snap.iter().any(|s| s.count > 0), "no exit was taken");
+    }
+
+    #[test]
+    fn hot_exit_compiles_side_trace() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // The parity branch exits the root trace every other iteration:
+        // the exit turns hot, a side trace is recorded from the exit pc,
+        // links back to the root (TRLINK_ROOT) and the parent exit is
+        // patched to it (count = SNAPCOUNT_DONE).
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local s = 0 \
+             for i = 1, 100000 do \
+               if i % 2 == 0 then s = s + 2 else s = s + 1 end \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(150000.0));
+
+        let g = lua.global();
+        let forl_pc = find_op(pt, BCOp::JFORL).expect("root trace patched");
+        let rootno = crate::bc::bc_d(pt.as_ref().bc[forl_pc]);
+        let root = g.jit.trace[rootno as usize].as_deref().unwrap();
+        assert!(root.nchild >= 1, "no side trace attached to the root");
+        // The linked exit no longer counts and points at the side trace.
+        let (exitno, side) = root
+            .snap
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| (s.sidetrace != 0).then_some((i, s.sidetrace)))
+            .expect("no exit linked to a side trace");
+        assert_eq!(root.snap[exitno].count, super::super::SNAPCOUNT_DONE);
+        let st = g.jit.trace[side as usize].as_deref().unwrap();
+        assert_eq!(st.root, rootno, "side trace not rooted");
+        assert_eq!(st.linktype, TraceLink::Root);
+        assert_eq!(st.link, rootno, "side trace must link back to the root");
+        assert_eq!(bc_op(st.startins), BCOp::JMP);
+        #[cfg(target_arch = "x86_64")]
+        assert!(st.mcode.is_some(), "side trace not assembled");
+    }
+
+    #[test]
+    fn hopeless_side_exit_gets_blacklisted() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // The taken branch calls an unrecordable builtin, so every side
+        // trace attempt aborts; after hotexit+tryside tries the exit is
+        // parked with SNAPCOUNT_DONE and never re-examined.
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local t = { x = 1 } \
+             local s = 0 \
+             for i = 1, 100000 do \
+               if i % 2 == 0 then s = s + (t.x or 0) else s = s + 1 end \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(100000.0));
+        let g = lua.global();
+        if let Some(forl_pc) = find_op(pt, BCOp::JFORL) {
+            let rootno = crate::bc::bc_d(pt.as_ref().bc[forl_pc]);
+            let root = g.jit.trace[rootno as usize].as_deref().unwrap();
+            assert_eq!(root.nchild, 0, "unrecordable side trace was compiled");
+            assert!(
+                root.snap.iter().any(|s| s.count == super::super::SNAPCOUNT_DONE
+                    && s.sidetrace == 0),
+                "hopeless exit was not blacklisted"
+            );
+        }
+        assert_eq!(g.jit.state, TraceState::Idle);
+    }
+
+    #[test]
+    fn nested_loop_side_trace_keeps_fori_semantics() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // The outer back edge becomes a side trace of the inner loop and
+        // re-enters it through JFORI: rec_for must record FORI semantics
+        // (no index increment) there, or one iteration per outer round
+        // gets lost.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local n = 0 \
+             for i = 1, 1000 do \
+               for j = 1, 1000 do n = n + 1 end \
+             end return n",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(1000000.0));
     }
 
     #[test]

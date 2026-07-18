@@ -21,19 +21,23 @@
 //! ABI of the emitted code:
 //! `extern "C" fn(base: *mut LuaValue, env: *mut u64) -> u32` returning
 //! the exit snapshot index. GPRs used are volatile in both the Win64 and
-//! SysV ABIs (rax/rcx/rdx, r10/r11); all 16 xmm registers are used, so
-//! the Win64 prologue/epilogue saves and restores xmm6-xmm15 (SysV has
-//! no callee-saved xmm registers).
+//! SysV ABIs (rax/rcx/rdx, r10/r11). The FP allocator prefers the
+//! volatile xmm0-xmm4 and only then the Win64 callee-saved xmm6-xmm15;
+//! the prologue/epilogue save exactly the callee-saved registers the
+//! trace touches (usually none for short side traces).
 
 use super::ir::*;
 use super::mcode::McodeArea;
 use super::record::{IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC};
 use super::{GCtrace, SNAP_NORESTORE, TraceError, TraceLink, snap_ref, snap_slot};
 
-/// Allocatable FP registers: xmm0-xmm14. xmm15 is the constant/mask
-/// scratch.
-const NREG: usize = 15;
-const XMM_SCRATCH: u8 = 15;
+/// Allocatable FP registers, in preference order: the always-volatile
+/// xmm0-xmm4 first, then xmm6-xmm15 (Win64 callee-saved, spilled only
+/// when used). xmm5 is the constant/mask scratch.
+const ALLOC_REGS: [u8; 15] = [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+const XMM_SCRATCH: u8 = 5;
+/// Register state arrays are indexed by the xmm number.
+const NREG: usize = 16;
 
 /// Fixed-role GPRs, volatile in both ABIs.
 const RAX: u8 = 0;
@@ -115,6 +119,9 @@ struct Asm<'a> {
     loop_pos: Option<usize>,
     /// Register state at IR_LOOP; the back edge restores exactly this.
     s0: [Owner; NREG],
+    /// Bitmask of callee-saved xmm registers handed out by the allocator
+    /// (Win64: xmm6-xmm15); only these are saved in the prologue.
+    used_csr: u16,
 }
 
 impl<'a> Asm<'a> {
@@ -151,6 +158,7 @@ impl<'a> Asm<'a> {
             phis: Vec::new(),
             loop_pos: None,
             s0: [Owner::None; NREG],
+            used_csr: 0,
         };
         let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
         for r in REF_FIRST..tr.ir.nins() {
@@ -226,24 +234,10 @@ impl<'a> Asm<'a> {
     // -- Main emission loop -------------------------------------------------
 
     fn emit(mut self) -> Result<McodeArea, TraceError> {
-        // Prologue: capture the two arguments in r10/r11. On Win64 also
-        // save the callee-saved xmm6-xmm15 (SysV has no callee-saved xmm).
-        #[cfg(windows)]
-        {
-            self.mov_rr64(RBASE, RCX);
-            self.mov_rr64(RENV, RDX);
-            self.code.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, 160
-            self.emit_u32(160);
-            for k in 0..10u8 {
-                self.movups_spill(6 + k, (k as i32) * 16, true);
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            self.mov_rr64(RBASE, RDI);
-            self.mov_rr64(RENV, RSI);
-        }
-        let head = self.code.len();
+        // The body is emitted first; the prologue is prepended at the end
+        // when the set of used callee-saved registers is known. All
+        // branches are relative, so prepending is offset-neutral.
+        let head = 0usize;
 
         let nins = self.tr.ir.nins();
         let mut r = REF_FIRST;
@@ -306,15 +300,20 @@ impl<'a> Asm<'a> {
             // Falls through into the epilogue.
         }
 
-        // Common epilogue: restore xmm6-xmm15 on Win64, return eax.
+        // Common epilogue: restore the used callee-saved xmm (Win64),
+        // return eax.
+        let saves: Vec<u8> = (6..16u8).filter(|&r| self.used_csr & (1 << r) != 0).collect();
+        let framesz = (saves.len() * 16) as i32;
         let epilogue = self.code.len();
         #[cfg(windows)]
         {
-            for k in 0..10u8 {
-                self.movups_spill(6 + k, (k as i32) * 16, false);
+            for (k, &r) in saves.iter().enumerate() {
+                self.movups_spill(r, (k as i32) * 16, false);
             }
-            self.code.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, 160
-            self.emit_u32(160);
+            if framesz > 0 {
+                self.code.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, n
+                self.emit_u32(framesz as u32);
+            }
         }
         self.code.push(0xC3);
 
@@ -331,6 +330,29 @@ impl<'a> Asm<'a> {
             let rel = (stubs[si] as i64 - (pos as i64 + 4)) as i32;
             self.code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
         }
+
+        // Prepend the prologue: capture the two arguments in r10/r11 and
+        // save the callee-saved xmm registers this trace actually uses.
+        let body = std::mem::take(&mut self.code);
+        #[cfg(windows)]
+        {
+            self.mov_rr64(RBASE, RCX);
+            self.mov_rr64(RENV, RDX);
+            if framesz > 0 {
+                self.code.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, n
+                self.emit_u32(framesz as u32);
+                for (k, &r) in saves.iter().enumerate() {
+                    self.movups_spill(r, (k as i32) * 16, true);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (&saves, framesz);
+            self.mov_rr64(RBASE, RDI);
+            self.mov_rr64(RENV, RSI);
+        }
+        self.code.extend_from_slice(&body);
 
         let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
         area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code);
@@ -706,15 +728,25 @@ impl<'a> Asm<'a> {
 
     /// Allocate a register, evicting the least useful value if needed.
     /// `pinned` is a bitmask of registers that must not be touched.
+    /// Volatile registers are preferred; handing out a callee-saved one
+    /// is recorded for the prologue/epilogue.
     fn alloc(&mut self, pinned: u16) -> Result<u8, TraceError> {
+        let rg = self.alloc_pick(pinned)?;
+        if rg >= 6 {
+            self.used_csr |= 1 << rg;
+        }
+        Ok(rg)
+    }
+
+    fn alloc_pick(&mut self, pinned: u16) -> Result<u8, TraceError> {
         // Free register first.
-        for rg in 0..NREG as u8 {
+        for &rg in ALLOC_REGS.iter() {
             if pinned & pin(rg) == 0 && self.owner[rg as usize] == Owner::None {
                 return Ok(rg);
             }
         }
         // Then any dead value (no further uses).
-        for rg in 0..NREG as u8 {
+        for &rg in ALLOC_REGS.iter() {
             if pinned & pin(rg) != 0 {
                 continue;
             }
@@ -730,7 +762,7 @@ impl<'a> Asm<'a> {
         }
         // Evict the value with the farthest next use.
         let mut best: Option<(u8, IRRef)> = None;
-        for rg in 0..NREG as u8 {
+        for &rg in ALLOC_REGS.iter() {
             if pinned & pin(rg) != 0 {
                 continue;
             }

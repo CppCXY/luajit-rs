@@ -1316,6 +1316,9 @@ impl Interp {
                             let tno = bc_d(self.proto().bc[jforl]);
                             let r = crate::jit::exec::trace_exec(self.l(), self.base, tno);
                             self.pc = r.pc;
+                            if self.rec_started() {
+                                return Ok(Flow::Rec); // Hot exit: record a side trace.
+                            }
                             resync!();
                         } else {
                             jump!(ins);
@@ -1363,6 +1366,9 @@ impl Interp {
                         sync!();
                         let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
                         self.pc = r.pc;
+                        if self.rec_started() {
+                            return Ok(Flow::Rec); // Hot exit: record a side trace.
+                        }
                         resync!();
                     }
                 }
@@ -1385,6 +1391,9 @@ impl Interp {
                     sync!();
                     let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
                     self.pc = r.pc;
+                    if self.rec_started() {
+                        return Ok(Flow::Rec); // Hot exit: record a side trace.
+                    }
                     resync!();
                 }
                 BCOp::JMP => jump!(ins),
@@ -1533,6 +1542,14 @@ impl Interp {
     fn hot_call(&mut self, pt: GcPtr<Proto>) -> bool {
         let base = self.base;
         crate::jit::trace::trace_hot(self.l(), base, pt, 0);
+        self.l().global().jit.state == crate::jit::TraceState::Record
+    }
+
+    /// Did a trace exit just start a side-trace recording? The caller
+    /// must then switch to the recording dispatch (`self.pc` is already
+    /// at the exit's resume point).
+    #[inline]
+    fn rec_started(&mut self) -> bool {
         self.l().global().jit.state == crate::jit::TraceState::Record
     }
 

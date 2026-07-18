@@ -124,6 +124,7 @@ fn loop_subst_snap(rec: &mut Record, osnapidx: usize, loopmap: &[SnapEntry], sub
         mapofs: nmapofs,
         iref: rec.cur.ir.nins(),
         pc: osnap.pc,
+        sidetrace: 0,
         nslots: osnap.nslots,
         topslot: osnap.topslot,
         nent: nent as u8,

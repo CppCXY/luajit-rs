@@ -17,8 +17,9 @@ use crate::value::LuaValue;
 
 use super::ir::*;
 use super::{
-    GCtrace, JitParam, JitState, PENALTY_MIN, PENALTY_SLOTS, SNAP_FRAME, SNAP_NORESTORE,
-    SnapEntry, SnapShot, TraceError, TraceLink, TraceNo, snap_entry,
+    GCtrace, JitParam, JitState, PENALTY_MIN, PENALTY_SLOTS, SNAP_CONT, SNAP_FRAME,
+    SNAP_NORESTORE, SnapEntry, SnapShot, TraceError, TraceLink, TraceNo, snap_entry, snap_ref,
+    snap_slot,
 };
 
 /// Maximum number of stack slots the recorder tracks (LJ_MAX_JSLOTS).
@@ -72,6 +73,10 @@ const PRI_VALUES: [LuaValue; 3] = [LuaValue::NIL, LuaValue::FALSE, LuaValue::TRU
 /// the recorder runs, plus the trace under construction (`J->cur`).
 pub struct Record {
     pub cur: GCtrace,
+    /// Parent trace of a side trace (J->parent, 0 = root).
+    pub parent: TraceNo,
+    /// Exit number in the parent trace (J->exitno).
+    pub exitno: u32,
     /// TRef of each stack slot (J->slot); the frame base is at
     /// `slot[baseslot]`.
     pub slot: [TRef; MAX_JSLOTS],
@@ -87,6 +92,9 @@ pub struct Record {
     /// Take a snapshot before recording the next bytecode (J->needsnap).
     pub needsnap: bool,
     pub scev: ScEv,
+    /// Loop-formation PC (J->startpc): hitting it again closes the trace
+    /// as a loop. None for side traces that cannot form an extra loop.
+    pub startpc: Option<usize>,
     /// Root-trace bytecode range (in instruction indexes): leaving it
     /// aborts with LLEAVE. `bc_extent = !0` means no limit.
     pub bc_min: usize,
@@ -127,6 +135,8 @@ impl Record {
                 root: 0,
                 nchild: 0,
             },
+            parent: parent as TraceNo,
+            exitno: exitno as u32,
             slot: [0; MAX_JSLOTS],
             baseslot: 2,
             maxslot: 0,
@@ -135,6 +145,7 @@ impl Record {
             mergesnap: false,
             needsnap: false,
             scev: ScEv::default(),
+            startpc: Some(pc),
             bc_min: 0,
             bc_extent: !0usize,
             loopref: 0,
@@ -246,6 +257,7 @@ impl Record {
             mapofs: nsnapmap,
             iref: self.cur.ir.nins(),
             pc: self.pc as u32,
+            sidetrace: 0,
             nslots: nslots as u8,
             topslot: self.pt.as_ref().framesize,
             nent: nent as u8,
@@ -274,6 +286,69 @@ impl Record {
         self.cur.ir.guardemit = 0;
         let snap = self.snapshot_stack(nsnapmap);
         self.cur.snap.push(snap);
+    }
+
+    /// `snap_replay_const`: re-intern a constant from the parent trace.
+    fn replay_const(&mut self, t: &GCtrace, r: IRRef) -> Result<TRef, TraceError> {
+        let ir = t.ir.ir(r);
+        match ir.op() {
+            IROp::KPRI => Ok(tref_pri(irt_type(ir.t()))),
+            IROp::KINT => Ok(self.cur.ir.kint(ir.i())),
+            IROp::KGC => Ok(self.cur.ir.kgc(t.ir.k64_val(r), irt_type(ir.t()))),
+            IROp::KNUM => Ok(self.cur.ir.knum_u64(t.ir.k64_val(r))),
+            IROp::KINT64 => Ok(self.cur.ir.kint64(t.ir.k64_val(r))),
+            _ => Err(TraceError::NYIBC), // Bad constant in a stack slot.
+        }
+    }
+
+    /// `lj_snap_replay`: replay a parent snapshot to set up a side trace.
+    /// Emits inherited SLOADs (or re-interned constants) for every slot
+    /// of the parent exit and takes snapshot #0.
+    pub fn snap_replay(&mut self, t: &GCtrace, exitno: usize) -> Result<(), TraceError> {
+        let snap = t.snap[exitno];
+        let ofs = snap.mapofs as usize;
+        self.framedepth = 0;
+        // Parent ref -> replayed tref, for de-duping aliased slots.
+        let mut seen: Vec<(IRRef, TRef)> = Vec::new();
+        for n in 0..snap.nent as usize {
+            let sn = t.snapmap[ofs + n];
+            let s = snap_slot(sn);
+            let r = snap_ref(sn);
+            let tr = if let Some(&(_, tr)) = seen.iter().find(|&&(pr, _)| pr == r) {
+                tr
+            } else {
+                let tr = if irref_isk(r) {
+                    // See the special treatment of the FR2 slot 1 in
+                    // snapshot_slots.
+                    if sn == (1 << 24) + SNAP_FRAME + SNAP_NORESTORE + REF_NIL {
+                        0
+                    } else {
+                        self.replay_const(t, r)?
+                    }
+                } else {
+                    let ir = t.ir.ir(r);
+                    let ty = irt_type(ir.t());
+                    let mut mode = IRSLOAD_INHERIT | IRSLOAD_PARENT;
+                    if ir.op() == IROp::SLOAD {
+                        mode |= ir.op2 as u32 & IRSLOAD_READONLY;
+                    }
+                    self.cur.ir.emit_ins(IRIns::new(irt(IROp::SLOAD, ty), s, mode))
+                };
+                seen.push((r, tr));
+                tr
+            };
+            self.slot[s as usize] = tr | (sn & (SNAP_CONT | SNAP_FRAME));
+            if sn & (SNAP_CONT | SNAP_FRAME) != 0 && s != 1 {
+                self.framedepth += 1;
+            }
+            if sn & SNAP_FRAME != 0 {
+                self.baseslot = s as usize + 1;
+            }
+        }
+        self.maxslot = snap.nslots as u32 - self.baseslot as u32;
+        self.pc = snap.pc as usize;
+        self.snap_add();
+        Ok(())
     }
 
     // -- FOR loops (rec_for*) ---------------------------------------------------
@@ -412,8 +487,15 @@ impl Record {
         Ok(())
     }
 
-    /// `rec_for`: record a FORL. `fori` is the index of the paired FORI.
-    fn rec_for(&mut self, l: &LuaState, base: usize, fori: usize) -> Result<LoopEvent, TraceError> {
+    /// `rec_for`: record a FORL/JFORL (`isforl`) or FORI/JFORI loop op.
+    /// `fori` is the index of the (paired) FORI.
+    fn rec_for(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        fori: usize,
+        isforl: bool,
+    ) -> Result<LoopEvent, TraceError> {
         let ins = self.pt.as_ref().bc[fori];
         let ra = bc_a(ins);
         // Avoid semantic mismatches and always-failing guards.
@@ -427,23 +509,36 @@ impl Record {
             return Err(TraceError::GFAIL);
         }
 
-        let idx = self.base_ref(ra + FORL_IDX);
         let (stop, t);
-        if self.scev.pc == Some(fori) && tref_ref(idx) == self.scev.idx {
-            t = self.scev.t;
-            stop = self.scev.stop;
-            let step = self.scev.step;
-            let nidx = self.cur.ir.emitir(irt(IROp::ADD, t), tref_ref(idx), step)?;
-            self.set_base(ra + FORL_IDX, nidx);
-            self.set_base(ra + FORL_EXT, nidx);
+        if isforl {
+            // FORL/JFORL: move the loop variable forward.
+            let idx = self.base_ref(ra + FORL_IDX);
+            if self.scev.pc == Some(fori) && tref_ref(idx) == self.scev.idx {
+                t = self.scev.t;
+                stop = self.scev.stop;
+                let step = self.scev.step;
+                let nidx = self.cur.ir.emitir(irt(IROp::ADD, t), tref_ref(idx), step)?;
+                self.set_base(ra + FORL_IDX, nidx);
+                self.set_base(ra + FORL_EXT, nidx);
+            } else {
+                self.for_loop(l, base, fori, false)?;
+                t = self.scev.t;
+                stop = self.scev.stop;
+            }
         } else {
-            self.for_loop(l, base, fori, false)?;
-            t = self.scev.t;
-            stop = self.scev.stop;
+            // FORI/JFORI: load the loop variables, no increment.
+            let idx = self.getslot(l, base, ra + FORL_IDX);
+            let stop_tr = self.getslot(l, base, ra + FORL_STOP);
+            let step = self.getslot(l, base, ra + FORL_STEP);
+            self.set_base(ra + FORL_EXT, idx);
+            t = IRT_NUM;
+            stop = tref_ref(stop_tr);
+            let dir = Self::for_direction(self.slot_val(l, base, ra + FORL_STEP));
+            self.for_check(dir, step)?;
         }
 
         let mut op = IROp::LE;
-        let ev = Self::for_iter(&mut op, l, base, ra, true);
+        let ev = Self::for_iter(&mut op, l, base, ra, isforl);
         // The bytecode index after the loop (FORI's forward jump target).
         let exit_pc = (fori as i64 + 1 + bc_j(ins)) as usize;
         // The first loop-body instruction.
@@ -497,19 +592,19 @@ impl Record {
     }
 
     /// `rec_loop_interp`: handle hitting an interpreted loop opcode.
-    /// Returns the link type when the trace closes.
+    /// Returns the link (type, target) when the trace closes.
     fn loop_interp(
         &mut self,
         js: &JitState,
         pc: usize,
         ev: LoopEvent,
-    ) -> Result<Option<TraceLink>, TraceError> {
-        if self.cur.root == 0 {
-            if pc == self.cur.startpc && self.framedepth + self.retdepth == 0 {
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
+        if self.parent == 0 && self.exitno == 0 {
+            if Some(pc) == self.startpc && self.framedepth + self.retdepth == 0 {
                 if ev == LoopEvent::Leave {
                     return Err(TraceError::LLEAVE); // Must loop back.
                 }
-                return Ok(Some(TraceLink::Loop)); // Looping root trace.
+                return Ok(Some((TraceLink::Loop, self.cur.traceno))); // Looping root trace.
             } else if ev != LoopEvent::Leave {
                 // Entering an inner loop: better wait until it is traced
                 // itself, unless it repeatedly failed to loop back.
@@ -529,6 +624,29 @@ impl Record {
                 self.loopref = self.cur.ir.nins();
             }
         }
+        Ok(None)
+    }
+
+    /// `rec_loop_jit`: handle hitting an already compiled loop opcode.
+    fn loop_jit(
+        &mut self,
+        lnk: TraceNo,
+        ev: LoopEvent,
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
+        if self.parent == 0 && self.exitno == 0 {
+            // Root trace hit an inner loop: better let the inner loop
+            // spawn a side trace back here.
+            return Err(TraceError::LINNER);
+        }
+        if ev != LoopEvent::Leave {
+            // Side trace enters a compiled loop.
+            self.instunroll = 0; // Cannot continue across a compiled loop op.
+            if Some(self.pc) == self.startpc && self.framedepth + self.retdepth == 0 {
+                return Ok(Some((TraceLink::Loop, self.cur.traceno))); // Form an extra loop.
+            }
+            return Ok(Some((TraceLink::Root, lnk))); // Link to the loop.
+        }
+        // Side trace continues across a loop that's left or not entered.
         Ok(None)
     }
 
@@ -594,14 +712,15 @@ impl Record {
     // -- Main recording entry (lj_record_ins) ---------------------------------------
 
     /// Record the instruction at `pc` *before* it is executed. Returns the
-    /// link type when the trace just completed, None to keep recording.
+    /// link (type, target) when the trace just completed, None to keep
+    /// recording.
     pub fn record_ins(
         &mut self,
         js: &JitState,
         l: &LuaState,
         base: usize,
         pc: usize,
-    ) -> Result<Option<TraceLink>, TraceError> {
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
         // Need a snapshot before recording the next bytecode (e.g. after
         // a loop condition guard).
         if self.needsnap {
@@ -770,7 +889,7 @@ impl Record {
             }
             BCOp::FORL => {
                 let fori = (pc as i64 + bc_j(ins)) as usize;
-                let ev = self.rec_for(l, base, fori)?;
+                let ev = self.rec_for(l, base, fori, true)?;
                 if let Some(link) = self.loop_interp(js, pc, ev)? {
                     return Ok(Some(link));
                 }
@@ -784,11 +903,41 @@ impl Record {
             BCOp::IFORL | BCOp::IITERL | BCOp::ILOOP | BCOp::IFUNCF | BCOp::IFUNCV => {
                 return Err(TraceError::BLACKL);
             }
-            BCOp::JFORI | BCOp::JFORL | BCOp::JITERL | BCOp::JLOOP => {
-                // rec_loop_jit: a root trace hit an inner compiled loop —
-                // better let the inner loop spawn a side trace back here.
-                return Err(TraceError::LINNER);
+            BCOp::JFORI => {
+                // The JFORI's jump targets the instruction after the JFORL.
+                let jforl = (pc as i64 + bc_j(ins)) as usize;
+                debug_assert_eq!(bc_op(pt.as_ref().bc[jforl]), BCOp::JFORL);
+                if self.rec_for(l, base, pc, false)? != LoopEvent::Leave {
+                    // Link to the existing loop.
+                    return Ok(Some((TraceLink::Root, bc_d(pt.as_ref().bc[jforl]))));
+                }
+                // Continue tracing if the loop is not entered.
             }
+            BCOp::JFORL => {
+                // D holds the trace number; recover the FORI position from
+                // the original FORL stored as the trace's start instruction.
+                let lnk = bc_d(ins);
+                let startins =
+                    js.trace[lnk as usize].as_ref().ok_or(TraceError::NYIBC)?.startins;
+                let fori = (pc as i64 + bc_j(startins)) as usize;
+                let ev = self.rec_for(l, base, fori, true)?;
+                if let Some(link) = self.loop_jit(lnk, ev)? {
+                    return Ok(Some(link));
+                }
+            }
+            BCOp::JLOOP => {
+                let lnk = bc_d(ins);
+                let startins =
+                    js.trace[lnk as usize].as_ref().ok_or(TraceError::NYIBC)?.startins;
+                if bc_isret(bc_op(startins)) || bc_op(startins) == BCOp::ITERN {
+                    return Err(TraceError::NYIBC); // Patched RET/ITERN loops.
+                }
+                let ev = self.rec_loop(bc_a(ins));
+                if let Some(link) = self.loop_jit(lnk, ev)? {
+                    return Ok(Some(link));
+                }
+            }
+            BCOp::JITERL => return Err(TraceError::NYIBC), // Iterators are NYI.
 
             // Everything else is NYI in Phase 2: calls, returns, tables,
             // upvalues, iterators, varargs, concat, bit ops, lengths.
