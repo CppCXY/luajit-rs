@@ -109,19 +109,26 @@ equivalent (LuaJIT always JITs; we can fall back to interpreting IR).
 
 `base` (incl. `pcall`/`error`/metatable APIs), `string` with full Lua
 patterns, `table` (+ `sort`), `math`, `bit` (LuaJIT semantics:
-wrapping `tobit` conversion), `os` (subset), `coroutine`.
+wrapping `tobit` conversion), `os` (subset), `coroutine`, `io`
+(subset: `open`/`read`/`write`/`lines`/`close` and file methods),
+`require` with `package.loaded`/`package.preload`/`package.path`.
 
-Not yet implemented: `io`, `package`/`require` beyond `preload`,
-`debug`, FFI.
+Not yet implemented: full `io` (seek, popen, stdout objects),
+`package.cpath`/C loaders, `debug`, FFI.
 
 ## Roadmap
 
-- [ ] String operations on trace (`string.sub`/`byte`/`char` recff, SNEW)
-- [ ] `table.insert`/`remove`/`concat` fast functions on trace
+- [x] String operations on trace (`string.len/sub/byte/char`, `#s`,
+      string comparisons — IRCALL helpers)
+- [x] Table allocation and library ops on trace (TNEW/TDUP, `#t`,
+      `table.insert`/`remove` array fast paths, `table.concat`)
+- [ ] Recursive-call traces (up/down recursion — the binary-trees
+      hot path is recursive and currently stays in the interpreter)
 - [ ] Trace stitching across NYI bytecodes/builtins
 - [ ] ARM64 machine-code backend
-- [ ] `io` library and a `require` loader
-- [ ] Incremental GC steps on trace exits
+- [x] `io` library subset and a `require` loader
+- [ ] Cheaper table allocation + incremental GC (allocation-bound
+      workloads are dominated by alloc/collect costs, not dispatch)
 
 ## License
 

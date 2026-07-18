@@ -295,6 +295,12 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         val(env, carg.op2 as IRRef),
                     );
                 }
+                IROp::TNEW => {
+                    env[(r - REF_BIAS) as usize] = jit_tnew();
+                }
+                IROp::TDUP => {
+                    env[(r - REF_BIAS) as usize] = jit_tdup(val(env, ins.op1 as IRRef));
+                }
                 IROp::CALLL => {
                     let idx = ins.op2 as u32;
                     let bits = match super::record::ircall_arity(idx) {
@@ -303,6 +309,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                             match idx {
                                 super::record::IRCALL_STR_LEN => jit_str_len(x),
                                 super::record::IRCALL_STR_CHAR => jit_str_char(x),
+                                super::record::IRCALL_TAB_LEN => jit_alen(x),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -316,6 +323,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                                 super::record::IRCALL_FMOD => jit_fmod(x, y),
                                 super::record::IRCALL_STR_CMP => jit_str_cmp(x, y),
                                 super::record::IRCALL_STR_BYTE => jit_str_byte(x, y),
+                                super::record::IRCALL_TAB_CONCAT => jit_tconcat(x, y),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -628,14 +636,19 @@ fn str_bytes(bits: u64) -> &'static [u8] {
     unsafe { std::mem::transmute::<&[u8], &'static [u8]>(s.as_ref().as_bytes()) }
 }
 
-/// Intern `bytes` in the bound heap, tracking the growth as GC debt.
-fn jit_intern(bytes: &[u8]) -> u64 {
-    let heap = unsafe {
+/// The heap bound by `trace_exec` (for allocating helpers).
+fn jit_heap() -> &'static mut crate::state::GcHeap {
+    unsafe {
         JIT_HEAP
             .with(|c| c.get())
             .as_mut()
-            .expect("string allocation outside trace_exec")
-    };
+            .expect("allocating helper outside trace_exec")
+    }
+}
+
+/// Intern `bytes` in the bound heap, tracking the growth as GC debt.
+fn jit_intern(bytes: &[u8]) -> u64 {
+    let heap = jit_heap();
     let before = heap.strings.bytes();
     let sid = heap.strings.intern(bytes);
     let grown = heap.strings.bytes() - before;
@@ -696,4 +709,62 @@ pub extern "C" fn jit_str_sub(s_bits: u64, i_bits: u64, j_bits: u64) -> u64 {
 pub extern "C" fn jit_str_char(c_bits: u64) -> u64 {
     let b = (f64::from_bits(c_bits) as u32 & 0xff) as u8;
     jit_intern(&[b])
+}
+
+// -- Table allocation and library helpers ------------------------------------
+
+/// BC_TNEW: a fresh empty table (the interpreter ignores the size hint).
+pub extern "C" fn jit_tnew() -> u64 {
+    let t = jit_heap().alloc_table(crate::table::LuaTable::new(0, 0));
+    LuaValue::table(t).to_bits()
+}
+
+/// BC_TDUP: duplicate a template table. `templ_addr` is the raw address
+/// of the prototype's KGc template (stable: Box or pool).
+pub extern "C" fn jit_tdup(templ_addr: u64) -> u64 {
+    let templ = unsafe { &*(templ_addr as usize as *const crate::table::LuaTable) };
+    let t = jit_heap().alloc_table(templ.dup());
+    LuaValue::table(t).to_bits()
+}
+
+/// `#t` / table.insert boundary: the raw table length (no metamethods,
+/// mirroring the interpreter's LEN fast path).
+pub extern "C" fn jit_alen(tab_bits: u64) -> u64 {
+    let t = LuaValue::from_bits(tab_bits).as_table().expect("ALEN on a non-table");
+    (t.as_ref().len() as f64).to_bits()
+}
+
+/// table.concat(t [, sep]) — the (t, sep, 1, nil) form. Mirrors
+/// `tab_concat`; an invalid element yields nil, which fails the
+/// recorded STR guard so the interpreter re-runs the call and raises.
+pub extern "C" fn jit_tconcat(tab_bits: u64, sep_bits: u64) -> u64 {
+    let t = LuaValue::from_bits(tab_bits).as_table().expect("CONCAT on a non-table");
+    let sep_v = LuaValue::from_bits(sep_bits);
+    let sep: &[u8] = match sep_v.as_string() {
+        Some(s) => s.as_ref().as_bytes(),
+        None => b"",
+    };
+    let tab = t.as_ref();
+    let mut out = Vec::new();
+    let mut first = true;
+    let mut i = 1usize;
+    loop {
+        let v = tab.get_int(i as i32);
+        if v.is_nil() {
+            break;
+        }
+        if !first {
+            out.extend_from_slice(sep);
+        }
+        first = false;
+        if let Some(s) = v.as_string() {
+            out.extend_from_slice(s.as_ref().as_bytes());
+        } else if let Some(n) = v.as_number() {
+            out.extend_from_slice(crate::strfmt::g14(n).as_bytes());
+        } else {
+            return LuaValue::NIL.to_bits(); // Error path: guard exit.
+        }
+        i += 1;
+    }
+    jit_intern(&out)
 }

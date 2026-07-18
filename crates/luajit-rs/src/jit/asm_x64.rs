@@ -240,6 +240,7 @@ impl<'a> Asm<'a> {
                         a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
                     }
                 }
+                IROp::TNEW | IROp::TDUP => {} // Literal / constant operands.
                 IROp::ALOAD => {
                     // Table via env/GPR, key via xmm.
                     if ins.op1 as IRRef >= REF_BIAS {
@@ -426,6 +427,17 @@ impl<'a> Asm<'a> {
                 IROp::CARG => {} // Consumed by HSTORE/CALLL/ASTORE.
                 IROp::HSTORE => self.asm_hstore(&ins),
                 IROp::CALLL => self.asm_calll(&ins)?,
+                IROp::TNEW => {
+                    self.helper_call(super::exec::jit_tnew as usize as u64, &[]);
+                    self.ff_result(&ins)?;
+                }
+                IROp::TDUP => {
+                    self.helper_call(
+                        super::exec::jit_tdup as usize as u64,
+                        &[ins.op1 as IRRef],
+                    );
+                    self.ff_result(&ins)?;
+                }
                 IROp::ALOAD => self.asm_aload(&ins)?,
                 IROp::ASTORE => self.asm_astore(&ins)?,
                 IROp::GCSTEP => self.asm_gcstep(&ins),
@@ -721,6 +733,8 @@ impl<'a> Asm<'a> {
             rec::IRCALL_STR_BYTE => super::exec::jit_str_byte as usize as u64,
             rec::IRCALL_STR_SUB => super::exec::jit_str_sub as usize as u64,
             rec::IRCALL_STR_CHAR => super::exec::jit_str_char as usize as u64,
+            rec::IRCALL_TAB_LEN => super::exec::jit_alen as usize as u64,
+            rec::IRCALL_TAB_CONCAT => super::exec::jit_tconcat as usize as u64,
             _ => unreachable!("bad IRCALL index"),
         };
         match rec::ircall_arity(idx) {

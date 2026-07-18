@@ -10,7 +10,7 @@ use crate::lual_reg;
 
 use super::sort::introsort;
 
-fn tab_concat(l: &mut LuaState) -> LuaResult<i32> {
+pub fn tab_concat(l: &mut LuaState) -> LuaResult<i32> {
     let t = match arg(l, 0).as_table() {
         Some(t) => t,
         None => return Err(err_bad_arg(l, 1, "table.concat", "table", "")),
@@ -54,7 +54,7 @@ fn tab_concat(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn tab_insert(l: &mut LuaState) -> LuaResult<i32> {
+pub fn tab_insert(l: &mut LuaState) -> LuaResult<i32> {
     let t = match arg(l, 0).as_table() {
         Some(t) => t,
         None => return Err(err_bad_arg(l, 1, "table.insert", "table", "")),
@@ -120,7 +120,7 @@ fn tab_pack(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn tab_remove(l: &mut LuaState) -> LuaResult<i32> {
+pub fn tab_remove(l: &mut LuaState) -> LuaResult<i32> {
     let t = match arg(l, 0).as_table() {
         Some(t) => t,
         None => return Err(err_bad_arg(l, 1, "table.remove", "table", "")),

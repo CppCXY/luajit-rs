@@ -51,12 +51,14 @@ pub const IRCALL_STR_CMP: u32 = 3;
 pub const IRCALL_STR_BYTE: u32 = 4;
 pub const IRCALL_STR_SUB: u32 = 5;
 pub const IRCALL_STR_CHAR: u32 = 6;
+pub const IRCALL_TAB_LEN: u32 = 7;
+pub const IRCALL_TAB_CONCAT: u32 = 8;
 
 /// Argument count of an IRCALL: 1 = op1 is the argument, 2 = op1 is a
 /// CARG pair, 3 = op1 is CARG(CARG(a, b), c).
 pub fn ircall_arity(idx: u32) -> u32 {
     match idx {
-        IRCALL_STR_LEN | IRCALL_STR_CHAR => 1,
+        IRCALL_STR_LEN | IRCALL_STR_CHAR | IRCALL_TAB_LEN => 1,
         IRCALL_STR_SUB => 3,
         _ => 2,
     }
@@ -1269,8 +1271,15 @@ impl Record {
 
     /// GC-debt guard: exit when a collection is due (the boundary check
     /// in the trace-entry dispatch arms then collects). Must follow any
-    /// on-trace allocation (table growth, string interning).
+    /// on-trace allocation (table growth, string interning). One guard
+    /// per trace suffices: the debt accumulates and a single iteration
+    /// allocates far less than the threshold headroom (the loop peel
+    /// keeps one copy in the loop body).
     fn rec_gcstep(&mut self, l: &LuaState) {
+        if self.cur.ir.chain[IROp::GCSTEP as usize] != 0 {
+            self.needsnap = true;
+            return;
+        }
         let heap = &l.global().heap;
         let ktotal = self.cur.ir.kint64(&heap.total as *const usize as u64);
         let kthres = self.cur.ir.kint64(&heap.threshold as *const usize as u64);
@@ -1609,6 +1618,124 @@ impl Record {
                 self.rec_gcstep(l);
                 nres = 1;
             }
+            Recff::TableInsert => {
+                // Push form only: t[#t+1] = v (the builtin stores raw,
+                // no metatable check). The ASTORE bounds guard exits on
+                // the growth iterations; the interpreter then resizes.
+                if nargs != 2 {
+                    return Err(TraceError::NYIBC); // Positional insert NYI.
+                }
+                let tab = self.base_ref(a + 2);
+                let val = self.base_ref(a + 3);
+                if !tref_istab(tab) {
+                    return Err(TraceError::NYIBC);
+                }
+                let t = argv[0].as_table().expect("guarded table tref");
+                let lenv = t.as_ref().len();
+                // Record only the in-bounds fast path.
+                if lenv + 1 >= t.as_ref().asize {
+                    return Err(TraceError::NYIBC);
+                }
+                let len = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_NUM),
+                    tref_ref(tab),
+                    IRCALL_TAB_LEN,
+                ));
+                let one = self.cur.ir.knum(1.0);
+                let k = self.cur.ir.emitir(irtn(IROp::ADD), tref_ref(len), tref_ref(one))?;
+                let carg = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(k),
+                    tref_ref(val),
+                ));
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::ASTORE, IRT_NIL),
+                    tref_ref(tab),
+                    tref_ref(carg),
+                ));
+                self.needsnap = true;
+                nres = 0;
+            }
+            Recff::TableRemove => {
+                // Pop form only: v = t[#t]; t[#t] = nil; return v.
+                if nargs != 1 {
+                    return Err(TraceError::NYIBC); // Positional remove NYI.
+                }
+                let tab = self.base_ref(a + 2);
+                if !tref_istab(tab) {
+                    return Err(TraceError::NYIBC);
+                }
+                let t = argv[0].as_table().expect("guarded table tref");
+                let lenv = t.as_ref().len();
+                // Stay on the array fast path (the empty and hash-part
+                // boundaries exit to the interpreter).
+                if lenv == 0 || lenv >= t.as_ref().asize {
+                    return Err(TraceError::NYIBC);
+                }
+                let vv = t.as_ref().get_int(lenv as i32);
+                if vv.is_nil() {
+                    return Err(TraceError::NYIBC);
+                }
+                let len = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_NUM),
+                    tref_ref(tab),
+                    IRCALL_TAB_LEN,
+                ));
+                let zero = self.cur.ir.knum(0.0);
+                self.cur.ir.emitir(irtg(IROp::GT, IRT_NUM), tref_ref(len), tref_ref(zero))?;
+                let ty = Self::value_irt(vv);
+                let v = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::ALOAD, IRT_GUARD | ty),
+                    tref_ref(tab),
+                    tref_ref(len),
+                ));
+                let carg = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(len),
+                    tref_ref(TREF_NIL),
+                ));
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::ASTORE, IRT_NIL),
+                    tref_ref(tab),
+                    tref_ref(carg),
+                ));
+                self.needsnap = true;
+                res[0] = v;
+                nres = 1;
+            }
+            Recff::TableConcat => {
+                // (t [, sep]) form only; the helper returns nil for an
+                // invalid element, failing the STR guard so the
+                // interpreter re-runs the call and raises the error.
+                if nargs > 2 {
+                    return Err(TraceError::NYIBC); // i/j range NYI.
+                }
+                let tab = self.base_ref(a + 2);
+                if !tref_istab(tab) {
+                    return Err(TraceError::NYIBC);
+                }
+                let sep = if nargs >= 2 {
+                    let sep = self.base_ref(a + 3);
+                    if !tref_isstr(sep) && !tref_isnil(sep) {
+                        return Err(TraceError::NYIBC);
+                    }
+                    sep
+                } else {
+                    TREF_NIL
+                };
+                let carg = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(tab),
+                    tref_ref(sep),
+                ));
+                res[0] = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_GUARD | IRT_STR),
+                    tref_ref(carg),
+                    IRCALL_TAB_CONCAT,
+                ));
+                self.rec_gcstep(l);
+                nres = 1;
+            }
         }
         // Write the results; pad/discard per the call's wanted count.
         for i in 0..want as u32 {
@@ -1867,14 +1994,23 @@ impl Record {
                 result = self.cur.ir.emitir(irtn(IROp::NEG), tref_ref(rc), tref_ref(signbit))?;
             }
             BCOp::LEN => {
-                if !tref_isstr(rc) {
-                    return Err(TraceError::NYIBC); // Table len/__len NYI.
+                if tref_isstr(rc) {
+                    result = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_NUM),
+                        tref_ref(rc),
+                        IRCALL_STR_LEN,
+                    ));
+                } else if tref_istab(rc) {
+                    // Raw length, mirroring the interpreter's table fast
+                    // path (no __len for tables).
+                    result = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_NUM),
+                        tref_ref(rc),
+                        IRCALL_TAB_LEN,
+                    ));
+                } else {
+                    return Err(TraceError::NYIBC); // __len NYI.
                 }
-                result = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CALLL, IRT_NUM),
-                    tref_ref(rc),
-                    IRCALL_STR_LEN,
-                ));
             }
 
             // -- Constants -------------------------------------------------------------
@@ -2011,6 +2147,27 @@ impl Record {
             BCOp::UGET => result = self.rec_uget(l, base, bc_d(ins))?,
 
             // -- Table indexing ----------------------------------------------------
+            BCOp::TNEW => {
+                // Mirror the interpreter: a fresh empty table (the size
+                // hint in D is ignored there too).
+                result = self.cur.ir.emit_ins(IRIns::new(irt(IROp::TNEW, IRT_TAB), 0, 0));
+                self.rec_gcstep(l);
+            }
+            BCOp::TDUP => {
+                let templ_addr = match &pt.as_ref().kgc[bc_d(ins) as usize] {
+                    crate::proto::KGc::Table(t) => &**t as *const crate::table::LuaTable,
+                    crate::proto::KGc::TableRef(t) => {
+                        t.as_ref() as *const crate::table::LuaTable
+                    }
+                    _ => return Err(TraceError::NYIBC),
+                };
+                let k = self.cur.ir.kint64(templ_addr as u64);
+                result = self
+                    .cur
+                    .ir
+                    .emit_ins(IRIns::new(irt(IROp::TDUP, IRT_TAB), tref_ref(k), 0));
+                self.rec_gcstep(l);
+            }
             BCOp::TGETV | BCOp::TGETS | BCOp::TGETB => {
                 let tabv = self.slot_val(l, base, bc_b(ins));
                 let (key, keyv) = if op == BCOp::TGETB {
@@ -2135,12 +2292,16 @@ enum Recff {
     StrByte,
     StrSub,
     StrChar,
+    /// table.* (raw array ops + IRCALL helpers).
+    TableInsert,
+    TableRemove,
+    TableConcat,
 }
 
 fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
     use crate::func::CFunction;
-    use crate::stdlib::{base, bit, math, string};
-    let entries: [(CFunction, Recff); 24] = [
+    use crate::stdlib::{base, bit, math, string, table};
+    let entries: [(CFunction, Recff); 27] = [
         (math::floor, Recff::Floor),
         (math::ceil, Recff::Ceil),
         (math::sqrt, Recff::Sqrt),
@@ -2165,6 +2326,9 @@ fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
         (string::str_byte, Recff::StrByte),
         (string::str_sub, Recff::StrSub),
         (string::str_char, Recff::StrChar),
+        (table::tab_insert, Recff::TableInsert),
+        (table::tab_remove, Recff::TableRemove),
+        (table::tab_concat, Recff::TableConcat),
     ];
     entries
         .iter()
