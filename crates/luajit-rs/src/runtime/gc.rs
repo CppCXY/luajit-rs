@@ -457,6 +457,21 @@ pub fn full_gc(g: &mut GlobalState) {
     if let Some(cur) = g.cur_l {
         m.mark_thread(cur);
     }
+    // JIT roots: completed traces and any active recording keep their
+    // start prototype and KGC constants alive (a trace is a GC root in
+    // LuaJIT, too).
+    for t in g.jit.trace.iter().flatten() {
+        m.mark_proto(t.startpt);
+        for v in t.ir.kgc_values() {
+            m.mark_value(v);
+        }
+    }
+    if let Some(rec) = &g.jit.rec {
+        m.mark_proto(rec.cur.startpt);
+        for v in rec.cur.ir.kgc_values() {
+            m.mark_value(v);
+        }
+    }
     m.propagate();
 
     // -- Sweep phase (GCSsweepstring + GCSsweep) --

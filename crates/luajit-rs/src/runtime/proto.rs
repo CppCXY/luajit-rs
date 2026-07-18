@@ -64,6 +64,10 @@ pub const PROTO_CHILD: u8 = 0x01;
 pub const PROTO_VARARG: u8 = 0x02;
 #[allow(dead_code)]
 pub const PROTO_FFI: u8 = 0x04;
+/// JIT disabled for this function.
+pub const PROTO_NOJIT: u8 = 0x08;
+/// Patched bytecode with ILOOP etc. (blacklisted by the trace compiler).
+pub const PROTO_ILOOP: u8 = 0x10;
 pub const PROTO_HAS_RETURN: u8 = 0x20;
 pub const PROTO_FIXUP_RETURN: u8 = 0x40;
 pub const PROTO_BITOP: u8 = 0x80;

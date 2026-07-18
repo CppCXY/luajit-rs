@@ -220,6 +220,17 @@ fn run_args(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) -> i3
                     }
                 }
             }
+            Some('j') => {
+                let cmd = if a.len() > 2 { &a[2..] } else { i += 1; argv[i].as_str() };
+                match cmd {
+                    "on" => lua.main().global().jit.set_on(true),
+                    "off" => lua.main().global().jit.set_on(false),
+                    _ => {
+                        eprintln!("luajit-rs: unknown luaJIT command or jit.* modules not installed");
+                        return 1;
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;

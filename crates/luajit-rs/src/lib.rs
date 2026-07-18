@@ -1,4 +1,5 @@
 pub mod compiler;
+pub mod jit;
 pub mod runtime;
 pub mod stdlib;
 pub mod util;

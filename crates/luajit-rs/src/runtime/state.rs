@@ -115,6 +115,8 @@ pub struct GlobalState {
     /// The currently running thread (LuaJIT's `cur_L`): the main thread or
     /// the innermost resumed coroutine.
     pub cur_l: Option<StateRef>,
+    /// The JIT compiler state (LuaJIT embeds `jit_State` in `GG_State`).
+    pub jit: crate::jit::JitState,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
@@ -148,6 +150,7 @@ impl GlobalState {
             basemt: [None; ITYPE_COUNT],
             mmname,
             cur_l: None,
+            jit: crate::jit::JitState::new(),
             boot_time: boot,
             main: None,
         }

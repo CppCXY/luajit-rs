@@ -25,6 +25,7 @@ pub mod err;
 use crate::err::{LuaError, LuaResult};
 use crate::func::{GcFunc, LuaClosure, Upval};
 use crate::gc::GcPtr;
+use crate::jit::{HOTCOUNT_CALL, HOTCOUNT_LOOP};
 use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto};
 use crate::runtime::meta::MM;
 use crate::state::{LuaState, Suspend};
@@ -164,6 +165,14 @@ fn call_c(
         l.top = func_slot + n;
         Ok(n)
     }
+}
+
+/// Dispatch-loop exit reasons: a host-frame return, or a switch between
+/// the plain and the recording interpreter (LuaJIT switches dispatch
+/// tables instead).
+enum Flow {
+    Ret(usize),
+    Rec,
 }
 
 /// Interpreter context. The per-instruction hot state is *not* kept here; it
@@ -460,7 +469,31 @@ impl Interp {
     /// alive across the dispatch forces spills (measured: rustc packs the
     /// extras into an XMM register and unpacks per instruction).
     /// `sync!`/`resync!` bridge to the fields around calls and returns.
+    ///
+    /// `run` is the mode trampoline: it re-enters `dispatch` whenever the
+    /// trace recorder turns on or off, standing in for LuaJIT's dispatch
+    /// table switching (`lj_dispatch_update`). `dispatch::<true>` is the
+    /// recording interpreter: it feeds every instruction through
+    /// `lj_record_ins` before executing it.
     fn run(&mut self) -> LuaResult<usize> {
+        loop {
+            let rec = self.l().global().jit.state == crate::jit::TraceState::Record;
+            let r = if rec { self.dispatch::<true>() } else { self.dispatch::<false>() };
+            match r {
+                Ok(Flow::Ret(n)) => return Ok(n),
+                Ok(Flow::Rec) => continue, // Recording toggled: switch modes.
+                Err(e) => {
+                    // An error raised while recording aborts the trace.
+                    if rec {
+                        crate::jit::trace::rec_abort_error(self.l().global());
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    fn dispatch<const REC: bool>(&mut self) -> LuaResult<Flow> {
         let mut bp = unsafe { self.sp.add(self.base) };
         let mut ip = unsafe { self.bcp.add(self.pc) };
 
@@ -597,8 +630,46 @@ impl Interp {
                 }
             }};
         }
+        // FORL/ITERL loop-edge semantics, shared between the normal arm
+        // and the "hot counter fired, recording just started" path (the
+        // hot instruction itself runs before the trace entry).
+        macro_rules! forl_body {
+            ($ins:expr, $a:expr) => {{
+                let i = reg!($a + FORL_IDX).num();
+                let s = reg!($a + FORL_STOP).num();
+                let st = reg!($a + FORL_STEP).num();
+                let ni = i + st;
+                let cont = if st >= 0.0 { ni <= s } else { ni >= s };
+                if cont {
+                    let nv = LuaValue::number_raw(ni);
+                    setreg!($a + FORL_IDX, nv);
+                    setreg!($a + FORL_EXT, nv);
+                    jump!($ins);
+                }
+            }};
+        }
+        macro_rules! iterl_body {
+            ($ins:expr, $a:expr) => {{
+                let first = reg!($a);
+                if !first.is_nil() {
+                    setreg!($a - 1, first);
+                    jump!($ins);
+                }
+            }};
+        }
 
         loop {
+            if REC {
+                // Recording dispatch: feed the instruction about to be
+                // executed through the recorder (lj_trace_ins).
+                sync!();
+                let pt = self.lua_cl().proto;
+                let (pc, base) = (self.pc, self.base);
+                if !crate::jit::trace::rec_ins(self.l(), base, pt, pc) {
+                    return Ok(Flow::Rec); // Recording ended: switch modes.
+                }
+                resync!();
+            }
             let ins = unsafe { *ip };
             ip = unsafe { ip.add(1) };
             let a = bc_a(ins);
@@ -994,6 +1065,7 @@ impl Interp {
                     if let Some(gf) = f.as_func()
                         && let GcFunc::Lua(cl) = gf.as_ref()
                     {
+                        let ptref = cl.proto;
                         let pt = cl.proto.as_ref();
                         if (pt.flags & PROTO_VARARG) == 0 {
                             let nargs = bc_c(ins) as usize - 1;
@@ -1017,6 +1089,20 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
+                            // hotcall (vm_hotcall): count the FUNCF header.
+                            // The other Lua-entry paths do not count until
+                            // call recording lands (Phase 3).
+                            if !REC
+                                && bc_op(pt.bc[0]) == BCOp::FUNCF
+                                && self.hot_count(ip as usize, HOTCOUNT_CALL)
+                            {
+                                sync!();
+                                if self.hot_call(ptref) {
+                                    // Record from the callee's first ins.
+                                    return Ok(Flow::Rec);
+                                }
+                                resync!();
+                            }
                             continue;
                         }
                     }
@@ -1071,7 +1157,7 @@ impl Interp {
                     let nargs = bc_d(ins) as usize - 1;
                     sync!();
                     if let Some(n) = self.do_tailcall(a, nargs)? {
-                        return Ok(n);
+                        return Ok(Flow::Ret(n));
                     }
                     resync!();
                 }
@@ -1079,7 +1165,7 @@ impl Interp {
                     let nargs = bc_d(ins) as usize + self.multres;
                     sync!();
                     if let Some(n) = self.do_tailcall(a, nargs)? {
-                        return Ok(n);
+                        return Ok(Flow::Ret(n));
                     }
                     resync!();
                 }
@@ -1104,7 +1190,7 @@ impl Interp {
                     }
                     sync!();
                     if let Some(n) = self.do_return(cur_base!(), 0) {
-                        return Ok(n);
+                        return Ok(Flow::Ret(n));
                     }
                     resync!();
                 }
@@ -1130,7 +1216,7 @@ impl Interp {
                     }
                     sync!();
                     if let Some(n) = self.do_return(cur_base!() + a as usize, 1) {
-                        return Ok(n);
+                        return Ok(Flow::Ret(n));
                     }
                     resync!();
                 }
@@ -1159,7 +1245,7 @@ impl Interp {
                     }
                     sync!();
                     if let Some(n) = self.do_return(cur_base!() + a as usize, n) {
-                        return Ok(n);
+                        return Ok(Flow::Ret(n));
                     }
                     resync!();
                 }
@@ -1188,7 +1274,7 @@ impl Interp {
                     }
                     sync!();
                     if let Some(n) = self.do_return(cur_base!() + a as usize, n) {
-                        return Ok(n);
+                        return Ok(Flow::Ret(n));
                     }
                     resync!();
                 }
@@ -1212,20 +1298,40 @@ impl Interp {
                             .runtime_error(b"'for' initial value must be a number"));
                     }
                 }
-                BCOp::FORL => {
-                    let i = reg!(a + FORL_IDX).num();
-                    let s = reg!(a + FORL_STOP).num();
-                    let st = reg!(a + FORL_STEP).num();
-                    let ni = i + st;
-                    let cont = if st >= 0.0 { ni <= s } else { ni >= s };
-                    if cont {
-                        let nv = LuaValue::number_raw(ni);
-                        setreg!(a + FORL_IDX, nv);
-                        setreg!(a + FORL_EXT, nv);
-                        jump!(ins);
+                BCOp::FORL | BCOp::IFORL => {
+                    // FORL is the hot-counting variant (lj_vm's `hotloop`
+                    // macro); IFORL is the blacklisted/non-counting one.
+                    if !REC
+                        && bc_op(ins) == BCOp::FORL
+                        && self.hot_count(ip as usize, HOTCOUNT_LOOP)
+                    {
+                        sync!();
+                        if self.hot_loop() {
+                            // Recording started: run this FORL un-recorded
+                            // (it sits before the trace entry), then
+                            // switch to the recording dispatch.
+                            resync!();
+                            forl_body!(ins, a);
+                            sync!();
+                            return Ok(Flow::Rec);
+                        }
+                        resync!();
+                    }
+                    forl_body!(ins, a);
+                }
+                BCOp::LOOP | BCOp::ILOOP => {
+                    // No-op apart from hot counting (ILOOP: not even that).
+                    if !REC
+                        && bc_op(ins) == BCOp::LOOP
+                        && self.hot_count(ip as usize, HOTCOUNT_LOOP)
+                    {
+                        sync!();
+                        if self.hot_loop() {
+                            return Ok(Flow::Rec); // pc already past LOOP.
+                        }
+                        resync!();
                     }
                 }
-                BCOp::LOOP => { /* hotcount hook: no-op for now */ }
                 BCOp::JMP => jump!(ins),
                 BCOp::ISNEXT => jump!(ins),
                 BCOp::ITERC | BCOp::ITERN => {
@@ -1233,12 +1339,21 @@ impl Interp {
                     self.iter_call(a, bc_b(ins) as usize)?;
                     resync!();
                 }
-                BCOp::ITERL => {
-                    let first = reg!(a);
-                    if !first.is_nil() {
-                        setreg!(a - 1, first);
-                        jump!(ins);
+                BCOp::ITERL | BCOp::IITERL => {
+                    if !REC
+                        && bc_op(ins) == BCOp::ITERL
+                        && self.hot_count(ip as usize, HOTCOUNT_LOOP)
+                    {
+                        sync!();
+                        if self.hot_loop() {
+                            resync!();
+                            iterl_body!(ins, a);
+                            sync!();
+                            return Ok(Flow::Rec);
+                        }
+                        resync!();
                     }
+                    iterl_body!(ins, a);
                 }
                 BCOp::VARG => {
                     let link = unsafe { (*bp.sub(1)).to_bits() };
@@ -1314,11 +1429,8 @@ impl Interp {
                 | BCOp::TGETR
                 | BCOp::TSETR
                 | BCOp::JFORI
-                | BCOp::IFORL
                 | BCOp::JFORL
-                | BCOp::IITERL
                 | BCOp::JITERL
-                | BCOp::ILOOP
                 | BCOp::JLOOP
                 | BCOp::FUNCF
                 | BCOp::IFUNCF
@@ -1338,6 +1450,39 @@ impl Interp {
     }
 
     // -- Cold slow paths -------------------------------------------------
+
+    // -- JIT hot-path detection (lj_dispatch's hotloop/hotcall) -----------
+
+    /// Decrement the hot counter hashed from `addr` (the interpreter PC
+    /// *after* fetching the counting instruction, LuaJIT's offset-by-1
+    /// convention). Returns true when it underflows: the path turned hot.
+    /// Does nothing while the JIT is off.
+    #[inline(always)]
+    fn hot_count(&mut self, addr: usize, amount: crate::jit::HotCount) -> bool {
+        let js = &mut self.l().global().jit;
+        js.is_on() && js.hot_decrement(addr, amount)
+    }
+
+    /// `->vm_hotloop`: the FORL/ITERL/LOOP at `self.pc - 1` (locals must be
+    /// synced) turned hot. Returns true when recording started and the
+    /// caller must switch to the recording dispatch.
+    #[cold]
+    fn hot_loop(&mut self) -> bool {
+        let pt = self.lua_cl().proto;
+        let pc = self.pc - 1;
+        let base = self.base;
+        crate::jit::trace::trace_hot(self.l(), base, pt, pc);
+        self.l().global().jit.state == crate::jit::TraceState::Record
+    }
+
+    /// `->vm_hotcall`: the FUNCF header of `pt` turned hot. Same contract
+    /// as `hot_loop`; the frame must already be entered and synced.
+    #[cold]
+    fn hot_call(&mut self, pt: GcPtr<Proto>) -> bool {
+        let base = self.base;
+        crate::jit::trace::trace_hot(self.l(), base, pt, 0);
+        self.l().global().jit.state == crate::jit::TraceState::Record
+    }
 
     /// `lj_gc_check` + `lj_gc_step_fixtop`: run a collection if the
     /// allocation debt is due. Only called from safe points (before an
