@@ -16,6 +16,217 @@ struct Slot<T> {
     marked: bool,
 }
 
+/// Low-address page memory for the pools. GC object addresses travel in
+/// the 47-bit payload of a NaN-boxed `LuaValue`; on platforms whose
+/// user-space VA exceeds 47 bits (e.g. Linux/AArch64 with 48-bit VA) the
+/// global allocator can return pointers above that limit, so the pages
+/// fall back to hint-probed `mmap` like LuaJIT's `lj_alloc` does.
+mod lowmem {
+    use std::alloc::Layout;
+    use std::ptr::NonNull;
+
+    /// NaN-boxed pointers must fit the 47-bit LuaValue payload.
+    const LIMIT: u64 = 1 << 47;
+
+    /// Allocate `layout` with the whole block below 2^47. The flag in
+    /// the result records whether the block came from the OS mapper
+    /// (true) or the global allocator (false).
+    pub fn alloc(layout: Layout) -> (NonNull<u8>, bool) {
+        unsafe {
+            let p = std::alloc::alloc(layout);
+            if !p.is_null() {
+                if (p as u64).saturating_add(layout.size() as u64) <= LIMIT {
+                    return (NonNull::new_unchecked(p), false);
+                }
+                std::alloc::dealloc(p, layout);
+            }
+        }
+        match os_alloc_low(layout.size().max(1)) {
+            Some(p) => (p, true),
+            None => panic!("cannot allocate GC pages below 2^47 (NaN-boxing limit)"),
+        }
+    }
+
+    /// Free a block from `alloc`.
+    ///
+    /// # Safety
+    /// `ptr`/`layout`/`mapped` must match a single previous `alloc`.
+    pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout, mapped: bool) {
+        if mapped {
+            os_free(ptr.as_ptr(), layout.size().max(1));
+        } else {
+            unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+        }
+    }
+
+    /// Pseudo-random probe hints in [2^38, 2^46], 64K aligned: high
+    /// enough to dodge the program segments, low enough for the payload.
+    fn probe_hints() -> impl Iterator<Item = u64> {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(std::process::id() as u64 | 1);
+        (0..128).map(move |_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((1u64 << 38) + (seed % ((1u64 << 46) - (1u64 << 38)))) & !0xFFFF
+        })
+    }
+
+    #[cfg(unix)]
+    fn os_alloc_low(size: usize) -> Option<NonNull<u8>> {
+        const PROT_READ: i32 = 1;
+        const PROT_WRITE: i32 = 2;
+        const MAP_PRIVATE: i32 = 0x02;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const MAP_ANON: i32 = 0x20;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const MAP_ANON: i32 = 0x1000;
+        /// The hint is only binding on Linux (elsewhere the kernel may
+        /// place the mapping anywhere; the result is checked either way).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const MAP_FIXED_NOREPLACE: i32 = 0;
+
+        unsafe extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+        for hint in probe_hints() {
+            let p = unsafe {
+                mmap(
+                    hint as *mut u8,
+                    size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if p as isize == -1 || p.is_null() {
+                continue;
+            }
+            if (p as u64).saturating_add(size as u64) <= LIMIT {
+                return NonNull::new(p);
+            }
+            unsafe { munmap(p, size) };
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    fn os_free(ptr: *mut u8, size: usize) {
+        unsafe extern "C" {
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+        unsafe { munmap(ptr, size) };
+    }
+
+    #[cfg(windows)]
+    fn os_alloc_low(size: usize) -> Option<NonNull<u8>> {
+        // Practically unreachable (Windows user space is 47-bit), kept
+        // for completeness.
+        const MEM_COMMIT: u32 = 0x1000;
+        const MEM_RESERVE: u32 = 0x2000;
+        const PAGE_READWRITE: u32 = 0x04;
+        unsafe extern "system" {
+            fn VirtualAlloc(addr: *mut u8, size: usize, ty: u32, prot: u32) -> *mut u8;
+        }
+        for hint in probe_hints() {
+            let p = unsafe {
+                VirtualAlloc(hint as *mut u8, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+            };
+            if p.is_null() {
+                continue;
+            }
+            if (p as u64).saturating_add(size as u64) <= LIMIT {
+                return NonNull::new(p);
+            }
+            os_free(p, size);
+        }
+        None
+    }
+
+    #[cfg(windows)]
+    fn os_free(ptr: *mut u8, _size: usize) {
+        const MEM_RELEASE: u32 = 0x8000;
+        unsafe extern "system" {
+            fn VirtualFree(addr: *mut u8, size: usize, ty: u32) -> i32;
+        }
+        unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn os_probe_returns_low_writable_memory() {
+            let size = 1 << 20;
+            let p = os_alloc_low(size).expect("probe failed");
+            assert!((p.as_ptr() as u64) + size as u64 <= LIMIT);
+            unsafe {
+                p.as_ptr().write(0xAB);
+                p.as_ptr().add(size - 1).write(0xCD);
+                assert_eq!(p.as_ptr().read(), 0xAB);
+                os_free(p.as_ptr(), size);
+            }
+        }
+
+        #[test]
+        fn alloc_dealloc_roundtrip() {
+            let layout = Layout::from_size_align(4096, 16).unwrap();
+            let (p, mapped) = alloc(layout);
+            assert!((p.as_ptr() as u64) + 4096 <= LIMIT);
+            unsafe {
+                p.as_ptr().write_bytes(0x5A, 4096);
+                dealloc(p, layout, mapped);
+            }
+        }
+    }
+}
+
+/// One pool page: a raw array of slots in low memory (see `lowmem`).
+/// Live objects are dropped by `Pool::sweep`/`Pool::drop`; the page only
+/// releases the memory.
+struct RawPage<T> {
+    ptr: NonNull<Slot<T>>,
+    cap: usize,
+    mapped: bool,
+}
+
+impl<T> RawPage<T> {
+    fn layout(cap: usize) -> std::alloc::Layout {
+        std::alloc::Layout::array::<Slot<T>>(cap).expect("pool page layout overflow")
+    }
+
+    fn new(cap: usize) -> RawPage<T> {
+        let (raw, mapped) = lowmem::alloc(Self::layout(cap));
+        let ptr = raw.cast::<Slot<T>>();
+        unsafe {
+            for i in 0..cap {
+                ptr.as_ptr().add(i).write(Slot {
+                    data: MaybeUninit::uninit(),
+                    live: false,
+                    marked: false,
+                });
+            }
+        }
+        RawPage { ptr, cap, mapped }
+    }
+
+    fn slots(&self) -> &[Slot<T>] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.cap) }
+    }
+
+    fn slots_mut(&mut self) -> &mut [Slot<T>] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) }
+    }
+}
+
+impl<T> Drop for RawPage<T> {
+    fn drop(&mut self) {
+        unsafe { lowmem::dealloc(self.ptr.cast(), Self::layout(self.cap), self.mapped) };
+    }
+}
+
 /// A typed, stable-address object pool.
 ///
 /// Objects are allocated inside fixed-size pages (`Box<[Slot<T>]>`); pages
@@ -25,7 +236,7 @@ struct Slot<T> {
 /// of roughly the same byte size (small objects → many slots; huge objects
 /// → few).
 pub struct Pool<T> {
-    pages: Vec<Box<[Slot<T>]>>,
+    pages: Vec<RawPage<T>>,
     free: Vec<NonNull<Slot<T>>>,
     live: usize,
     page_cap: usize,
@@ -47,16 +258,8 @@ impl<T> Pool<T> {
     }
 
     fn add_page(&mut self) {
-        let mut page: Vec<Slot<T>> = Vec::with_capacity(self.page_cap);
-        for _ in 0..self.page_cap {
-            page.push(Slot {
-                data: MaybeUninit::uninit(),
-                live: false,
-                marked: false,
-            });
-        }
-        let mut page = page.into_boxed_slice();
-        for s in page.iter_mut().rev() {
+        let mut page = RawPage::new(self.page_cap);
+        for s in page.slots_mut().iter_mut().rev() {
             self.free.push(NonNull::from(s));
         }
         self.pages.push(page);
@@ -104,7 +307,7 @@ impl<T> Pool<T> {
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.pages
             .iter()
-            .flat_map(|p| p.iter())
+            .flat_map(|p| p.slots().iter())
             .filter(|s| s.live)
             .map(|s| unsafe { s.data.assume_init_ref() })
     }
@@ -116,7 +319,7 @@ impl<T> Pool<T> {
         let mut free = std::mem::take(&mut self.free);
         let mut live = 0;
         for page in &mut self.pages {
-            for s in page.iter_mut() {
+            for s in page.slots_mut() {
                 if !s.live {
                     continue;
                 }
@@ -147,7 +350,7 @@ impl<T> Default for Pool<T> {
 impl<T> Drop for Pool<T> {
     fn drop(&mut self) {
         for page in &mut self.pages {
-            for s in page.iter_mut() {
+            for s in page.slots_mut() {
                 if s.live {
                     unsafe { s.data.assume_init_drop() };
                     s.live = false;
