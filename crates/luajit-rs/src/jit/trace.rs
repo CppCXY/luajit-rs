@@ -104,6 +104,7 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         js.parent as u16,
         js.exitno as u16,
         js.param(JitParam::LoopUnroll),
+        js.param(JitParam::InstUnroll),
     );
 
     // rec_setup_root: determine the next PC and the loop bytecode range.
@@ -195,6 +196,33 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             true
         }
         Ok(Some(link)) => {
+            // lj_record_stop: add the loop snapshot. Note: all loop ops
+            // set J->pc to the following instruction, which is what this
+            // snapshot must describe.
+            rec.needsnap = false;
+            rec.mergesnap = true;
+            rec.snap_add();
+            rec.mergesnap = true; // In case recording continues below.
+            // LJ_TRACE_END: unroll self-linking loops (lj_opt_loop).
+            if link == TraceLink::Loop && rec.framedepth + rec.retdepth == 0 {
+                match super::opt_loop::opt_loop(&mut rec) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // Fixable failure (TYPEINS/GFAIL), already undone:
+                        // continue recording, i.e. unroll the loop once
+                        // more (LJ_TRACE_END -> LJ_TRACE_RECORD).
+                        rec.loopref = rec.cur.ir.nins();
+                        g.jit.rec = Some(rec);
+                        return true;
+                    }
+                    Err(e) => {
+                        g.jit.err = e;
+                        g.jit.state = TraceState::Err;
+                        trace_abort(g);
+                        return false;
+                    }
+                }
+            }
             trace_stop(g, rec, link);
             false
         }
@@ -225,11 +253,6 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink) {
     let traceno = rec.cur.traceno;
     rec.cur.linktype = linktype;
     rec.cur.link = if linktype == TraceLink::Loop { traceno } else { 0 };
-    // Note: all loop ops set J->pc to the following instruction, which is
-    // what the final loop snapshot must describe.
-    rec.needsnap = false;
-    rec.mergesnap = true;
-    rec.snap_add();
 
     let trace = std::mem::replace(
         &mut rec.cur,
@@ -447,21 +470,32 @@ mod tests {
         // The x64 backend must have assembled this numeric loop.
         #[cfg(target_arch = "x86_64")]
         assert!(tr.mcode.is_some(), "trace not assembled to machine code");
-        // The loop body must contain two num ADDs (s+i and i+step) and a
-        // loop-condition guard.
+        // After lj_opt_loop the trace holds the pre-roll plus the copied
+        // variant part: two num ADDs each (s+i, i+step), separated by
+        // LOOP, with PHIs for the two loop-carried values at the tail.
         let mut adds = 0;
         let mut guards = 0;
+        let mut phis = 0;
+        let mut loops = 0;
         for r in crate::jit::ir::REF_FIRST..tr.ir.nins() {
             let ir = tr.ir.ir(r);
             if ir.op() == IROp::ADD && irt_type(ir.t()) == IRT_NUM {
                 adds += 1;
             }
-            if ir.is_guard() {
+            if ir.is_guard() && ir.op() != IROp::LOOP {
                 guards += 1;
             }
+            if ir.op() == IROp::PHI {
+                phis += 1;
+            }
+            if ir.op() == IROp::LOOP {
+                loops += 1;
+            }
         }
-        assert_eq!(adds, 2, "expected s+i and i+step");
-        assert!(guards >= 1, "expected the loop condition guard");
+        assert_eq!(adds, 4, "expected s+i and i+step in pre-roll and body");
+        assert!(guards >= 2, "expected the loop condition guards");
+        assert_eq!(loops, 1, "expected the LOOP marker");
+        assert_eq!(phis, 2, "expected PHIs for s and i");
         assert!(tr.snap.len() >= 2);
         // The loop finished through the trace: the leave-exit was taken.
         assert!(tr.snap.iter().any(|s| s.count > 0), "no exit was taken");
@@ -527,6 +561,45 @@ mod tests {
         assert_eq!(tr.linktype, TraceLink::Loop);
         assert_eq!(bc_op(tr.startins), BCOp::LOOP);
         assert!(tr.snap.iter().any(|s| s.count > 0), "no exit was taken");
+    }
+
+    #[test]
+    fn swap_phis_use_parallel_assignment() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // a,b = b,a builds a PHI cycle: the back edge must read both
+        // right refs before writing either left ref.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local a, b = 1.5, 2.5 \
+             local s = 0 \
+             for i = 1, 100001 do a, b = b, a s = s + a end \
+             return a * 1000 + b * 100 + s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        // Odd iteration count: a,b end up swapped; s alternates +2.5/+1.5.
+        let s = 50000.0 * (1.5 + 2.5) + 2.5;
+        assert_eq!(r[0].as_number(), Some(2.5 * 1000.0 + 1.5 * 100.0 + s));
+    }
+
+    #[test]
+    fn portable_exec_runs_loop_optimized_ir() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // Differential test: strip the machine code from all traces and
+        // re-run, forcing run_ir through the LOOP/PHI execution path.
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local s = 0 for i = 1, 300 do s = s + i end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(45150.0));
+        assert!(find_op(pt, BCOp::JFORL).is_some());
+        for t in lua.global().jit.trace.iter_mut().flatten() {
+            t.mcode = None;
+        }
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(45150.0), "portable tier diverged");
     }
 
     #[test]

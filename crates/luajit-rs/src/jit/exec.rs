@@ -13,12 +13,12 @@
 //!   stubs, and the exit handler funnels back into the same
 //!   snapshot-restore path below.
 //!
-//! Execution model for a self-linked loop trace (no IR_LOOP until
-//! lj_opt_loop is ported): run the IR top to bottom; when the tail is
-//! reached, materialize the final snapshot into the Lua stack (LuaJIT's
-//! asm_tail_link stack sync) and restart from the top — the head SLOADs
-//! then re-read the just-written slots. A failing guard exits through its
-//! covering snapshot instead.
+//! Execution model for a self-linked loop trace: for loop-optimized IR
+//! (lj_opt_loop ported: LOOP + PHIs), the pre-roll runs once and the
+//! variant part re-enters after LOOP with the PHI values carried over in
+//! `env`. Traces without IR_LOOP fall back to: run top to bottom,
+//! materialize the final snapshot into the Lua stack and restart from
+//! the top. A failing guard exits through its covering snapshot.
 
 use crate::state::LuaState;
 use crate::value::LuaValue;
@@ -88,12 +88,28 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
     let ir = &tr.ir;
     let nins = ir.nins();
     let looping = tr.linktype == TraceLink::Loop && tr.link == tr.traceno;
+    // Loop-optimized traces: re-enter at the LOOP instruction with the
+    // PHI values carried over; legacy traces re-run from the top after a
+    // final-snapshot restore.
+    let loopref = if looping { ir.chain[IROp::LOOP as usize] as IRRef } else { 0 };
+    let mut phis: Vec<(IRRef, IRRef)> = Vec::new();
+    if loopref != 0 {
+        // PHIs are the last instructions of the trace.
+        let mut r = nins - 1;
+        while r > loopref && ir.ir(r).op() == IROp::PHI {
+            let ins = ir.ir(r);
+            phis.push((ins.op1 as IRRef, ins.op2 as IRRef));
+            r -= 1;
+        }
+    }
+    let mut phivals: Vec<u64> = Vec::with_capacity(phis.len());
 
+    let mut start = REF_FIRST;
     'trace: loop {
         // Snapshot cursor: the guard at ref R exits through the last
         // snapshot with iref <= R.
         let mut snapidx = 0usize;
-        let mut r = REF_FIRST;
+        let mut r = start;
         while r < nins {
             while snapidx + 1 < tr.snap.len() && tr.snap[snapidx + 1].iref <= r {
                 snapidx += 1;
@@ -102,7 +118,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
             let op = ins.op();
             let val = |env: &[u64], op: IRRef| -> u64 { read_ref(ir, env, op) };
             match op {
-                IROp::NOP | IROp::BASE | IROp::LOOP => {}
+                IROp::NOP | IROp::BASE | IROp::LOOP | IROp::PHI => {}
                 IROp::SLOAD => {
                     // op1 = absolute recorder slot (baseslot-based).
                     let slot = ins.op1 as usize - 2;
@@ -174,10 +190,24 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
         }
 
         if looping {
-            // Loop edge: sync the final snapshot into the stack, then
-            // re-enter the trace head (asm_tail_link's stack sync).
+            if loopref != 0 {
+                // Loop edge of an unrolled trace: parallel-assign the PHI
+                // values (read all right refs before writing any left
+                // ref), then re-enter the variant part after LOOP.
+                phivals.clear();
+                phivals.extend(phis.iter().map(|&(_, rref)| read_ref(ir, env, rref)));
+                for (&(lref, _), &v) in phis.iter().zip(phivals.iter()) {
+                    env[(lref - REF_BIAS) as usize] = v;
+                }
+                start = loopref + 1;
+                continue 'trace;
+            }
+            // Legacy loop edge (no IR_LOOP): sync the final snapshot into
+            // the stack, then re-enter the trace head (the head SLOADs
+            // re-read the just-written slots).
             let lastidx = tr.snap.len() - 1;
             restore_snapshot(l, base, tr, env, lastidx);
+            start = REF_FIRST;
             continue 'trace;
         }
         // Non-looping tail (TraceLink::None safety net): exit through the

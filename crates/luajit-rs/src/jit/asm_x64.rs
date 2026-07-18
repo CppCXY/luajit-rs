@@ -20,18 +20,20 @@
 //!
 //! ABI of the emitted code:
 //! `extern "C" fn(base: *mut LuaValue, env: *mut u64) -> u32` returning
-//! the exit snapshot index. Only registers that are volatile in both the
-//! Win64 and SysV ABIs are used (rax/rcx/rdx, r10/r11, xmm0-xmm5), so
-//! there is no frame setup at all.
+//! the exit snapshot index. GPRs used are volatile in both the Win64 and
+//! SysV ABIs (rax/rcx/rdx, r10/r11); all 16 xmm registers are used, so
+//! the Win64 prologue/epilogue saves and restores xmm6-xmm15 (SysV has
+//! no callee-saved xmm registers).
 
 use super::ir::*;
 use super::mcode::McodeArea;
 use super::record::{IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC};
 use super::{GCtrace, SNAP_NORESTORE, TraceError, TraceLink, snap_ref, snap_slot};
 
-/// Allocatable FP registers: xmm0-xmm4. xmm5 is the constant/mask scratch.
-const NREG: usize = 5;
-const XMM_SCRATCH: u8 = 5;
+/// Allocatable FP registers: xmm0-xmm14. xmm15 is the constant/mask
+/// scratch.
+const NREG: usize = 15;
+const XMM_SCRATCH: u8 = 15;
 
 /// Fixed-role GPRs, volatile in both ABIs.
 const RAX: u8 = 0;
@@ -68,6 +70,19 @@ enum Owner {
     Konst(IRRef),
 }
 
+/// A loop-carried value: `PHI(lref, rref)` — on the back edge the value
+/// of `rref` becomes the next iteration's `lref`.
+#[derive(Clone, Copy)]
+struct PhiInfo {
+    /// Ref of the PHI instruction itself; its env slot doubles as the
+    /// scratch buffer for the parallel move on the back edge.
+    phi: IRRef,
+    lref: IRRef,
+    rref: IRRef,
+    /// FP value (lives in xmm registers); GC values are carried via env.
+    num: bool,
+}
+
 /// Assemble a completed trace. On error the caller keeps `mcode = None`
 /// and the portable executor runs the trace.
 pub fn assemble(tr: &GCtrace) -> Result<McodeArea, TraceError> {
@@ -94,6 +109,12 @@ struct Asm<'a> {
     owner: [Owner; NREG],
     /// (position of rel32, target snapshot index).
     fixups: Vec<(usize, usize)>,
+    /// Loop-carried values (PHIs at the trace tail).
+    phis: Vec<PhiInfo>,
+    /// Code offset of the loop re-entry point (right after IR_LOOP).
+    loop_pos: Option<usize>,
+    /// Register state at IR_LOOP; the back edge restores exactly this.
+    s0: [Owner; NREG],
 }
 
 impl<'a> Asm<'a> {
@@ -127,6 +148,9 @@ impl<'a> Asm<'a> {
             loc: vec![None; nins],
             owner: [Owner::None; NREG],
             fixups: Vec::new(),
+            phis: Vec::new(),
+            loop_pos: None,
+            s0: [Owner::None; NREG],
         };
         let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
         for r in REF_FIRST..tr.ir.nins() {
@@ -162,6 +186,24 @@ impl<'a> Asm<'a> {
                         }
                     }
                 }
+                IROp::PHI => {
+                    // Loop-carried: both sides stay live across the back
+                    // edge; non-FP values are carried through env.
+                    let (lref, rref) = (ins.op1 as IRRef, ins.op2 as IRRef);
+                    let inf = tr.ir.nins();
+                    a.mark_use(lref, inf);
+                    a.mark_use(rref, inf);
+                    let num = irt_isnum(ins.t());
+                    if !num {
+                        if lref >= REF_BIAS {
+                            a.needs_env[Self::iidx(lref)] = true;
+                        }
+                        if rref >= REF_BIAS {
+                            a.needs_env[Self::iidx(rref)] = true;
+                        }
+                    }
+                    a.phis.push(PhiInfo { phi: r, lref, rref, num });
+                }
                 _ => return Err(TraceError::NYIIR), // POW and later-phase IR.
             }
         }
@@ -171,17 +213,30 @@ impl<'a> Asm<'a> {
                 a.needs_env[Self::iidx(rref)] = true;
             }
         }
+        // The PHI's own env slot is the back-edge scratch buffer: it must
+        // not double as a snapshot value.
+        for p in &a.phis {
+            if a.needs_env[Self::iidx(p.phi)] {
+                return Err(TraceError::NYIIR);
+            }
+        }
         Ok(a)
     }
 
     // -- Main emission loop -------------------------------------------------
 
     fn emit(mut self) -> Result<McodeArea, TraceError> {
-        // Prologue: capture the two arguments in r10/r11.
+        // Prologue: capture the two arguments in r10/r11. On Win64 also
+        // save the callee-saved xmm6-xmm15 (SysV has no callee-saved xmm).
         #[cfg(windows)]
         {
             self.mov_rr64(RBASE, RCX);
             self.mov_rr64(RENV, RDX);
+            self.code.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, 160
+            self.emit_u32(160);
+            for k in 0..10u8 {
+                self.movups_spill(6 + k, (k as i32) * 16, true);
+            }
         }
         #[cfg(not(windows))]
         {
@@ -202,7 +257,9 @@ impl<'a> Asm<'a> {
             self.cur = r;
             let ins = *self.tr.ir.ir(r);
             match ins.op() {
-                IROp::NOP | IROp::BASE | IROp::LOOP => {}
+                IROp::NOP | IROp::BASE => {}
+                IROp::LOOP => self.asm_loop_head(),
+                IROp::PHI => {} // Handled at the back edge.
                 IROp::SLOAD => self.asm_sload(&ins)?,
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX => {
                     self.asm_arith(&ins)?
@@ -229,25 +286,46 @@ impl<'a> Asm<'a> {
             r += 1;
         }
 
-        // Tail: loop back through the final snapshot, or leave through it.
+        // Tail: loop-optimized traces jump back to IR_LOOP with the PHI
+        // values moved into place; legacy loops re-materialize the final
+        // snapshot and restart at the head; others leave through the
+        // final snapshot.
         let lastsnap = self.tr.snap.len() - 1;
         let looping = self.tr.linktype == TraceLink::Loop && self.tr.link == self.tr.traceno;
         if looping {
-            self.tail_restore(lastsnap);
-            self.code.push(0xE9); // jmp head
-            let rel = head as i64 - (self.code.len() as i64 + 4);
-            self.emit_u32(rel as i32 as u32);
+            if let Some(lp) = self.loop_pos {
+                self.asm_loop_back(lp);
+            } else {
+                self.tail_restore(lastsnap);
+                self.code.push(0xE9); // jmp head
+                let rel = head as i64 - (self.code.len() as i64 + 4);
+                self.emit_u32(rel as i32 as u32);
+            }
         } else {
             self.mov_eax_imm(lastsnap as u32);
-            self.code.push(0xC3);
+            // Falls through into the epilogue.
         }
 
-        // Exit stubs: mov eax, snapidx; ret.
+        // Common epilogue: restore xmm6-xmm15 on Win64, return eax.
+        let epilogue = self.code.len();
+        #[cfg(windows)]
+        {
+            for k in 0..10u8 {
+                self.movups_spill(6 + k, (k as i32) * 16, false);
+            }
+            self.code.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, 160
+            self.emit_u32(160);
+        }
+        self.code.push(0xC3);
+
+        // Exit stubs: mov eax, snapidx; jmp ->epilogue.
         let mut stubs = Vec::with_capacity(self.tr.snap.len());
         for i in 0..self.tr.snap.len() {
             stubs.push(self.code.len());
             self.mov_eax_imm(i as u32);
-            self.code.push(0xC3);
+            self.code.push(0xE9);
+            let rel = epilogue as i64 - (self.code.len() as i64 + 4);
+            self.emit_u32(rel as i32 as u32);
         }
         for (pos, si) in std::mem::take(&mut self.fixups) {
             let rel = (stubs[si] as i64 - (pos as i64 + 4)) as i32;
@@ -421,6 +499,7 @@ impl<'a> Asm<'a> {
 
     /// The loop edge: write the final snapshot back to the Lua stack
     /// (asm_tail_link's stack sync in this VM's portable semantics).
+    /// Only used for traces without IR_LOOP.
     fn tail_restore(&mut self, snapidx: usize) {
         let snap = &self.tr.snap[snapidx];
         let ofs = snap.mapofs as usize;
@@ -442,6 +521,151 @@ impl<'a> Asm<'a> {
                 self.mov_r64_imm64(RAX, super::exec::const_bits(&self.tr.ir, rref));
                 self.mov_mem_r64(RBASE, disp, RAX);
             }
+        }
+    }
+
+    /// IR_LOOP: park every live value in env (their registers stay
+    /// valid), then snapshot the register state — the back edge restores
+    /// exactly this state, so the loop body can be entered from both the
+    /// pre-roll fall-through and the back-edge jump.
+    fn asm_loop_head(&mut self) {
+        for rg in 0..NREG as u8 {
+            let dead = match self.owner[rg as usize] {
+                Owner::Ins(o) => self.last_use[Self::iidx(o)] <= self.cur,
+                Owner::Konst(k) => self.klast_use[Self::kidx(k)] <= self.cur,
+                Owner::None => false,
+            };
+            if dead {
+                self.steal_quiet(rg);
+            }
+        }
+        for rg in 0..NREG as u8 {
+            if let Owner::Ins(o) = self.owner[rg as usize] {
+                let i = Self::iidx(o);
+                if !self.env_valid[i] {
+                    self.movsd_store(RENV, Self::env_disp(o), rg);
+                    self.env_valid[i] = true;
+                }
+            }
+        }
+        self.s0 = self.owner;
+        self.loop_pos = Some(self.code.len());
+    }
+
+    /// The back edge of a loop-optimized trace: carry the PHI values
+    /// (rref -> lref home), restore the IR_LOOP register state and jump
+    /// back. env[lref] is always refreshed, since body code and exits
+    /// read the carried value through it.
+    fn asm_loop_back(&mut self, loop_pos: usize) {
+        let s0 = self.s0;
+        let phis = std::mem::take(&mut self.phis);
+        // The lref home registers (the parallel-move destinations).
+        let homes: Vec<Option<u8>> = phis
+            .iter()
+            .map(|p| (0..NREG as u8).find(|&rg| s0[rg as usize] == Owner::Ins(p.lref)))
+            .collect();
+        let dstset: u16 = homes.iter().flatten().fold(0, |m, &rg| m | pin(rg));
+        // Direct moves are safe iff no source lives in a destination
+        // register and no source env slot is another PHI's lref slot.
+        let direct = phis.iter().all(|p| {
+            if p.rref < REF_BIAS {
+                return true; // Constants are re-materialized.
+            }
+            if let Some(rg) = self.reg_of(p.rref) {
+                if p.num {
+                    return dstset & pin(rg) == 0;
+                }
+            }
+            !phis.iter().any(|q| q.lref == p.rref)
+        });
+        if direct {
+            for (p, home) in phis.iter().zip(homes.iter()) {
+                self.phi_move(p, *home);
+            }
+        } else {
+            // Buffered parallel move: read all right values into the
+            // PHIs' own env slots first, then land them in their homes.
+            for p in &phis {
+                if p.rref >= REF_BIAS {
+                    if p.num && let Some(rg) = self.reg_of(p.rref) {
+                        self.movsd_store(RENV, Self::env_disp(p.phi), rg);
+                    } else {
+                        debug_assert!(self.env_valid[Self::iidx(p.rref)]);
+                        self.mov_r64_mem(RAX, RENV, Self::env_disp(p.rref));
+                        self.mov_mem_r64(RENV, Self::env_disp(p.phi), RAX);
+                    }
+                } else {
+                    self.mov_r64_imm64(RAX, super::exec::const_bits(&self.tr.ir, p.rref));
+                    self.mov_mem_r64(RENV, Self::env_disp(p.phi), RAX);
+                }
+            }
+            for (p, home) in phis.iter().zip(homes.iter()) {
+                if p.num && let Some(rg) = *home {
+                    self.movsd_load(rg, RENV, Self::env_disp(p.phi));
+                    self.movsd_store(RENV, Self::env_disp(p.lref), rg);
+                } else {
+                    self.mov_r64_mem(RAX, RENV, Self::env_disp(p.phi));
+                    self.mov_mem_r64(RENV, Self::env_disp(p.lref), RAX);
+                }
+            }
+        }
+        // Restore the remaining IR_LOOP register state: invariants are
+        // reloaded from env, constants re-materialized.
+        for rg in 0..NREG as u8 {
+            let so = s0[rg as usize];
+            if so == Owner::None || so == self.owner[rg as usize] {
+                continue;
+            }
+            if phis.iter().any(|p| so == Owner::Ins(p.lref)) {
+                continue; // PHI homes were just written.
+            }
+            match so {
+                Owner::Ins(x) => {
+                    debug_assert!(self.env_valid[Self::iidx(x)]);
+                    self.movsd_load(rg, RENV, Self::env_disp(x));
+                }
+                Owner::Konst(k) => {
+                    self.mov_r64_imm64(RAX, super::exec::const_bits(&self.tr.ir, k));
+                    self.movq_xmm_gpr(rg, RAX);
+                }
+                Owner::None => unreachable!(),
+            }
+        }
+        self.phis = phis;
+        self.code.push(0xE9); // jmp ->IR_LOOP
+        let rel = loop_pos as i64 - (self.code.len() as i64 + 4);
+        self.emit_u32(rel as i32 as u32);
+    }
+
+    /// One direct PHI move: load the right value into the lref home
+    /// register (if any) and refresh env[lref].
+    fn phi_move(&mut self, p: &PhiInfo, home: Option<u8>) {
+        if p.num && let Some(rg) = home {
+            if p.rref >= REF_BIAS {
+                if let Some(src) = self.reg_of(p.rref) {
+                    if src != rg {
+                        self.movsd_rr(rg, src);
+                    }
+                } else {
+                    debug_assert!(self.env_valid[Self::iidx(p.rref)]);
+                    self.movsd_load(rg, RENV, Self::env_disp(p.rref));
+                }
+            } else {
+                self.mov_r64_imm64(RAX, super::exec::const_bits(&self.tr.ir, p.rref));
+                self.movq_xmm_gpr(rg, RAX);
+            }
+            self.movsd_store(RENV, Self::env_disp(p.lref), rg);
+        } else if p.rref >= REF_BIAS {
+            if p.num && let Some(src) = self.reg_of(p.rref) {
+                self.movsd_store(RENV, Self::env_disp(p.lref), src);
+            } else {
+                debug_assert!(self.env_valid[Self::iidx(p.rref)]);
+                self.mov_r64_mem(RAX, RENV, Self::env_disp(p.rref));
+                self.mov_mem_r64(RENV, Self::env_disp(p.lref), RAX);
+            }
+        } else {
+            self.mov_r64_imm64(RAX, super::exec::const_bits(&self.tr.ir, p.rref));
+            self.mov_mem_r64(RENV, Self::env_disp(p.lref), RAX);
         }
     }
 
@@ -482,7 +706,7 @@ impl<'a> Asm<'a> {
 
     /// Allocate a register, evicting the least useful value if needed.
     /// `pinned` is a bitmask of registers that must not be touched.
-    fn alloc(&mut self, pinned: u8) -> Result<u8, TraceError> {
+    fn alloc(&mut self, pinned: u16) -> Result<u8, TraceError> {
         // Free register first.
         for rg in 0..NREG as u8 {
             if pinned & pin(rg) == 0 && self.owner[rg as usize] == Owner::None {
@@ -534,7 +758,7 @@ impl<'a> Asm<'a> {
     }
 
     /// Bring an operand (instruction value or constant) into an xmm reg.
-    fn fetch_xmm(&mut self, r: IRRef, pinned: u8) -> Result<u8, TraceError> {
+    fn fetch_xmm(&mut self, r: IRRef, pinned: u16) -> Result<u8, TraceError> {
         if let Some(rg) = self.reg_of(r) {
             return Ok(rg);
         }
@@ -630,10 +854,14 @@ impl<'a> Asm<'a> {
         self.mem(reg, base, disp);
     }
 
-    /// SSE op, register-direct (all our xmm regs are below 8: no REX).
+    /// SSE op, register-direct.
     fn sse_rr(&mut self, pfx: u8, op: u8, reg: u8, rm: u8) {
         if pfx != 0 {
             self.code.push(pfx);
+        }
+        let rex = 0x40 | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
         }
         self.code.push(0x0F);
         self.code.push(op);
@@ -652,9 +880,39 @@ impl<'a> Asm<'a> {
 
     /// roundsd dst, src, imm (66 0F 3A 0B /r ib, SSE4.1).
     fn roundsd(&mut self, dst: u8, src: u8, imm: u8) {
-        self.code.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B]);
+        self.code.push(0x66);
+        let rex = 0x40 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1);
+        if rex != 0x40 {
+            self.code.push(rex);
+        }
+        self.code.extend_from_slice(&[0x0F, 0x3A, 0x0B]);
         self.modrm(3, dst, src);
         self.code.push(imm);
+    }
+
+    /// movups xmm, [rsp+disp] / movups [rsp+disp], xmm — the Win64
+    /// callee-saved xmm spill area (rsp base needs a SIB byte).
+    #[cfg(windows)]
+    fn movups_spill(&mut self, xmm: u8, disp: i32, store: bool) {
+        if xmm >= 8 {
+            self.code.push(0x44); // REX.R
+        }
+        self.code.push(0x0F);
+        self.code.push(if store { 0x11 } else { 0x10 });
+        if disp == 0 {
+            self.modrm(0, xmm, 4);
+        } else if (-128..=127).contains(&disp) {
+            self.modrm(1, xmm, 4);
+            self.code.push(0x24); // SIB: base rsp, no index.
+            self.code.push(disp as u8);
+            return;
+        } else {
+            self.modrm(2, xmm, 4);
+            self.code.push(0x24);
+            self.emit_u32(disp as u32);
+            return;
+        }
+        self.code.push(0x24);
     }
 
     /// movq xmm, r64 (66 REX.W 0F 6E /r).
@@ -734,6 +992,6 @@ impl<'a> Asm<'a> {
 }
 
 #[inline]
-fn pin(rg: u8) -> u8 {
-    1u8 << rg
+fn pin(rg: u8) -> u16 {
+    1u16 << rg
 }

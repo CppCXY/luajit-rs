@@ -319,6 +319,11 @@ pub fn irt_isgcv(t: u8) -> bool {
 pub fn irt_isinteger(t: u8) -> bool {
     (IRT_I8..=IRT_INT).contains(&irt_type(t))
 }
+/// `irt_sametype`: same base type, ignoring the flag bits.
+#[inline]
+pub fn irt_sametype(t1: u8, t2: u8) -> bool {
+    (t1 ^ t2) & IRT_TYPE == 0
+}
 
 /// Combined opcode + type (`IRT(o, t)`).
 #[inline]
@@ -485,6 +490,27 @@ impl IRIns {
     #[inline]
     pub fn sideeff(&self) -> bool {
         ((self.t() | !IRT_GUARD) & IR_MODE[self.op() as usize]) >= IRM_S
+    }
+    // IRT_MARK / IRT_ISPHI flag maintenance (irt_setmark & friends).
+    #[inline]
+    pub fn is_marked(&self) -> bool {
+        self.t() & IRT_MARK != 0
+    }
+    #[inline]
+    pub fn set_mark(&mut self) {
+        self.ot |= IRT_MARK as u16;
+    }
+    #[inline]
+    pub fn clear_mark(&mut self) {
+        self.ot &= !(IRT_MARK as u16);
+    }
+    #[inline]
+    pub fn set_phi(&mut self) {
+        self.ot |= IRT_ISPHI as u16;
+    }
+    #[inline]
+    pub fn clear_phi(&mut self) {
+        self.ot &= !(IRT_ISPHI as u16);
     }
     /// Replace with NOP (`lj_ir_nop`).
     #[inline]
@@ -685,5 +711,14 @@ impl IrBuf {
     #[inline]
     pub fn emitir(&mut self, ot: u16, a: IRRef, b: IRRef) -> Result<TRef, TraceError> {
         super::opt_fold::opt_fold(self, IRIns::new(ot, a, b))
+    }
+
+    /// `lj_ir_rollback`: undo all instructions emitted at or above `r`,
+    /// unlinking them from the CSE chains via their `prev` fields.
+    pub fn rollback(&mut self, r: IRRef) {
+        while self.nins() > r {
+            let ins = self.ins.pop().unwrap();
+            self.chain[ins.op() as usize] = ins.prev;
+        }
     }
 }

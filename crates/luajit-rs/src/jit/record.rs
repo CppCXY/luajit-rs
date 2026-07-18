@@ -94,6 +94,8 @@ pub struct Record {
     /// IR ref at the last inner-loop boundary (J->loopref).
     pub loopref: IRRef,
     pub loopunroll: i32,
+    /// Remaining unroll attempts for unstable loops (J->instunroll).
+    pub instunroll: i32,
     /// The proto being recorded (single-frame traces: always startpt).
     pub pt: GcPtr<Proto>,
     /// Current bytecode index, updated as recording progresses (J->pc).
@@ -108,6 +110,7 @@ impl Record {
         parent: u16,
         exitno: u16,
         loopunroll: i32,
+        instunroll: i32,
     ) -> Box<Record> {
         Box::new(Record {
             cur: GCtrace {
@@ -136,6 +139,7 @@ impl Record {
             bc_extent: !0usize,
             loopref: 0,
             loopunroll,
+            instunroll,
             pt,
             pc,
         })

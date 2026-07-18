@@ -6,6 +6,7 @@
 //! * hot-path detection: hotcount table + penalties + blacklisting,
 //! * `ir`: the SSA IR format and buffer (lj_ir.h/c),
 //! * `opt_fold`: FOLD/CSE engine (lj_opt_fold.c subset),
+//! * `opt_loop`: loop unrolling via copy-substitution + PHIs (lj_opt_loop.c),
 //! * `record`: the bytecode recorder for numeric single-frame traces
 //!   (lj_record.c + lj_snap.c subsets),
 //! * `trace`: the trace compiler state machine (lj_trace.c),
@@ -28,6 +29,7 @@ pub mod exec;
 pub mod ir;
 pub mod mcode;
 pub mod opt_fold;
+pub mod opt_loop;
 pub mod record;
 pub mod trace;
 #[cfg(target_arch = "x86_64")]
