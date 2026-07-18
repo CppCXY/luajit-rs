@@ -10,8 +10,10 @@
 pub mod base;
 pub mod bit;
 pub mod coroutine;
+pub mod io;
 pub mod math;
 pub mod os;
+pub mod package;
 pub mod pattern;
 pub mod reg;
 pub mod sort;
@@ -161,4 +163,6 @@ pub fn open_libs(l: &mut LuaState) {
     math::open(l);
     bit::open(l);
     os::open(l);
+    io::open(l);
+    package::open(l);
 }

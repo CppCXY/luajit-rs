@@ -51,6 +51,9 @@ pub struct ExitResult {
 /// synced the frame and must switch to the recording dispatch when a
 /// side trace recording was started (jit.state == Record).
 pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult {
+    // Bind the heap for allocating helpers (string interning): traces
+    // are executed strictly single-threaded per VM.
+    JIT_HEAP.with(|c| c.set(l.heap() as *mut crate::state::GcHeap));
     let g = l.global();
     let mut env = std::mem::take(&mut g.jit.exec_env);
     if env.len() < g.jit.env_need {
@@ -293,14 +296,44 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     );
                 }
                 IROp::CALLL => {
-                    let carg = *ir.ir(ins.op1 as IRRef);
-                    debug_assert_eq!(carg.op(), IROp::CARG);
-                    let (x, y) =
-                        (val(env, carg.op1 as IRRef), val(env, carg.op2 as IRRef));
-                    let bits = match ins.op2 as u32 {
-                        super::record::IRCALL_TAB_NEXTK => jit_tnextk(x, y),
-                        super::record::IRCALL_FMOD => jit_fmod(x, y),
-                        _ => unreachable!("bad IRCALL index"),
+                    let idx = ins.op2 as u32;
+                    let bits = match super::record::ircall_arity(idx) {
+                        1 => {
+                            let x = val(env, ins.op1 as IRRef);
+                            match idx {
+                                super::record::IRCALL_STR_LEN => jit_str_len(x),
+                                super::record::IRCALL_STR_CHAR => jit_str_char(x),
+                                _ => unreachable!("bad IRCALL index"),
+                            }
+                        }
+                        2 => {
+                            let carg = *ir.ir(ins.op1 as IRRef);
+                            debug_assert_eq!(carg.op(), IROp::CARG);
+                            let (x, y) =
+                                (val(env, carg.op1 as IRRef), val(env, carg.op2 as IRRef));
+                            match idx {
+                                super::record::IRCALL_TAB_NEXTK => jit_tnextk(x, y),
+                                super::record::IRCALL_FMOD => jit_fmod(x, y),
+                                super::record::IRCALL_STR_CMP => jit_str_cmp(x, y),
+                                super::record::IRCALL_STR_BYTE => jit_str_byte(x, y),
+                                _ => unreachable!("bad IRCALL index"),
+                            }
+                        }
+                        _ => {
+                            let cargj = *ir.ir(ins.op1 as IRRef);
+                            debug_assert_eq!(cargj.op(), IROp::CARG);
+                            let cargi = *ir.ir(cargj.op1 as IRRef);
+                            debug_assert_eq!(cargi.op(), IROp::CARG);
+                            let (x, y, z) = (
+                                val(env, cargi.op1 as IRRef),
+                                val(env, cargi.op2 as IRRef),
+                                val(env, cargj.op2 as IRRef),
+                            );
+                            match idx {
+                                super::record::IRCALL_STR_SUB => jit_str_sub(x, y, z),
+                                _ => unreachable!("bad IRCALL index"),
+                            }
+                        }
                     };
                     let v = LuaValue::from_bits(bits);
                     if ins.is_guard() && !typecheck(v, ins.t()) {
@@ -574,4 +607,93 @@ pub extern "C" fn jit_pow(a_bits: u64, b_bits: u64) -> u64 {
 /// and NaN), mirroring the builtin bit for bit.
 pub extern "C" fn jit_fmod(a_bits: u64, b_bits: u64) -> u64 {
     LuaValue::number(f64::from_bits(a_bits) % f64::from_bits(b_bits)).to_bits()
+}
+
+// -- String helpers ----------------------------------------------------------
+//
+// The read-only ones decode the string object straight from the value
+// bits. The allocating ones (sub/char) intern through the heap bound by
+// `trace_exec`; the growth is added to the GC debt cell so the on-trace
+// GCSTEP guard sees it.
+
+thread_local! {
+    /// Heap of the VM currently executing a trace (set by `trace_exec`).
+    static JIT_HEAP: std::cell::Cell<*mut crate::state::GcHeap> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+#[inline]
+fn str_bytes(bits: u64) -> &'static [u8] {
+    let s = LuaValue::from_bits(bits).as_string().expect("string op on a non-string");
+    unsafe { std::mem::transmute::<&[u8], &'static [u8]>(s.as_ref().as_bytes()) }
+}
+
+/// Intern `bytes` in the bound heap, tracking the growth as GC debt.
+fn jit_intern(bytes: &[u8]) -> u64 {
+    let heap = unsafe {
+        JIT_HEAP
+            .with(|c| c.get())
+            .as_mut()
+            .expect("string allocation outside trace_exec")
+    };
+    let before = heap.strings.bytes();
+    let sid = heap.strings.intern(bytes);
+    let grown = heap.strings.bytes() - before;
+    if grown > 0 {
+        crate::table::TABLE_EXTRA.with(|c| c.set(c.get() + grown));
+    }
+    heap.str_value(sid).to_bits()
+}
+
+/// string.len / `#s`.
+pub extern "C" fn jit_str_len(s_bits: u64) -> u64 {
+    (str_bytes(s_bits).len() as f64).to_bits()
+}
+
+/// Lexicographic byte compare: -1/0/1 as a number (the interpreter's
+/// `meta_comp` string path uses the same slice ordering).
+pub extern "C" fn jit_str_cmp(a_bits: u64, b_bits: u64) -> u64 {
+    let c = match str_bytes(a_bits).cmp(str_bytes(b_bits)) {
+        std::cmp::Ordering::Less => -1.0f64,
+        std::cmp::Ordering::Equal => 0.0,
+        std::cmp::Ordering::Greater => 1.0,
+    };
+    c.to_bits()
+}
+
+/// string.byte(s, i) — the single-index case (j defaults to i): the
+/// byte as a number, or nil when out of range (mirrors `str_byte`).
+pub extern "C" fn jit_str_byte(s_bits: u64, i_bits: u64) -> u64 {
+    let s = str_bytes(s_bits);
+    let i = f64::from_bits(i_bits) as i64;
+    let len = s.len() as i64;
+    let idx = if i < 0 { len + i } else { i - 1 };
+    if idx < 0 || idx >= len {
+        LuaValue::NIL.to_bits()
+    } else {
+        LuaValue::number(s[idx as usize] as f64).to_bits()
+    }
+}
+
+/// string.sub(s, i, j) — j always present (a missing j records as -1,
+/// which selects the same suffix). Mirrors `str_sub`.
+pub extern "C" fn jit_str_sub(s_bits: u64, i_bits: u64, j_bits: u64) -> u64 {
+    let s = str_bytes(s_bits);
+    let i = f64::from_bits(i_bits) as i64;
+    let j = f64::from_bits(j_bits) as i64;
+    let len = s.len() as i64;
+    let a = if i < 0 {
+        (len + i).max(0) as usize
+    } else {
+        (i - 1).max(0).min(len) as usize
+    };
+    let j = if j < 0 { len + j } else { j - 1 };
+    let b = (j.max(-1).min(len - 1) + 1) as usize;
+    if a >= b { jit_intern(b"") } else { jit_intern(&s[a..b]) }
+}
+
+/// string.char(c) — the single-argument case (mirrors `str_char`).
+pub extern "C" fn jit_str_char(c_bits: u64) -> u64 {
+    let b = (f64::from_bits(c_bits) as u32 & 0xff) as u8;
+    jit_intern(&[b])
 }

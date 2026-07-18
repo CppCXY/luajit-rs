@@ -231,7 +231,15 @@ impl<'a> Asm<'a> {
                         a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
                     }
                 }
-                IROp::CALLL => {} // Arguments are marked by the CARG arm.
+                IROp::CALLL => {
+                    // Arity >= 2 arguments are marked by the CARG arm;
+                    // single-argument calls take op1 directly.
+                    if super::record::ircall_arity(ins.op2 as u32) == 1
+                        && ins.op1 as IRRef >= REF_BIAS
+                    {
+                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                    }
+                }
                 IROp::ALOAD => {
                     // Table via env/GPR, key via xmm.
                     if ins.op1 as IRRef >= REF_BIAS {
@@ -700,17 +708,39 @@ impl<'a> Asm<'a> {
         self.ff_result(ins)
     }
 
-    /// CALLL: guarded helper calls with a CARG argument tuple, selected
-    /// by the IRCALL index in op2.
+    /// CALLL: guarded helper calls selected by the IRCALL index in op2.
+    /// op1 is the argument (arity 1) or a CARG chain (arity 2/3).
     fn asm_calll(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let carg = *self.tr.ir.ir(ins.op1 as IRRef);
-        debug_assert_eq!(carg.op(), IROp::CARG);
-        let addr = match ins.op2 as u32 {
-            super::record::IRCALL_TAB_NEXTK => super::exec::jit_tnextk as usize as u64,
-            super::record::IRCALL_FMOD => super::exec::jit_fmod as usize as u64,
+        use super::record as rec;
+        let idx = ins.op2 as u32;
+        let addr = match idx {
+            rec::IRCALL_TAB_NEXTK => super::exec::jit_tnextk as usize as u64,
+            rec::IRCALL_FMOD => super::exec::jit_fmod as usize as u64,
+            rec::IRCALL_STR_LEN => super::exec::jit_str_len as usize as u64,
+            rec::IRCALL_STR_CMP => super::exec::jit_str_cmp as usize as u64,
+            rec::IRCALL_STR_BYTE => super::exec::jit_str_byte as usize as u64,
+            rec::IRCALL_STR_SUB => super::exec::jit_str_sub as usize as u64,
+            rec::IRCALL_STR_CHAR => super::exec::jit_str_char as usize as u64,
             _ => unreachable!("bad IRCALL index"),
         };
-        self.helper_call(addr, &[carg.op1 as IRRef, carg.op2 as IRRef]);
+        match rec::ircall_arity(idx) {
+            1 => self.helper_call(addr, &[ins.op1 as IRRef]),
+            2 => {
+                let carg = *self.tr.ir.ir(ins.op1 as IRRef);
+                debug_assert_eq!(carg.op(), IROp::CARG);
+                self.helper_call(addr, &[carg.op1 as IRRef, carg.op2 as IRRef]);
+            }
+            _ => {
+                let cargj = *self.tr.ir.ir(ins.op1 as IRRef);
+                debug_assert_eq!(cargj.op(), IROp::CARG);
+                let cargi = *self.tr.ir.ir(cargj.op1 as IRRef);
+                debug_assert_eq!(cargi.op(), IROp::CARG);
+                self.helper_call(
+                    addr,
+                    &[cargi.op1 as IRRef, cargi.op2 as IRRef, cargj.op2 as IRRef],
+                );
+            }
+        }
         self.ff_result(ins)
     }
 

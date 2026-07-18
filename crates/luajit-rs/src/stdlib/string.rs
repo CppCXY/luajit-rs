@@ -202,7 +202,7 @@ fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
-fn str_byte(l: &mut LuaState) -> LuaResult<i32> {
+pub fn str_byte(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
         None => return Err(err_bad_arg(l, 1, "string.byte", "string", "")),
@@ -227,7 +227,7 @@ fn str_byte(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
-fn str_char(l: &mut LuaState) -> LuaResult<i32> {
+pub fn str_char(l: &mut LuaState) -> LuaResult<i32> {
     let n = nargs(l);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -295,7 +295,7 @@ fn str_format(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
-fn str_len(l: &mut LuaState) -> LuaResult<i32> {
+pub fn str_len(l: &mut LuaState) -> LuaResult<i32> {
     match arg(l, 0).as_string_id() {
         Some(sid) => {
             push(l, LuaValue::number(l.str_static(sid).len() as f64));
@@ -357,7 +357,7 @@ fn str_reverse(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
+pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
         None => return Err(err_bad_arg(l, 1, "string.sub", "string", "")),

@@ -46,6 +46,21 @@ pub const IRFL_TAB_META: u32 = 0;
 /// IRCALL indexes (CALLL op2 literals).
 pub const IRCALL_TAB_NEXTK: u32 = 0;
 pub const IRCALL_FMOD: u32 = 1;
+pub const IRCALL_STR_LEN: u32 = 2;
+pub const IRCALL_STR_CMP: u32 = 3;
+pub const IRCALL_STR_BYTE: u32 = 4;
+pub const IRCALL_STR_SUB: u32 = 5;
+pub const IRCALL_STR_CHAR: u32 = 6;
+
+/// Argument count of an IRCALL: 1 = op1 is the argument, 2 = op1 is a
+/// CARG pair, 3 = op1 is CARG(CARG(a, b), c).
+pub fn ircall_arity(idx: u32) -> u32 {
+    match idx {
+        IRCALL_STR_LEN | IRCALL_STR_CHAR => 1,
+        IRCALL_STR_SUB => 3,
+        _ => 2,
+    }
+}
 
 /// Loop event (LoopEvent).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -816,14 +831,14 @@ impl Record {
         };
         match gf.as_ref() {
             crate::func::GcFunc::C(cc) => {
-                let mut argv = [LuaValue::NIL; 2];
-                for i in 0..nargs.min(2) {
+                let mut argv = [LuaValue::NIL; 3];
+                for i in 0..nargs.min(3) {
                     argv[i as usize] = self.slot_val(l, base, a + 2 + i);
                 }
                 for i in 0..nargs {
                     self.getslot(l, base, a + 2 + i);
                 }
-                self.rec_callff_core(a, want, nargs, fv, cc.f, &argv)
+                self.rec_callff_core(l, a, want, nargs, fv, cc.f, &argv)
             }
             crate::func::GcFunc::Lua(_) => self.rec_call_lua(l, base, pc, a, nargs, want, fv),
         }
@@ -920,7 +935,7 @@ impl Record {
         match gf.as_ref() {
             crate::func::GcFunc::C(cc) => {
                 let argv = [self.slot_val(l, base, a - 2), self.slot_val(l, base, a - 1)];
-                self.rec_callff_core(a, want, 2, fv, cc.f, &argv)
+                self.rec_callff_core(l, a, want, 2, fv, cc.f, &argv)
             }
             crate::func::GcFunc::Lua(_) => self.rec_call_lua(l, base, pc, a, 2, want, fv),
         }
@@ -1248,8 +1263,14 @@ impl Record {
             return Ok(());
         }
         self.cur.ir.emit_ins(IRIns::new(irt(IROp::HSTORE, IRT_NIL), tref_ref(tab), tref_ref(carg)));
-        // GC-debt guard: exit when a collection is due (the boundary
-        // check in the trace-entry dispatch arms then collects).
+        self.rec_gcstep(l);
+        Ok(())
+    }
+
+    /// GC-debt guard: exit when a collection is due (the boundary check
+    /// in the trace-entry dispatch arms then collects). Must follow any
+    /// on-trace allocation (table growth, string interning).
+    fn rec_gcstep(&mut self, l: &LuaState) {
         let heap = &l.global().heap;
         let ktotal = self.cur.ir.kint64(&heap.total as *const usize as u64);
         let kthres = self.cur.ir.kint64(&heap.threshold as *const usize as u64);
@@ -1259,7 +1280,6 @@ impl Record {
             tref_ref(kthres),
         ));
         self.needsnap = true;
-        Ok(())
     }
 
     // -- Fast functions (lj_ffrecord.c, pointer-keyed subset) -----------------
@@ -1271,6 +1291,7 @@ impl Record {
     /// abort with NYIBC.
     fn rec_callff_core(
         &mut self,
+        l: &LuaState,
         a: u32,
         want: i32,
         nargs: u32,
@@ -1479,6 +1500,115 @@ impl Record {
                     self.cur.ir.emit_ins(IRIns::new(irtn(irop), tref_ref(x), tref_ref(n)));
                 nres = 1;
             }
+            Recff::StrLen => {
+                let s = self.base_ref(a + 2);
+                if !tref_isstr(s) {
+                    return Err(TraceError::NYIBC);
+                }
+                res[0] = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_NUM),
+                    tref_ref(s),
+                    IRCALL_STR_LEN,
+                ));
+                nres = 1;
+            }
+            Recff::StrByte => {
+                // Only the single-index form (j defaults to i): always
+                // exactly one result, a number or nil — specialize on
+                // the record-time outcome like Next does.
+                if nargs > 2 {
+                    return Err(TraceError::NYIBC);
+                }
+                let s = self.base_ref(a + 2);
+                if !tref_isstr(s) {
+                    return Err(TraceError::NYIBC);
+                }
+                let i = if nargs >= 2 {
+                    let i = self.base_ref(a + 3);
+                    if !tref_isnum(i) {
+                        return Err(TraceError::NYIBC);
+                    }
+                    i
+                } else {
+                    self.cur.ir.knum(1.0)
+                };
+                let iv = if nargs >= 2 { argv[1] } else { LuaValue::number(1.0) };
+                let outv = LuaValue::from_bits(super::exec::jit_str_byte(
+                    argv[0].to_bits(),
+                    iv.to_bits(),
+                ));
+                let t_out = Self::value_irt(outv);
+                let carg = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(s),
+                    tref_ref(i),
+                ));
+                let mut out = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_GUARD | t_out),
+                    tref_ref(carg),
+                    IRCALL_STR_BYTE,
+                ));
+                if irt_ispri(t_out) {
+                    out = tref_pri(t_out);
+                }
+                res[0] = out;
+                nres = 1;
+            }
+            Recff::StrSub => {
+                // string.sub(s, i [, j]) — a missing j records as -1
+                // (the same suffix). The result is always a string.
+                if nargs < 2 || nargs > 3 {
+                    return Err(TraceError::NYIBC);
+                }
+                let s = self.base_ref(a + 2);
+                let i = self.base_ref(a + 3);
+                if !tref_isstr(s) || !tref_isnum(i) {
+                    return Err(TraceError::NYIBC);
+                }
+                let j = if nargs >= 3 {
+                    let j = self.base_ref(a + 4);
+                    if !tref_isnum(j) {
+                        return Err(TraceError::NYIBC);
+                    }
+                    j
+                } else {
+                    self.cur.ir.knum(-1.0)
+                };
+                let cargi = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(s),
+                    tref_ref(i),
+                ));
+                let cargj = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(cargi),
+                    tref_ref(j),
+                ));
+                res[0] = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_STR),
+                    tref_ref(cargj),
+                    IRCALL_STR_SUB,
+                ));
+                self.rec_gcstep(l);
+                nres = 1;
+            }
+            Recff::StrChar => {
+                // Single argument only (multi-arg concatenation NYI).
+                if nargs != 1 {
+                    return Err(TraceError::NYIBC);
+                }
+                let c = self.base_ref(a + 2);
+                if !tref_isnum(c) {
+                    return Err(TraceError::NYIBC);
+                }
+                res[0] = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_STR),
+                    tref_ref(c),
+                    IRCALL_STR_CHAR,
+                ));
+                self.rec_gcstep(l);
+                nres = 1;
+            }
         }
         // Write the results; pad/discard per the call's wanted count.
         for i in 0..want as u32 {
@@ -1641,8 +1771,31 @@ impl Record {
             BCOp::ISLT | BCOp::ISGE | BCOp::ISLE | BCOp::ISGT => {
                 // Emit nothing for two numeric constants.
                 if !(tref_isk(ra) && tref_isk(rc) && tref_isnum(ra) && tref_isnum(rc)) {
-                    if !(tref_isnum(ra) && tref_isnum(rc)) {
-                        return Err(TraceError::NYIBC); // Strings/metamethods NYI.
+                    let (x, y, xn, yn);
+                    if tref_isnum(ra) && tref_isnum(rc) {
+                        (x, y) = (ra, rc);
+                        (xn, yn) = (rav.num(), rcv.num());
+                    } else if tref_isstr(ra) && tref_isstr(rc) {
+                        // Strings: compare through the helper, then
+                        // guard the sign of the result against 0.
+                        let carg = self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::CARG, IRT_NIL),
+                            tref_ref(ra),
+                            tref_ref(rc),
+                        ));
+                        x = self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::CALLL, IRT_NUM),
+                            tref_ref(carg),
+                            IRCALL_STR_CMP,
+                        ));
+                        y = self.cur.ir.knum(0.0);
+                        xn = f64::from_bits(super::exec::jit_str_cmp(
+                            rav.to_bits(),
+                            rcv.to_bits(),
+                        ));
+                        yn = 0.0;
+                    } else {
+                        return Err(TraceError::NYIBC); // Mixed/metamethods NYI.
                     }
                     self.comp_prep();
                     let mut irop = IROp::from_u8(op as u8 - BCOp::ISLT as u8 + IROp::LT as u8);
@@ -1650,10 +1803,10 @@ impl Record {
                         // ISGE/ISGT are unordered (NaN behavior).
                         irop = IROp::from_u8(irop as u8 ^ 4);
                     }
-                    if !super::opt_fold::fold_numcmp(rav.num(), rcv.num(), irop) {
+                    if !super::opt_fold::fold_numcmp(xn, yn, irop) {
                         irop = IROp::from_u8(irop as u8 ^ 5);
                     }
-                    self.cur.ir.emitir(irtg(irop, IRT_NUM), tref_ref(ra), tref_ref(rc))?;
+                    self.cur.ir.emitir(irtg(irop, IRT_NUM), tref_ref(x), tref_ref(y))?;
                     self.comp_fixup(pc, ((op as u8) ^ (irop as u8)) & 1 != 0);
                 }
             }
@@ -1674,7 +1827,9 @@ impl Record {
                         if diff == 1 && tref_istab(ra) {
                             return Err(TraceError::NYIBC); // __eq metamethod NYI.
                         }
-                        self.comp_fixup(pc, ((op as u8) & 1 == 1) == (diff != 0));
+                        // lj_record.c: `(op & 1) == !diff` — the snapshot
+                        // resumes on the branch the trace does not take.
+                        self.comp_fixup(pc, ((op as u8) & 1 == 1) == (diff == 0));
                     }
                 }
             }
@@ -1710,6 +1865,16 @@ impl Record {
                 // op2 stands in for LuaJIT's KSIMD sign-flip constant.
                 let signbit = self.cur.ir.knum(-0.0);
                 result = self.cur.ir.emitir(irtn(IROp::NEG), tref_ref(rc), tref_ref(signbit))?;
+            }
+            BCOp::LEN => {
+                if !tref_isstr(rc) {
+                    return Err(TraceError::NYIBC); // Table len/__len NYI.
+                }
+                result = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_NUM),
+                    tref_ref(rc),
+                    IRCALL_STR_LEN,
+                ));
             }
 
             // -- Constants -------------------------------------------------------------
@@ -1965,12 +2130,17 @@ enum Recff {
     Rol,
     Ror,
     Bswap,
+    /// string.* (IRCALL helpers; sub/char allocate + GCSTEP).
+    StrLen,
+    StrByte,
+    StrSub,
+    StrChar,
 }
 
 fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
     use crate::func::CFunction;
-    use crate::stdlib::{base, bit, math};
-    let entries: [(CFunction, Recff); 20] = [
+    use crate::stdlib::{base, bit, math, string};
+    let entries: [(CFunction, Recff); 24] = [
         (math::floor, Recff::Floor),
         (math::ceil, Recff::Ceil),
         (math::sqrt, Recff::Sqrt),
@@ -1991,6 +2161,10 @@ fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
         (bit::rol, Recff::Rol),
         (bit::ror, Recff::Ror),
         (bit::bswap, Recff::Bswap),
+        (string::str_len, Recff::StrLen),
+        (string::str_byte, Recff::StrByte),
+        (string::str_sub, Recff::StrSub),
+        (string::str_char, Recff::StrChar),
     ];
     entries
         .iter()
