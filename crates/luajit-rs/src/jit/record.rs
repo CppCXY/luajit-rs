@@ -40,6 +40,9 @@ pub const IRFPM_CEIL: u32 = 1;
 pub const IRFPM_TRUNC: u32 = 2;
 pub const IRFPM_SQRT: u32 = 3;
 
+/// FLOAD field literals (IRFLDEF subset).
+pub const IRFL_TAB_META: u32 = 0;
+
 /// Loop event (LoopEvent).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LoopEvent {
@@ -812,7 +815,11 @@ impl Record {
             return Err(TraceError::NYIBC); // __call metamethod NYI.
         };
         let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
-            return Err(TraceError::NYIBC); // Fast functions NYI (recff).
+            // Builtins: inline recordable fast functions (lj_ffrecord).
+            if let crate::func::GcFunc::C(cc) = gf.as_ref() {
+                return self.rec_callff(l, base, ins, fv, cc.f);
+            }
+            return Err(TraceError::NYIBC);
         };
         let cpt = cl.proto;
         if cpt.as_ref().flags & crate::proto::PROTO_VARARG != 0 {
@@ -1069,6 +1076,145 @@ impl Record {
         Ok(tr)
     }
 
+    // -- Table indexing (lj_record_idx, coarse helper-based form) -------------
+
+    /// Guard `tab.metatable == nil` (FLOAD IRFL_TAB_META).
+    fn meta_guard(&mut self, tab: TRef) {
+        self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::FLOAD, IRT_GUARD | IRT_NIL),
+            tref_ref(tab),
+            IRFL_TAB_META,
+        ));
+    }
+
+    /// Record a raw table load: HLOAD specialized to the runtime result
+    /// type; a nil result additionally guards `metatable == nil` (the
+    /// interpreter only consults `__index` for nil results). Metamethod
+    /// paths abort with NYIBC.
+    fn rec_tget(
+        &mut self,
+        tabv: LuaValue,
+        tab: TRef,
+        keyv: LuaValue,
+        key: TRef,
+    ) -> Result<TRef, TraceError> {
+        if !tref_istab(tab) {
+            return Err(TraceError::NYIBC); // __index on non-tables NYI.
+        }
+        let t = tabv.as_table().expect("guarded table tref");
+        let v = LuaValue::from_bits(super::exec::jit_tget(tabv.to_bits(), keyv.to_bits()));
+        if v.is_nil() {
+            if t.as_ref().metatable.is_some() {
+                return Err(TraceError::NYIBC); // __index metamethod NYI.
+            }
+            self.meta_guard(tab);
+        }
+        let ty = Self::value_irt(v);
+        let mut tr = self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::HLOAD, IRT_GUARD | ty),
+            tref_ref(tab),
+            tref_ref(key),
+        ));
+        if irt_ispri(ty) {
+            tr = tref_pri(ty);
+        }
+        Ok(tr)
+    }
+
+    /// Record a raw table store: `metatable == nil` guard + HSTORE (the
+    /// helper mirrors the interpreter's raw set dispatch, including
+    /// inserts and resizes). Forces a snapshot after the store so exits
+    /// never replay a load/store sequence.
+    fn rec_tset(
+        &mut self,
+        tabv: LuaValue,
+        tab: TRef,
+        keyv: LuaValue,
+        key: TRef,
+        val: TRef,
+    ) -> Result<(), TraceError> {
+        if !tref_istab(tab) {
+            return Err(TraceError::NYIBC);
+        }
+        let t = tabv.as_table().expect("guarded table tref");
+        if t.as_ref().metatable.is_some() {
+            return Err(TraceError::NYIBC); // __newindex / protected path NYI.
+        }
+        if keyv.is_nil() {
+            return Err(TraceError::NYIBC); // Runtime error path.
+        }
+        self.meta_guard(tab);
+        let carg =
+            self.cur.ir.emit_ins(IRIns::new(irt(IROp::CARG, IRT_NIL), tref_ref(key), tref_ref(val)));
+        self.cur.ir.emit_ins(IRIns::new(irt(IROp::HSTORE, IRT_NIL), tref_ref(tab), tref_ref(carg)));
+        self.needsnap = true;
+        Ok(())
+    }
+
+    // -- Fast functions (lj_ffrecord.c, pointer-keyed subset) -----------------
+
+    /// Record a call to a recordable builtin: the callee identity is
+    /// guarded like a Lua closure, then the semantics are inlined as IR
+    /// (no frame). Unknown builtins abort with NYIBC.
+    fn rec_callff(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        ins: BCIns,
+        fv: LuaValue,
+        f: crate::func::CFunction,
+    ) -> Result<(), TraceError> {
+        let ff = recff_lookup(f).ok_or(TraceError::NYIBC)?;
+        let a = bc_a(ins);
+        let want = bc_b(ins) as i32 - 1;
+        if want < 0 {
+            return Err(TraceError::NYIBC); // Multres call NYI.
+        }
+        let nargs = (bc_c(ins) as u32).wrapping_sub(1);
+        if nargs < 1 {
+            return Err(TraceError::NYIBC); // Argument error path.
+        }
+        // Guard the callee identity.
+        let ftr = self.getslot(l, base, a);
+        let kf = self.cur.ir.kgc(fv.to_bits(), IRT_FUNC);
+        if !tref_isk(ftr) {
+            self.cur.ir.emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
+        }
+        let arg0 = self.getslot(l, base, a + 2);
+        if !tref_isnum(arg0) {
+            return Err(TraceError::NYIBC); // Coercion/error path.
+        }
+        let res = match ff {
+            Recff::Abs => self.cur.ir.emitir(irtn(IROp::ABS), tref_ref(arg0), 0)?,
+            Recff::Floor | Recff::Ceil | Recff::Sqrt => {
+                let fpm = match ff {
+                    Recff::Floor => IRFPM_FLOOR,
+                    Recff::Ceil => IRFPM_CEIL,
+                    _ => IRFPM_SQRT,
+                };
+                let r = self.cur.ir.emitir(irtn(IROp::FPMATH), tref_ref(arg0), fpm)?;
+                // The builtins push through LuaValue::number, which
+                // normalizes -0.0 to +0.0: match that exactly (x + 0.0;
+                // raw-emitted so no fold rule may drop it).
+                let zero = self.cur.ir.knum(0.0);
+                self.cur.ir.emit_ins(IRIns::new(irtn(IROp::ADD), tref_ref(r), tref_ref(zero)))
+            }
+        };
+        // Write the (single) result; pad/discard per the call's B.
+        if want >= 1 {
+            self.set_base(a, res);
+            for i in 1..want as u32 {
+                self.set_base(a + i, TREF_NIL);
+            }
+        }
+        // Clear the stale callee/arg slots above the results.
+        for s in (a + want.max(0) as u32)..(a + 2 + nargs) {
+            self.set_base(s, 0);
+        }
+        self.maxslot = a + want as u32;
+        Ok(())
+    }
+
     // -- Main recording entry (lj_record_ins) ---------------------------------------
 
     /// Record the instruction at `pc` *before* it is executed. Returns the
@@ -1302,6 +1448,45 @@ impl Record {
             // -- Upvalues ----------------------------------------------------------
             BCOp::UGET => result = self.rec_uget(l, base, bc_d(ins))?,
 
+            // -- Table indexing ----------------------------------------------------
+            BCOp::TGETV | BCOp::TGETS | BCOp::TGETB => {
+                let tabv = self.slot_val(l, base, bc_b(ins));
+                let (key, keyv) = if op == BCOp::TGETB {
+                    let n = bc_c(ins) as f64;
+                    (self.cur.ir.knum(n), LuaValue::number(n))
+                } else {
+                    (rc, rcv)
+                };
+                result = self.rec_tget(tabv, rb, keyv, key)?;
+            }
+            BCOp::TSETV | BCOp::TSETS | BCOp::TSETB => {
+                let tabv = self.slot_val(l, base, bc_b(ins));
+                let tab = self.getslot(l, base, bc_b(ins));
+                let (key, keyv) = if op == BCOp::TSETB {
+                    let n = bc_c(ins) as f64;
+                    (self.cur.ir.knum(n), LuaValue::number(n))
+                } else {
+                    (rc, rcv)
+                };
+                let val = self.getslot(l, base, bc_a(ins));
+                self.rec_tset(tabv, tab, keyv, key, val)?;
+            }
+            BCOp::GGET | BCOp::GSET => {
+                // The environment table of the (specialized) closure is a
+                // constant; globals are then plain string-keyed lookups.
+                let fnval = l.stack[base - 2];
+                self.specialize_curfn(l, base, fnval)?;
+                let env = fnval.as_func().expect("current frame function").as_ref().env();
+                let tabv = LuaValue::table(env);
+                let tab = self.cur.ir.kgc(tabv.to_bits(), IRT_TAB);
+                if op == BCOp::GGET {
+                    result = self.rec_tget(tabv, tab, rcv, rc)?;
+                } else {
+                    let val = self.getslot(l, base, bc_a(ins));
+                    self.rec_tset(tabv, tab, rcv, rc, val)?;
+                }
+            }
+
             // -- Calls and returns -------------------------------------------------
             BCOp::CALL => self.rec_call(l, base, pc, ins)?,
             BCOp::CALLT => self.rec_callt(l, base, ins)?,
@@ -1351,6 +1536,31 @@ fn arith_irop(op: BCOp) -> IROp {
         BCOp::DIVVN | BCOp::DIVNV | BCOp::DIVVV => IROp::DIV,
         BCOp::MODVN | BCOp::MODNV | BCOp::MODVV => IROp::MOD,
         _ => unreachable!("bad arith opcode"),
+    }
+}
+
+/// Recordable fast functions (the lj_ffrecord dispatch, keyed by the
+/// builtin's function pointer instead of an ffid).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recff {
+    Floor,
+    Ceil,
+    Sqrt,
+    Abs,
+}
+
+fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
+    use crate::stdlib::math;
+    if std::ptr::fn_addr_eq(f, math::floor as crate::func::CFunction) {
+        Some(Recff::Floor)
+    } else if std::ptr::fn_addr_eq(f, math::ceil as crate::func::CFunction) {
+        Some(Recff::Ceil)
+    } else if std::ptr::fn_addr_eq(f, math::sqrt as crate::func::CFunction) {
+        Some(Recff::Sqrt)
+    } else if std::ptr::fn_addr_eq(f, math::abs as crate::func::CFunction) {
+        Some(Recff::Abs)
+    } else {
+        None
     }
 }
 

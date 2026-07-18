@@ -214,6 +214,21 @@ impl<'a> Asm<'a> {
             match ins.op() {
                 IROp::NOP | IROp::BASE | IROp::LOOP | IROp::SLOAD => {}
                 IROp::ULOAD => {} // op1 is a KINT64 address constant.
+                IROp::FLOAD | IROp::HLOAD | IROp::CARG => {
+                    // Helper-call arguments are read from env as raw bits.
+                    for op in [ins.op1 as IRRef, ins.op2 as IRRef] {
+                        if op >= REF_BIAS {
+                            a.needs_env[Self::iidx(op)] = true;
+                        }
+                    }
+                }
+                IROp::HSTORE => {
+                    // op2 is the CARG tuple (its operands are marked by
+                    // the CARG arm); op1 is the table argument.
+                    if ins.op1 as IRRef >= REF_BIAS {
+                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                    }
+                }
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX
                 | IROp::NEG => {
                     a.mark_use(ins.op1 as IRRef, r);
@@ -350,6 +365,10 @@ impl<'a> Asm<'a> {
                 IROp::PHI => {} // Handled at the back edge.
                 IROp::SLOAD => self.asm_sload(&ins)?,
                 IROp::ULOAD => self.asm_uload(&ins)?,
+                IROp::FLOAD => self.asm_meta_guard(&ins),
+                IROp::HLOAD => self.asm_hload(&ins)?,
+                IROp::CARG => {} // Consumed by HSTORE.
+                IROp::HSTORE => self.asm_hstore(&ins),
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX => {
                     self.asm_arith(&ins)?
                 }
@@ -598,6 +617,117 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
+    /// FLOAD IRFL_TAB_META as a guard: exit unless `tab.metatable` is
+    /// None (the niche encoding makes that a plain null check).
+    fn asm_meta_guard(&mut self, ins: &IRIns) {
+        const META_OFF: i32 =
+            std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
+        self.gpr_load_ref(RAX, ins.op1 as IRRef);
+        self.mov_r64_imm64(RCX, crate::value::LJ_GCVMASK);
+        self.and_rr64(RAX, RCX); // NaN-boxed table value -> pointer.
+        self.cmp_mem64_imm8(RAX, META_OFF, 0);
+        self.guard(CC_NE);
+    }
+
+    /// HLOAD: raw table get through the shared helper, with the SLOAD
+    /// typecheck shapes applied to the returned value bits in rax.
+    fn asm_hload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let addr = super::exec::jit_tget as usize as u64;
+        self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
+        let t = ins.t();
+        let i = Self::iidx(self.cur);
+        if irt_isnum(t) {
+            if ins.is_guard() {
+                // High dword below the GC tag space = number.
+                self.mov_rr64(RCX, RAX);
+                self.shr_r64_imm(RCX, 32);
+                self.cmp_r32_imm32(RCX, TISNUM_HI);
+                self.guard(CC_AE);
+            }
+            if self.last_use[i] != 0 || self.needs_env[i] {
+                let d = self.alloc(0)?;
+                self.movq_xmm_gpr(d, RAX);
+                self.def(d);
+            }
+            return Ok(());
+        }
+        if self.needs_env[i] {
+            self.mov_mem_r64(RENV, Self::env_disp(self.cur), RAX);
+            self.env_valid[i] = true;
+        }
+        if !ins.is_guard() {
+            return Ok(());
+        }
+        let ty = irt_type(t);
+        if ty <= IRT_TRUE {
+            // Primitives: full bit compare against the canonical value.
+            let bits = match ty {
+                IRT_NIL => crate::value::LuaValue::NIL.to_bits(),
+                IRT_FALSE => crate::value::LuaValue::FALSE.to_bits(),
+                _ => crate::value::LuaValue::TRUE.to_bits(),
+            };
+            self.mov_r64_imm64(RCX, bits);
+            self.cmp_rr64(RAX, RCX);
+            self.guard(CC_NE);
+        } else {
+            self.mov_rr64(RCX, RAX);
+            self.sar_r64_imm(RCX, 47);
+            self.cmp_r32_imm8(RCX, !(ty as u32) as i8);
+            self.guard(CC_NE);
+        }
+        Ok(())
+    }
+
+    /// HSTORE: raw table set through the shared helper. op2 is the CARG
+    /// tuple holding (key, value).
+    fn asm_hstore(&mut self, ins: &IRIns) {
+        let carg = *self.tr.ir.ir(ins.op2 as IRRef);
+        debug_assert_eq!(carg.op(), IROp::CARG);
+        let addr = super::exec::jit_tset as usize as u64;
+        self.helper_call(
+            addr,
+            &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef],
+        );
+    }
+
+    /// Emit a call to an `extern "C"` helper with up to three u64
+    /// arguments (raw ref bits from env or constants). The volatile xmm
+    /// registers are parked in env first (the callee-saved xmm6-xmm15
+    /// survive); r10/r11 (BASE/ENV) are saved around the call.
+    fn helper_call(&mut self, addr: u64, args: &[IRRef]) {
+        // Park live values held in volatile xmm registers.
+        for rg in 0..=4u8 {
+            if let Owner::Ins(o) = self.owner[rg as usize] {
+                let i = Self::iidx(o);
+                if self.last_use[i] > self.cur && !self.env_valid[i] {
+                    self.movsd_store(RENV, Self::env_disp(o), rg);
+                    self.env_valid[i] = true;
+                }
+            }
+            self.steal_quiet(rg);
+        }
+        // Load the arguments (from env or constants; r11 still live).
+        #[cfg(windows)]
+        const ARGREGS: [u8; 3] = [RCX, 2, 8]; // rcx, rdx, r8
+        #[cfg(not(windows))]
+        const ARGREGS: [u8; 3] = [7, 6, 2]; // rdi, rsi, rdx
+        debug_assert!(args.len() <= 3);
+        for (n, &r) in args.iter().enumerate() {
+            self.gpr_load_ref(ARGREGS[n], r);
+        }
+        // push r10; push r11 (keeps 16-byte parity).
+        self.code.extend_from_slice(&[0x41, 0x52, 0x41, 0x53]);
+        // Align the stack for the call: body rsp is 8 mod 16; Win64 also
+        // needs 32 bytes of shadow space.
+        let adj: u8 = if cfg!(windows) { 40 } else { 8 };
+        self.code.extend_from_slice(&[0x48, 0x83, 0xEC, adj]); // sub rsp, adj
+        self.mov_r64_imm64(RAX, addr);
+        self.code.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        self.code.extend_from_slice(&[0x48, 0x83, 0xC4, adj]); // add rsp, adj
+        // pop r11; pop r10
+        self.code.extend_from_slice(&[0x41, 0x5B, 0x41, 0x5A]);
+    }
+
     fn asm_arith(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let op = ins.op();
         let (mut a, mut b) = (ins.op1 as IRRef, ins.op2 as IRRef);
@@ -767,10 +897,12 @@ impl<'a> Asm<'a> {
         }
         for pi in 0..self.phis.len() {
             let p = self.phis[pi];
-            if p.num && self.loc[Self::iidx(p.lref)].is_some() {
+            let i = Self::iidx(p.lref);
+            if p.num && self.loc[i].is_some() && !self.needs_env[i] {
                 // A pre-roll env copy (def store or eviction) is stale
-                // from the second iteration on.
-                self.env_valid[Self::iidx(p.lref)] = false;
+                // from the second iteration on. (needs_env lrefs stay
+                // valid: the back edge refreshes their env slot.)
+                self.env_valid[i] = false;
             }
         }
         self.s0 = self.owner;
@@ -828,6 +960,11 @@ impl<'a> Asm<'a> {
             for (p, home) in phis.iter().zip(homes.iter()) {
                 if p.num && let Some(rg) = *home {
                     self.movsd_load(rg, RENV, Self::env_disp(p.phi));
+                    if self.needs_env[Self::iidx(p.lref)] {
+                        // Env-resident consumers (helper args) read the
+                        // carried value through env[lref].
+                        self.movsd_store(RENV, Self::env_disp(p.lref), rg);
+                    }
                 } else {
                     self.mov_r64_mem(RAX, RENV, Self::env_disp(p.phi));
                     self.mov_mem_r64(RENV, Self::env_disp(p.lref), RAX);
@@ -863,7 +1000,8 @@ impl<'a> Asm<'a> {
     }
 
     /// One direct PHI move: load the right value into the lref home
-    /// register, or refresh env[lref] for env-carried PHIs.
+    /// register (env[lref] is refreshed too when env-resident consumers
+    /// exist), or refresh env[lref] for env-carried PHIs.
     fn phi_move(&mut self, p: &PhiInfo, home: Option<u8>) {
         if p.num && let Some(rg) = home {
             if p.rref >= REF_BIAS {
@@ -878,6 +1016,9 @@ impl<'a> Asm<'a> {
             } else {
                 self.mov_r64_imm64(RAX, super::exec::const_bits(&self.tr.ir, p.rref));
                 self.movq_xmm_gpr(rg, RAX);
+            }
+            if self.needs_env[Self::iidx(p.lref)] {
+                self.movsd_store(RENV, Self::env_disp(p.lref), rg);
             }
         } else if p.rref >= REF_BIAS {
             if p.num && let Some(src) = self.reg_of(p.rref) {
@@ -1016,12 +1157,17 @@ impl<'a> Asm<'a> {
         }
     }
 
-    /// Bind the current instruction's result. Snapshot values stay in
-    /// registers; the exit stubs flush them (no store-on-def).
+    /// Bind the current instruction's result. Values that must be
+    /// env-resident (helper-call arguments, GC bits) are stored on def;
+    /// FP snapshot values stay in registers (the exit stubs flush them).
     fn def(&mut self, d: u8) {
         let i = Self::iidx(self.cur);
         self.owner[d as usize] = Owner::Ins(self.cur);
         self.loc[i] = Some(d);
+        if self.needs_env[i] {
+            self.movsd_store(RENV, Self::env_disp(self.cur), d);
+            self.env_valid[i] = true;
+        }
     }
 
     /// Raw 64-bit value of an operand into a GPR (GC-identity compares).
@@ -1175,6 +1321,26 @@ impl<'a> Asm<'a> {
         self.code.push(0xC1);
         self.modrm(3, 7, reg);
         self.code.push(sh);
+    }
+    fn shr_r64_imm(&mut self, reg: u8, sh: u8) {
+        self.code.push(0x48 | ((reg >> 3) & 1));
+        self.code.push(0xC1);
+        self.modrm(3, 5, reg);
+        self.code.push(sh);
+    }
+    fn and_rr64(&mut self, a: u8, b: u8) {
+        // and a, b (REX.W 21 /r: rm = a, reg = b).
+        self.code.push(0x48 | (((b >> 3) & 1) << 2) | ((a >> 3) & 1));
+        self.code.push(0x21);
+        self.modrm(3, b, a);
+    }
+    fn cmp_r32_imm32(&mut self, reg: u8, imm: u32) {
+        if reg >= 8 {
+            self.code.push(0x41);
+        }
+        self.code.push(0x81);
+        self.modrm(3, 7, reg);
+        self.emit_u32(imm);
     }
     fn cmp_rr64(&mut self, a: u8, b: u8) {
         self.code.push(0x48 | (((b >> 3) & 1) << 2) | ((a >> 3) & 1));

@@ -733,14 +733,14 @@ mod tests {
         // parked with SNAPCOUNT_DONE and never re-examined.
         let (f, pt) = load_proto(
             &mut lua,
-            "local t = { x = 1 } \
+            "local ts = tostring \
              local s = 0 \
              for i = 1, 100000 do \
-               if i % 2 == 0 then s = s + (t.x or 0) else s = s + 1 end \
+               if i % 2 == 0 then ts(i) s = s + 2 else s = s + 1 end \
              end return s",
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
-        assert_eq!(r[0].as_number(), Some(100000.0));
+        assert_eq!(r[0].as_number(), Some(150000.0));
         let g = lua.global();
         if let Some(forl_pc) = find_op(pt, BCOp::JFORL) {
             let rootno = crate::bc::bc_d(pt.as_ref().bc[forl_pc]);
@@ -843,12 +843,12 @@ mod tests {
     fn unrecordable_loop_still_blacklists() {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
-        // The CALL to next() makes the loop body unrecordable (NYIBC),
-        // so the penalty machinery must eventually blacklist the FORL.
+        // Calls to non-recff C functions are unrecordable, so the
+        // penalty machinery must eventually blacklist the FORL.
         let (f, pt) = load_proto(
             &mut lua,
-            "local t = {} local s = 0 \
-             for i = 1, 2000000 do s = s + (t.x or 1) end return s",
+            "local ts = tostring local s = 0 \
+             for i = 1, 2000000 do ts(i) s = s + 1 end return s",
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(2000000.0));
@@ -1044,6 +1044,112 @@ mod tests {
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200000.0 * 200001.0 / 2.0));
+    }
+
+    #[test]
+    fn table_array_load_store_compile() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // Fill (inserts + array growth via the HSTORE helper), then sum
+        // (HLOAD specialized to numbers).
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local t = {} \
+             for i = 1, 100000 do t[i] = i * 2 end \
+             local s = 0 \
+             for i = 1, 100000 do s = s + t[i] end \
+             return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(100000.0 * 100001.0));
+        assert!(find_op(pt, BCOp::JFORL).is_some(), "table loops not compiled");
+    }
+
+    #[test]
+    fn table_field_and_globals_compile() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // TGETS/TSETS on a hash field plus GGET/GSET on a global counter.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "gcnt = 0 \
+             local t = { x = 0 } \
+             for i = 1, 200000 do \
+               t.x = t.x + 1 \
+               gcnt = gcnt + 2 \
+             end return t.x * 1000000 + gcnt",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(200000.0 * 1000000.0 + 400000.0));
+    }
+
+    #[test]
+    fn nil_load_specializes_and_metatable_falls_back() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // t.missing stays nil (HLOAD specialized to NIL under the
+        // metatable guard); u gets a metatable with __index mid-loop,
+        // whose lookups must keep working through the fallback.
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local t = { a = 1 } \
+             local u = {} \
+             local mt = { __index = function() return 5 end } \
+             local s = 0 \
+             for i = 1, 60000 do \
+               if t.missing == nil then s = s + 1 end \
+               if i == 50000 then setmetatable(u, mt) end \
+               s = s + (u.k or 0) \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        // +1 per iteration, plus __index result 5 for i in 50000..=60000.
+        assert_eq!(r[0].as_number(), Some(60000.0 + 10001.0 * 5.0));
+    }
+
+    #[test]
+    fn math_fast_functions_record_inline() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // floor/sqrt/abs inline as FPMATH/ABS IR under the callee guard;
+        // the -0.0 normalization matches the interpreter's push path.
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local fl, sq, ab = math.floor, math.sqrt, math.abs \
+             local s = 0 \
+             for i = 1, 200000 do \
+               s = s + fl(i / 2) + sq(i) - ab(-i) \
+             end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let mut want = 0.0f64;
+        for i in 1..=200000 {
+            // Mirror the bytecode's association order exactly.
+            let x = i as f64;
+            want += (x / 2.0).floor();
+            want += x.sqrt();
+            want -= x;
+        }
+        assert_eq!(r[0].as_number(), Some(want));
+        assert!(find_op(pt, BCOp::JFORL).is_some(), "recff loop not compiled");
+    }
+
+    #[test]
+    fn recff_floor_normalizes_negative_zero() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // The interpreter pushes through LuaValue::number (-0.0 -> +0.0):
+        // the compiled trace must agree, so 1/floor(-0.0) stays +inf
+        // (z * -1 produces a runtime -0.0).
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local fl = math.floor \
+             local z = 0 \
+             local acc = 0 \
+             for i = 1, 200 do acc = acc + 1 / fl(z * -1) end return acc",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(f64::INFINITY));
     }
 
     #[test]

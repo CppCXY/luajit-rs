@@ -13,7 +13,9 @@ use crate::lual_reg;
 
 macro_rules! math1 {
     ($name:ident, $fn:expr) => {
-        fn $name(l: &mut LuaState) -> LuaResult<i32> {
+        /// (pub: the JIT's fast-function recorder identifies builtins by
+        /// their function pointer.)
+        pub fn $name(l: &mut LuaState) -> LuaResult<i32> {
             let x = match arg(l, 0).as_number() {
                 Some(n) => n,
                 None => {

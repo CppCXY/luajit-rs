@@ -205,6 +205,35 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
                 }
+                IROp::FLOAD => {
+                    // Guarded `metatable == nil` check (IRFL_TAB_META).
+                    debug_assert!(ins.is_guard());
+                    let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
+                    let mt = tv.as_table().expect("FLOAD on a non-table").as_ref().metatable;
+                    if mt.is_some() {
+                        return exit_snapshot(l, base, tr, env, snapidx);
+                    }
+                }
+                IROp::HLOAD => {
+                    let v = LuaValue::from_bits(jit_tget(
+                        val(env, ins.op1 as IRRef),
+                        val(env, ins.op2 as IRRef),
+                    ));
+                    if ins.is_guard() && !typecheck(v, ins.t()) {
+                        return exit_snapshot(l, base, tr, env, snapidx);
+                    }
+                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                }
+                IROp::CARG => {} // Consumed by HSTORE.
+                IROp::HSTORE => {
+                    let carg = *ir.ir(ins.op2 as IRRef);
+                    debug_assert_eq!(carg.op(), IROp::CARG);
+                    jit_tset(
+                        val(env, ins.op1 as IRRef),
+                        val(env, carg.op1 as IRRef),
+                        val(env, carg.op2 as IRRef),
+                    );
+                }
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::POW
                 | IROp::MIN | IROp::MAX => {
                     let x = f64::from_bits(val(env, ins.op1 as IRRef));
@@ -361,5 +390,51 @@ fn typecheck(v: LuaValue, t: u8) -> bool {
             // GC types: compare the negated itype tag.
             !v.is_number() && (!v.itype()) as u8 & IRT_TYPE == ty
         }
+    }
+}
+
+// -- Table helpers shared by the recorder, run_ir and the machine code ------
+//
+// These mirror the interpreter's raw TGET/TSET dispatch bit for bit, so a
+// recorded HLOAD/HSTORE is semantically identical to what the interpreter
+// would have done. The traces guard the table type and (where required)
+// `metatable == nil` before reaching them.
+
+/// Raw table get (the TGETV dispatch). Returns the NaN-boxed result.
+pub extern "C" fn jit_tget(tab_bits: u64, key_bits: u64) -> u64 {
+    let t = LuaValue::from_bits(tab_bits).as_table().expect("HLOAD on a non-table");
+    let k = LuaValue::from_bits(key_bits);
+    let v = if k.is_string() {
+        t.as_ref().get_str(k)
+    } else if k.is_number() {
+        let ki = k.num() as i32;
+        if ki as f64 == k.num() && ki >= 0 {
+            t.as_ref().get_int(ki)
+        } else {
+            t.as_ref().get(k)
+        }
+    } else {
+        t.as_ref().get(k)
+    };
+    v.to_bits()
+}
+
+/// Raw table set (the TSETV dispatch, `metatable == nil` guarded).
+pub extern "C" fn jit_tset(tab_bits: u64, key_bits: u64, val_bits: u64) {
+    let t = LuaValue::from_bits(tab_bits).as_table().expect("HSTORE on a non-table");
+    let k = LuaValue::from_bits(key_bits);
+    let v = LuaValue::from_bits(val_bits);
+    debug_assert!(!k.is_nil(), "nil key must be guarded at record time");
+    if k.is_string() {
+        t.as_mut().set_str(k, v);
+    } else if k.is_number() {
+        let ki = k.num() as i32;
+        if ki as f64 == k.num() && ki >= 0 {
+            t.as_mut().set_int(ki, v);
+        } else {
+            t.as_mut().set(k, v);
+        }
+    } else {
+        t.as_mut().set(k, v);
     }
 }
