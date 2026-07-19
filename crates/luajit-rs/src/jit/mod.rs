@@ -380,9 +380,9 @@ impl JitState {
         // On platforms without a native codegen backend, JIT is off by
         // default — the portable IR executor is slower than pure
         // interpretation.  Users can still enable it with `jit.on()`.
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         let flags = JIT_F_ON;
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(not(target_arch = "x86_64"))]
         let flags = 0;
         let mut js = JitState {
             flags,

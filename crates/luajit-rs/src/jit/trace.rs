@@ -400,7 +400,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             stub_tails: Vec::new(),
         },
     );
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     let trace = {
         // `lj_asm_trace`: assemble the IR to machine code. On NYI/OOM the
         // trace stays on the portable IR executor (mcode = None). Root
@@ -536,7 +536,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             // entry (lj_asm_patchexit) — the whole tree then runs in
             // machine code without Rust round trips.
             debug_assert!(parent != 0 && root != 0, "not a side trace");
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
             {
                 let target = js.trace[traceno as usize].as_ref().and_then(|t| {
                     t.mcode
@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(tr.linktype, TraceLink::Loop);
         assert_eq!(tr.link, tr.traceno);
         // The x64 backend must have assembled this numeric loop.
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         assert!(tr.mcode.is_some(), "trace not assembled to machine code");
         // After lj_opt_loop the trace holds the pre-roll plus the copied
         // variant part: two num ADDs each (s+i, i+step), separated by
@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(st.linktype, TraceLink::Root);
         assert_eq!(st.link, rootno, "side trace must link back to the root");
         assert_eq!(bc_op(st.startins), BCOp::JMP);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         assert!(st.mcode.is_some(), "side trace not assembled");
     }
 
@@ -1037,7 +1037,7 @@ mod tests {
         let tno = crate::bc::bc_d(pt.as_ref().bc[forl_pc]);
         let tr = g.jit.trace[tno as usize].as_deref().unwrap();
         assert_eq!(tr.linktype, TraceLink::Loop);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         assert!(tr.mcode.is_some(), "inlined-call loop not assembled");
         // The callee's FUNCF header stays untouched (not blacklisted).
         let child = pt
@@ -1144,7 +1144,7 @@ mod tests {
         assert!(root.snap[exitno].baseslot > 2, "exit is not inside a frame");
         let st = g.jit.trace[side as usize].as_deref().unwrap();
         assert_eq!(st.linktype, TraceLink::Root);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         assert!(st.mcode.is_some(), "deep side trace not assembled");
     }
 
@@ -1351,7 +1351,7 @@ mod tests {
             .unwrap();
         assert_eq!(tr.linktype, TraceLink::Loop);
         assert_eq!(bc_op(tr.startins), BCOp::ITERL);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         assert!(tr.mcode.is_some(), "ipairs trace not assembled");
     }
 
