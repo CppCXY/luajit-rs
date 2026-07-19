@@ -436,17 +436,17 @@ fn to_arm64_cc(x86_cc: u8) -> u8 {
 
 /// FMOV (register): `fmov dd, dn` (64-bit float).
 fn fmov_reg(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E604000 | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x9E604000 | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FMOV (GPR to FP): `fmov dd, xn`.
 fn fmov_gpr_fp(code: &mut Vec<u8>, dd: u8, xn: u8) {
-    emit32(code, 0x9E660000 | ((xn as u32) << 5) | dd as u32);
+    emit32(code, 0x9E670000 | ((xn as u32) << 5) | dd as u32);
 }
 
 /// FMOV (FP to GPR): `fmov xd, dn`.
 fn fmov_fp_gpr(code: &mut Vec<u8>, xd: u8, dn: u8) {
-    emit32(code, 0x9E660000 | 1u32 << 16 | ((dn as u32) << 5) | xd as u32);
+    emit32(code, 0x9E660000 | ((dn as u32) << 5) | xd as u32);
 }
 
 /// FADD: `fadd dd, dn, dm`.
@@ -486,12 +486,12 @@ fn fsqrt(code: &mut Vec<u8>, dd: u8, dn: u8) {
 
 /// FMIN: `fmin dd, dn, dm`.
 fn fmin(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E204800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E606800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FMAX: `fmax dd, dn, dm`.
 fn fmax(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E204800 | (1u32 << 22) | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E606C00 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FRINTM (floor): `frintm dd, dn`.
