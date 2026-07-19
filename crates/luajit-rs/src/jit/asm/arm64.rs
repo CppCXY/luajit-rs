@@ -1498,8 +1498,8 @@ impl<'a> Asm<'a> {
         area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code);
 
         // Always dump traces on aarch64 so CI can disassemble them.
-        println!(
-            "[arm64] TRACE {} mcode {:5} bytes  nins={}  linktype={:?}",
+        print!(
+            "[arm64] TRACE {} mcode={:5}B nins={} link={:?} hex=",
             self.tr.traceno,
             self.code.len(),
             self.tr.ir.nins() - REF_BIAS,
@@ -1507,8 +1507,10 @@ impl<'a> Asm<'a> {
         );
         for (i, chunk) in self.code.chunks(4).enumerate() {
             let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            println!("  {:4}: {:08x}", i * 4, w);
+            if i > 0 { print!(","); }
+            print!("{:08x}", w);
         }
+        println!();
 
         if !area.protect_exec() { return Err(TraceError::MCODEAL); }
         Ok((area, inner, std::mem::take(&mut self.stub_tails)))

@@ -44,7 +44,12 @@ jobs:
         run: cargo build --release --workspace
 
       - name: Test (debug, assertions on)
+        if: matrix.name != 'linux-arm64'
         run: cargo test --workspace
+
+      - name: Test (debug + hex dump)
+        if: matrix.name == 'linux-arm64'
+        run: cargo test --workspace -- --nocapture
 
       - name: Test (release)
         if: matrix.name != 'linux-arm64'
