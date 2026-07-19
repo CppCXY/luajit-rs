@@ -220,6 +220,15 @@ fn lsr_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     );
 }
 
+/// LSR (immediate): `lsr rd, rn, #imm` (64-bit).
+fn lsr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
+    let sf = 1u32 << 31;
+    let n = 1u32 << 22;
+    let immr = imm as u32;
+    let imms = 63u32;
+    emit32(code, sf | 0x13000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
+}
+
 /// ASR (immediate): `asr rd, rn, #imm`.
 fn asr_reg_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
     debug_assert!(imm > 0 && imm <= 64);
@@ -1035,6 +1044,37 @@ impl<'a> Asm<'a> {
                     self.asm_comp(&ins)?;
                 }
                 IROp::EQ | IROp::NE => self.asm_equal(&ins)?,
+                IROp::CARG => {} // Consumed by HSTORE/CALLL/ASTORE.
+                IROp::CALLL => self.asm_calll(&ins)?,
+                IROp::TNEW => {
+                    self.helper_call(super::super::exec::jit_tnew as *const () as u64, &[]);
+                    self.ff_result(&ins)?;
+                }
+                IROp::TDUP => {
+                    self.helper_call(
+                        super::super::exec::jit_tdup as *const () as u64,
+                        &[ins.op1 as IRRef],
+                    );
+                    self.ff_result(&ins)?;
+                }
+                IROp::HSTORE => {
+                    let carg = *self.tr.ir.ir(ins.op2 as IRRef);
+                    debug_assert_eq!(carg.op(), IROp::CARG);
+                    self.helper_call(
+                        super::super::exec::jit_tset as *const () as u64,
+                        &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef],
+                    );
+                }
+                IROp::GCSTEP => self.asm_gcstep(&ins),
+                IROp::FLOAD => self.asm_fload(&ins),
+                IROp::HLOAD => {
+                    self.helper_call(
+                        super::super::exec::jit_tget as *const () as u64,
+                        &[ins.op1 as IRRef, ins.op2 as IRRef],
+                    );
+                    self.ff_result(&ins)?;
+                }
+                IROp::ULOAD => self.asm_uload(&ins)?,
                 _ => return Err(TraceError::NYIIR),
             }
             r += 1;
@@ -1124,6 +1164,165 @@ impl<'a> Asm<'a> {
             ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(s), 64);
             str_imm(&mut self.code, RSCR, RENV, Self::env_disp(d), 64);
         }
+    }
+
+    // -- Helper call / GCSTEP / CALLL ----------------------------------------
+
+    /// Call an `extern "C"` helper with up to three u64 args. ARM64
+    /// x19/x20 are callee-saved (no save needed). Caller-saved FP regs
+    /// are parked to env before the call.
+    fn helper_call(&mut self, addr: u64, args: &[IRRef]) {
+        for rg in 0..=4u8 {
+            if let Owner::Ins(o) = self.owner[rg as usize] {
+                let i = Self::iidx(o);
+                if self.last_use[i] > self.cur && !self.env_valid[i] {
+                    str_fp(&mut self.code, rg, RENV, Self::env_disp(o));
+                    self.env_valid[i] = true;
+                }
+            }
+            self.steal_quiet(rg);
+        }
+        const AARGS: [u8; 3] = [0, 1, 2];
+        debug_assert!(args.len() <= 3);
+        for (n, &r) in args.iter().enumerate() {
+            self.gpr_load_ref(AARGS[n], r);
+        }
+        mov_imm64(&mut self.code, RSCR2, addr);
+        br_reg(&mut self.code, RSCR2, true); // blr x2
+    }
+
+    /// GCSTEP guard: exit when a collection is due.
+    fn asm_gcstep(&mut self, ins: &IRIns) {
+        let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
+        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
+        // total
+        mov_imm64(&mut self.code, RSCR, total_addr);
+        ldr_imm(&mut self.code, RSCR, RSCR, 0, 64);
+        // total += TABLE_EXTRA
+        mov_imm64(&mut self.code, RSCR2, extra_addr);
+        ldr_imm(&mut self.code, RSCR3, RSCR2, 0, 64);
+        add_reg_lsl(&mut self.code, RSCR, RSCR, RSCR3, 0);
+        // cmp total, threshold
+        mov_imm64(&mut self.code, RSCR2, thres_addr);
+        ldr_imm(&mut self.code, RSCR2, RSCR2, 0, 64);
+        cmp_reg(&mut self.code, RSCR, RSCR2);
+        self.guard_gc(CC_CS);
+    }
+
+    /// CALLL: guarded helper call, selected by the IRCALL index in op2.
+    fn asm_calll(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        use super::super::record as rec;
+        let idx = ins.op2 as u32;
+        let addr = match idx {
+            rec::IRCALL_TAB_NEXTK => super::super::exec::jit_tnextk as *const () as u64,
+            rec::IRCALL_FMOD => super::super::exec::jit_fmod as *const () as u64,
+            rec::IRCALL_STR_LEN => super::super::exec::jit_str_len as *const () as u64,
+            rec::IRCALL_STR_CMP => super::super::exec::jit_str_cmp as *const () as u64,
+            rec::IRCALL_STR_BYTE => super::super::exec::jit_str_byte as *const () as u64,
+            rec::IRCALL_STR_SUB => super::super::exec::jit_str_sub as *const () as u64,
+            rec::IRCALL_STR_CHAR => super::super::exec::jit_str_char as *const () as u64,
+            rec::IRCALL_TAB_LEN => super::super::exec::jit_alen as *const () as u64,
+            rec::IRCALL_TAB_CONCAT => super::super::exec::jit_tconcat as *const () as u64,
+            _ => unreachable!("bad IRCALL index"),
+        };
+        match rec::ircall_arity(idx) {
+            1 => self.helper_call(addr, &[ins.op1 as IRRef]),
+            2 => {
+                let carg = *self.tr.ir.ir(ins.op1 as IRRef);
+                debug_assert_eq!(carg.op(), IROp::CARG);
+                self.helper_call(addr, &[carg.op1 as IRRef, carg.op2 as IRRef]);
+            }
+            _ => {
+                let cargj = *self.tr.ir.ir(ins.op1 as IRRef);
+                debug_assert_eq!(cargj.op(), IROp::CARG);
+                let cargi = *self.tr.ir.ir(cargj.op1 as IRRef);
+                debug_assert_eq!(cargi.op(), IROp::CARG);
+                self.helper_call(
+                    addr,
+                    &[cargi.op1 as IRRef, cargi.op2 as IRRef, cargj.op2 as IRRef],
+                );
+            }
+        }
+        self.ff_result(ins)
+    }
+
+    /// Shared tail of helper-returning ops: typecheck and land the result.
+    fn ff_result(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let t = ins.t();
+        let i = Self::iidx(self.cur);
+        if irt_isnum(t) {
+            if ins.is_guard() {
+                // Check whether the result is a number: the top 32 bits
+                // of a raw IEEE 754 double are < 0xFFF9_0000, while all
+                // NaN-boxed GC tags sit at or above that threshold.
+                lsr_imm(&mut self.code, RSCR2, RSCR, 32);
+                mov_imm64(&mut self.code, RSCR3, 0xFFF9_0000u64);
+                cmp_reg(&mut self.code, RSCR2, RSCR3);
+                self.guard(CC_CS);
+            }
+            if self.last_use[i] != 0 || self.needs_env[i] {
+                let d = self.alloc(0)?;
+                fmov_gpr_fp(&mut self.code, d, RSCR);
+                self.def(d);
+            }
+            return Ok(());
+        }
+        if self.needs_env[i] {
+            str_imm(&mut self.code, RSCR, RENV, Self::env_disp(self.cur), 64);
+            self.env_valid[i] = true;
+        }
+        if !ins.is_guard() {
+            return Ok(());
+        }
+        let ty = irt_type(t);
+        if ty <= IRT_TRUE {
+            let bits = match ty {
+                IRT_NIL => crate::value::LuaValue::NIL.to_bits(),
+                IRT_FALSE => crate::value::LuaValue::FALSE.to_bits(),
+                _ => crate::value::LuaValue::TRUE.to_bits(),
+            };
+            mov_imm64(&mut self.code, RSCR2, bits);
+            cmp_reg(&mut self.code, RSCR, RSCR2);
+            self.guard(CC_NE);
+        } else {
+            asr_imm(&mut self.code, RSCR2, RSCR, 47);
+            cmp_imm(&mut self.code, RSCR2, (!(ty as u32)) as u32, 0);
+            self.guard(CC_NE);
+        }
+        Ok(())
+    }
+
+    /// FLOAD: guarded metatable-nil check.
+    fn asm_fload(&mut self, ins: &IRIns) {
+        debug_assert!(ins.is_guard());
+        // ins.op1 is the table ref. Load TABLE obj, check metatable field.
+        // metatable offset in LuaTable.
+        const MT_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
+        self.gpr_load_ref(RSCR, ins.op1 as IRRef);
+        mov_imm64(&mut self.code, RSCR2, crate::value::LJ_GCVMASK);
+        and_reg(&mut self.code, RSCR, RSCR, RSCR2);
+        ldr_imm(&mut self.code, RSCR, RSCR, MT_OFF, 64);
+        // metatable is Option<GcPtr<LuaTable>> — for our purposes, None = 0.
+        cmp_imm(&mut self.code, RSCR, 0, 0);
+        self.guard(CC_NE);
+    }
+
+    /// ULOAD: closed upvalue read through a constant address.
+    fn asm_uload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        mov_imm64(&mut self.code, RSCR, addr);
+        ldr_imm(&mut self.code, RSCR, RSCR, 0, 64);
+        if ins.is_guard() {
+            asr_imm(&mut self.code, RSCR2, RSCR, 47);
+            let expected = (!(irt_type(ins.t()) as u32)) as u8;
+            cmp_imm(&mut self.code, RSCR2, expected as u32, 0);
+            self.guard(CC_NE);
+        }
+        let r = self.cur;
+        str_imm(&mut self.code, RSCR, RENV, Self::env_disp(r), 64);
+        self.env_valid[Self::iidx(r)] = true;
+        Ok(())
     }
 
     // -- SLOAD ---------------------------------------------------------------
