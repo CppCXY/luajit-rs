@@ -1324,6 +1324,18 @@ impl<'a> Asm<'a> {
             if self.needs_env[Self::iidx(p.phi)] {
                 str_fp(&mut self.code, d, RENV, Self::env_disp(p.phi));
             }
+            // After moving the value into `d`, restore the lref's register
+            // mapping so that reg_of(lref) works in the next iteration.
+            // Also map the pre-loop source ref (which opt_loop resolves
+            // via tref_ref, e.g. MUL_pre_ref) to `d` so the post-loop body
+            // can find the value via reg_of instead of loading from env.
+            self.loc[Self::iidx(p.lref)] = Some(d);
+            self.owner[d as usize] = Owner::Ins(p.lref);
+            let post_ir = self.tr.ir.ir(p.rref);
+            let pre_ref = post_ir.op1 as IRRef;
+            if pre_ref >= REF_BIAS && p.num && self.loc[Self::iidx(pre_ref)].is_none() {
+                self.loc[Self::iidx(pre_ref)] = Some(d);
+            }
         } else {
             debug_assert!(self.env_valid[Self::iidx(p.rref)]);
             ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.rref), 64);
