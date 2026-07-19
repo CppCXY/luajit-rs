@@ -467,12 +467,12 @@ fn fmov_reg(code: &mut Vec<u8>, dd: u8, dn: u8) {
 
 /// FMOV (GPR to FP): `fmov dd, xn`.
 fn fmov_gpr_fp(code: &mut Vec<u8>, dd: u8, xn: u8) {
-    emit32(code, 0x9E660000 | ((xn as u32) << 5) | dd as u32);
+    emit32(code, 0x9E670000 | ((xn as u32) << 5) | dd as u32);
 }
 
 /// FMOV (FP to GPR): `fmov xd, dn`.
 fn fmov_fp_gpr(code: &mut Vec<u8>, xd: u8, dn: u8) {
-    emit32(code, 0x9E670000 | ((dn as u32) << 5) | xd as u32);
+    emit32(code, 0x9E660000 | ((dn as u32) << 5) | xd as u32);
 }
 
 /// FADD: `fadd dd, dn, dm`.
