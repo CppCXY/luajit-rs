@@ -278,13 +278,14 @@ fn and_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32) {
 
 /// LDR (register, 64-bit, uxtw scaled): `ldr rd, [rn, rm, uxtw #3]`.
 fn ldr_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    // 10_1110_0000_1_mmmmm_011_1_10_nnnnn_ttttt
-    emit32(code, 0xB8607800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    // (A64I_LDRx ^ A64I_LS_R) | A64I_LS_UXTWx | A64I_LS_SH = 0xF8605800
+    emit32(code, 0xF8605800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// STR (register, 64-bit, uxtw scaled): `str rd, [rn, rm, uxtw #3]`.
 fn str_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    emit32(code, 0xB8207800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    // (A64I_STRx ^ A64I_LS_R) | A64I_LS_UXTWx | A64I_LS_SH = 0xF8205800
+    emit32(code, 0xF8205800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// REV32 (reverse bytes in 32-bit word, zero-extending).
@@ -304,15 +305,15 @@ fn ldr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
 /// STR (FP, unsigned offset): `str dn, [rn, #offset]`.
 fn str_fp(code: &mut Vec<u8>, dn: u8, rn: u8, offset: i32) {
     debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
-    // SIMD&FP store, unsigned offset, 64-bit: 11_1111_0100 ...
-    emit32(code, 0xFC000000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dn as u32);
+    // SIMD&FP store, unsigned offset, 64-bit: A64I_STRd = 0xFD000000
+    emit32(code, 0xFD000000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dn as u32);
 }
 
 /// LDR (FP, unsigned offset): `ldr dd, [rn, #offset]`.
 fn ldr_fp(code: &mut Vec<u8>, dd: u8, rn: u8, offset: i32) {
     debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
-    // SIMD&FP load, unsigned offset, 64-bit: 11_1111_0101 ...
-    emit32(code, 0xFC400000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dd as u32);
+    // SIMD&FP load, unsigned offset, 64-bit: A64I_LDRd = 0xFD400000
+    emit32(code, 0xFD400000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dd as u32);
 }
 
 /// STR (GPR, unsigned offset): `str rd, [rn, #offset]`.
@@ -325,13 +326,14 @@ fn str_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
 
 /// LDR (register, 64-bit, lsl scaled): `ldr rd, [rn, rm, lsl #3]`.
 fn ldr_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    // 10_1110_0000_1_mmmmm_011_1_10_nnnnn_ttttt (LDR, LSL #3 = UXTX #3 for 64-bit)
-    emit32(code, 0xF8607800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    // (A64I_LDRx ^ A64I_LS_R) | A64I_LS_SXTXx | A64I_LS_SH = 0xF860F800
+    emit32(code, 0xF860F800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// STR (register, 64-bit, lsl scaled): `str rd, [rn, rm, lsl #3]`.
 fn str_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    emit32(code, 0xF8207800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    // (A64I_STRx ^ A64I_LS_R) | A64I_LS_SXTXx | A64I_LS_SH = 0xF820F800
+    emit32(code, 0xF820F800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// STP (store pair, offset): `stp rt1, rt2, [rn, #offset]`.
@@ -436,17 +438,17 @@ fn to_arm64_cc(x86_cc: u8) -> u8 {
 
 /// FMOV (register): `fmov dd, dn` (64-bit float).
 fn fmov_reg(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x9E604000 | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E604000 | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FMOV (GPR to FP): `fmov dd, xn`.
 fn fmov_gpr_fp(code: &mut Vec<u8>, dd: u8, xn: u8) {
-    emit32(code, 0x9E670000 | ((xn as u32) << 5) | dd as u32);
+    emit32(code, 0x9E660000 | ((xn as u32) << 5) | dd as u32);
 }
 
 /// FMOV (FP to GPR): `fmov xd, dn`.
 fn fmov_fp_gpr(code: &mut Vec<u8>, xd: u8, dn: u8) {
-    emit32(code, 0x9E660000 | ((dn as u32) << 5) | xd as u32);
+    emit32(code, 0x9E670000 | ((dn as u32) << 5) | xd as u32);
 }
 
 /// FADD: `fadd dd, dn, dm`.
@@ -512,20 +514,20 @@ fn frintz(code: &mut Vec<u8>, dd: u8, dn: u8) {
 /// FCVTZS (FP to int32, truncating): `fcvtzs wd, dn`. D-register
 /// source (64-bit), W-register destination (32-bit), toward-zero.
 fn fcvtzs_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
-    // sf=0, type=01(D), rmode=11(toward-zero), opcode=110001
-    emit32(code, 0x1E21C000 | ((dn as u32) << 5) | wd as u32);
+    // A64I_FCVT_S32_F64 = 0x1e780000  (rmode=11 toward-zero)
+    emit32(code, 0x1E780000 | ((dn as u32) << 5) | wd as u32);
 }
 
 /// FCVTNS (FP to int32, round-to-nearest-even): `fcvtns wd, dn`.
 fn fcvtns_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
-    emit32(code, 0x1E218000 | ((dn as u32) << 5) | wd as u32);
+    emit32(code, 0x1E700000 | ((dn as u32) << 5) | wd as u32);
 }
 
 /// SCVTF (int32 to FP, 64-bit): `scvtf dd, wn`. W-register source
 /// (32-bit), D-register destination (64-bit), signed.
 fn scvtf_w(code: &mut Vec<u8>, dd: u8, wn: u8) {
-    // sf=1(D-dest), type=00(W-src 32-bit), rmode=00, opcode=010001
-    emit32(code, 0x9E204400 | ((wn as u32) << 5) | dd as u32);
+    // A64I_FCVT_F64_S32 = 0x1e620000
+    emit32(code, 0x1E620000 | ((wn as u32) << 5) | dd as u32);
 }
 
 /// FCMP: `fcmp dn, dm`.
