@@ -20,6 +20,7 @@ pub struct GcHeap {
     pub tables: Pool<LuaTable>,
     pub funcs: Pool<GcFunc>,
     pub upvals: Pool<crate::func::Upval>,
+    pub cdatas: Pool<crate::runtime::cdata::CData>,
     /// Threads (the main thread and all coroutines). Coroutines are
     /// collected by the GC like any other object; the main thread is a
     /// permanent root.
@@ -39,6 +40,7 @@ impl Default for GcHeap {
             tables: Pool::with_page_size(64),
             funcs: Pool::with_page_size(64),
             upvals: Pool::with_page_size(128),
+            cdatas: Pool::with_page_size(32),
             threads: Pool::with_page_size(4),
             total: 0,
             threshold: crate::gc::GC_THRESHOLD_MIN,

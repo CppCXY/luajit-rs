@@ -194,6 +194,18 @@ impl LuaValue {
         self.itype() == LJ_TFUNC
     }
 
+    pub fn is_cdata(self) -> bool {
+        self.itype() == LJ_TCDATA
+    }
+
+    pub fn as_cdata(self) -> Option<GcPtr<crate::runtime::cdata::CData>> {
+        if self.is_cdata() { GcPtr::from_addr(self.gc_addr()) } else { None }
+    }
+
+    pub fn cdata(p: GcPtr<crate::runtime::cdata::CData>) -> LuaValue {
+        LuaValue::gcval(LJ_TCDATA, p.addr())
+    }
+
     /// `tvisgcv`: value references a GC object (string, table, function, ...).
     pub fn is_gcv(self) -> bool {
         (LJ_TISGCV..=LJ_TSTR).contains(&self.itype())
