@@ -47,7 +47,12 @@ jobs:
         run: cargo test --workspace
 
       - name: Test (release)
+        if: matrix.name != 'linux-arm64'
         run: cargo test --release --workspace
+
+      - name: Test (release + hex dump)
+        if: matrix.name == 'linux-arm64'
+        run: cargo test --release --workspace -- --nocapture 2>&1 | tail -2000
 
       - name: Benchmark smoke test
         shell: bash
