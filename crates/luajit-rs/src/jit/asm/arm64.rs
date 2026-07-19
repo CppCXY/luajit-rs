@@ -284,20 +284,15 @@ fn and_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32) {
     emit32(code, sf | 0x0A000000 | ((2u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
-/// LDR (register, scaled, zero-extended word): `ldr rd, [rn, rm, uxtw #3]`.
+/// LDR (register, 64-bit, uxtw scaled): `ldr rd, [rn, rm, uxtw #3]`.
 fn ldr_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 30; // 64-bit
-    let extend = 0b010u32 << 13; // UXTW
-    let shift = 3u32 << 12; // lsl #3
-    emit32(code, sf | 0x38604000 | extend | shift | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    // 10_1110_0000_1_mmmmm_011_1_10_nnnnn_ttttt
+    emit32(code, 0xB8607800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
-/// STR (register, scaled, zero-extended word): `str rd, [rn, rm, uxtw #3]`.
+/// STR (register, 64-bit, uxtw scaled): `str rd, [rn, rm, uxtw #3]`.
 fn str_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 30; // 64-bit
-    let extend = 0b010u32 << 13;
-    let shift = 3u32 << 12;
-    emit32(code, sf | 0x38204000 | extend | shift | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(code, 0xB8207800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// REV32 (reverse bytes in 32-bit word, zero-extending).
@@ -306,57 +301,45 @@ fn rev32(code: &mut Vec<u8>, rd: u8, rn: u8) {
     emit32(code, sf | 0x5AC00800 | ((rn as u32) << 5) | rd as u32);
 }
 
-/// LDR (immediate): `ldr rd, [rn, #offset]` (scaled, 9-bit signed).
+/// LDR (GPR, unsigned offset): `ldr rd, [rn, #offset]`.
 fn ldr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
-    debug_assert!(offset >= -256 && offset <= 255 && offset % 8 == 0);
-    let sf = if size == 64 { 1u32 << 30 } else { 0 };
-    let imm = ((offset.abs() / 8) as u32) << 10;
-    let u_bit = if offset >= 0 { 1u32 << 24 } else { 0 };
-    emit32(code, sf | 0x39400000 | u_bit | imm | ((rn as u32) << 5) | rd as u32);
+    debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
+    let base = if size == 64 { 0xF9400000u32 } else { 0xB9400000u32 };
+    emit32(code, base | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | rd as u32);
 }
 
-/// STR (FP register): `str dn, [rn, #offset]` (scaled, 9-bit signed).
+/// STR (FP, unscaled offset): `str dn, [rn, #offset]`.
 fn str_fp(code: &mut Vec<u8>, dn: u8, rn: u8, offset: i32) {
     debug_assert!(offset >= -256 && offset <= 255 && offset % 8 == 0);
-    let imm = ((offset.abs() / 8) as u32) << 10;
+    let imm9 = ((offset.abs() / 8) as u32) & 0x1FF;
     let u_bit = if offset >= 0 { 1u32 << 24 } else { 0 };
-    let v_bit = 1u32 << 26; // FP/SIMD
-    emit32(code, v_bit | 0x3D000000 | u_bit | imm | ((rn as u32) << 5) | dn as u32);
+    emit32(code, 0x3C000000 | u_bit | (imm9 << 12) | ((rn as u32) << 5) | dn as u32);
 }
 
-/// LDR (FP register): `ldr dd, [rn, #offset]` (scaled, 9-bit signed).
+/// LDR (FP, unscaled offset): `ldr dd, [rn, #offset]`.
 fn ldr_fp(code: &mut Vec<u8>, dd: u8, rn: u8, offset: i32) {
     debug_assert!(offset >= -256 && offset <= 255 && offset % 8 == 0);
-    let imm = ((offset.abs() / 8) as u32) << 10;
+    let imm9 = ((offset.abs() / 8) as u32) & 0x1FF;
     let u_bit = if offset >= 0 { 1u32 << 24 } else { 0 };
-    let v_bit = 1u32 << 26;
-    emit32(code, v_bit | 0x3D400000 | u_bit | imm | ((rn as u32) << 5) | dd as u32);
+    emit32(code, 0x3C400000 | u_bit | (imm9 << 12) | ((rn as u32) << 5) | dd as u32);
 }
 
-/// STR (GPR): `str rd, [rn, #offset]` (scaled, 9-bit signed).
+/// STR (GPR, unsigned offset): `str rd, [rn, #offset]`.
 fn str_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
-    let sf = if size == 64 { 1u32 << 30 } else { 0 };
-    let imm = ((offset.abs() / 8) as u32) << 10;
-    let u_bit = if offset >= 0 { 1u32 << 24 } else { 0 };
-    emit32(code, sf | 0x39000000 | u_bit | imm | ((rn as u32) << 5) | rd as u32);
+    debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
+    let base = if size == 64 { 0xF9000000u32 } else { 0xB9000000u32 };
+    emit32(code, base | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | rd as u32);
 }
 
-/// LDR (register): `ldr rd, [rn, rm, lsl #3]`.
+/// LDR (register, 64-bit, lsl scaled): `ldr rd, [rn, rm, lsl #3]`.
 fn ldr_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 30; // 64-bit
-    emit32(
-        code,
-        sf | 0x38606800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
+    // 10_1110_0000_1_mmmmm_011_1_10_nnnnn_ttttt (LDR, LSL #3 = UXTX #3 for 64-bit)
+    emit32(code, 0xF8607800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
-/// STR (register): `str rd, [rn, rm, lsl #3]`.
+/// STR (register, 64-bit, lsl scaled): `str rd, [rn, rm, lsl #3]`.
 fn str_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 30; // 64-bit
-    emit32(
-        code,
-        sf | 0x38206800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
+    emit32(code, 0xF8207800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// STP (store pair): `stp rt1, rt2, [rn, #offset]!` (pre-index).
@@ -558,19 +541,23 @@ fn frintz(code: &mut Vec<u8>, dd: u8, dn: u8) {
     emit32(code, 0x1E65C000 | ((dn as u32) << 5) | dd as u32);
 }
 
-/// FCVTZS (FP to int32, truncating): `fcvtzs wd, dn`.
+/// FCVTZS (FP to int32, truncating): `fcvtzs wd, dn`. D-register
+/// source (64-bit), W-register destination (32-bit), toward-zero.
 fn fcvtzs_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
-    emit32(code, 0x1E380000 | (1u32 << 19) | ((dn as u32) << 5) | wd as u32);
+    // sf=0, type=01(D), rmode=11(toward-zero), opcode=110001
+    emit32(code, 0x1E21C000 | ((dn as u32) << 5) | wd as u32);
 }
 
 /// FCVTNS (FP to int32, round-to-nearest-even): `fcvtns wd, dn`.
 fn fcvtns_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
-    emit32(code, 0x1E280000 | (1u32 << 19) | ((dn as u32) << 5) | wd as u32);
+    emit32(code, 0x1E218000 | ((dn as u32) << 5) | wd as u32);
 }
 
-/// SCVTF (int32 to FP): `scvtf dd, wn`.
+/// SCVTF (int32 to FP, 64-bit): `scvtf dd, wn`. W-register source
+/// (32-bit), D-register destination (64-bit), signed.
 fn scvtf_w(code: &mut Vec<u8>, dd: u8, wn: u8) {
-    emit32(code, 0x1E220000 | (1u32 << 16) | ((wn as u32) << 5) | dd as u32);
+    // sf=1(D), type=00(W), rmode=00, opcode=010001
+    emit32(code, 0x1E204400 | ((wn as u32) << 5) | dd as u32);
 }
 
 /// FCMP: `fcmp dn, dm`.
@@ -630,6 +617,7 @@ enum Owner {
     Konst(IRRef),
 }
 
+#[derive(Clone, Copy)]
 struct PhiInfo {
     phi: IRRef,
     lref: IRRef,
@@ -653,6 +641,8 @@ struct Asm<'a> {
     needs_env: Vec<bool>,
     env_valid: Vec<bool>,
     owner: [Owner; NREG],
+    /// Snapshot of `owner` at the LOOP instruction (for `asm_loop_back`).
+    s0: [Owner; NREG],
     loc: Vec<Option<u8>>,
     loop_pos: Option<usize>,
     link: Option<*const u8>,
@@ -687,6 +677,7 @@ impl<'a> Asm<'a> {
             needs_env: vec![false; (nins - REF_BIAS) as usize],
             env_valid: vec![false; (nins - REF_BIAS) as usize],
             owner: [Owner::None; NREG],
+            s0: [Owner::None; NREG],
             loc: vec![None; (nins - REF_BIAS) as usize],
             loop_pos: None,
             link,
@@ -1122,6 +1113,136 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
+    // -- Loop optimisation / Tail --------------------------------------------
+
+    fn asm_loop_head(&mut self) {
+        for rg in 0..NREG as u8 {
+            let dead = match self.owner[rg as usize] {
+                Owner::Ins(o) => self.last_use[Self::iidx(o)] <= self.cur,
+                Owner::Konst(k) => self.klast_use[Self::kidx(k)] <= self.cur,
+                Owner::None => false,
+            };
+            if dead { self.steal_quiet(rg); }
+        }
+        for rg in 0..NREG as u8 {
+            if let Owner::Ins(o) = self.owner[rg as usize] {
+                if self.phis.iter().any(|p| p.num && p.lref == o) { continue; }
+                let i = Self::iidx(o);
+                if !self.env_valid[i] {
+                    str_fp(&mut self.code, rg, RENV, Self::env_disp(o));
+                    self.env_valid[i] = true;
+                }
+            }
+        }
+        for pi in 0..self.phis.len() {
+            let p = self.phis[pi];
+            let i = Self::iidx(p.lref);
+            if p.num && self.loc[i].is_some() && !self.needs_env[i] {
+                self.env_valid[i] = false;
+            }
+        }
+        self.s0 = self.owner;
+        self.loop_pos = Some(self.code.len());
+    }
+
+    fn asm_loop_back(&mut self, loop_pos: usize) {
+        let s0 = self.s0;
+        let phis = std::mem::take(&mut self.phis);
+        let homes: Vec<Option<u8>> = phis.iter()
+            .map(|p| (0..NREG as u8).find(|&rg| s0[rg as usize] == Owner::Ins(p.lref)))
+            .collect();
+        let dstset: u16 = homes.iter().flatten().fold(0, |m, &rg| m | Self::pin(rg));
+        let direct = phis.iter().all(|p| {
+            if p.rref < REF_BIAS { return true; }
+            if let Some(rg) = self.reg_of(p.rref) && p.num {
+                return dstset & Self::pin(rg) == 0;
+            }
+            !phis.iter().any(|q| q.lref == p.rref)
+        });
+        if direct {
+            for (p, home) in phis.iter().zip(homes.iter()) {
+                self.phi_move(p, *home);
+            }
+        } else {
+            // Buffered: read right values into PHI env slots, then land.
+            for p in &phis {
+                if p.rref >= REF_BIAS {
+                    if p.num && let Some(rg) = self.reg_of(p.rref) {
+                        str_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
+                    } else {
+                        ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.rref), 64);
+                        str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
+                    }
+                } else {
+                    mov_imm64(&mut self.code, RSCR,
+                        super::super::exec::const_bits(&self.tr.ir, p.rref));
+                    str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
+                }
+            }
+            for (p, home) in phis.iter().zip(homes.iter()) {
+                if p.num && let Some(rg) = *home {
+                    ldr_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
+                    if self.needs_env[Self::iidx(p.lref)] {
+                        str_fp(&mut self.code, rg, RENV, Self::env_disp(p.lref));
+                    }
+                } else {
+                    ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
+                    str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
+                }
+            }
+        }
+        // Restore invariants from env.
+        for rg in 0..NREG as u8 {
+            let so = s0[rg as usize];
+            if so == Owner::None || so == self.owner[rg as usize] { continue; }
+            if phis.iter().any(|p| so == Owner::Ins(p.lref)) { continue; }
+            match so {
+                Owner::Ins(x) => {
+                    ldr_fp(&mut self.code, rg, RENV, Self::env_disp(x));
+                    self.owner[rg as usize] = Owner::Ins(x);
+                    self.loc[Self::iidx(x)] = Some(rg);
+                }
+                Owner::Konst(k) => {
+                    mov_imm64(&mut self.code, RSCR,
+                        super::super::exec::const_bits(&self.tr.ir, k));
+                    fmov_gpr_fp(&mut self.code, rg, RSCR);
+                    self.owner[rg as usize] = Owner::Konst(k);
+                }
+                Owner::None => unreachable!(),
+            }
+        }
+        // Jump back.
+        let offset = loop_pos as i32 - self.code.len() as i32;
+        b_imm(&mut self.code, offset, false);
+    }
+
+    fn phi_move(&mut self, p: &PhiInfo, home: Option<u8>) {
+        if p.rref < REF_BIAS {
+            mov_imm64(&mut self.code, RSCR,
+                super::super::exec::const_bits(&self.tr.ir, p.rref));
+            if p.num {
+                if let Some(rg) = home {
+                    fmov_gpr_fp(&mut self.code, rg, RSCR);
+                    if self.needs_env[Self::iidx(p.lref)] {
+                        str_fp(&mut self.code, rg, RENV, Self::env_disp(p.lref));
+                    }
+                } else {
+                    str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
+                }
+            }
+        } else if p.num && let Some(rg) = self.reg_of(p.rref) {
+            let d = home.unwrap_or(0);
+            if d != rg { fmov_reg(&mut self.code, d, rg); }
+            if self.needs_env[Self::iidx(p.lref)] {
+                str_fp(&mut self.code, d, RENV, Self::env_disp(p.lref));
+            }
+        } else {
+            debug_assert!(self.env_valid[Self::iidx(p.rref)]);
+            ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.rref), 64);
+            str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
+        }
+    }
+
     // -- Emit loop -----------------------------------------------------------
 
     fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
@@ -1156,23 +1277,7 @@ impl<'a> Asm<'a> {
             let ins = *self.tr.ir.ir(r);
             match ins.op() {
                 IROp::NOP | IROp::BASE | IROp::PHI => {}
-                IROp::LOOP => {
-                    // Legacy loop tail: restore the final snapshot into
-                    // the Lua stack and branch back to the head.
-                    let head_ofs = inner as i32 - self.code.len() as i32;
-                    self.snapidx = self.tr.snap.len() - 1;
-                    self.tail_restore(self.snapidx);
-                    // Flush the live FP snapshot values to env before
-                    // restarting (the head SLOADs re-read from env for FP,
-                    // and from the Lua stack for GC values).
-                    let flush = self.exit_flush_set(self.snapidx);
-                    for (rg, rref) in &flush {
-                        str_fp(&mut self.code, *rg, RENV, Self::env_disp(*rref));
-                    }
-                    b_imm(&mut self.code, head_ofs, false);
-                    // Stop the main loop: tail_restore + b consume the rest.
-                    r = nins;
-                }
+                IROp::LOOP => self.asm_loop_head(),
                 IROp::SLOAD => self.asm_sload(&ins)?,
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX => {
                     self.asm_arith(&ins)?;
@@ -1254,23 +1359,70 @@ impl<'a> Asm<'a> {
             r += 1;
         }
 
-        // Tail / final snapshot
+        // Tail section
         let lastsnap = self.tr.snap.len() - 1;
-        self.snapidx = lastsnap;
-        self.tail_restore(lastsnap);
-        let flush = self.exit_flush_set(lastsnap);
-        for (rg, rref) in &flush {
-            str_fp(&mut self.code, *rg, RENV, Self::env_disp(*rref));
+        let looping = self.tr.linktype == TraceLink::Loop && self.tr.link == self.tr.traceno;
+        let recursing = matches!(self.tr.linktype, TraceLink::Uprec | TraceLink::Tailrec)
+            && self.tr.link == self.tr.traceno;
+        if looping {
+            if let Some(lp) = self.loop_pos {
+                self.asm_loop_back(lp);
+            } else {
+                self.snapidx = lastsnap;
+                self.tail_restore(lastsnap);
+                let head_ofs = inner as i32 - self.code.len() as i32;
+                b_imm(&mut self.code, head_ofs, false);
+            }
+        } else if recursing {
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
+            // rax_equiv(x0) = RBASE + delta + headroom
+            mov_reg(&mut self.code, 0, RBASE);
+            add_imm(&mut self.code, 0, 0, (delta + (255 + 8) * 8) as u32, 0);
+            mov_imm64(&mut self.code, 1, super::super::exec::stack_end_cell_addr());
+            ldr_imm(&mut self.code, 1, 1, 0, 64);
+            cmp_reg(&mut self.code, 0, 1);
+            self.guard(CC_HI);
+            if delta != 0 {
+                add_imm(&mut self.code, RBASE, RBASE, delta as u32, 0);
+            }
+            let inner_ofs = inner as i32 - self.code.len() as i32;
+            b_imm(&mut self.code, inner_ofs, false);
+        } else if self.tr.linktype == TraceLink::Root && let Some(target) = self.link {
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
+            if delta != 0 {
+                mov_reg(&mut self.code, 0, RBASE);
+                add_imm(&mut self.code, 0, 0, (delta + (255 + 8) * 8) as u32, 0);
+                mov_imm64(&mut self.code, 1, super::super::exec::stack_end_cell_addr());
+                ldr_imm(&mut self.code, 1, 1, 0, 64);
+                cmp_reg(&mut self.code, 0, 1);
+                self.guard(CC_HI);
+                add_imm(&mut self.code, RBASE, RBASE, delta as u32, 0);
+            }
+            mov_imm64(&mut self.code, 0, target as u64);
+            br_reg(&mut self.code, 0, false); // br x0
+        } else {
+            // None/Stitch: exit through final snapshot
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            let flush = self.exit_flush_set(lastsnap);
+            for (rg, rref) in &flush {
+                str_fp(&mut self.code, *rg, RENV, Self::env_disp(*rref));
+            }
+            let ec = self.exit_code(lastsnap);
+            mov_imm64(&mut self.code, 0, ec as u64);
+            // Fall through to epilogue
         }
 
-        // Exit code in w0
-        let ec = self.exit_code(lastsnap);
-        mov_imm64(&mut self.code, 0, ec as u64);
-
         // -- Epilogue --
+        // x0 (w0) holds the exit code from the exit path above.
+        // Report BASE back through the cell, then restore and return.
         let epilogue = self.code.len();
-        mov_imm64(&mut self.code, RSCR, super::super::exec::exit_base_cell_addr());
-        str_imm(&mut self.code, RBASE, RSCR, 0, 64);
+        mov_imm64(&mut self.code, RSCR2, super::super::exec::exit_base_cell_addr());
+        str_imm(&mut self.code, RBASE, RSCR2, 0, 64);
         ldp_offset(&mut self.code, 27, 28, 31, 80);
         ldp_offset(&mut self.code, 25, 26, 31, 64);
         ldp_offset(&mut self.code, 23, 24, 31, 48);
