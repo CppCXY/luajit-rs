@@ -89,7 +89,7 @@ pub const JIT_PARAM_DEFAULT: [i32; JIT_P_MAX] = [
     500,  // maxirconst
     100,  // maxside
     500,  // maxsnap
-    0,    // minstitch
+    10,   // minstitch
     56,   // hotloop
     10,   // hotexit
     4,    // tryside

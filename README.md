@@ -36,7 +36,7 @@ Measured on Windows x64 against PUC Lua (`lua`), lower is better:
 | Benchmark          | luajit-rs | PUC Lua | Ratio |
 |--------------------|----------:|--------:|------:|
 | fannkuch-redux (9) |    0.096s |  0.319s | 0.30x |
-| binary-trees (14)  |    1.560s |  1.211s | 1.29x |
+| binary-trees (14)  |    1.658s |  1.260s | 1.23x |
 | nbody (500k)       |    0.941s |  1.201s | 0.78x |
 | spectral-norm (150)|    0.019s |  0.050s | 0.38x |
 | mandelbrot (600)   |    0.043s |  0.254s | 0.17x |
@@ -122,9 +122,16 @@ Not yet implemented: full `io` (seek, popen, stdout objects),
       string comparisons — IRCALL helpers)
 - [x] Table allocation and library ops on trace (TNEW/TDUP, `#t`,
       `table.insert`/`remove` array fast paths, `table.concat`)
-- [ ] Recursive-call traces (up/down recursion — the binary-trees
-      hot path is recursive and currently stays in the interpreter)
-- [ ] Trace stitching across NYI bytecodes/builtins
+- [x] Recursive-call traces: up/tail recursion (self-linking function
+      traces), hot-call trace entry (JFUNCF), call-linked trace chains
+      with on-trace frame pushes and native base-shifting tails
+- [x] Trace stitching: partial traces across NYI bytecodes. When
+      recording hits an unsupported bytecode (CAT, string.format, …),
+      the prefix trace is kept as a Stitch link — the interpreter
+      handles the NYI off-trace and the prefix runs natively on every
+      subsequent iteration. (minstitch=10 IR ins threshold)
+- [ ] Down-recursion / return-following (the unwind side of recursion
+      still interprets; binary-trees needs it to pull ahead)
 - [ ] ARM64 machine-code backend
 - [x] `io` library subset and a `require` loader
 - [ ] Cheaper table allocation + incremental GC (allocation-bound

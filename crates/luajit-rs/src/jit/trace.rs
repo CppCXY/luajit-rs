@@ -317,9 +317,31 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             false
         }
         Err(e) => {
-            g.jit.err = e;
-            g.jit.state = TraceState::Err;
-            trace_abort(g);
+            // Keep a partial root trace (trace stitching): when the
+            // root trace has enough IR instructions, stop it as a
+            // Stitch prefix — the interpreter handles the NYI off-
+            // trace and the prefix runs natively next time. Side
+            // traces never stitch (a stitch prefix traced from an
+            // exit would just repeat the same NYI).
+            let minstitch = g.jit.param(JitParam::MinStitch) as u32;
+            if minstitch > 0
+                && rec.parent == 0
+                && matches!(e, TraceError::NYIBC | TraceError::NYIFFU)
+                && rec.cur.ir.nins() - super::ir::REF_FIRST >= minstitch
+            {
+                // The snapshot describes the state right before the NYI
+                // bytecode; the interpreter resumes there, executes it
+                // off-trace, and optionally records a continuation.
+                rec.needsnap = false;
+                rec.mergesnap = true;
+                rec.snap_add();
+                rec.cur.linktype = TraceLink::Stitch;
+                trace_stop(g, rec, TraceLink::Stitch, 0);
+            } else {
+                g.jit.err = e;
+                g.jit.state = TraceState::Err;
+                trace_abort(g);
+            }
             false
         }
     }

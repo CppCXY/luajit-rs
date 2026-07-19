@@ -396,7 +396,6 @@ impl<'a> Asm<'a> {
         let head = self.code.len();
 
         let nins = self.tr.ir.nins();
-        let trdump = std::env::var("LUAJIT_RS_TRDUMP").is_ok();
         let mut r = REF_FIRST;
         while r < nins {
             // Same covering-snapshot rule as the portable executor.
@@ -407,7 +406,7 @@ impl<'a> Asm<'a> {
             }
             self.cur = r;
             let ins = *self.tr.ir.ir(r);
-            if trdump {
+            if std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2") {
                 eprintln!(
                     "  tr{} {:#05x} {:04} {:?} {} {} t={}",
                     self.tr.traceno,
