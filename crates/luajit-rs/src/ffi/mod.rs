@@ -5,13 +5,16 @@
 //!
 //! Module layout follows LuaJIT's source organisation:
 //! * `mod.rs`     — Core type definitions (CTInfo, CType, CTState)
-//! * `parser.rs`  — C declaration parser (ffi.cdef) [TODO]
+//! * `parser.rs`  — C declaration parser (ffi.cdef)
 //! * `ccall.rs`   — C function calling convention [TODO]
 //! * `lib.rs`     — Lua FFI library API (ffi.new, ffi.cast, etc.) [TODO]
 //!
 //! CData objects live in `crate::runtime::cdata` — use `LuaValue::cdata()`
 //! and `LuaValue::as_cdata()` for construction / access.
 //! Reference: LuaJIT/src/lj_ctype.h, lj_cdata.h, lj_cparse.h
+
+pub mod parser;
+pub mod lib;
 
 // ---------------------------------------------------------------------------
 // C type numbers (enum from lj_ctype.h)
@@ -207,8 +210,7 @@ pub enum CTypeID {
     PCChar,
     PUInt8,
     ACChar,
-    CTypeID,
-    // MAX
+    CTypeIDType, // CTID_CTYPEID — cdata holding a type ID
     Max = 65536,
 }
 
@@ -245,18 +247,16 @@ pub struct CType {
     pub name: u64, // GCRef<GCstr> — bit pattern, 0 = no name
 }
 
-// ---------------------------------------------------------------------------
-// CTState: C type system state
-// ---------------------------------------------------------------------------
-
 pub const CTHASH_SIZE: usize = 128;
 
-/// C type system state — owns the type table and iteration state.
+/// C type system state.
 pub struct CTState {
     pub tab: Vec<CType>,
     pub top: u32,
-    pub miscmap: u64,     // GCRef<GCtab>
+    pub miscmap: u64,
     pub hash: [u16; CTHASH_SIZE],
+    /// Typedef name → type ID index (for ffi.typeof/ffi.new name lookup).
+    pub names: std::collections::HashMap<String, u32>,
 }
 
 impl CTState {
@@ -266,12 +266,12 @@ impl CTState {
             top: 0,
             miscmap: 0,
             hash: [u16::MAX; CTHASH_SIZE],
+            names: std::collections::HashMap::new(),
         };
         cts.init_predefined();
         cts
     }
 
-    /// Pre-populate the type table with LuaJIT's predefined types (CTTYDEF).
     fn init_predefined(&mut self) {
         use ctinfo::*;
 
@@ -370,8 +370,11 @@ impl CTState {
     pub fn raw(&self, mut id: u32) -> &CType {
         loop {
             let ct = self.get(id);
-            if !ctype_isattrib(ct.info) { return ct; }
-            id = ctype_cid(ct.info);
+            if ctype_isattrib(ct.info) || ctype_istypedef(ct.info) {
+                id = ctype_cid(ct.info);
+            } else {
+                return ct;
+            }
         }
     }
 

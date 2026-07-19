@@ -120,6 +120,8 @@ pub struct GlobalState {
     pub cur_l: Option<StateRef>,
     /// The JIT compiler state (LuaJIT embeds `jit_State` in `GG_State`).
     pub jit: crate::jit::JitState,
+    /// FFI C type system (lazy-initialised by `ffi.load` / first FFI call).
+    pub cts: Option<crate::ffi::CTState>,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
@@ -154,6 +156,7 @@ impl GlobalState {
             mmname,
             cur_l: None,
             jit: crate::jit::JitState::new(),
+            cts: None,
             boot_time: boot,
             main: None,
         }

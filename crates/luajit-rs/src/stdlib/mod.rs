@@ -23,6 +23,7 @@ pub mod table;
 pub use reg::{LibBuilder, LibTarget};
 
 use crate::err::LuaResult;
+use crate::ffi;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
@@ -168,4 +169,5 @@ pub fn open_libs(l: &mut LuaState) {
     os::open(l);
     io::open(l);
     package::open(l);
+    ffi::lib::open(l);
 }
