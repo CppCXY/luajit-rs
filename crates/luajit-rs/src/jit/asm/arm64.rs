@@ -226,7 +226,8 @@ fn lsr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
     let n = 1u32 << 22;
     let immr = imm as u32;
     let imms = 63u32;
-    emit32(code, sf | 0x13000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
+    // UBFM: sf|10|100110|N|immr|imms|Rn|Rd  (LSR allocates UBFM, not SBFM!)
+    emit32(code, sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// ASR (immediate): `asr rd, rn, #imm`.
@@ -270,10 +271,12 @@ fn ror_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
     emit32(code, 0 | 0x13800000 | 0 | ((imm as u32) << 16) | (31u32 << 10) | ((rn as u32) << 5) | rd as u32);
 }
 
-/// NEG (32-bit): `neg wd, wn`.
+/// NEG (32-bit): `neg wd, wn` (alias of SUB wd, WZR, wn).
 fn neg_w(code: &mut Vec<u8>, rd: u8, rn: u8) {
     let sf = 0u32 << 31;
-    emit32(code, sf | 0x4B0003E0 | ((rn as u32) << 5) | rd as u32);
+    // SUB (shifted register): WZR(w31) as Rn, wn as Rm.
+    // Base 0x4B0003E0 has Rn=31(WZR), imm6=0, shift=00.
+    emit32(code, sf | 0x4B0003E0 | ((rn as u32) << 16) | rd as u32);
 }
 
 /// AND (immediate, 32-bit): `and wd, wn, #imm` (bitmask).
@@ -342,18 +345,6 @@ fn str_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     emit32(code, 0xF8207800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
 }
 
-/// STP (store pair): `stp rt1, rt2, [rn, #offset]!` (pre-index).
-fn stp_pre(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
-    debug_assert!(offset % 8 == 0 && offset >= -512 && offset <= 504);
-    let imm7 = ((offset.abs() / 8) as u32) << 15;
-    let sf = 1u32 << 31;
-    let mode = 0b11u32 << 23;
-    emit32(
-        code,
-        sf | 0x29800000 | mode | imm7 | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt1 as u32,
-    );
-}
-
 /// STP (store pair, offset): `stp rt1, rt2, [rn, #offset]`.
 fn stp_offset(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
     debug_assert!(offset % 8 == 0 && offset >= -512 && offset <= 504);
@@ -373,18 +364,6 @@ fn ldp_offset(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
     emit32(
         code,
         sf | 0x29400000 | (imm7) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt1 as u32,
-    );
-}
-
-/// LDP (load pair, post-index): `ldp rt1, rt2, [rn], #offset`.
-fn ldp_post(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
-    debug_assert!(offset % 8 == 0 && offset >= -512 && offset <= 504);
-    let imm7 = ((offset.abs() / 8) as u32) << 15;
-    let sf = 1u32 << 31;
-    let mode = 0b01u32 << 23;
-    emit32(
-        code,
-        sf | 0x28C00000 | mode | imm7 | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt1 as u32,
     );
 }
 
@@ -556,8 +535,8 @@ fn fcvtns_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
 /// SCVTF (int32 to FP, 64-bit): `scvtf dd, wn`. W-register source
 /// (32-bit), D-register destination (64-bit), signed.
 fn scvtf_w(code: &mut Vec<u8>, dd: u8, wn: u8) {
-    // sf=1(D), type=00(W), rmode=00, opcode=010001
-    emit32(code, 0x1E204400 | ((wn as u32) << 5) | dd as u32);
+    // sf=1(D-dest), type=00(W-src 32-bit), rmode=00, opcode=010001
+    emit32(code, 0x9E204400 | ((wn as u32) << 5) | dd as u32);
 }
 
 /// FCMP: `fcmp dn, dm`.
@@ -1247,9 +1226,9 @@ impl<'a> Asm<'a> {
 
     fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
         // AAPCS64 prologue: x0=base, x1=env
-        // stp x29, x30, [sp, #-256]!  — pre-index, save frame pointer + lr
         const FRAME: i32 = 256;
-        stp_pre(&mut self.code, 29, 30, 31, -FRAME);
+        sub_imm(&mut self.code, 31, 31, FRAME as u32, 0);   // sub sp, sp, #256
+        stp_offset(&mut self.code, 29, 30, 31, 0);           // stp x29, x30, [sp, #0]
         // Save x19-x28 at [sp + 16*k]
         stp_offset(&mut self.code, 19, 20, 31, 16);
         stp_offset(&mut self.code, 21, 22, 31, 32);
@@ -1428,7 +1407,8 @@ impl<'a> Asm<'a> {
         ldp_offset(&mut self.code, 23, 24, 31, 48);
         ldp_offset(&mut self.code, 21, 22, 31, 32);
         ldp_offset(&mut self.code, 19, 20, 31, 16);
-        ldp_post(&mut self.code, 29, 30, 31, FRAME);
+        ldp_offset(&mut self.code, 29, 30, 31, 0);
+        add_imm(&mut self.code, 31, 31, FRAME as u32, 0);    // add sp, sp, #256
         ret(&mut self.code, 30);
 
         // -- Guard-exit stubs --
