@@ -303,32 +303,32 @@ fn rev32(code: &mut Vec<u8>, rd: u8, rn: u8) {
 
 /// LDR (GPR, unsigned offset): `ldr rd, [rn, #offset]`.
 fn ldr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
-    debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
+    let scale = (size / 8) as i32;
+    debug_assert!(offset >= 0 && offset % scale == 0 && offset <= 32760);
     let base = if size == 64 { 0xF9400000u32 } else { 0xB9400000u32 };
-    emit32(code, base | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(code, base | ((offset as u32 / scale as u32) << 10) | ((rn as u32) << 5) | rd as u32);
 }
 
-/// STR (FP, unscaled offset): `str dn, [rn, #offset]`.
+/// STR (FP, unsigned offset): `str dn, [rn, #offset]`.
 fn str_fp(code: &mut Vec<u8>, dn: u8, rn: u8, offset: i32) {
-    debug_assert!(offset >= -256 && offset <= 255 && offset % 8 == 0);
-    let imm9 = ((offset.abs() / 8) as u32) & 0x1FF;
-    let u_bit = if offset >= 0 { 1u32 << 24 } else { 0 };
-    emit32(code, 0x3C000000 | u_bit | (imm9 << 12) | ((rn as u32) << 5) | dn as u32);
+    debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
+    // SIMD&FP store, unsigned offset, 64-bit: 11_1111_0100 ...
+    emit32(code, 0xFC000000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dn as u32);
 }
 
-/// LDR (FP, unscaled offset): `ldr dd, [rn, #offset]`.
+/// LDR (FP, unsigned offset): `ldr dd, [rn, #offset]`.
 fn ldr_fp(code: &mut Vec<u8>, dd: u8, rn: u8, offset: i32) {
-    debug_assert!(offset >= -256 && offset <= 255 && offset % 8 == 0);
-    let imm9 = ((offset.abs() / 8) as u32) & 0x1FF;
-    let u_bit = if offset >= 0 { 1u32 << 24 } else { 0 };
-    emit32(code, 0x3C400000 | u_bit | (imm9 << 12) | ((rn as u32) << 5) | dd as u32);
+    debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
+    // SIMD&FP load, unsigned offset, 64-bit: 11_1111_0101 ...
+    emit32(code, 0xFC400000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dd as u32);
 }
 
 /// STR (GPR, unsigned offset): `str rd, [rn, #offset]`.
 fn str_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
-    debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
+    let scale = (size / 8) as i32;
+    debug_assert!(offset >= 0 && offset % scale == 0 && offset <= 32760);
     let base = if size == 64 { 0xF9000000u32 } else { 0xB9000000u32 };
-    emit32(code, base | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(code, base | ((offset as u32 / scale as u32) << 10) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// LDR (register, 64-bit, lsl scaled): `ldr rd, [rn, rm, lsl #3]`.
