@@ -42,7 +42,8 @@ impl Interp {
                 if mo.is_func() {
                     match mo.as_func().unwrap().as_ref() {
                         GcFunc::C(cc) => {
-                            let v = self.call_c_fn(cc.f, mo, &[cur, k])?; return Ok(Some(v));
+                            let v = self.call_c_fn(cc.f, mo, &[cur, k])?;
+                            return Ok(Some(v));
                         }
                         GcFunc::Lua(_) => {
                             self.mmcall_cont(Cont::Ra, a, mo, &[cur, k]);
@@ -54,12 +55,15 @@ impl Interp {
             } else {
                 let mo = meta_lookup(self.l().global(), cur, MM::Index);
                 if mo.is_nil() {
-                    return Err(self.l().runtime_error(b"attempt to index a non-table value"));
+                    return Err(self
+                        .l()
+                        .runtime_error(b"attempt to index a non-table value"));
                 }
                 if mo.is_func() {
                     match mo.as_func().unwrap().as_ref() {
                         GcFunc::C(cc) => {
-                            let v = self.call_c_fn(cc.f, mo, &[cur, k])?; return Ok(Some(v));
+                            let v = self.call_c_fn(cc.f, mo, &[cur, k])?;
+                            return Ok(Some(v));
                         }
                         GcFunc::Lua(_) => {
                             self.mmcall_cont(Cont::Ra, a, mo, &[cur, k]);
@@ -122,7 +126,9 @@ impl Interp {
             } else {
                 let mo = meta_lookup(self.l().global(), cur, MM::Newindex);
                 if mo.is_nil() {
-                    return Err(self.l().runtime_error(b"attempt to index a non-table value"));
+                    return Err(self
+                        .l()
+                        .runtime_error(b"attempt to index a non-table value"));
                 }
                 if mo.is_func() {
                     match mo.as_func().unwrap().as_ref() {
@@ -170,7 +176,8 @@ impl Interp {
         if mo.is_func() {
             match mo.as_func().unwrap().as_ref() {
                 GcFunc::C(cc) => {
-                    let v = self.call_c_fn(cc.f, mo, &[rb, rc])?; return Ok(Some(v));
+                    let v = self.call_c_fn(cc.f, mo, &[rb, rc])?;
+                    return Ok(Some(v));
                 }
                 GcFunc::Lua(_) => {
                     self.mmcall_cont(Cont::Ra, a, mo, &[rb, rc]);
@@ -277,7 +284,8 @@ impl Interp {
             let cont = if ne != 0 { Cont::Condf } else { Cont::Condt };
             match mo.as_func().unwrap().as_ref() {
                 GcFunc::C(cc) => {
-                    let v = self.call_c_fn(cc.f, mo, &[o1, o2])?; let is_eq = v.is_truthy();
+                    let v = self.call_c_fn(cc.f, mo, &[o1, o2])?;
+                    let is_eq = v.is_truthy();
                     return Ok(Some(is_eq));
                 }
                 GcFunc::Lua(_) => {
@@ -408,11 +416,7 @@ fn foldarith(mm: MM, b: f64, c: f64) -> f64 {
 /// `func_slot`. Shifts the arguments up one slot, inserts the original
 /// callee as the first argument and installs the metamethod as the callee.
 /// Returns the new argument count.
-pub(super) fn meta_call(
-    l: &mut LuaState,
-    func_slot: usize,
-    nargs: usize,
-) -> LuaResult<usize> {
+pub(super) fn meta_call(l: &mut LuaState, func_slot: usize, nargs: usize) -> LuaResult<usize> {
     let f = l.stack[func_slot];
     let mo = meta_lookup(l.global(), f, MM::Call);
     if !mo.is_func() {

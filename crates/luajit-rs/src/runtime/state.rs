@@ -325,9 +325,7 @@ impl LuaState {
     #[inline]
     pub fn stack_ensure(&mut self, need: usize) {
         if need > self.stack.len() {
-            let new_len = (self.stack.len() * 2)
-                .max(need + 16)
-                .min(STACK_MAX);
+            let new_len = (self.stack.len() * 2).max(need + 16).min(STACK_MAX);
             debug_assert!(
                 new_len <= self.stack.capacity(),
                 "stack overflow: {} > {}",
@@ -370,12 +368,11 @@ impl LuaState {
     /// running C closure.
     pub fn set_upvalue(&mut self, i: usize, v: LuaValue) {
         let f = self.stack[self.base - 2];
-        if let Some(gf) = f.as_func() {
-            if let crate::func::GcFunc::C(cc) = gf.as_mut() {
-                if i < cc.upvals.len() {
-                    cc.upvals[i] = v;
-                }
-            }
+        if let Some(gf) = f.as_func()
+            && let crate::func::GcFunc::C(cc) = gf.as_mut()
+            && i < cc.upvals.len()
+        {
+            cc.upvals[i] = v;
         }
     }
 

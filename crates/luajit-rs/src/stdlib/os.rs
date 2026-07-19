@@ -90,6 +90,7 @@ fn civil_from_days(mut d: i64) -> (i64, i64, i64) {
     (y, m as i64, d as i64)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_fmt(fmt: &[u8], y: i64, mo: i64, d: i64, h: u64, m: u64, s: u64, wday: u32) -> String {
     let mut out = String::new();
     let mut i = 0;

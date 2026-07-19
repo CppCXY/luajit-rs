@@ -86,12 +86,15 @@ fn loop_subst_snap(rec: &mut Record, osnapidx: usize, loopmap: &[SnapEntry], sub
     }
     let nmapofs = rec.cur.snapmap.len() as u32;
     let ofs = osnap.mapofs as usize;
-    let oentries: Vec<SnapEntry> =
-        rec.cur.snapmap[ofs..ofs + osnap.nent as usize].to_vec();
+    let oentries: Vec<SnapEntry> = rec.cur.snapmap[ofs..ofs + osnap.nent as usize].to_vec();
     // Merge the loop-entry slots with the substituted snapshot slots
     // (both are sorted by slot).
     let lslot = |ln: usize| -> u32 {
-        if ln < loopmap.len() { snap_slot(loopmap[ln]) } else { u32::MAX }
+        if ln < loopmap.len() {
+            snap_slot(loopmap[ln])
+        } else {
+            u32::MAX
+        }
     };
     let (mut on, mut ln) = (0usize, 0usize);
     let mut nent = 0u32;
@@ -142,16 +145,20 @@ fn loop_unroll(rec: &mut Record) -> Result<(), TraceError> {
 
     // LOOP separates the pre-roll from the loop body. Its guard bit also
     // forces the first copied snapshot to be a fresh one.
-    rec.cur.ir.emit_ins(IRIns::new(irtg(IROp::LOOP, IRT_NIL), 0, 0));
+    rec.cur
+        .ir
+        .emit_ins(IRIns::new(irtg(IROp::LOOP, IRT_NIL), 0, 0));
 
     // The loop snapshot (the last one) provides fallback substitutions.
     let onsnap = rec.cur.snap.len();
     debug_assert!(onsnap >= 2, "missing loop snapshot");
     let loopsnap = rec.cur.snap[onsnap - 1];
-    debug_assert_eq!(loopsnap.pc, rec.cur.snap[0].pc, "mismatched PC for loop snapshot");
+    debug_assert_eq!(
+        loopsnap.pc, rec.cur.snap[0].pc,
+        "mismatched PC for loop snapshot"
+    );
     let lofs = loopsnap.mapofs as usize;
-    let loopmap: Vec<SnapEntry> =
-        rec.cur.snapmap[lofs..lofs + loopsnap.nent as usize].to_vec();
+    let loopmap: Vec<SnapEntry> = rec.cur.snapmap[lofs..lofs + loopsnap.nent as usize].to_vec();
 
     let mut phi: Vec<IRRef> = Vec::new();
 
@@ -336,7 +343,9 @@ fn loop_emit_phi(
                 rec.cur.ir.ir_mut(rref).set_phi();
             }
             let t = irt_type(rec.cur.ir.ir(lref).t());
-            rec.cur.ir.emit_ins(IRIns::new(irt(IROp::PHI, t), lref, rref));
+            rec.cur
+                .ir
+                .emit_ins(IRIns::new(irt(IROp::PHI, t), lref, rref));
         } else {
             let ir = rec.cur.ir.ir_mut(lref);
             ir.clear_mark();

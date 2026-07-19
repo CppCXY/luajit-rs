@@ -4,7 +4,7 @@
 //! registry (files are OS resources shared across VMs).
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::sync::Mutex;
 
 use crate::err::{LuaError, LuaResult};
@@ -79,7 +79,11 @@ fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
     for (name, f) in entries {
         let sid = l.heap().intern(name);
         let k = l.heap().str_value(sid);
-        let fref = l.heap().alloc_func(GcFunc::C(CClosure { f, env, upvals: Vec::new() }));
+        let fref = l.heap().alloc_func(GcFunc::C(CClosure {
+            f,
+            env,
+            upvals: Vec::new(),
+        }));
         t.as_mut().set(k, LuaValue::func(fref));
     }
     let fd_sid = l.heap().intern(b"__fd");
@@ -111,7 +115,10 @@ fn read_format(l: &mut LuaState, r: &mut dyn BufRead, fmt: LuaValue) -> Result<L
         let sid = l.heap().intern(&buf[..got]);
         return Ok(l.heap().str_value(sid));
     }
-    let spec = fmt.as_string_id().map(|sid| l.str_static(sid)).unwrap_or(b"*l");
+    let spec = fmt
+        .as_string_id()
+        .map(|sid| l.str_static(sid))
+        .unwrap_or(b"*l");
     let kind = *spec.iter().find(|&&c| c != b'*').unwrap_or(&b'l');
     match kind {
         b'l' | b'L' => {
@@ -239,7 +246,10 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
     let result: std::io::Result<()> = match fd {
         None => {
             let mut so = std::io::stdout();
-            chunks.iter().try_for_each(|c| so.write_all(c)).and_then(|_| so.flush())
+            chunks
+                .iter()
+                .try_for_each(|c| so.write_all(c))
+                .and_then(|_| so.flush())
         }
         Some(id) => {
             let mut files = FILES.lock().unwrap();
@@ -369,7 +379,11 @@ fn io_open(l: &mut LuaState) -> LuaResult<i32> {
     let entry = match m {
         "r" => File::open(&path).map(|f| Entry::Read(BufReader::new(f))),
         "w" => File::create(&path).map(Entry::Write),
-        "a" => std::fs::OpenOptions::new().append(true).create(true).open(&path).map(Entry::Write),
+        "a" => std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .map(Entry::Write),
         _ => return ret_fail(l, &format!("invalid mode '{}'", mode)),
     };
     match entry {

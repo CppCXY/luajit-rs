@@ -22,9 +22,9 @@ pub mod table;
 
 pub use reg::{LibBuilder, LibTarget};
 
+use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::value::LuaValue;
-use crate::err::LuaResult;
 
 /// `lua_push` a single result value.
 #[inline]
@@ -102,7 +102,10 @@ pub fn tostring_meta(l: &mut LuaState, v: LuaValue) -> LuaResult<Vec<u8>> {
     // mmcall: place the metamethod and arg above the current frame.
     let saved_top = l.top;
     let fs = l.top + 16;
-    assert!(fs + 16 < crate::state::STACK_MAX, "stack overflow in __tostring");
+    assert!(
+        fs + 16 < crate::state::STACK_MAX,
+        "stack overflow in __tostring"
+    );
     l.stack[fs] = mo;
     // Args start at func_slot + 2.
     l.stack[fs + 2] = v;
@@ -136,7 +139,7 @@ pub fn make_lib(l: &mut LuaState, name: &[u8], entries: &[(&[u8], crate::func::C
     use crate::func::{CClosure, GcFunc};
     let t = l.heap().alloc_table(crate::table::LuaTable::new(
         0,
-        (entries.len() as u32).next_power_of_two().trailing_zeros() as u32,
+        (entries.len() as u32).next_power_of_two().trailing_zeros(),
     ));
     for &(field, f) in entries {
         let sid = l.heap().intern(field);

@@ -24,7 +24,9 @@ use crate::state::LuaState;
 use crate::value::LuaValue;
 
 use super::ir::*;
-use super::{GCtrace, JitParam, SNAP_NORESTORE, SNAPCOUNT_DONE, TraceLink, TraceNo, snap_ref, snap_slot};
+use super::{
+    GCtrace, JitParam, SNAP_NORESTORE, SNAPCOUNT_DONE, TraceLink, TraceNo, snap_ref, snap_slot,
+};
 
 /// Result of running a trace: the bytecode index (into the resume
 /// frame's proto) at which the interpreter resumes.
@@ -75,9 +77,7 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
         // The recursive machine-code tails check their stack headroom
         // against this bound (re-bound each iteration: growth happens
         // only here in Rust).
-        STACK_END.with(|c| {
-            c.set(unsafe { l.stack.as_ptr().add(l.stack.len()) } as u64)
-        });
+        STACK_END.with(|c| c.set(unsafe { l.stack.as_ptr().add(l.stack.len()) } as u64));
         // The traces are owned by the registry inside GlobalState; the
         // executor additionally mutates the Lua stack. Split the borrows
         // via raw pointers — the registry never drops traces while one
@@ -100,10 +100,7 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
         let (exitno, restored, gcexit) = if let Some(mc) = &tr.mcode {
             let entry: extern "C" fn(*mut LuaValue, *mut u64) -> u32 =
                 unsafe { std::mem::transmute(mc.ptr()) };
-            let code = entry(
-                unsafe { l.stack.as_mut_ptr().add(cbase) },
-                env.as_mut_ptr(),
-            ) as usize;
+            let code = entry(unsafe { l.stack.as_mut_ptr().add(cbase) }, env.as_mut_ptr()) as usize;
             // Recursive/call-link tails shift the base register inside
             // the mcode chain: recover the actual exit base from the
             // epilogue's report.
@@ -179,13 +176,11 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
         // trace's own prelude performs the env hand-over.)
         let sidetrace = tr.snap[exitno].sidetrace;
         if sidetrace != 0 {
-            let side_native = unsafe {
-                l.global().jit.trace[sidetrace as usize]
-                    .as_ref()
-                    .expect("linked exit to a freed trace")
-                    .mcode
-                    .is_some()
-            };
+            let side_native = l.global().jit.trace[sidetrace as usize]
+                .as_ref()
+                .expect("linked exit to a freed trace")
+                .mcode
+                .is_some();
             if !side_native && !restored {
                 // The portable side tier reads the Lua stack: materialize.
                 restore_snapshot(l, cbase, tr, &env, exitno);
@@ -204,12 +199,10 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             cbase += tr.snap[exitno].baseslot as usize - 2;
             if cbase != base {
                 let need = {
-                    let lk = unsafe {
-                        l.global().jit.trace[link as usize]
-                            .as_ref()
-                            .expect("link to a freed trace")
-                            .startpt
-                    };
+                    let lk = l.global().jit.trace[link as usize]
+                        .as_ref()
+                        .expect("link to a freed trace")
+                        .startpt;
                     cbase + lk.as_ref().framesize as usize + 8
                 };
                 l.stack_ensure(need);
@@ -253,7 +246,11 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
     // Loop-optimized traces: re-enter at the LOOP instruction with the
     // PHI values carried over; legacy traces re-run from the top after a
     // final-snapshot restore.
-    let loopref = if looping { ir.chain[IROp::LOOP as usize] as IRRef } else { 0 };
+    let loopref = if looping {
+        ir.chain[IROp::LOOP as usize] as IRRef
+    } else {
+        0
+    };
     let mut phis: Vec<(IRRef, IRRef)> = Vec::new();
     if loopref != 0 {
         // PHIs are the last instructions of the trace.
@@ -304,7 +301,11 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     // Guarded `metatable == nil` check (IRFL_TAB_META).
                     debug_assert!(ins.is_guard());
                     let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
-                    let mt = tv.as_table().expect("FLOAD on a non-table").as_ref().metatable;
+                    let mt = tv
+                        .as_table()
+                        .expect("FLOAD on a non-table")
+                        .as_ref()
+                        .metatable;
                     if mt.is_some() {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
@@ -388,8 +389,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         2 => {
                             let carg = *ir.ir(ins.op1 as IRRef);
                             debug_assert_eq!(carg.op(), IROp::CARG);
-                            let (x, y) =
-                                (val(env, carg.op1 as IRRef), val(env, carg.op2 as IRRef));
+                            let (x, y) = (val(env, carg.op1 as IRRef), val(env, carg.op2 as IRRef));
                             match idx {
                                 super::record::IRCALL_TAB_NEXTK => jit_tnextk(x, y),
                                 super::record::IRCALL_FMOD => jit_fmod(x, y),
@@ -432,8 +432,15 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
                     env[(r - REF_BIAS) as usize] = ((x.swap_bytes()) as f64).to_bits();
                 }
-                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
-                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT => {
+                IROp::BAND
+                | IROp::BOR
+                | IROp::BXOR
+                | IROp::BSHL
+                | IROp::BSHR
+                | IROp::BSAR
+                | IROp::BROL
+                | IROp::BROR
+                | IROp::BNOT => {
                     // Fused num -> int32 -> op -> num, mirroring the
                     // interpreter's coercions (operands are range-guarded).
                     let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
@@ -442,9 +449,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         IROp::BAND => {
                             (x & f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64
                         }
-                        IROp::BOR => {
-                            (x | f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64
-                        }
+                        IROp::BOR => (x | f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64,
                         IROp::BXOR => {
                             (x ^ f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64
                         }
@@ -461,8 +466,13 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     };
                     env[(r - REF_BIAS) as usize] = z.to_bits();
                 }
-                IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::POW
-                | IROp::MIN | IROp::MAX => {
+                IROp::ADD
+                | IROp::SUB
+                | IROp::MUL
+                | IROp::DIV
+                | IROp::POW
+                | IROp::MIN
+                | IROp::MAX => {
                     let x = f64::from_bits(val(env, ins.op1 as IRRef));
                     let y = f64::from_bits(val(env, ins.op2 as IRRef));
                     let z = super::opt_fold::fold_numarith(x, y, op);
@@ -487,8 +497,14 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     };
                     env[(r - REF_BIAS) as usize] = z.to_bits();
                 }
-                IROp::LT | IROp::GE | IROp::LE | IROp::GT
-                | IROp::ULT | IROp::UGE | IROp::ULE | IROp::UGT => {
+                IROp::LT
+                | IROp::GE
+                | IROp::LE
+                | IROp::GT
+                | IROp::ULT
+                | IROp::UGE
+                | IROp::ULE
+                | IROp::UGT => {
                     let cond = if irt_isnum(ins.t()) {
                         let x = f64::from_bits(val(env, ins.op1 as IRRef));
                         let y = f64::from_bits(val(env, ins.op2 as IRRef));
@@ -684,7 +700,9 @@ fn typecheck(v: LuaValue, t: u8) -> bool {
 
 /// Raw table get (the TGETV dispatch). Returns the NaN-boxed result.
 pub extern "C" fn jit_tget(tab_bits: u64, key_bits: u64) -> u64 {
-    let t = LuaValue::from_bits(tab_bits).as_table().expect("HLOAD on a non-table");
+    let t = LuaValue::from_bits(tab_bits)
+        .as_table()
+        .expect("HLOAD on a non-table");
     let k = LuaValue::from_bits(key_bits);
     let v = if k.is_string() {
         t.as_ref().get_str(k)
@@ -703,7 +721,9 @@ pub extern "C" fn jit_tget(tab_bits: u64, key_bits: u64) -> u64 {
 
 /// Raw table set (the TSETV dispatch, `metatable == nil` guarded).
 pub extern "C" fn jit_tset(tab_bits: u64, key_bits: u64, val_bits: u64) {
-    let t = LuaValue::from_bits(tab_bits).as_table().expect("HSTORE on a non-table");
+    let t = LuaValue::from_bits(tab_bits)
+        .as_table()
+        .expect("HSTORE on a non-table");
     let k = LuaValue::from_bits(key_bits);
     let v = LuaValue::from_bits(val_bits);
     debug_assert!(!k.is_nil(), "nil key must be guarded at record time");
@@ -725,7 +745,9 @@ pub extern "C" fn jit_tset(tab_bits: u64, key_bits: u64, val_bits: u64) {
 /// `key`, or nil at the end. The value is re-fetched with a plain HLOAD
 /// of the returned key.
 pub extern "C" fn jit_tnextk(tab_bits: u64, key_bits: u64) -> u64 {
-    let t = LuaValue::from_bits(tab_bits).as_table().expect("NEXTK on a non-table");
+    let t = LuaValue::from_bits(tab_bits)
+        .as_table()
+        .expect("NEXTK on a non-table");
     match t.as_ref().next(LuaValue::from_bits(key_bits)) {
         Some((k, _)) => k.to_bits(),
         None => LuaValue::NIL.to_bits(),
@@ -775,7 +797,9 @@ pub(super) fn exit_base_cell_addr() -> u64 {
 
 #[inline]
 fn str_bytes(bits: u64) -> &'static [u8] {
-    let s = LuaValue::from_bits(bits).as_string().expect("string op on a non-string");
+    let s = LuaValue::from_bits(bits)
+        .as_string()
+        .expect("string op on a non-string");
     unsafe { std::mem::transmute::<&[u8], &'static [u8]>(s.as_ref().as_bytes()) }
 }
 
@@ -845,7 +869,11 @@ pub extern "C" fn jit_str_sub(s_bits: u64, i_bits: u64, j_bits: u64) -> u64 {
     };
     let j = if j < 0 { len + j } else { j - 1 };
     let b = (j.max(-1).min(len - 1) + 1) as usize;
-    if a >= b { jit_intern(b"") } else { jit_intern(&s[a..b]) }
+    if a >= b {
+        jit_intern(b"")
+    } else {
+        jit_intern(&s[a..b])
+    }
 }
 
 /// string.char(c) — the single-argument case (mirrors `str_char`).
@@ -873,7 +901,9 @@ pub extern "C" fn jit_tdup(templ_addr: u64) -> u64 {
 /// `#t` / table.insert boundary: the raw table length (no metamethods,
 /// mirroring the interpreter's LEN fast path).
 pub extern "C" fn jit_alen(tab_bits: u64) -> u64 {
-    let t = LuaValue::from_bits(tab_bits).as_table().expect("ALEN on a non-table");
+    let t = LuaValue::from_bits(tab_bits)
+        .as_table()
+        .expect("ALEN on a non-table");
     (t.as_ref().len() as f64).to_bits()
 }
 
@@ -881,7 +911,9 @@ pub extern "C" fn jit_alen(tab_bits: u64) -> u64 {
 /// `tab_concat`; an invalid element yields nil, which fails the
 /// recorded STR guard so the interpreter re-runs the call and raises.
 pub extern "C" fn jit_tconcat(tab_bits: u64, sep_bits: u64) -> u64 {
-    let t = LuaValue::from_bits(tab_bits).as_table().expect("CONCAT on a non-table");
+    let t = LuaValue::from_bits(tab_bits)
+        .as_table()
+        .expect("CONCAT on a non-table");
     let sep_v = LuaValue::from_bits(sep_bits);
     let sep: &[u8] = match sep_v.as_string() {
         Some(s) => s.as_ref().as_bytes(),

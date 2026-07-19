@@ -63,10 +63,14 @@ pub(crate) enum Cont {
     Condf = 3,
 }
 impl Cont {
-    pub fn encode(self, extra: u32) -> u64 { ((self as u64) << 32) | (extra as u64) }
+    pub fn encode(self, extra: u32) -> u64 {
+        ((self as u64) << 32) | (extra as u64)
+    }
     pub fn decode(bits: u64) -> (Cont, u32) {
-        (unsafe { std::mem::transmute::<u8, Cont>((bits >> 32) as u8) },
-         (bits & 0xFFFF_FFFF) as u32)
+        (
+            unsafe { std::mem::transmute::<u8, Cont>((bits >> 32) as u8) },
+            (bits & 0xFFFF_FFFF) as u32,
+        )
     }
 }
 
@@ -320,7 +324,10 @@ impl Interp {
     /// Generalised fast-return: walk the VARG chain inline and return the
     /// real frame's bp, along with `(want, ret_ip, caller_a)`.
     #[inline(always)]
-    fn ret_fast_n(&self, mut bp: *const LuaValue) -> Option<(*const LuaValue, i32, *const BCIns, i32)> {
+    fn ret_fast_n(
+        &self,
+        mut bp: *const LuaValue,
+    ) -> Option<(*const LuaValue, i32, *const BCIns, i32)> {
         let mut link = unsafe { (*bp.sub(1)).to_bits() };
         while link & FRAME_TYPE_MASK == FRAME_VARG {
             bp = unsafe { bp.sub((link >> 3) as usize) };
@@ -425,7 +432,11 @@ impl Interp {
         let (cont, extra) = Cont::decode(self.at(mmbase - 4).to_bits());
         let saved_pc = self.at(mmbase - 3).to_bits() as usize;
         // Ensure one valid result (cont_dispatch's "Ensure one valid arg").
-        let result = if n > 0 { self.at(mmbase - 2) } else { LuaValue::NIL };
+        let result = if n > 0 {
+            self.at(mmbase - 2)
+        } else {
+            LuaValue::NIL
+        };
 
         self.base = caller_base;
         let cl = self.at(caller_base - 2).as_func().unwrap();
@@ -478,7 +489,11 @@ impl Interp {
     fn run(&mut self) -> LuaResult<usize> {
         loop {
             let rec = self.l().global().jit.state == crate::jit::TraceState::Record;
-            let r = if rec { self.dispatch::<true>() } else { self.dispatch::<false>() };
+            let r = if rec {
+                self.dispatch::<true>()
+            } else {
+                self.dispatch::<false>()
+            };
             match r {
                 Ok(Flow::Ret(n)) => return Ok(n),
                 Ok(Flow::Rec) => continue, // Recording toggled: switch modes.
@@ -532,7 +547,10 @@ impl Interp {
         macro_rules! resync {
             () => {{
                 bp = unsafe { self.sp.add(self.base) };
-                ip = unsafe { self.bcp.add(self.pc) };
+                #[allow(unused_assignments)]
+                {
+                    ip = unsafe { self.bcp.add(self.pc) };
+                }
             }};
         }
         // Numeric binary op fast path; slow path calls meta_arith for
@@ -549,7 +567,10 @@ impl Interp {
                     sync!();
                     match self.meta_arith($mm, xv, yv, $a)? {
                         Some(r) => setreg!($a, r),
-                        None => { resync!(); continue; }
+                        None => {
+                            resync!();
+                            continue;
+                        }
                     }
                 }
             }};
@@ -567,7 +588,10 @@ impl Interp {
                     sync!();
                     match self.meta_arith($mm, xv, kslot!(bc_c($ins)), $a)? {
                         Some(r) => setreg!($a, r),
-                        None => { resync!(); continue; }
+                        None => {
+                            resync!();
+                            continue;
+                        }
                     }
                 }
             }};
@@ -586,7 +610,10 @@ impl Interp {
                     sync!();
                     match self.meta_arith($mm, $x, yv, $a)? {
                         Some(r) => setreg!($a, r),
-                        None => { resync!(); continue; }
+                        None => {
+                            resync!();
+                            continue;
+                        }
                     }
                 }
             }};
@@ -603,22 +630,33 @@ impl Interp {
                 if xv.is_number() && yv.is_number() {
                     let x = xv.num();
                     let y = yv.num();
+                    #[allow(clippy::neg_cmp_op_on_partial_ord)]
                     let cond = match $op {
-                        0 => x < y, 1 => !(x < y), 2 => x <= y, 3 => !(x <= y),
+                        0 => x < y,
+                        1 => !(x < y),
+                        2 => x <= y,
+                        3 => !(x <= y),
                         _ => unreachable!(),
                     };
                     let jmp = unsafe { *ip };
                     ip = unsafe { ip.add(1) };
-                    if cond { jump!(jmp); }
+                    if cond {
+                        jump!(jmp);
+                    }
                 } else {
                     sync!();
                     match self.meta_comp(xv, yv, $op)? {
                         Some(cond) => {
                             let jmp = unsafe { *ip };
                             ip = unsafe { ip.add(1) };
-                            if cond { jump!(jmp); }
+                            if cond {
+                                jump!(jmp);
+                            }
                         }
-                        None => { resync!(); continue; }
+                        None => {
+                            resync!();
+                            continue;
+                        }
                     }
                 }
             }};
@@ -691,7 +729,10 @@ impl Interp {
                         sync!();
                         match self.meta_equal(x, y, 0)? {
                             Some(eq) => branch!(eq),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     } else {
                         branch!(false);
@@ -707,7 +748,10 @@ impl Interp {
                         sync!();
                         match self.meta_equal(x, y, 1)? {
                             Some(eq) => branch!(!eq),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     } else {
                         branch!(true);
@@ -773,7 +817,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Unm, v, v, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -917,7 +964,14 @@ impl Interp {
                     if !v.is_nil() || env.as_ref().metatable.is_none() {
                         setreg!(a, v);
                     } else {
-                        sync!(); match self.meta_tget(LuaValue::table(env), key, a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
+                        sync!();
+                        match self.meta_tget(LuaValue::table(env), key, a)? {
+                            Some(v) => setreg!(a, v),
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
                 BCOp::GSET => {
@@ -927,7 +981,14 @@ impl Interp {
                     if mt.is_none() || !env.as_ref().get_str(key).is_nil() {
                         env.as_mut().set_str(key, reg!(a));
                     } else {
-                        sync!(); match self.meta_tset(LuaValue::table(env), key, reg!(a))? { Some(_) => {}, None => { resync!(); continue; } }
+                        sync!();
+                        match self.meta_tset(LuaValue::table(env), key, reg!(a))? {
+                            Some(_) => {}
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
                 BCOp::TGETV => {
@@ -949,10 +1010,24 @@ impl Interp {
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
                             setreg!(a, v);
                         } else {
-                            sync!(); match self.meta_tget(t, k, a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
+                            sync!();
+                            match self.meta_tget(t, k, a)? {
+                                Some(v) => setreg!(a, v),
+                                None => {
+                                    resync!();
+                                    continue;
+                                }
+                            }
                         }
                     } else {
-                        sync!(); match self.meta_tget(t, k, a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
+                        sync!();
+                        match self.meta_tget(t, k, a)? {
+                            Some(v) => setreg!(a, v),
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
                 BCOp::TGETS => {
@@ -963,10 +1038,24 @@ impl Interp {
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
                             setreg!(a, v);
                         } else {
-                            sync!(); match self.meta_tget(t, k, a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
+                            sync!();
+                            match self.meta_tget(t, k, a)? {
+                                Some(v) => setreg!(a, v),
+                                None => {
+                                    resync!();
+                                    continue;
+                                }
+                            }
                         }
                     } else {
-                        sync!(); match self.meta_tget(t, self.kstr_at(bc_c(ins)), a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
+                        sync!();
+                        match self.meta_tget(t, self.kstr_at(bc_c(ins)), a)? {
+                            Some(v) => setreg!(a, v),
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
                 BCOp::TGETB => {
@@ -977,10 +1066,24 @@ impl Interp {
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
                             setreg!(a, v);
                         } else {
-                            sync!(); match self.meta_tget(t, LuaValue::number(k as f64), a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
+                            sync!();
+                            match self.meta_tget(t, LuaValue::number(k as f64), a)? {
+                                Some(v) => setreg!(a, v),
+                                None => {
+                                    resync!();
+                                    continue;
+                                }
+                            }
                         }
                     } else {
-                        sync!(); match self.meta_tget(t, LuaValue::number(bc_c(ins) as f64), a)? { Some(v) => setreg!(a, v), None => { resync!(); continue; } }
+                        sync!();
+                        match self.meta_tget(t, LuaValue::number(bc_c(ins) as f64), a)? {
+                            Some(v) => setreg!(a, v),
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
                 BCOp::TSETV => {
@@ -1006,7 +1109,14 @@ impl Interp {
                             tab.as_mut().set(k, v);
                         }
                     } else {
-                        sync!(); match self.meta_tset(t, k, v)? { Some(_) => {}, None => { resync!(); continue; } }
+                        sync!();
+                        match self.meta_tset(t, k, v)? {
+                            Some(_) => {}
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
                 BCOp::TSETS => {
@@ -1018,7 +1128,14 @@ impl Interp {
                         let k = self.kstr_at(bc_c(ins));
                         tab.as_mut().set_str(k, v);
                     } else {
-                        sync!(); match self.meta_tset(t, self.kstr_at(bc_c(ins)), v)? { Some(_) => {}, None => { resync!(); continue; } }
+                        sync!();
+                        match self.meta_tset(t, self.kstr_at(bc_c(ins)), v)? {
+                            Some(_) => {}
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
                 BCOp::TSETB => {
@@ -1029,7 +1146,14 @@ impl Interp {
                     {
                         tab.as_mut().set_int(bc_c(ins) as i32, v);
                     } else {
-                        sync!(); match self.meta_tset(t, LuaValue::number(bc_c(ins) as f64), v)? { Some(_) => {}, None => { resync!(); continue; } }
+                        sync!();
+                        match self.meta_tset(t, LuaValue::number(bc_c(ins) as f64), v)? {
+                            Some(_) => {}
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
                 BCOp::TSETM => {
@@ -1037,7 +1161,8 @@ impl Interp {
                     // R[a..a+multres-1], base_key from constant table.
                     let t = reg!(a as usize - 1);
                     if let Some(tab) = t.as_table() {
-                        let base_key = unsafe { *self.knp.add(bc_d(ins) as usize) } as i64 - (1i64 << 52);
+                        let base_key =
+                            unsafe { *self.knp.add(bc_d(ins) as usize) } as i64 - (1i64 << 52);
                         let mr = self.multres;
                         if mr > 0 && base_key == 1 {
                             let need = (base_key as u32).wrapping_add(mr as u32);
@@ -1096,11 +1221,8 @@ impl Interp {
                             // from the fresh frame.
                             if !REC && bc_op(head) == BCOp::JFUNCF {
                                 sync!();
-                                let r = crate::jit::exec::trace_exec(
-                                    self.l(),
-                                    self.base,
-                                    bc_d(head),
-                                );
+                                let r =
+                                    crate::jit::exec::trace_exec(self.l(), self.base, bc_d(head));
                                 self.sp = self.l().stack.as_mut_ptr();
                                 self.pc = r.pc;
                                 if r.baseslot != 2 {
@@ -1108,8 +1230,7 @@ impl Interp {
                                 } else {
                                     let bp2 = unsafe { self.sp.add(self.base) };
                                     self.reload_at(bp2);
-                                    self.l().top =
-                                        self.base + self.proto().framesize as usize;
+                                    self.l().top = self.base + self.proto().framesize as usize;
                                 }
                                 if self.rec_started() {
                                     return Ok(Flow::Rec); // Hot exit side trace.
@@ -1157,7 +1278,10 @@ impl Interp {
                         let link = unsafe { (*bp.sub(1)).to_bits() };
                         if (pt.flags & PROTO_VARARG) == 0 && link & FRAME_TYPE_MASK != FRAME_VARG {
                             let nargs = bc_d(ins) as usize - 1;
-                            let fs_need = cur_base!() + a.max(nargs as u32) as usize + pt.framesize as usize + 8;
+                            let fs_need = cur_base!()
+                                + a.max(nargs as u32) as usize
+                                + pt.framesize as usize
+                                + 8;
                             if fs_need > self.l().stack.len() {
                                 sync!();
                                 self.l().stack_ensure(fs_need);
@@ -1183,11 +1307,8 @@ impl Interp {
                             let head = pt.bc[0];
                             if !REC && bc_op(head) == BCOp::JFUNCF {
                                 sync!();
-                                let r = crate::jit::exec::trace_exec(
-                                    self.l(),
-                                    self.base,
-                                    bc_d(head),
-                                );
+                                let r =
+                                    crate::jit::exec::trace_exec(self.l(), self.base, bc_d(head));
                                 self.sp = self.l().stack.as_mut_ptr();
                                 self.pc = r.pc;
                                 if r.baseslot != 2 {
@@ -1195,8 +1316,7 @@ impl Interp {
                                 } else {
                                     let bp2 = unsafe { self.sp.add(self.base) };
                                     self.reload_at(bp2);
-                                    self.l().top =
-                                        self.base + self.proto().framesize as usize;
+                                    self.l().top = self.base + self.proto().framesize as usize;
                                 }
                                 if self.rec_started() {
                                     return Ok(Flow::Rec); // Hot exit side trace.
@@ -1524,8 +1644,11 @@ impl Interp {
                             let want = (bc_b(ins) - 1) as usize;
                             for i in 0..want {
                                 unsafe {
-                                    *bp.add(dst + i) =
-                                        if i < nvarg { *src.add(i) } else { LuaValue::NIL };
+                                    *bp.add(dst + i) = if i < nvarg {
+                                        *src.add(i)
+                                    } else {
+                                        LuaValue::NIL
+                                    };
                                 }
                             }
                         }
@@ -1674,6 +1797,7 @@ impl Interp {
     }
 
     #[cold]
+    #[allow(dead_code)]
     fn len_op(&self, v: LuaValue) -> LuaResult<LuaValue> {
         if let Some(sid) = v.as_string_id() {
             let n = self.l().heap().strings.get(sid).len();
@@ -1791,7 +1915,10 @@ impl Interp {
             self.set_at(func_slot + i, v);
         }
         let l = self.l();
-        l.suspend = Suspend::Return { base: self.base, slot: func_slot };
+        l.suspend = Suspend::Return {
+            base: self.base,
+            slot: func_slot,
+        };
         l.top = (self.base + self.proto().framesize as usize).max(func_slot + ny);
         l.base = self.base;
         LuaError::Yield
@@ -1982,6 +2109,7 @@ impl Interp {
     /// Copy varargs into `dst..`, per BC_VARG. The varargs sit between the
     /// vararg frame and the frame below it (see `enter_lua`); their extent
     /// is recovered from the FRAME_VARG delta, LuaJIT-style.
+    #[allow(dead_code)]
     fn vararg(&mut self, a: u32, b: u32) {
         let base = self.base;
         let link = self.at(base - 1).to_bits();
@@ -2032,10 +2160,7 @@ impl Interp {
             }
         }
         let nn = std::ptr::NonNull::new(ptr).unwrap();
-        let uv = self
-            .l()
-            .heap()
-            .alloc_upval(Upval::new_open(nn, false));
+        let uv = self.l().heap().alloc_upval(Upval::new_open(nn, false));
         self.l().openuv.push(uv);
         uv
     }
@@ -2110,9 +2235,19 @@ pub(crate) fn vm_pow(mut x: f64, y: f64) -> f64 {
     if k as f64 == y && k.unsigned_abs() <= 65536 {
         if k >= 1 {
             let mut n = k as u32;
-            while n & 1 == 0 { x *= x; n >>= 1; }
-            let mut z = x; n >>= 1;
-            while n != 0 { x *= x; if n & 1 != 0 { z *= x; } n >>= 1; }
+            while n & 1 == 0 {
+                x *= x;
+                n >>= 1;
+            }
+            let mut z = x;
+            n >>= 1;
+            while n != 0 {
+                x *= x;
+                if n & 1 != 0 {
+                    z *= x;
+                }
+                n >>= 1;
+            }
             z
         } else if k == 0 {
             1.0
@@ -2140,10 +2275,16 @@ pub fn resume_continue(
     // yield time and stack length never shrinks.
     if want >= 0 {
         let limit = nargs.min(want as usize);
-        for i in 0..limit { co.stack[slot + i] = co.stack[slot + 2 + i]; }
-        for i in limit..(want as usize) { co.stack[slot + i] = LuaValue::NIL; }
+        for i in 0..limit {
+            co.stack[slot + i] = co.stack[slot + 2 + i];
+        }
+        for i in limit..(want as usize) {
+            co.stack[slot + i] = LuaValue::NIL;
+        }
     } else {
-        for i in 0..nargs { co.stack[slot + i] = co.stack[slot + 2 + i]; }
+        for i in 0..nargs {
+            co.stack[slot + i] = co.stack[slot + 2 + i];
+        }
     }
     let mut vm = Interp::new(co);
     vm.base = sbase;
@@ -2165,7 +2306,12 @@ pub fn resume_continue(
 /// Finish a coroutine suspended via `Suspend::Return`. Delivers resume
 /// args as a return from the saved frame, like `do_return`; if the return
 /// lands in a Lua frame, the dispatch loop continues running.
-pub fn resume_finish(co: &mut LuaState, slot: usize, nargs: usize, sbase: usize) -> LuaResult<usize> {
+pub fn resume_finish(
+    co: &mut LuaState,
+    slot: usize,
+    nargs: usize,
+    sbase: usize,
+) -> LuaResult<usize> {
     co.c_depth += 1;
     let link = co.stack[slot + 1].to_bits();
     if link & FRAME_TYPE_MASK != FRAME_C && link & FRAME_TYPE_MASK != FRAME_LUA {

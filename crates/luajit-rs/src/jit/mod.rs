@@ -26,6 +26,8 @@
 //!   bytecode to the non-counting I* variants, which removes the check
 //!   from the hot path for good.
 
+#[cfg(target_arch = "x86_64")]
+pub mod asm_x64;
 pub mod exec;
 pub mod ir;
 pub mod mcode;
@@ -34,8 +36,6 @@ pub mod opt_fold;
 pub mod opt_loop;
 pub mod record;
 pub mod trace;
-#[cfg(target_arch = "x86_64")]
-pub mod asm_x64;
 
 use crate::bc::BCIns;
 use crate::gc::GcPtr;
@@ -171,8 +171,7 @@ pub const SNAP_KEYINDEX: u32 = 0x10_0000;
 
 #[inline]
 pub fn snap_entry(slot: u32, tr: ir::TRef) -> SnapEntry {
-    (slot << 24)
-        + (tr & (ir::TREF_KEYINDEX | ir::TREF_CONT | ir::TREF_FRAME | ir::TREF_REFMASK))
+    (slot << 24) + (tr & (ir::TREF_KEYINDEX | ir::TREF_CONT | ir::TREF_FRAME | ir::TREF_REFMASK))
 }
 #[inline]
 pub fn snap_slot(sn: SnapEntry) -> u32 {
@@ -294,7 +293,11 @@ pub struct HotPenalty {
 
 impl Default for HotPenalty {
     fn default() -> HotPenalty {
-        HotPenalty { pc: 0, val: 0, reason: TraceError::RECERR }
+        HotPenalty {
+            pc: 0,
+            val: 0,
+            reason: TraceError::RECERR,
+        }
     }
 }
 

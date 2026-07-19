@@ -95,6 +95,7 @@ struct PhiInfo {
 /// compiled). On error the caller keeps `mcode = None` and the portable
 /// executor runs the trace. Returns the code area, the inner entry
 /// offset and the patchable exit-stub tail offsets.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn assemble(
     tr: &GCtrace,
     link: Option<*const u8>,
@@ -258,14 +259,26 @@ impl<'a> Asm<'a> {
                     // Key/value are marked (and env-pinned) by the CARG arm.
                 }
                 IROp::GCSTEP => {} // Both operands are address constants.
-                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
-                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT => {
+                IROp::BAND
+                | IROp::BOR
+                | IROp::BXOR
+                | IROp::BSHL
+                | IROp::BSHR
+                | IROp::BSAR
+                | IROp::BROL
+                | IROp::BROR
+                | IROp::BNOT => {
                     a.mark_use(ins.op1 as IRRef, r);
                     if ins.op2 != 0 {
                         a.mark_use(ins.op2 as IRRef, r);
                     }
                 }
-                IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX
+                IROp::ADD
+                | IROp::SUB
+                | IROp::MUL
+                | IROp::DIV
+                | IROp::MIN
+                | IROp::MAX
                 | IROp::NEG => {
                     a.mark_use(ins.op1 as IRRef, r);
                     a.mark_use(ins.op2 as IRRef, r);
@@ -277,8 +290,14 @@ impl<'a> Asm<'a> {
                     }
                     a.mark_use(ins.op1 as IRRef, r);
                 }
-                IROp::LT | IROp::GE | IROp::LE | IROp::GT | IROp::ULT | IROp::UGE
-                | IROp::ULE | IROp::UGT => {
+                IROp::LT
+                | IROp::GE
+                | IROp::LE
+                | IROp::GT
+                | IROp::ULT
+                | IROp::UGE
+                | IROp::ULE
+                | IROp::UGT => {
                     a.mark_use(ins.op1 as IRRef, r);
                     a.mark_use(ins.op2 as IRRef, r);
                 }
@@ -321,7 +340,12 @@ impl<'a> Asm<'a> {
                             a.needs_env[Self::iidx(rref)] = true;
                         }
                     }
-                    a.phis.push(PhiInfo { phi: r, lref, rref, num });
+                    a.phis.push(PhiInfo {
+                        phi: r,
+                        lref,
+                        rref,
+                        num,
+                    });
                 }
                 _ => return Err(TraceError::NYIIR), // POW and later-phase IR.
             }
@@ -333,8 +357,11 @@ impl<'a> Asm<'a> {
         // NORESTORE entries are never written back to the Lua stack, but
         // the env hand-over to side traces still reads them.
         for (i, snap) in tr.snap.iter().enumerate() {
-            let live_until =
-                if i + 1 < tr.snap.len() { tr.snap[i + 1].iref } else { tr.ir.nins() };
+            let live_until = if i + 1 < tr.snap.len() {
+                tr.snap[i + 1].iref
+            } else {
+                tr.ir.nins()
+            };
             let ofs = snap.mapofs as usize;
             for sn in &tr.snapmap[ofs..ofs + snap.nent as usize] {
                 let rref = snap_ref(*sn);
@@ -364,6 +391,7 @@ impl<'a> Asm<'a> {
 
     // -- Main emission loop -------------------------------------------------
 
+    #[allow(clippy::type_complexity)]
     fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
         // Uniform outer frame: capture the two arguments in r10/r11 and
         // (Win64) save all callee-saved xmm registers. Every trace uses
@@ -399,8 +427,7 @@ impl<'a> Asm<'a> {
         let mut r = REF_FIRST;
         while r < nins {
             // Same covering-snapshot rule as the portable executor.
-            while self.snapidx + 1 < self.tr.snap.len()
-                && self.tr.snap[self.snapidx + 1].iref <= r
+            while self.snapidx + 1 < self.tr.snap.len() && self.tr.snap[self.snapidx + 1].iref <= r
             {
                 self.snapidx += 1;
             }
@@ -430,12 +457,12 @@ impl<'a> Asm<'a> {
                 IROp::HSTORE => self.asm_hstore(&ins),
                 IROp::CALLL => self.asm_calll(&ins)?,
                 IROp::TNEW => {
-                    self.helper_call(super::exec::jit_tnew as usize as u64, &[]);
+                    self.helper_call(super::exec::jit_tnew as *const () as usize as u64, &[]);
                     self.ff_result(&ins)?;
                 }
                 IROp::TDUP => {
                     self.helper_call(
-                        super::exec::jit_tdup as usize as u64,
+                        super::exec::jit_tdup as *const () as usize as u64,
                         &[ins.op1 as IRRef],
                     );
                     self.ff_result(&ins)?;
@@ -445,10 +472,16 @@ impl<'a> Asm<'a> {
                 IROp::GCSTEP => self.asm_gcstep(&ins),
                 IROp::POW => self.asm_pow(&ins)?,
                 IROp::TOBIT => self.asm_tobit(&ins)?,
-                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
-                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT | IROp::BSWAP => {
-                    self.asm_bitop(&ins)?
-                }
+                IROp::BAND
+                | IROp::BOR
+                | IROp::BXOR
+                | IROp::BSHL
+                | IROp::BSHR
+                | IROp::BSAR
+                | IROp::BROL
+                | IROp::BROR
+                | IROp::BNOT
+                | IROp::BSWAP => self.asm_bitop(&ins)?,
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX => {
                     self.asm_arith(&ins)?
                 }
@@ -466,8 +499,14 @@ impl<'a> Asm<'a> {
                     self.def(d);
                 }
                 IROp::FPMATH => self.asm_fpmath(&ins)?,
-                IROp::LT | IROp::GE | IROp::LE | IROp::GT | IROp::ULT | IROp::UGE
-                | IROp::ULE | IROp::UGT => self.asm_comp(&ins)?,
+                IROp::LT
+                | IROp::GE
+                | IROp::LE
+                | IROp::GT
+                | IROp::ULT
+                | IROp::UGE
+                | IROp::ULE
+                | IROp::UGT => self.asm_comp(&ins)?,
                 IROp::EQ | IROp::NE => self.asm_equal(&ins)?,
                 _ => unreachable!("op rejected by the NYI scan"),
             }
@@ -512,7 +551,9 @@ impl<'a> Asm<'a> {
             self.code.push(0xE9); // jmp inner (re-enter from the top)
             let rel = inner as i64 - (self.code.len() as i64 + 4);
             self.emit_u32(rel as i32 as u32);
-        } else if self.tr.linktype == TraceLink::Root && let Some(target) = self.link {
+        } else if self.tr.linktype == TraceLink::Root
+            && let Some(target) = self.link
+        {
             // asm_tail_link: materialize the final snapshot into the Lua
             // stack (the root re-reads it through its SLOADs), then jump
             // to the root's inner entry — no Rust round trip. Call-frame
@@ -616,9 +657,9 @@ impl<'a> Asm<'a> {
             .collect();
         let mut parked: Option<IRRef> = None; // Slot value held in xmm scratch.
         while !pending.is_empty() {
-            let ready = pending.iter().position(|&(d, _)| {
-                !pending.iter().any(|&(_, s)| s == d && parked != Some(s))
-            });
+            let ready = pending
+                .iter()
+                .position(|&(d, _)| !pending.iter().any(|&(_, s)| s == d && parked != Some(s)));
             if let Some(i) = ready {
                 let (d, s) = pending.remove(i);
                 if parked == Some(s) {
@@ -742,8 +783,7 @@ impl<'a> Asm<'a> {
     /// FLOAD IRFL_TAB_META as a guard: exit unless `tab.metatable` is
     /// None (the niche encoding makes that a plain null check).
     fn asm_meta_guard(&mut self, ins: &IRIns) {
-        const META_OFF: i32 =
-            std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
+        const META_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
         self.gpr_load_ref(RAX, ins.op1 as IRRef);
         self.mov_r64_imm64(RCX, crate::value::LJ_GCVMASK);
         self.and_rr64(RAX, RCX); // NaN-boxed table value -> pointer.
@@ -754,7 +794,7 @@ impl<'a> Asm<'a> {
     /// HLOAD: raw table get through the shared helper, with the SLOAD
     /// typecheck shapes applied to the returned value bits in rax.
     fn asm_hload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let addr = super::exec::jit_tget as usize as u64;
+        let addr = super::exec::jit_tget as *const () as usize as u64;
         self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
         self.ff_result(ins)
     }
@@ -765,15 +805,15 @@ impl<'a> Asm<'a> {
         use super::record as rec;
         let idx = ins.op2 as u32;
         let addr = match idx {
-            rec::IRCALL_TAB_NEXTK => super::exec::jit_tnextk as usize as u64,
-            rec::IRCALL_FMOD => super::exec::jit_fmod as usize as u64,
-            rec::IRCALL_STR_LEN => super::exec::jit_str_len as usize as u64,
-            rec::IRCALL_STR_CMP => super::exec::jit_str_cmp as usize as u64,
-            rec::IRCALL_STR_BYTE => super::exec::jit_str_byte as usize as u64,
-            rec::IRCALL_STR_SUB => super::exec::jit_str_sub as usize as u64,
-            rec::IRCALL_STR_CHAR => super::exec::jit_str_char as usize as u64,
-            rec::IRCALL_TAB_LEN => super::exec::jit_alen as usize as u64,
-            rec::IRCALL_TAB_CONCAT => super::exec::jit_tconcat as usize as u64,
+            rec::IRCALL_TAB_NEXTK => super::exec::jit_tnextk as *const () as u64,
+            rec::IRCALL_FMOD => super::exec::jit_fmod as *const () as u64,
+            rec::IRCALL_STR_LEN => super::exec::jit_str_len as *const () as u64,
+            rec::IRCALL_STR_CMP => super::exec::jit_str_cmp as *const () as u64,
+            rec::IRCALL_STR_BYTE => super::exec::jit_str_byte as *const () as u64,
+            rec::IRCALL_STR_SUB => super::exec::jit_str_sub as *const () as u64,
+            rec::IRCALL_STR_CHAR => super::exec::jit_str_char as *const () as u64,
+            rec::IRCALL_TAB_LEN => super::exec::jit_alen as *const () as u64,
+            rec::IRCALL_TAB_CONCAT => super::exec::jit_tconcat as *const () as u64,
             _ => unreachable!("bad IRCALL index"),
         };
         match rec::ircall_arity(idx) {
@@ -895,7 +935,7 @@ impl<'a> Asm<'a> {
     /// POW: the interpreter's vm_pow via a helper call (raw bits in and
     /// out; the result is always a number, no guard).
     fn asm_pow(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let addr = super::exec::jit_pow as usize as u64;
+        let addr = super::exec::jit_pow as *const () as usize as u64;
         self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
         let i = Self::iidx(self.cur);
         if self.last_use[i] != 0 || self.needs_env[i] {
@@ -911,7 +951,7 @@ impl<'a> Asm<'a> {
     fn asm_hstore(&mut self, ins: &IRIns) {
         let carg = *self.tr.ir.ir(ins.op2 as IRRef);
         debug_assert_eq!(carg.op(), IROp::CARG);
-        let addr = super::exec::jit_tset as usize as u64;
+        let addr = super::exec::jit_tset as *const () as usize as u64;
         self.helper_call(
             addr,
             &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef],
@@ -1000,7 +1040,9 @@ impl<'a> Asm<'a> {
         self.guard(CC_E);
         self.mov_r64_mem(RAX, RAX, APTR_OFF);
         let val = carg.op2 as IRRef;
-        if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
+        if val >= REF_BIAS
+            && let Some(sv) = self.reg_of(val)
+        {
             self.movsd_store_sib(RAX, RCX, sv);
         } else {
             self.gpr_load_ref(RDX, val);
@@ -1048,7 +1090,11 @@ impl<'a> Asm<'a> {
             _ => unreachable!(),
         };
         let d = self.into_dst(a)?;
-        let rhs = if b == a { d } else { self.fetch_xmm(b, pin(d))? };
+        let rhs = if b == a {
+            d
+        } else {
+            self.fetch_xmm(b, pin(d))?
+        };
         self.sse_rr(0xF2, xo, d, rhs);
         self.def(d);
         Ok(())
@@ -1098,7 +1144,11 @@ impl<'a> Asm<'a> {
             _ => unreachable!(),
         };
         let f = self.fetch_xmm(fst, 0)?;
-        let s = if snd == fst { f } else { self.fetch_xmm(snd, pin(f))? };
+        let s = if snd == fst {
+            f
+        } else {
+            self.fetch_xmm(snd, pin(f))?
+        };
         self.sse_rr(0x66, 0x2E, f, s); // ucomisd
         self.guard(cc);
         Ok(())
@@ -1227,10 +1277,10 @@ impl<'a> Asm<'a> {
             if p.rref < REF_BIAS {
                 return true; // Constants are re-materialized.
             }
-            if let Some(rg) = self.reg_of(p.rref) {
-                if p.num {
-                    return dstset & pin(rg) == 0;
-                }
+            if let Some(rg) = self.reg_of(p.rref)
+                && p.num
+            {
+                return dstset & pin(rg) == 0;
             }
             !phis.iter().any(|q| q.lref == p.rref)
         });
@@ -1243,7 +1293,9 @@ impl<'a> Asm<'a> {
             // PHIs' own env slots first, then land them in their homes.
             for p in &phis {
                 if p.rref >= REF_BIAS {
-                    if p.num && let Some(rg) = self.reg_of(p.rref) {
+                    if p.num
+                        && let Some(rg) = self.reg_of(p.rref)
+                    {
                         self.movsd_store(RENV, Self::env_disp(p.phi), rg);
                     } else {
                         debug_assert!(self.env_valid[Self::iidx(p.rref)]);
@@ -1256,7 +1308,9 @@ impl<'a> Asm<'a> {
                 }
             }
             for (p, home) in phis.iter().zip(homes.iter()) {
-                if p.num && let Some(rg) = *home {
+                if p.num
+                    && let Some(rg) = *home
+                {
                     self.movsd_load(rg, RENV, Self::env_disp(p.phi));
                     if self.needs_env[Self::iidx(p.lref)] {
                         // Env-resident consumers (helper args) read the
@@ -1301,7 +1355,9 @@ impl<'a> Asm<'a> {
     /// register (env[lref] is refreshed too when env-resident consumers
     /// exist), or refresh env[lref] for env-carried PHIs.
     fn phi_move(&mut self, p: &PhiInfo, home: Option<u8>) {
-        if p.num && let Some(rg) = home {
+        if p.num
+            && let Some(rg) = home
+        {
             if p.rref >= REF_BIAS {
                 if let Some(src) = self.reg_of(p.rref) {
                     if src != rg {
@@ -1319,7 +1375,9 @@ impl<'a> Asm<'a> {
                 self.movsd_store(RENV, Self::env_disp(p.lref), rg);
             }
         } else if p.rref >= REF_BIAS {
-            if p.num && let Some(src) = self.reg_of(p.rref) {
+            if p.num
+                && let Some(src) = self.reg_of(p.rref)
+            {
                 self.movsd_store(RENV, Self::env_disp(p.lref), src);
             } else {
                 debug_assert!(self.env_valid[Self::iidx(p.rref)]);
@@ -1335,7 +1393,11 @@ impl<'a> Asm<'a> {
     // -- Register allocation ---------------------------------------------------
 
     fn last_use_of(&self, r: IRRef) -> IRRef {
-        if r >= REF_BIAS { self.last_use[Self::iidx(r)] } else { self.klast_use[Self::kidx(r)] }
+        if r >= REF_BIAS {
+            self.last_use[Self::iidx(r)]
+        } else {
+            self.klast_use[Self::kidx(r)]
+        }
     }
 
     fn mark_use(&mut self, opr: IRRef, at: IRRef) {
@@ -1443,6 +1505,7 @@ impl<'a> Asm<'a> {
     }
 
     /// Fetch op1 as the (destroyed) destination of a two-address SSE op.
+    #[allow(clippy::wrong_self_convention)]
     fn into_dst(&mut self, a: IRRef) -> Result<u8, TraceError> {
         let r1 = self.fetch_xmm(a, 0)?;
         if self.dying(a) {
@@ -1584,7 +1647,8 @@ impl<'a> Asm<'a> {
     /// movq xmm, r64 (66 REX.W 0F 6E /r).
     fn movq_xmm_gpr(&mut self, dst: u8, src: u8) {
         self.code.push(0x66);
-        self.code.push(0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
+        self.code
+            .push(0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1));
         self.code.push(0x0F);
         self.code.push(0x6E);
         self.modrm(3, dst, src);
@@ -1627,17 +1691,20 @@ impl<'a> Asm<'a> {
     }
 
     fn mov_rr64(&mut self, dst: u8, src: u8) {
-        self.code.push(0x48 | (((src >> 3) & 1) << 2) | ((dst >> 3) & 1));
+        self.code
+            .push(0x48 | (((src >> 3) & 1) << 2) | ((dst >> 3) & 1));
         self.code.push(0x89);
         self.modrm(3, src, dst);
     }
     fn mov_r64_mem(&mut self, reg: u8, base: u8, disp: i32) {
-        self.code.push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
+        self.code
+            .push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
         self.code.push(0x8B);
         self.mem(reg, base, disp);
     }
     fn mov_mem_r64(&mut self, base: u8, disp: i32, reg: u8) {
-        self.code.push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
+        self.code
+            .push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
         self.code.push(0x89);
         self.mem(reg, base, disp);
     }
@@ -1664,7 +1731,8 @@ impl<'a> Asm<'a> {
     }
     fn and_rr64(&mut self, a: u8, b: u8) {
         // and a, b (REX.W 21 /r: rm = a, reg = b).
-        self.code.push(0x48 | (((b >> 3) & 1) << 2) | ((a >> 3) & 1));
+        self.code
+            .push(0x48 | (((b >> 3) & 1) << 2) | ((a >> 3) & 1));
         self.code.push(0x21);
         self.modrm(3, b, a);
     }
@@ -1677,7 +1745,8 @@ impl<'a> Asm<'a> {
         self.emit_u32(imm);
     }
     fn cmp_rr64(&mut self, a: u8, b: u8) {
-        self.code.push(0x48 | (((b >> 3) & 1) << 2) | ((a >> 3) & 1));
+        self.code
+            .push(0x48 | (((b >> 3) & 1) << 2) | ((a >> 3) & 1));
         self.code.push(0x39);
         self.modrm(3, b, a);
     }
@@ -1714,13 +1783,15 @@ impl<'a> Asm<'a> {
     }
     /// cmp r64, qword [base+disp] (REX.W 3B /r).
     fn cmp_r64_mem(&mut self, reg: u8, base: u8, disp: i32) {
-        self.code.push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
+        self.code
+            .push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
         self.code.push(0x3B);
         self.mem(reg, base, disp);
     }
     /// add r64, qword [base+disp] (REX.W 03 /r).
     fn add_r64_mem(&mut self, reg: u8, base: u8, disp: i32) {
-        self.code.push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
+        self.code
+            .push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
         self.code.push(0x03);
         self.mem(reg, base, disp);
     }
@@ -1783,7 +1854,11 @@ impl<'a> Asm<'a> {
 
     fn make_stub(&mut self, gc: bool) -> usize {
         let flush = self.exit_flush_set(self.snapidx);
-        self.stubs.push(Stub { snapidx: self.snapidx, flush, gc });
+        self.stubs.push(Stub {
+            snapidx: self.snapidx,
+            flush,
+            gc,
+        });
         self.stubs.len() - 1
     }
 

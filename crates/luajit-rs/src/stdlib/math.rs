@@ -58,10 +58,7 @@ fn math_atan2(l: &mut LuaState) -> LuaResult<i32> {
         Some(n) => n,
         None => return Err(err_bad_arg(l, 1, "math.atan", "number", "")),
     };
-    let x = match arg(l, 1).as_number() {
-        Some(n) => n,
-        None => 1.0,
-    };
+    let x = arg(l, 1).as_number().unwrap_or(1.0);
     push(l, LuaValue::number(y.atan2(x)));
     Ok(1)
 }
@@ -132,15 +129,12 @@ pub fn math_max(l: &mut LuaState) -> LuaResult<i32> {
         push(l, LuaValue::number(f64::NEG_INFINITY));
         return Ok(1);
     }
-    let mut max = match arg(l, 0).as_number() {
-        Some(n) => n,
-        None => f64::NEG_INFINITY,
-    };
+    let mut max = arg(l, 0).as_number().unwrap_or(f64::NEG_INFINITY);
     for i in 1..n {
-        if let Some(n) = arg(l, i).as_number() {
-            if n > max {
-                max = n;
-            }
+        if let Some(n) = arg(l, i).as_number()
+            && n > max
+        {
+            max = n;
         }
     }
     push(l, LuaValue::number(max));
@@ -153,15 +147,12 @@ pub fn math_min(l: &mut LuaState) -> LuaResult<i32> {
         push(l, LuaValue::number(f64::INFINITY));
         return Ok(1);
     }
-    let mut min = match arg(l, 0).as_number() {
-        Some(n) => n,
-        None => f64::INFINITY,
-    };
+    let mut min = arg(l, 0).as_number().unwrap_or(f64::INFINITY);
     for i in 1..n {
-        if let Some(n) = arg(l, i).as_number() {
-            if n < min {
-                min = n;
-            }
+        if let Some(n) = arg(l, i).as_number()
+            && n < min
+        {
+            min = n;
         }
     }
     push(l, LuaValue::number(min));

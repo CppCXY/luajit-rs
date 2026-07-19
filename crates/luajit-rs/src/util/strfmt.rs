@@ -4,11 +4,20 @@
 use std::fmt::Write;
 
 /// Stack buffer for `core::fmt::Write` — zero-allocation formatting.
-struct BufWriter<'a> { buf: &'a mut [u8], pos: usize }
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
 impl<'a> BufWriter<'a> {
-    fn new(buf: &'a mut [u8]) -> Self { BufWriter { buf, pos: 0 } }
-    fn as_slice(&self) -> &[u8] { &self.buf[..self.pos] }
-    fn len(&self) -> usize { self.pos }
+    fn new(buf: &'a mut [u8]) -> Self {
+        BufWriter { buf, pos: 0 }
+    }
+    fn as_slice(&self) -> &[u8] {
+        &self.buf[..self.pos]
+    }
+    fn len(&self) -> usize {
+        self.pos
+    }
 }
 impl<'a> Write for BufWriter<'a> {
     fn write_str(&mut self, s: &str) -> std::fmt::Result {
@@ -33,13 +42,25 @@ pub fn g14(n: f64) -> String {
 pub fn g14_to_buf(n: f64, buf: &mut [u8; 64]) -> usize {
     // Special values
     if n == 0.0 {
-        if n.is_sign_negative() { buf[0] = b'-'; buf[1] = b'0'; return 2; }
-        buf[0] = b'0'; return 1;
+        if n.is_sign_negative() {
+            buf[0] = b'-';
+            buf[1] = b'0';
+            return 2;
+        }
+        buf[0] = b'0';
+        return 1;
     }
-    if n.is_nan() { buf[..3].copy_from_slice(b"nan"); return 3; }
+    if n.is_nan() {
+        buf[..3].copy_from_slice(b"nan");
+        return 3;
+    }
     if n.is_infinite() {
-        if n < 0.0 { buf[..4].copy_from_slice(b"-inf"); return 4; }
-        buf[..3].copy_from_slice(b"inf"); return 3;
+        if n < 0.0 {
+            buf[..4].copy_from_slice(b"-inf");
+            return 4;
+        }
+        buf[..3].copy_from_slice(b"inf");
+        return 3;
     }
     // Integer fast path (|n| < 2^53).
     let i = n as i64;
@@ -58,12 +79,19 @@ pub fn g14_to_buf(n: f64, buf: &mut [u8; 64]) -> usize {
         // Scientific notation.
         let m2 = m.trim_end_matches('0').trim_end_matches('.');
         let mut w2 = BufWriter::new(buf);
-        let _ = write!(w2, "{}e{}{:02}", m2, if exp < 0 { '-' } else { '+' }, exp.abs());
+        let _ = write!(
+            w2,
+            "{}e{}{:02}",
+            m2,
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        );
         return w2.len();
     }
     // Decimal notation.
     let prec = (13 - exp).max(0) as usize;
-    let out = {
+
+    {
         let mut w3 = BufWriter::new(buf);
         let _ = write!(w3, "{:.*}", prec, n);
         let s = std::str::from_utf8(w3.as_slice()).unwrap();
@@ -72,17 +100,19 @@ pub fn g14_to_buf(n: f64, buf: &mut [u8; 64]) -> usize {
             let blen = t.len().min(64);
             let mut tmp = [0u8; 64];
             tmp[..blen].copy_from_slice(t.as_bytes());
-            // Need to write back into buf. Drop w3 first.
+            // Need to write back into buf. Drop w3 first (releases the
+            // mutable borrow so buf can be accessed again).
+            #[allow(clippy::drop_non_drop)]
             drop(w3);
             buf[..blen].copy_from_slice(&tmp[..blen]);
             blen
         } else {
             let blen = s.len().min(64);
+            #[allow(clippy::drop_non_drop)]
             drop(w3);
             blen
         }
-    };
-    out
+    }
 }
 
 /// Minimal signed integer-to-ASCII, returns byte count.
@@ -93,15 +123,28 @@ fn itoa_i64(mut v: i64, buf: &mut [u8; 64]) -> usize {
     let mut t = 20;
     if neg {
         let mut u = (v as u64).wrapping_neg();
-        while u >= 10 { t -= 1; tmp[t] = b'0' + (u % 10) as u8; u /= 10; }
-        t -= 1; tmp[t] = b'0' + u as u8;
+        while u >= 10 {
+            t -= 1;
+            tmp[t] = b'0' + (u % 10) as u8;
+            u /= 10;
+        }
+        t -= 1;
+        tmp[t] = b'0' + u as u8;
     } else {
-        while v >= 10 { t -= 1; tmp[t] = b'0' + (v % 10) as u8; v /= 10; }
-        t -= 1; tmp[t] = b'0' + v as u8;
+        while v >= 10 {
+            t -= 1;
+            tmp[t] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        t -= 1;
+        tmp[t] = b'0' + v as u8;
     }
     let digits = 20 - t;
     let mut o = 0;
-    if neg { buf[0] = b'-'; o = 1; }
+    if neg {
+        buf[0] = b'-';
+        o = 1;
+    }
     buf[o..o + digits].copy_from_slice(&tmp[t..]);
     o + digits
 }

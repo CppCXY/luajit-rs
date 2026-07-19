@@ -1,6 +1,11 @@
 //! FOLD: constant folding, algebraic simplifications and reassociation
 //! plus CSE as the fallback. Ported from lj_opt_fold.c.
 //!
+//! The U* comparison ops (ULT/UGE/ULE/UGT) are the IEEE unordered
+//! comparisons: ULT(a,b) is defined as `!(a >= b)`. The negated form
+//! is the correct LuaJIT semantics and cannot be replaced by partial_cmp.
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
+//!
 //! LuaJIT drives rule dispatch through a generated semi-perfect hash of
 //! `(ins-op, left-op, right-op)` keys; here the same rules are matched by
 //! hand per opcode, ordered from most to least specific exactly like the
@@ -73,7 +78,11 @@ pub fn opt_cse(buf: &mut IrBuf, fins: IRIns) -> TRef {
 /// `CONDFOLD(cond)`: drop the guard if true, otherwise the guard would
 /// always fail.
 fn condfold(cond: bool) -> Result<Step, TraceError> {
-    if cond { Ok(Step::Drop) } else { Err(TraceError::GFAIL) }
+    if cond {
+        Ok(Step::Drop)
+    } else {
+        Err(TraceError::GFAIL)
+    }
 }
 
 /// `lj_vm_foldarith` for the FP ops (must match the interpreter exactly).
@@ -87,8 +96,20 @@ pub fn fold_numarith(x: f64, y: f64, op: IROp) -> f64 {
         IROp::POW => crate::vm::vm_pow(x, y),
         IROp::NEG => -x,
         IROp::ABS => x.abs(),
-        IROp::MIN => if x < y { x } else { y },
-        IROp::MAX => if x > y { x } else { y },
+        IROp::MIN => {
+            if x < y {
+                x
+            } else {
+                y
+            }
+        }
+        IROp::MAX => {
+            if x > y {
+                x
+            } else {
+                y
+            }
+        }
         _ => x,
     }
 }
@@ -119,7 +140,11 @@ fn kfold_intop(k1: i32, k2: i32, op: IROp) -> i32 {
         IROp::MOD => {
             // lj_vm_modi: floor modulo; caller ensures k2 != 0.
             let r = k1.wrapping_rem(k2);
-            if r != 0 && (r ^ k2) < 0 { r.wrapping_add(k2) } else { r }
+            if r != 0 && (r ^ k2) < 0 {
+                r.wrapping_add(k2)
+            } else {
+                r
+            }
         }
         IROp::NEG => (k1 as u32).wrapping_neg() as i32,
         IROp::BAND => k1 & k2,
@@ -163,8 +188,16 @@ fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
         return Ok(Step::Cse);
     }
     // Operand instruction copies (fleft/fright); None for literals/none.
-    let fleft = if fins.op1 as IRRef >= nk { Some(*buf.ir(fins.op1 as IRRef)) } else { None };
-    let fright = if fins.op2 as IRRef >= nk { Some(*buf.ir(fins.op2 as IRRef)) } else { None };
+    let fleft = if fins.op1 as IRRef >= nk {
+        Some(*buf.ir(fins.op1 as IRRef))
+    } else {
+        None
+    };
+    let fright = if fins.op2 as IRRef >= nk {
+        Some(*buf.ir(fins.op2 as IRRef))
+    } else {
+        None
+    };
     let lop = fleft.map(|i| i.op());
     let rop = fright.map(|i| i.op());
     let knumleft = |buf: &IrBuf| buf.knum_val(fins.op1 as IRRef);
@@ -432,7 +465,11 @@ fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
                     }
                 }
             }
-            if op != IROp::SUBOV { comm_swap(fins) } else { Ok(Step::Cse) }
+            if op != IROp::SUBOV {
+                comm_swap(fins)
+            } else {
+                Ok(Step::Cse)
+            }
         }
 
         // -- Bit ops ---------------------------------------------------------
@@ -448,7 +485,9 @@ fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
         }
         IROp::BSWAP => {
             if lop == Some(IROp::KINT) {
-                return Ok(Step::TRef(buf.kint((fleft.unwrap().i() as u32).swap_bytes() as i32)));
+                return Ok(Step::TRef(
+                    buf.kint((fleft.unwrap().i() as u32).swap_bytes() as i32),
+                ));
             }
             if lop == Some(IROp::BSWAP) {
                 phibarrier!(fleft.unwrap());
@@ -456,8 +495,14 @@ fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
             }
             Ok(Step::Cse)
         }
-        IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR | IROp::BSAR
-        | IROp::BROL | IROp::BROR => {
+        IROp::BAND
+        | IROp::BOR
+        | IROp::BXOR
+        | IROp::BSHL
+        | IROp::BSHR
+        | IROp::BSAR
+        | IROp::BROL
+        | IROp::BROR => {
             if lop == Some(IROp::KINT) && rop == Some(IROp::KINT) {
                 let y = kfold_intop(fleft.unwrap().i(), fright.unwrap().i(), op);
                 return Ok(Step::TRef(buf.kint(y)));
@@ -497,8 +542,14 @@ fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
             }
             comm_swap_comp(fins)
         }
-        IROp::LT | IROp::GE | IROp::LE | IROp::GT
-        | IROp::ULT | IROp::UGE | IROp::ULE | IROp::UGT => {
+        IROp::LT
+        | IROp::GE
+        | IROp::LE
+        | IROp::GT
+        | IROp::ULT
+        | IROp::UGE
+        | IROp::ULE
+        | IROp::UGT => {
             if lop == Some(IROp::KNUM) && rop == Some(IROp::KNUM) {
                 return condfold(fold_numcmp(knumleft(buf), knumright(buf), op));
             }
@@ -538,8 +589,7 @@ fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
                 )
             {
                 let k = knumright(buf);
-                if (op == IROp::GE && k <= -2147483648.0) || (op == IROp::LE && k >= 2147483647.0)
-                {
+                if (op == IROp::GE && k <= -2147483648.0) || (op == IROp::LE && k >= 2147483647.0) {
                     return Ok(Step::Drop);
                 }
             }

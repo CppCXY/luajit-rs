@@ -1072,10 +1072,8 @@ impl Parser {
             if !e.isk_nojump() {
                 self.expr_toanyreg(e);
             }
-        } else {
-            if !e.isnumk_nojump() {
-                self.expr_toanyreg(e);
-            }
+        } else if !e.isnumk_nojump() {
+            self.expr_toanyreg(e);
         }
     }
 
@@ -1837,7 +1835,7 @@ impl Parser {
                     let kt = LuaTable::new(if needarr { narr } else { 0 }, hsize2hbits(nhash));
                     let fs = self.cur_mut();
                     let kidx = fs.kgc.len() as u32;
-                    fs.kgc.push(KGc::Table(Box::new(LuaTable::default())));
+                    fs.kgc.push(KGc::Table(Box::default()));
                     *self.ins_mut(pc) = bcins_ad(BCOp::TDUP, freg - 1, kidx);
                     t = Some((kidx, kt));
                 }

@@ -278,7 +278,7 @@ impl LuaTable {
             return;
         }
         if k > 0 && (k as u32) == self.asize {
-            let new_sz = (self.asize * 2).max(4).min(LJ_MAX_ASIZE);
+            let new_sz = (self.asize * 2).clamp(4, LJ_MAX_ASIZE);
             self.reasize(new_sz - 1);
             self.array[k as usize] = v;
             return;

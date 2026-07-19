@@ -33,22 +33,50 @@ pub const IRM_S: u8 = 0x60;
 pub const IRM_W: u8 = 0x80;
 
 macro_rules! irm_flag {
-    (N) => { IRM_N };
-    (C) => { IRM_C };
-    (R) => { IRM_N };
-    (A) => { IRM_A };
-    (L) => { IRM_L };
-    (S) => { IRM_S };
-    (NW) => { IRM_N | IRM_W };
-    (CW) => { IRM_C | IRM_W };
-    (AW) => { IRM_A | IRM_W };
-    (LW) => { IRM_L | IRM_W };
+    (N) => {
+        IRM_N
+    };
+    (C) => {
+        IRM_C
+    };
+    (R) => {
+        IRM_N
+    };
+    (A) => {
+        IRM_A
+    };
+    (L) => {
+        IRM_L
+    };
+    (S) => {
+        IRM_S
+    };
+    (NW) => {
+        IRM_N | IRM_W
+    };
+    (CW) => {
+        IRM_C | IRM_W
+    };
+    (AW) => {
+        IRM_A | IRM_W
+    };
+    (LW) => {
+        IRM_L | IRM_W
+    };
 }
 macro_rules! irm_mode {
-    (ref) => { IRM_REF };
-    (lit) => { IRM_LIT };
-    (cst) => { IRM_CST };
-    (___) => { IRM_NONE };
+    (ref) => {
+        IRM_REF
+    };
+    (lit) => {
+        IRM_LIT
+    };
+    (cst) => {
+        IRM_CST
+    };
+    (___) => {
+        IRM_NONE
+    };
 }
 
 /// IR instruction definition. Order matters (ORDER IR): comparison
@@ -225,9 +253,7 @@ const _: () = {
     assert!(IROp::LT as u8 ^ 3 == IROp::GT as u8);
     assert!(IROp::LT as u8 ^ 4 == IROp::ULT as u8);
     // xLOAD -> xSTORE delta is constant.
-    assert!(
-        IROp::ASTORE as u8 - IROp::ALOAD as u8 == IROp::HSTORE as u8 - IROp::HLOAD as u8
-    );
+    assert!(IROp::ASTORE as u8 - IROp::ALOAD as u8 == IROp::HSTORE as u8 - IROp::HLOAD as u8);
 };
 
 #[inline]
@@ -451,7 +477,12 @@ impl IRIns {
     #[inline]
     pub fn new(ot: u16, op1: IRRef, op2: IRRef) -> IRIns {
         debug_assert!(op1 <= 0xffff && op2 <= 0xffff);
-        IRIns { op1: op1 as IRRef1, op2: op2 as IRRef1, ot, prev: 0 }
+        IRIns {
+            op1: op1 as IRRef1,
+            op2: op2 as IRRef1,
+            ot,
+            prev: 0,
+        }
     }
 
     #[inline]
@@ -611,9 +642,11 @@ impl IrBuf {
 
     /// All KGC constants as NaN-boxed values, for GC root marking.
     pub fn kgc_values(&self) -> impl Iterator<Item = crate::value::LuaValue> + '_ {
-        self.k.iter().zip(self.k64.iter()).filter_map(|(ins, &bits)| {
-            (ins.op() == IROp::KGC).then(|| crate::value::LuaValue::from_bits(bits))
-        })
+        self.k
+            .iter()
+            .zip(self.k64.iter())
+            .filter(|&(ins, &_bits)| ins.op() == IROp::KGC)
+            .map(|(_ins, &bits)| crate::value::LuaValue::from_bits(bits))
     }
 
     #[inline]

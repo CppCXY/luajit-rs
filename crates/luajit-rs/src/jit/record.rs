@@ -3,6 +3,7 @@
 //! lj_snap.c (snapshot_slots/snapshot_stack/lj_snap_add).
 //!
 //! Phase 2 scope: single-frame numeric traces — FORL and LOOP roots,
+#![allow(clippy::too_many_arguments)]
 //! arithmetic, moves, constants and comparisons. Everything else aborts
 //! with NYIBC and feeds the penalty/blacklist engine, exactly like LuaJIT
 //! handles unrecordable bytecode. Calls, table access and returns arrive
@@ -17,9 +18,8 @@ use crate::value::LuaValue;
 
 use super::ir::*;
 use super::{
-    GCtrace, JitParam, JitState, PENALTY_MIN, PENALTY_SLOTS, SNAP_CONT, SNAP_FRAME,
-    SNAP_NORESTORE, SnapEntry, SnapShot, TraceError, TraceLink, TraceNo, snap_entry, snap_ref,
-    snap_slot,
+    GCtrace, JitParam, JitState, PENALTY_MIN, PENALTY_SLOTS, SNAP_CONT, SNAP_FRAME, SNAP_NORESTORE,
+    SnapEntry, SnapShot, TraceError, TraceLink, TraceNo, snap_entry, snap_ref, snap_slot,
 };
 
 /// Maximum number of stack slots the recorder tracks (LJ_MAX_JSLOTS).
@@ -86,7 +86,14 @@ pub struct ScEv {
 
 impl Default for ScEv {
     fn default() -> ScEv {
-        ScEv { pc: None, idx: REF_NIL, stop: 0, step: 0, t: IRT_NUM, dir: true }
+        ScEv {
+            pc: None,
+            idx: REF_NIL,
+            stop: 0,
+            step: 0,
+            t: IRT_NUM,
+            dir: true,
+        }
     }
 }
 
@@ -158,6 +165,7 @@ pub struct Record {
 }
 
 impl Record {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         traceno: TraceNo,
         pt: GcPtr<Proto>,
@@ -231,7 +239,11 @@ impl Record {
 
     /// `itype2irt`: map a runtime value to its IR type.
     fn value_irt(v: LuaValue) -> u8 {
-        if v.is_number() { IRT_NUM } else { (!v.itype()) as u8 & IRT_TYPE }
+        if v.is_number() {
+            IRT_NUM
+        } else {
+            (!v.itype()) as u8 & IRT_TYPE
+        }
     }
 
     /// `sloadt`: specialize a slot to a specific type, no typecheck guard.
@@ -332,7 +344,9 @@ impl Record {
         {
             if nsnap == 1 {
                 // But preserve snap #0: its PC anchors the trace entry.
-                self.cur.ir.emit_ins(IRIns::new(irt(IROp::NOP, IRT_NIL), 0, 0));
+                self.cur
+                    .ir
+                    .emit_ins(IRIns::new(irt(IROp::NOP, IRT_NIL), 0, 0));
             } else {
                 nsnap -= 1;
                 nsnapmap = self.cur.snap[nsnap].mapofs;
@@ -400,10 +414,15 @@ impl Record {
                     if ir.op() == IROp::SLOAD {
                         mode |= ir.op2 as u32 & IRSLOAD_READONLY;
                     }
-                    let tr = self.cur.ir.emit_ins(IRIns::new(irt(IROp::SLOAD, ty), s, mode));
+                    let tr = self
+                        .cur
+                        .ir
+                        .emit_ins(IRIns::new(irt(IROp::SLOAD, ty), s, mode));
                     // The executor pre-fills env[own] from the parent's
                     // env[r] on a linked exit (register-free hand-over).
-                    self.cur.parentmap.push((tref_ref(tr) as IRRef1, r as IRRef1));
+                    self.cur
+                        .parentmap
+                        .push((tref_ref(tr) as IRRef1, r as IRRef1));
                     tr
                 };
                 seen.push((r, tr));
@@ -418,12 +437,16 @@ impl Record {
                     return Err(TraceError::NYIBC);
                 }
                 let link_bits = t.ir.k64_val(r);
-                let Some((fs, fref)) = prev_entry else { return Err(TraceError::NYIBC) };
+                let Some((fs, fref)) = prev_entry else {
+                    return Err(TraceError::NYIBC);
+                };
                 if fs != s - 1 || !irref_isk(fref) {
                     return Err(TraceError::NYIBC);
                 }
                 let fv = LuaValue::from_bits(t.ir.k64_val(fref));
-                let Some(gf) = fv.as_func() else { return Err(TraceError::NYIBC) };
+                let Some(gf) = fv.as_func() else {
+                    return Err(TraceError::NYIBC);
+                };
                 let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
                     return Err(TraceError::NYIBC);
                 };
@@ -481,13 +504,21 @@ impl Record {
         if Self::for_direction(l.stack[base + (ra + FORL_STEP) as usize]) {
             if idx <= stop {
                 *op = IROp::LE;
-                return if idx + 2.0 * step > stop { LoopEvent::EnterLo } else { LoopEvent::Enter };
+                return if idx + 2.0 * step > stop {
+                    LoopEvent::EnterLo
+                } else {
+                    LoopEvent::Enter
+                };
             }
             *op = IROp::GT;
         } else {
             if stop <= idx {
                 *op = IROp::GE;
-                return if idx + 2.0 * step < stop { LoopEvent::EnterLo } else { LoopEvent::Enter };
+                return if idx + 2.0 * step < stop {
+                    LoopEvent::EnterLo
+                } else {
+                    LoopEvent::Enter
+                };
             }
             *op = IROp::LT;
         }
@@ -589,7 +620,10 @@ impl Record {
             idx = self.sloadt(ra + FORL_IDX, IRT_NUM, IRSLOAD_INHERIT);
         }
         if !init {
-            idx = self.cur.ir.emitir(irtn(IROp::ADD), tref_ref(idx), tref_ref(step))?;
+            idx = self
+                .cur
+                .ir
+                .emitir(irtn(IROp::ADD), tref_ref(idx), tref_ref(step))?;
             self.set_base(ra + FORL_IDX, idx);
         }
         self.set_base(ra + FORL_EXT, idx);
@@ -696,8 +730,10 @@ impl Record {
         let key = super::bc_addr(pt, pc);
         for i in 0..PENALTY_SLOTS {
             if js.penalty[i].pc == key {
-                return matches!(js.penalty[i].reason, TraceError::LLEAVE | TraceError::LINNER)
-                    && js.penalty[i].val as u32 >= 2 * PENALTY_MIN;
+                return matches!(
+                    js.penalty[i].reason,
+                    TraceError::LLEAVE | TraceError::LINNER
+                ) && js.penalty[i].val as u32 >= 2 * PENALTY_MIN;
             }
         }
         false
@@ -768,7 +804,9 @@ impl Record {
     fn comp_prep(&mut self) {
         // Prevent merging with snapshot #0, since its PC gets fixed up.
         if self.cur.snap.len() == 1 && self.cur.snap[0].iref == self.cur.ir.nins() {
-            self.cur.ir.emit_ins(IRIns::new(irt(IROp::NOP, IRT_NIL), 0, 0));
+            self.cur
+                .ir
+                .emit_ins(IRIns::new(irt(IROp::NOP, IRT_NIL), 0, 0));
         }
         self.snap_add();
     }
@@ -813,10 +851,22 @@ impl Record {
         }
         if op == IROp::MOD {
             // x % y ==> x - floor(x/y)*y (IR_MOD is integer-only).
-            let tmp = self.cur.ir.emitir(irtn(IROp::DIV), tref_ref(rb), tref_ref(rc))?;
-            let tmp = self.cur.ir.emitir(irtn(IROp::FPMATH), tref_ref(tmp), IRFPM_FLOOR)?;
-            let tmp = self.cur.ir.emitir(irtn(IROp::MUL), tref_ref(tmp), tref_ref(rc))?;
-            return self.cur.ir.emitir(irtn(IROp::SUB), tref_ref(rb), tref_ref(tmp));
+            let tmp = self
+                .cur
+                .ir
+                .emitir(irtn(IROp::DIV), tref_ref(rb), tref_ref(rc))?;
+            let tmp = self
+                .cur
+                .ir
+                .emitir(irtn(IROp::FPMATH), tref_ref(tmp), IRFPM_FLOOR)?;
+            let tmp = self
+                .cur
+                .ir
+                .emitir(irtn(IROp::MUL), tref_ref(tmp), tref_ref(rc))?;
+            return self
+                .cur
+                .ir
+                .emitir(irtn(IROp::SUB), tref_ref(rb), tref_ref(tmp));
         }
         self.cur.ir.emitir(irtn(op), tref_ref(rb), tref_ref(rc))
     }
@@ -863,6 +913,7 @@ impl Record {
     /// the recorder into the callee frame. Stops the trace (`Some`) on
     /// up-recursion to the trace head (`check_call_unroll`) or when the
     /// callee is already compiled (`rec_func_jit`).
+    #[allow(clippy::too_many_arguments)]
     fn rec_call_lua(
         &mut self,
         l: &LuaState,
@@ -877,7 +928,9 @@ impl Record {
             return Err(TraceError::NYIBC); // Multres call (CALLM context).
         }
         let gf = fv.as_func().expect("checked by the caller");
-        let crate::func::GcFunc::Lua(cl) = gf.as_ref() else { unreachable!() };
+        let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
+            unreachable!()
+        };
         let cpt = cl.proto;
         if cpt.as_ref().flags & crate::proto::PROTO_VARARG != 0 {
             return Err(TraceError::NYIBC);
@@ -887,8 +940,11 @@ impl Record {
         let is_head_call = self.parent == 0
             && bc_op(self.cur.startins) == BCOp::FUNCF
             && cpt.addr() == self.cur.startpt.addr();
-        let same_frames =
-            self.frames.iter().filter(|f| f.callee.addr() == cpt.addr()).count();
+        let same_frames = self
+            .frames
+            .iter()
+            .filter(|f| f.callee.addr() == cpt.addr())
+            .count();
         let stop_uprec = is_head_call && same_frames >= self.recunroll as usize;
         // A compiled callee stops the trace with a link to its root
         // trace (rec_func_jit) once the frame is laid down.
@@ -908,7 +964,9 @@ impl Record {
         debug_assert!(ftr != 0, "callee tref not loaded");
         let kf = self.cur.ir.kgc(fv.to_bits(), IRT_FUNC);
         if !tref_isk(ftr) {
-            self.cur.ir.emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
+            self.cur
+                .ir
+                .emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
         }
         self.set_base(a, kf);
         // The frame link the interpreter stores: the return ins address.
@@ -1015,7 +1073,7 @@ impl Record {
         ins: BCIns,
     ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
         let a = bc_a(ins);
-        let nargs = (bc_d(ins) as u32).wrapping_sub(1);
+        let nargs = bc_d(ins).wrapping_sub(1);
         let fv = self.slot_val(l, base, a);
         let Some(gf) = fv.as_func() else {
             return Err(TraceError::NYIBC);
@@ -1051,10 +1109,14 @@ impl Record {
         let ftr = self.getslot(l, base, a);
         let kf = self.cur.ir.kgc(fv.to_bits(), IRT_FUNC);
         if !tref_isk(ftr) {
-            self.cur.ir.emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
+            self.cur
+                .ir
+                .emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
         }
         // Load the arguments, then move func + args down in place.
-        let args: Vec<TRef> = (0..nargs).map(|i| self.getslot(l, base, a + 2 + i)).collect();
+        let args: Vec<TRef> = (0..nargs)
+            .map(|i| self.getslot(l, base, a + 2 + i))
+            .collect();
         self.slot[self.baseslot - 2] = kf; // Frame link (baseslot-1) stays.
         for (i, &tr) in args.iter().enumerate() {
             self.set_base(i as u32, tr);
@@ -1081,20 +1143,31 @@ impl Record {
     /// Record a RET0/RET1/RET from an inlined frame: move the results to
     /// the caller's call base and pop the frame. Returning past the
     /// trace's entry frame is NYI (LJ_TRERR_NYIRETL).
-    fn rec_ret(&mut self, l: &LuaState, base: usize, rbase: u32, gotres: u32) -> Result<(), TraceError> {
+    fn rec_ret(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        rbase: u32,
+        gotres: u32,
+    ) -> Result<(), TraceError> {
         if self.framedepth <= 0 {
             return Err(TraceError::NYIRETL);
         }
         // Load the results while still in the callee frame.
-        let res: Vec<TRef> =
-            (0..gotres).map(|i| self.getslot(l, base, rbase + i)).collect();
+        let res: Vec<TRef> = (0..gotres)
+            .map(|i| self.getslot(l, base, rbase + i))
+            .collect();
         let callee_top = self.baseslot + self.pt.as_ref().framesize as usize;
         let fr = self.frames.pop().expect("framedepth/frames mismatch");
         self.framedepth -= 1;
         self.baseslot = fr.prev_baseslot;
         self.pt = fr.pt;
         for i in 0..fr.want {
-            let tr = if i < gotres { res[i as usize] } else { TREF_NIL };
+            let tr = if i < gotres {
+                res[i as usize]
+            } else {
+                TREF_NIL
+            };
             self.set_base(fr.cbase + i, tr);
         }
         // Clear the dead frame area (stale KFUNC/link/local trefs).
@@ -1122,9 +1195,15 @@ impl Record {
             return Ok(cur); // Inlined frames are specialized already.
         }
         let kf = self.cur.ir.kgc(fnval.to_bits(), IRT_FUNC);
-        let ftr = if cur != 0 { cur } else { self.getslot_abs(l, base, fslot) };
+        let ftr = if cur != 0 {
+            cur
+        } else {
+            self.getslot_abs(l, base, fslot)
+        };
         if !tref_isk(ftr) {
-            self.cur.ir.emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
+            self.cur
+                .ir
+                .emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
         }
         self.slot[fslot] = kf;
         Ok(kf)
@@ -1158,7 +1237,11 @@ impl Record {
             self.cur.ir.knum_u64(v.to_bits())
         } else {
             let t = Self::value_irt(v);
-            if irt_ispri(t) { tref_pri(t) } else { self.cur.ir.kgc(v.to_bits(), t) }
+            if irt_ispri(t) {
+                tref_pri(t)
+            } else {
+                self.cur.ir.kgc(v.to_bits(), t)
+            }
         }
     }
 
@@ -1167,7 +1250,9 @@ impl Record {
     /// through their (constant) address with a type guard.
     fn rec_uget(&mut self, l: &LuaState, base: usize, uvidx: u32) -> Result<TRef, TraceError> {
         let fnval = l.stack[base - 2];
-        let Some(gf) = fnval.as_func() else { return Err(TraceError::NYIBC) };
+        let Some(gf) = fnval.as_func() else {
+            return Err(TraceError::NYIBC);
+        };
         let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
             return Err(TraceError::NYIBC);
         };
@@ -1179,9 +1264,7 @@ impl Record {
         // rec_upvalue_constify: immutable upvalues become constants under
         // the closure-identity guard (skip memory-heavy objects).
         if uvp.immutable
-            && !(val.is_table()
-                || val.is_thread()
-                || val.itype() == crate::value::LJ_TUDATA)
+            && !(val.is_table() || val.is_thread() || val.itype() == crate::value::LJ_TUDATA)
         {
             self.specialize_curfn(l, base, fnval)?;
             return Ok(self.constify(val));
@@ -1194,10 +1277,7 @@ impl Record {
             let sp = l.stack.as_ptr() as usize;
             let ptr = uvp.value_ptr() as usize;
             let frame0 = base - (self.baseslot - 2);
-            if ptr >= sp
-                && ptr < sp + l.stack.len() * 8
-                && (ptr - sp) % 8 == 0
-            {
+            if ptr >= sp && ptr < sp + l.stack.len() * 8 && (ptr - sp).is_multiple_of(8) {
                 let idx = (ptr - sp) / 8;
                 if idx + 2 >= frame0 + 2 && idx - frame0 + 2 < MAX_JSLOTS {
                     let abs = idx - frame0 + 2;
@@ -1214,10 +1294,11 @@ impl Record {
         // stable and closed cells never reopen); load with a type guard.
         let t = Self::value_irt(val);
         let cell = self.cur.ir.kint64(uvp.value_ptr() as u64);
-        let mut tr = self
-            .cur
-            .ir
-            .emit_ins(IRIns::new(irt(IROp::ULOAD, IRT_GUARD | t), tref_ref(cell), 0));
+        let mut tr = self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::ULOAD, IRT_GUARD | t),
+            tref_ref(cell),
+            0,
+        ));
         if irt_ispri(t) {
             tr = tref_pri(t);
         }
@@ -1304,8 +1385,11 @@ impl Record {
             return Err(TraceError::NYIBC); // Runtime error path.
         }
         self.meta_guard(tab);
-        let carg =
-            self.cur.ir.emit_ins(IRIns::new(irt(IROp::CARG, IRT_NIL), tref_ref(key), tref_ref(val)));
+        let carg = self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(key),
+            tref_ref(val),
+        ));
         // Array fast path (set_int's inline case): integer key strictly
         // inside the array part — a plain store, no allocation.
         let ki = keyv.as_number().map(|n| n as i32);
@@ -1315,13 +1399,19 @@ impl Record {
             && ki > 0
             && (ki as u32) < t.as_ref().asize
         {
-            self.cur
-                .ir
-                .emit_ins(IRIns::new(irt(IROp::ASTORE, IRT_NIL), tref_ref(tab), tref_ref(carg)));
+            self.cur.ir.emit_ins(IRIns::new(
+                irt(IROp::ASTORE, IRT_NIL),
+                tref_ref(tab),
+                tref_ref(carg),
+            ));
             self.needsnap = true;
             return Ok(());
         }
-        self.cur.ir.emit_ins(IRIns::new(irt(IROp::HSTORE, IRT_NIL), tref_ref(tab), tref_ref(carg)));
+        self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::HSTORE, IRT_NIL),
+            tref_ref(tab),
+            tref_ref(carg),
+        ));
         self.rec_gcstep(l);
         Ok(())
     }
@@ -1377,7 +1467,9 @@ impl Record {
         debug_assert!(ftr != 0, "callee tref not loaded");
         let kf = self.cur.ir.kgc(fv.to_bits(), IRT_FUNC);
         if !tref_isk(ftr) {
-            self.cur.ir.emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
+            self.cur
+                .ir
+                .emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr), tref_ref(kf))?;
         }
         let mut res = [TREF_NIL; 2];
         let nres: u32;
@@ -1395,16 +1487,20 @@ impl Record {
                             Recff::Ceil => IRFPM_CEIL,
                             _ => IRFPM_SQRT,
                         };
-                        let r =
-                            self.cur.ir.emitir(irtn(IROp::FPMATH), tref_ref(arg0), fpm)?;
+                        let r = self
+                            .cur
+                            .ir
+                            .emitir(irtn(IROp::FPMATH), tref_ref(arg0), fpm)?;
                         // The builtins push through LuaValue::number,
                         // which normalizes -0.0 to +0.0: match that
                         // exactly (x + 0.0; raw-emitted so no fold rule
                         // may drop it).
                         let zero = self.cur.ir.knum(0.0);
-                        self.cur
-                            .ir
-                            .emit_ins(IRIns::new(irtn(IROp::ADD), tref_ref(r), tref_ref(zero)))
+                        self.cur.ir.emit_ins(IRIns::new(
+                            irtn(IROp::ADD),
+                            tref_ref(r),
+                            tref_ref(zero),
+                        ))
                     }
                 };
                 nres = 1;
@@ -1420,7 +1516,10 @@ impl Record {
                     return Err(TraceError::NYIBC);
                 }
                 let one = self.cur.ir.knum(1.0);
-                let k = self.cur.ir.emitir(irtn(IROp::ADD), tref_ref(ctrl), tref_ref(one))?;
+                let k = self
+                    .cur
+                    .ir
+                    .emitir(irtn(IROp::ADD), tref_ref(ctrl), tref_ref(one))?;
                 let iv = argv[1].as_number().ok_or(TraceError::NYIBC)? + 1.0;
                 let v = self.rec_tget(argv[0], tab, LuaValue::number(iv), k)?;
                 if tref_isnil(v) {
@@ -1441,7 +1540,11 @@ impl Record {
                 if !tref_istab(tab) {
                     return Err(TraceError::NYIBC);
                 }
-                let key = if nargs >= 2 { self.base_ref(a + 3) } else { TREF_NIL };
+                let key = if nargs >= 2 {
+                    self.base_ref(a + 3)
+                } else {
+                    TREF_NIL
+                };
                 let tabv = argv[0];
                 let keyv = if nargs >= 2 { argv[1] } else { LuaValue::NIL };
                 let nkv =
@@ -1475,7 +1578,11 @@ impl Record {
                 // is exactly MIN(next, acc) — including the NaN and ±0
                 // tie behavior of minsd/maxsd. The push goes through
                 // LuaValue::number, so normalize -0.0 at the end.
-                let irop = if ff == Recff::MathMin { IROp::MIN } else { IROp::MAX };
+                let irop = if ff == Recff::MathMin {
+                    IROp::MIN
+                } else {
+                    IROp::MAX
+                };
                 let mut acc = self.base_ref(a + 2);
                 if !tref_isnum(acc) {
                     return Err(TraceError::NYIBC);
@@ -1488,10 +1595,11 @@ impl Record {
                     acc = self.cur.ir.emitir(irtn(irop), tref_ref(x), tref_ref(acc))?;
                 }
                 let zero = self.cur.ir.knum(0.0);
-                res[0] = self
-                    .cur
-                    .ir
-                    .emit_ins(IRIns::new(irtn(IROp::ADD), tref_ref(acc), tref_ref(zero)));
+                res[0] = self.cur.ir.emit_ins(IRIns::new(
+                    irtn(IROp::ADD),
+                    tref_ref(acc),
+                    tref_ref(zero),
+                ));
                 nres = 1;
             }
             Recff::Fmod => {
@@ -1523,13 +1631,18 @@ impl Record {
             }
             Recff::Bnot => {
                 let x = self.rec_tobit(self.base_ref(a + 2))?;
-                res[0] = self.cur.ir.emit_ins(IRIns::new(irtn(IROp::BNOT), tref_ref(x), 0));
+                res[0] = self
+                    .cur
+                    .ir
+                    .emit_ins(IRIns::new(irtn(IROp::BNOT), tref_ref(x), 0));
                 nres = 1;
             }
             Recff::Bswap => {
                 let x = self.rec_tobit(self.base_ref(a + 2))?;
-                res[0] =
-                    self.cur.ir.emit_ins(IRIns::new(irtn(IROp::BSWAP), tref_ref(x), 0));
+                res[0] = self
+                    .cur
+                    .ir
+                    .emit_ins(IRIns::new(irtn(IROp::BSWAP), tref_ref(x), 0));
                 nres = 1;
             }
             Recff::Band | Recff::Bor | Recff::Bxor => {
@@ -1562,8 +1675,10 @@ impl Record {
                 };
                 let x = self.rec_tobit(self.base_ref(a + 2))?;
                 let n = self.rec_tobit(self.base_ref(a + 3))?;
-                res[0] =
-                    self.cur.ir.emit_ins(IRIns::new(irtn(irop), tref_ref(x), tref_ref(n)));
+                res[0] = self
+                    .cur
+                    .ir
+                    .emit_ins(IRIns::new(irtn(irop), tref_ref(x), tref_ref(n)));
                 nres = 1;
             }
             Recff::StrLen => {
@@ -1598,11 +1713,13 @@ impl Record {
                 } else {
                     self.cur.ir.knum(1.0)
                 };
-                let iv = if nargs >= 2 { argv[1] } else { LuaValue::number(1.0) };
-                let outv = LuaValue::from_bits(super::exec::jit_str_byte(
-                    argv[0].to_bits(),
-                    iv.to_bits(),
-                ));
+                let iv = if nargs >= 2 {
+                    argv[1]
+                } else {
+                    LuaValue::number(1.0)
+                };
+                let outv =
+                    LuaValue::from_bits(super::exec::jit_str_byte(argv[0].to_bits(), iv.to_bits()));
                 let t_out = Self::value_irt(outv);
                 let carg = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CARG, IRT_NIL),
@@ -1623,7 +1740,7 @@ impl Record {
             Recff::StrSub => {
                 // string.sub(s, i [, j]) — a missing j records as -1
                 // (the same suffix). The result is always a string.
-                if nargs < 2 || nargs > 3 {
+                if !(2..=3).contains(&nargs) {
                     return Err(TraceError::NYIBC);
                 }
                 let s = self.base_ref(a + 2);
@@ -1699,7 +1816,10 @@ impl Record {
                     IRCALL_TAB_LEN,
                 ));
                 let one = self.cur.ir.knum(1.0);
-                let k = self.cur.ir.emitir(irtn(IROp::ADD), tref_ref(len), tref_ref(one))?;
+                let k = self
+                    .cur
+                    .ir
+                    .emitir(irtn(IROp::ADD), tref_ref(len), tref_ref(one))?;
                 let carg = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CARG, IRT_NIL),
                     tref_ref(k),
@@ -1739,7 +1859,9 @@ impl Record {
                     IRCALL_TAB_LEN,
                 ));
                 let zero = self.cur.ir.knum(0.0);
-                self.cur.ir.emitir(irtg(IROp::GT, IRT_NUM), tref_ref(len), tref_ref(zero))?;
+                self.cur
+                    .ir
+                    .emitir(irtg(IROp::GT, IRT_NUM), tref_ref(len), tref_ref(zero))?;
                 let ty = Self::value_irt(vv);
                 let v = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::ALOAD, IRT_GUARD | ty),
@@ -1815,8 +1937,12 @@ impl Record {
     fn bitrange_guard(&mut self, x: TRef, lo: f64, hi: f64) -> Result<(), TraceError> {
         let kmin = self.cur.ir.knum(lo);
         let kmax = self.cur.ir.knum(hi);
-        self.cur.ir.emitir(irtg(IROp::GE, IRT_NUM), tref_ref(x), tref_ref(kmin))?;
-        self.cur.ir.emitir(irtg(IROp::LE, IRT_NUM), tref_ref(x), tref_ref(kmax))?;
+        self.cur
+            .ir
+            .emitir(irtg(IROp::GE, IRT_NUM), tref_ref(x), tref_ref(kmin))?;
+        self.cur
+            .ir
+            .emitir(irtg(IROp::LE, IRT_NUM), tref_ref(x), tref_ref(kmax))?;
         Ok(())
     }
 
@@ -1853,7 +1979,10 @@ impl Record {
             return Ok(x); // Already an exact int32.
         }
         self.bitrange_guard(x, -2147483648.0, 2147483647.0)?;
-        Ok(self.cur.ir.emit_ins(IRIns::new(irtn(IROp::TOBIT), tref_ref(x), 0)))
+        Ok(self
+            .cur
+            .ir
+            .emit_ins(IRIns::new(irtn(IROp::TOBIT), tref_ref(x), 0)))
     }
 
     /// Record BAND/BOR/BXOR/BSHL/BSHR/BSAR/BNOT: both operands must be
@@ -1877,7 +2006,10 @@ impl Record {
         }
         // Raw-emitted: the integer fold rules do not apply to the fused
         // form (see fold_step), and CSE happens on re-emission anyway.
-        Ok(self.cur.ir.emit_ins(IRIns::new(irtn(irop), tref_ref(x), tref_ref(y))))
+        Ok(self
+            .cur
+            .ir
+            .emit_ins(IRIns::new(irtn(irop), tref_ref(x), tref_ref(y))))
     }
 
     // -- Main recording entry (lj_record_ins) ---------------------------------------
@@ -1976,10 +2108,7 @@ impl Record {
                             IRCALL_STR_CMP,
                         ));
                         y = self.cur.ir.knum(0.0);
-                        xn = f64::from_bits(super::exec::jit_str_cmp(
-                            rav.to_bits(),
-                            rcv.to_bits(),
-                        ));
+                        xn = f64::from_bits(super::exec::jit_str_cmp(rav.to_bits(), rcv.to_bits()));
                         yn = 0.0;
                     } else {
                         return Err(TraceError::NYIBC); // Mixed/metamethods NYI.
@@ -1993,12 +2122,20 @@ impl Record {
                     if !super::opt_fold::fold_numcmp(xn, yn, irop) {
                         irop = IROp::from_u8(irop as u8 ^ 5);
                     }
-                    self.cur.ir.emitir(irtg(irop, IRT_NUM), tref_ref(x), tref_ref(y))?;
+                    self.cur
+                        .ir
+                        .emitir(irtg(irop, IRT_NUM), tref_ref(x), tref_ref(y))?;
                     self.comp_fixup(pc, ((op as u8) ^ (irop as u8)) & 1 != 0);
                 }
             }
-            BCOp::ISEQV | BCOp::ISNEV | BCOp::ISEQS | BCOp::ISNES | BCOp::ISEQN
-            | BCOp::ISNEN | BCOp::ISEQP | BCOp::ISNEP => {
+            BCOp::ISEQV
+            | BCOp::ISNEV
+            | BCOp::ISEQS
+            | BCOp::ISNES
+            | BCOp::ISEQN
+            | BCOp::ISNEN
+            | BCOp::ISEQP
+            | BCOp::ISNEP => {
                 // Emit nothing for two non-table constants.
                 if !(tref_isk(ra) && tref_isk(rc) && !tref_istab(ra)) {
                     if tref_isnum(ra) && tref_isnum(rc) {
@@ -2006,8 +2143,10 @@ impl Record {
                         self.comp_prep();
                         let diff = rav.num() != rcv.num();
                         let o = if diff { IROp::NE } else { IROp::EQ };
-                        self.cur.ir.emitir(irtg(o, IRT_NUM), tref_ref(ra), tref_ref(rc))?;
-                        self.comp_fixup(pc, ((op as u8) & 1 == 1) == !diff);
+                        self.cur
+                            .ir
+                            .emitir(irtg(o, IRT_NUM), tref_ref(ra), tref_ref(rc))?;
+                        self.comp_fixup(pc, ((op as u8) & 1 == 1) != diff);
                     } else {
                         self.comp_prep();
                         let diff = self.objcmp(ra, rc, rav, rcv)?;
@@ -2043,7 +2182,11 @@ impl Record {
             BCOp::MOV => result = rc,
             BCOp::NOT => {
                 // Type specialization already forces a const result.
-                result = if rcv.is_truthy() { TREF_FALSE } else { TREF_TRUE };
+                result = if rcv.is_truthy() {
+                    TREF_FALSE
+                } else {
+                    TREF_TRUE
+                };
             }
             BCOp::UNM => {
                 if !tref_isnum(rc) {
@@ -2051,7 +2194,10 @@ impl Record {
                 }
                 // op2 stands in for LuaJIT's KSIMD sign-flip constant.
                 let signbit = self.cur.ir.knum(-0.0);
-                result = self.cur.ir.emitir(irtn(IROp::NEG), tref_ref(rc), tref_ref(signbit))?;
+                result = self
+                    .cur
+                    .ir
+                    .emitir(irtn(IROp::NEG), tref_ref(rc), tref_ref(signbit))?;
             }
             BCOp::LEN => {
                 if tref_isstr(rc) {
@@ -2089,8 +2235,16 @@ impl Record {
             }
 
             // -- Arithmetic --------------------------------------------------------------
-            BCOp::ADDVN | BCOp::SUBVN | BCOp::MULVN | BCOp::DIVVN | BCOp::MODVN
-            | BCOp::ADDVV | BCOp::SUBVV | BCOp::MULVV | BCOp::DIVVV | BCOp::MODVV => {
+            BCOp::ADDVN
+            | BCOp::SUBVN
+            | BCOp::MULVN
+            | BCOp::DIVVN
+            | BCOp::MODVN
+            | BCOp::ADDVV
+            | BCOp::SUBVV
+            | BCOp::MULVV
+            | BCOp::DIVVV
+            | BCOp::MODVV => {
                 result = self.arith(rb, rc, arith_irop(op))?;
             }
             BCOp::ADDNV | BCOp::SUBNV | BCOp::MULNV | BCOp::DIVNV | BCOp::MODNV => {
@@ -2154,8 +2308,10 @@ impl Record {
                 // D holds the trace number; recover the FORI position from
                 // the original FORL stored as the trace's start instruction.
                 let lnk = bc_d(ins);
-                let startins =
-                    js.trace[lnk as usize].as_ref().ok_or(TraceError::NYIBC)?.startins;
+                let startins = js.trace[lnk as usize]
+                    .as_ref()
+                    .ok_or(TraceError::NYIBC)?
+                    .startins;
                 let fori = (pc as i64 + bc_j(startins)) as usize;
                 let ev = self.rec_for(l, base, fori, true)?;
                 if let Some(link) = self.loop_jit(lnk, ev)? {
@@ -2164,8 +2320,10 @@ impl Record {
             }
             BCOp::JLOOP => {
                 let lnk = bc_d(ins);
-                let startins =
-                    js.trace[lnk as usize].as_ref().ok_or(TraceError::NYIBC)?.startins;
+                let startins = js.trace[lnk as usize]
+                    .as_ref()
+                    .ok_or(TraceError::NYIBC)?
+                    .startins;
                 if bc_isret(bc_op(startins)) || bc_op(startins) == BCOp::ITERN {
                     return Err(TraceError::NYIBC); // Patched RET/ITERN loops.
                 }
@@ -2178,8 +2336,10 @@ impl Record {
                 // rec_loop_jit for iterator loops: replay the original
                 // ITERL semantics (the jump lives in the trace startins).
                 let lnk = bc_d(ins);
-                let startins =
-                    js.trace[lnk as usize].as_ref().ok_or(TraceError::NYIBC)?.startins;
+                let startins = js.trace[lnk as usize]
+                    .as_ref()
+                    .ok_or(TraceError::NYIBC)?
+                    .startins;
                 let ev = self.rec_iterl(l, base, pc, startins);
                 if let Some(link) = self.loop_jit(lnk, ev)? {
                     return Ok(Some(link));
@@ -2214,15 +2374,16 @@ impl Record {
             BCOp::TNEW => {
                 // Mirror the interpreter: a fresh empty table (the size
                 // hint in D is ignored there too).
-                result = self.cur.ir.emit_ins(IRIns::new(irt(IROp::TNEW, IRT_TAB), 0, 0));
+                result = self
+                    .cur
+                    .ir
+                    .emit_ins(IRIns::new(irt(IROp::TNEW, IRT_TAB), 0, 0));
                 self.rec_gcstep(l);
             }
             BCOp::TDUP => {
                 let templ_addr = match &pt.as_ref().kgc[bc_d(ins) as usize] {
                     crate::proto::KGc::Table(t) => &**t as *const crate::table::LuaTable,
-                    crate::proto::KGc::TableRef(t) => {
-                        t.as_ref() as *const crate::table::LuaTable
-                    }
+                    crate::proto::KGc::TableRef(t) => t.as_ref() as *const crate::table::LuaTable,
                     _ => return Err(TraceError::NYIBC),
                 };
                 let k = self.cur.ir.kint64(templ_addr as u64);
@@ -2259,7 +2420,11 @@ impl Record {
                 // constant; globals are then plain string-keyed lookups.
                 let fnval = l.stack[base - 2];
                 self.specialize_curfn(l, base, fnval)?;
-                let env = fnval.as_func().expect("current frame function").as_ref().env();
+                let env = fnval
+                    .as_func()
+                    .expect("current frame function")
+                    .as_ref()
+                    .env();
                 let tabv = LuaValue::table(env);
                 let tab = self.cur.ir.kgc(tabv.to_bits(), IRT_TAB);
                 if op == BCOp::GGET {
@@ -2410,5 +2575,9 @@ fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
 
 /// Raw value equality, same semantics as the interpreter's `val_eq`.
 fn val_eq(a: LuaValue, b: LuaValue) -> bool {
-    if a.is_number() && b.is_number() { a.num() == b.num() } else { a.to_bits() == b.to_bits() }
+    if a.is_number() && b.is_number() {
+        a.num() == b.num()
+    } else {
+        a.to_bits() == b.to_bits()
+    }
 }

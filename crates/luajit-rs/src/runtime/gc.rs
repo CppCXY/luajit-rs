@@ -68,7 +68,10 @@ mod lowmem {
         static SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
         let s = SEED
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
-                Some(s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+                Some(
+                    s.wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407),
+                )
             })
             .unwrap();
         ((1u64 << 38) + (s % ((1u64 << 46) - (1u64 << 38)))) & !0xFFFF
@@ -83,7 +86,11 @@ mod lowmem {
 
     /// Probe loop shared by the OS backends: `map(hint, size)` returns a
     /// mapping (kernel-placed anywhere on some systems) or null.
-    fn probe<F: Fn(u64, usize) -> *mut u8>(size: usize, map: F, unmap: fn(*mut u8, usize)) -> Option<NonNull<u8>> {
+    fn probe<F: Fn(u64, usize) -> *mut u8>(
+        size: usize,
+        map: F,
+        unmap: fn(*mut u8, usize),
+    ) -> Option<NonNull<u8>> {
         use std::sync::atomic::Ordering;
         let mut hint = hint_state().load(Ordering::Relaxed);
         for _ in 0..1024 {
@@ -121,7 +128,8 @@ mod lowmem {
         const MAP_FIXED_NOREPLACE: i32 = 0;
 
         unsafe extern "C" {
-            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+            -> *mut u8;
         }
         probe(
             size,
@@ -160,7 +168,12 @@ mod lowmem {
         probe(
             size,
             |hint, size| unsafe {
-                VirtualAlloc(hint as *mut u8, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+                VirtualAlloc(
+                    hint as *mut u8,
+                    size,
+                    MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE,
+                )
             },
             os_free,
         )
@@ -211,7 +224,10 @@ mod lowmem {
             let mut pages = Vec::new();
             for i in 0..300 {
                 let p = os_alloc_low(size).expect("probe failed mid-run");
-                assert!((p.as_ptr() as u64) + size as u64 <= LIMIT, "page {i} too high");
+                assert!(
+                    (p.as_ptr() as u64) + size as u64 <= LIMIT,
+                    "page {i} too high"
+                );
                 unsafe { p.as_ptr().write_bytes(0x77, size) };
                 pages.push(p);
             }

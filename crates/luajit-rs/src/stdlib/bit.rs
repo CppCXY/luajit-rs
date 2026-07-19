@@ -50,7 +50,8 @@ macro_rules! bit_fold {
             let n = nargs(l);
             let mut acc = bitarg(l, 0, $lua)?;
             for i in 1..n {
-                acc = acc $op bitarg(l, i, $lua)?;
+                #[allow(clippy::assign_op_pattern)]
+                { acc = acc $op bitarg(l, i, $lua)?; }
             }
             ret(l, acc)
         }
@@ -73,7 +74,8 @@ macro_rules! bit_shift {
 }
 
 bit_shift!(lshift, "bit.lshift", |x, n| x.wrapping_shl(n));
-bit_shift!(rshift, "bit.rshift", |x, n| ((x as u32).wrapping_shr(n)) as i32);
+bit_shift!(rshift, "bit.rshift", |x, n| ((x as u32).wrapping_shr(n))
+    as i32);
 bit_shift!(arshift, "bit.arshift", |x, n| x.wrapping_shr(n));
 bit_shift!(rol, "bit.rol", |x, n| (x as u32).rotate_left(n) as i32);
 bit_shift!(ror, "bit.ror", |x, n| (x as u32).rotate_right(n) as i32);
@@ -85,13 +87,29 @@ pub fn bswap(l: &mut LuaState) -> LuaResult<i32> {
 
 fn tohex(l: &mut LuaState) -> LuaResult<i32> {
     let x = bitarg(l, 0, "bit.tohex")? as u32;
-    let n = if nargs(l) >= 2 { bitarg(l, 1, "bit.tohex")? } else { 8 };
-    let (digits, upper) = if n < 0 { ((-n) as usize, true) } else { (n as usize, false) };
+    let n = if nargs(l) >= 2 {
+        bitarg(l, 1, "bit.tohex")?
+    } else {
+        8
+    };
+    let (digits, upper) = if n < 0 {
+        ((-n) as usize, true)
+    } else {
+        (n as usize, false)
+    };
     let digits = digits.clamp(1, 8);
     let s = if upper {
-        format!("{:0width$X}", x & (!0u32 >> (32 - digits * 4)), width = digits)
+        format!(
+            "{:0width$X}",
+            x & (!0u32 >> (32 - digits * 4)),
+            width = digits
+        )
     } else {
-        format!("{:0width$x}", x & (!0u32 >> (32 - digits * 4)), width = digits)
+        format!(
+            "{:0width$x}",
+            x & (!0u32 >> (32 - digits * 4)),
+            width = digits
+        )
     };
     let sid = l.heap().intern(s.as_bytes());
     let v = l.heap().str_value(sid);

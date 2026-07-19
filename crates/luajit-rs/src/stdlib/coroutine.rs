@@ -36,7 +36,12 @@ enum Outcome {
 /// The shared resume core: validates status, moves `nargs` arguments from
 /// `l.stack[args_at..]` onto `co`'s stack, runs it and classifies the
 /// outcome. Maintains `cur_l` and both status fields.
-fn do_resume(l: &mut LuaState, co_ref: StateRef, args_at: usize, nargs: usize) -> LuaResult<Outcome> {
+fn do_resume(
+    l: &mut LuaState,
+    co_ref: StateRef,
+    args_at: usize,
+    nargs: usize,
+) -> LuaResult<Outcome> {
     let co = co_ref.get();
     match co.status {
         CoStatus::Dead => return Err(l.runtime_error(b"cannot resume dead coroutine")),
@@ -65,7 +70,13 @@ fn do_resume(l: &mut LuaState, co_ref: StateRef, args_at: usize, nargs: usize) -
             }
             crate::vm::execute(co, 0, nargs, -1)
         }
-        Suspend::Call { pc, cl, base, slot, want } => {
+        Suspend::Call {
+            pc,
+            cl,
+            base,
+            slot,
+            want,
+        } => {
             co.suspend = Suspend::Start;
             for i in 0..nargs {
                 co.stack[slot + 2 + i] = l.stack[args_at + i];

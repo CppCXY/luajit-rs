@@ -54,7 +54,9 @@ pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: us
     if js.state != TraceState::Idle {
         return;
     }
-    let t = js.trace[parent as usize].as_ref().expect("hot exit of a freed trace");
+    let t = js.trace[parent as usize]
+        .as_ref()
+        .expect("hot exit of a freed trace");
     // Deep exits record from within the inlined frame: snap_replay
     // rebuilds the frame stack and rec.pt from the snapshot constants.
     let (pt, pc) = (t.startpt, t.snap[exitno].pc as usize);
@@ -83,7 +85,10 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         // its non-counting variant so it stops triggering.
         if js.parent == 0 && js.exitno == 0 && op != BCOp::ITERN {
             debug_assert!(
-                matches!(op, BCOp::FORL | BCOp::ITERL | BCOp::LOOP | BCOp::FUNCF | BCOp::FUNCV),
+                matches!(
+                    op,
+                    BCOp::FORL | BCOp::ITERL | BCOp::LOOP | BCOp::FUNCF | BCOp::FUNCV
+                ),
                 "bad hot bytecode {:?}",
                 op
             );
@@ -141,8 +146,13 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         let parent = js.parent;
         let exitno = js.exitno as usize;
         let (root, exit_count) = {
-            let t = js.trace[parent as usize].as_ref().expect("freed parent trace");
-            (if t.root != 0 { t.root } else { parent }, t.snap[exitno].count)
+            let t = js.trace[parent as usize]
+                .as_ref()
+                .expect("freed parent trace");
+            (
+                if t.root != 0 { t.root } else { parent },
+                t.snap[exitno].count,
+            )
         };
         rec.cur.root = root;
         rec.cur.startins = crate::bc::bcins_ad(BCOp::JMP, 0, 0);
@@ -163,8 +173,9 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         }
         // The registry owns the parent; the borrow is split like in the
         // executor (traces are never freed while the compiler runs).
-        let t: *const super::GCtrace =
-            &**js.trace[parent as usize].as_ref().expect("freed parent trace");
+        let t: *const super::GCtrace = &**js.trace[parent as usize]
+            .as_ref()
+            .expect("freed parent trace");
         if let Err(e) = rec.snap_replay(unsafe { &*t }, exitno) {
             js.err = e;
             js.state = TraceState::Err;
@@ -395,14 +406,16 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         // trace stays on the portable IR executor (mcode = None). Root
         // links get the target's inner-entry address for a direct jump.
         let mut trace = trace;
-        let link_target: Option<*const u8> =
-            if trace.linktype == TraceLink::Root && trace.link != 0 {
-                js.trace[trace.link as usize].as_ref().and_then(|t| {
-                    t.mcode.as_ref().map(|m| unsafe { m.ptr().add(t.inner_ofs as usize) })
-                })
-            } else {
-                None
-            };
+        let link_target: Option<*const u8> = if trace.linktype == TraceLink::Root && trace.link != 0
+        {
+            js.trace[trace.link as usize].as_ref().and_then(|t| {
+                t.mcode
+                    .as_ref()
+                    .map(|m| unsafe { m.ptr().add(t.inner_ofs as usize) })
+            })
+        } else {
+            None
+        };
         let no_asm = std::env::var("LUAJIT_RS_NOASM").is_ok();
         if !no_asm && let Ok((mc, inner, tails)) = super::asm_x64::assemble(&trace, link_target) {
             if std::env::var("LUAJIT_RS_TRDUMP").is_ok() {
@@ -412,7 +425,13 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                     mc.ptr(),
                     mc.len(),
                     inner,
-                    trace.startpt.as_ref().lines.get(trace.startpc).copied().unwrap_or(0),
+                    trace
+                        .startpt
+                        .as_ref()
+                        .lines
+                        .get(trace.startpc)
+                        .copied()
+                        .unwrap_or(0),
                     trace.root,
                     trace.link,
                     trace.linktype,
@@ -431,7 +450,13 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             trace.linktype,
             trace.link,
             crate::bc::bc_op(trace.startins),
-            trace.startpt.as_ref().lines.get(trace.startpc).copied().unwrap_or(0),
+            trace
+                .startpt
+                .as_ref()
+                .lines
+                .get(trace.startpc)
+                .copied()
+                .unwrap_or(0),
             trace.mcode.is_some(),
             trace
                 .snap
@@ -453,8 +478,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                 );
             }
             for (si, s) in trace.snap.iter().enumerate() {
-                let map = &trace.snapmap
-                    [s.mapofs as usize..s.mapofs as usize + s.nent as usize];
+                let map = &trace.snapmap[s.mapofs as usize..s.mapofs as usize + s.nent as usize];
                 let ent: Vec<String> = map
                     .iter()
                     .map(|&sn| {
@@ -462,7 +486,11 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                             "{}={}{}",
                             super::snap_slot(sn),
                             super::snap_ref(sn) as i32 - REF_BIAS as i32,
-                            if sn & super::SNAP_NORESTORE != 0 { "!" } else { "" }
+                            if sn & super::SNAP_NORESTORE != 0 {
+                                "!"
+                            } else {
+                                ""
+                            }
                         )
                     })
                     .collect();
@@ -478,7 +506,9 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
     }
     // Machine-code chains switch traces without resizing env in Rust:
     // keep the high-water mark over all stored traces.
-    js.env_need = js.env_need.max((trace.ir.nins() - super::ir::REF_BIAS) as usize);
+    js.env_need = js
+        .env_need
+        .max((trace.ir.nins() - super::ir::REF_BIAS) as usize);
 
     // Patch the bytecode of the starting instruction in a root trace.
     let pt = trace.startpt;
@@ -509,7 +539,9 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             #[cfg(target_arch = "x86_64")]
             {
                 let target = js.trace[traceno as usize].as_ref().and_then(|t| {
-                    t.mcode.as_ref().map(|m| unsafe { m.ptr().add(t.inner_ofs as usize) })
+                    t.mcode
+                        .as_ref()
+                        .map(|m| unsafe { m.ptr().add(t.inner_ofs as usize) })
                 });
                 if let Some(target) = target {
                     let pt_ = js.trace[parent as usize].as_mut().unwrap();
@@ -544,25 +576,23 @@ fn trace_abort(g: &mut GlobalState) {
     if js.parent == 0
         && let Some(startpt) = js.startpt
         && !bc_isret(bc_op(js.startins))
+        && js.exitno == 0
     {
-        if js.exitno == 0 {
-            let startpc = js.startpc;
-            if e == TraceError::RETRY {
-                js.hotcount_set(bc_addr(startpt, startpc + 1), 1); // Immediate retry.
-            } else if e == TraceError::NYIRETL && bc_op(js.startins) == BCOp::FUNCF {
-                // A recursive function recorded through its base case
-                // (return below the entry frame). Do not penalize: a
-                // later hot call through the recursive path stops with
-                // an up-recursion link instead.
-                let reset =
-                    (js.param(JitParam::HotLoop) as u32 * HOTCOUNT_LOOP as u32) as HotCount;
-                js.hotcount_set(bc_addr(startpt, startpc + 1), reset);
-            } else {
-                penalty_pc(js, startpt, startpc, e);
-            }
+        let startpc = js.startpc;
+        if e == TraceError::RETRY {
+            js.hotcount_set(bc_addr(startpt, startpc + 1), 1); // Immediate retry.
+        } else if e == TraceError::NYIRETL && bc_op(js.startins) == BCOp::FUNCF {
+            // A recursive function recorded through its base case
+            // (return below the entry frame). Do not penalize: a
+            // later hot call through the recursive path stops with
+            // an up-recursion link instead.
+            let reset = (js.param(JitParam::HotLoop) as u32 * HOTCOUNT_LOOP as u32) as HotCount;
+            js.hotcount_set(bc_addr(startpt, startpc + 1), reset);
+        } else {
+            penalty_pc(js, startpt, startpc, e);
         }
-        // else: stitching aborts, once those exist.
     }
+    // else: stitching aborts, once those exist.
     // Aborted side traces are not penalized: the parent exit keeps
     // counting and retries until hotexit+tryside blacklists it at setup.
 
@@ -661,7 +691,12 @@ mod tests {
 
         penalty_pc(&mut g.jit, pt, pc, TraceError::NYIBC);
         let mut prev = {
-            let s = g.jit.penalty.iter().find(|s| s.pc == bc_addr(pt, pc)).unwrap();
+            let s = g
+                .jit
+                .penalty
+                .iter()
+                .find(|s| s.pc == bc_addr(pt, pc))
+                .unwrap();
             assert!(s.val as u32 >= PENALTY_MIN);
             s.val as u32
         };
@@ -672,7 +707,12 @@ mod tests {
             if find_op(pt, BCOp::IFORL).is_some() {
                 break; // Blacklisted: the slot is not bumped on this round.
             }
-            let s = g.jit.penalty.iter().find(|s| s.pc == bc_addr(pt, pc)).unwrap();
+            let s = g
+                .jit
+                .penalty
+                .iter()
+                .find(|s| s.pc == bc_addr(pt, pc))
+                .unwrap();
             assert!((s.val as u32) >= prev * 2, "penalty must at least double");
             prev = s.val as u32;
             assert!(rounds < 32, "never blacklisted");
@@ -700,7 +740,9 @@ mod tests {
         assert_eq!(bc_op(jforl), BCOp::JFORL);
         assert!(find_op(pt, BCOp::JFORI).is_some());
         let tno = crate::bc::bc_d(jforl);
-        let tr = g.jit.trace[tno as usize].as_deref().expect("trace registered");
+        let tr = g.jit.trace[tno as usize]
+            .as_deref()
+            .expect("trace registered");
         assert_eq!(tr.traceno, tno);
         assert_eq!(tr.linktype, TraceLink::Loop);
         assert_eq!(tr.link, tr.traceno);
@@ -794,7 +836,9 @@ mod tests {
         // LOOP patched to JLOOP and executed through the trace.
         let jloop = pt.as_ref().bc[loop_pc];
         assert_eq!(bc_op(jloop), BCOp::JLOOP);
-        let tr = g.jit.trace[crate::bc::bc_d(jloop) as usize].as_deref().unwrap();
+        let tr = g.jit.trace[crate::bc::bc_d(jloop) as usize]
+            .as_deref()
+            .unwrap();
         assert_eq!(tr.linktype, TraceLink::Loop);
         assert_eq!(bc_op(tr.startins), BCOp::LOOP);
         assert!(tr.snap.iter().any(|s| s.count > 0), "no exit was taken");
@@ -863,8 +907,9 @@ mod tests {
             let root = g.jit.trace[rootno as usize].as_deref().unwrap();
             assert_eq!(root.nchild, 0, "unrecordable side trace was compiled");
             assert!(
-                root.snap.iter().any(|s| s.count == super::super::SNAPCOUNT_DONE
-                    && s.sidetrace == 0),
+                root.snap
+                    .iter()
+                    .any(|s| s.count == super::super::SNAPCOUNT_DONE && s.sidetrace == 0),
                 "hopeless exit was not blacklisted"
             );
         }
@@ -1118,7 +1163,10 @@ mod tests {
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200000.0));
-        assert!(find_op(pt, BCOp::JFORL).is_some(), "tailcall loop not compiled");
+        assert!(
+            find_op(pt, BCOp::JFORL).is_some(),
+            "tailcall loop not compiled"
+        );
     }
 
     #[test]
@@ -1178,7 +1226,10 @@ mod tests {
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(100000.0 * 100001.0));
-        assert!(find_op(pt, BCOp::JFORL).is_some(), "table loops not compiled");
+        assert!(
+            find_op(pt, BCOp::JFORL).is_some(),
+            "table loops not compiled"
+        );
     }
 
     #[test]
@@ -1247,7 +1298,10 @@ mod tests {
             want -= x;
         }
         assert_eq!(r[0].as_number(), Some(want));
-        assert!(find_op(pt, BCOp::JFORL).is_some(), "recff loop not compiled");
+        assert!(
+            find_op(pt, BCOp::JFORL).is_some(),
+            "recff loop not compiled"
+        );
     }
 
     #[test]
@@ -1286,10 +1340,15 @@ mod tests {
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         // Each inner pass: sum of 2k over k=1..2000.
         assert_eq!(r[0].as_number(), Some(200.0 * (2000.0 * 2001.0)));
-        assert!(find_op(pt, BCOp::JITERL).is_some(), "ipairs loop not compiled");
+        assert!(
+            find_op(pt, BCOp::JITERL).is_some(),
+            "ipairs loop not compiled"
+        );
         let g = lua.global();
         let jiterl = pt.as_ref().bc[find_op(pt, BCOp::JITERL).unwrap()];
-        let tr = g.jit.trace[crate::bc::bc_d(jiterl) as usize].as_deref().unwrap();
+        let tr = g.jit.trace[crate::bc::bc_d(jiterl) as usize]
+            .as_deref()
+            .unwrap();
         assert_eq!(tr.linktype, TraceLink::Loop);
         assert_eq!(bc_op(tr.startins), BCOp::ITERL);
         #[cfg(target_arch = "x86_64")]
@@ -1339,7 +1398,10 @@ mod tests {
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200.0 * (1000.0 * 1001.0 / 2.0)));
-        assert!(find_op(pt, BCOp::JITERL).is_some(), "Lua-iterator loop not compiled");
+        assert!(
+            find_op(pt, BCOp::JITERL).is_some(),
+            "Lua-iterator loop not compiled"
+        );
     }
 
     #[test]
@@ -1361,7 +1423,10 @@ mod tests {
              end return s",
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
-        assert_eq!(r[0].as_number(), Some(300.0 * (500.0 * 501.0 / 2.0 + 3000.0)));
+        assert_eq!(
+            r[0].as_number(),
+            Some(300.0 * (500.0 * 501.0 / 2.0 + 3000.0))
+        );
         let jiterl_pc = find_op(pt, BCOp::JITERL).expect("pairs loop not compiled");
         let g = lua.global();
         let rootno = crate::bc::bc_d(pt.as_ref().bc[jiterl_pc]);
@@ -1392,7 +1457,11 @@ mod tests {
         // Mirror the interpreter's fused semantics in Rust.
         let mut h: i32 = 0;
         for i in 1..=200000i64 {
-            let x: f64 = if i == 150000 { (2.0f64).powi(40) } else { i as f64 };
+            let x: f64 = if i == 150000 {
+                (2.0f64).powi(40)
+            } else {
+                i as f64
+            };
             let mixed = ((h << 5) | ((h as u32) >> 27) as i32) ^ (x as i32);
             h = mixed & 2147483647;
         }
@@ -1439,7 +1508,10 @@ mod tests {
         );
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200000.0));
-        assert!(find_op(pt, BCOp::FORL).is_some(), "FORL must stay untouched");
+        assert!(
+            find_op(pt, BCOp::FORL).is_some(),
+            "FORL must stay untouched"
+        );
         assert!(pt.as_ref().flags & PROTO_ILOOP == 0);
         assert!(lua.global().jit.trace.iter().flatten().next().is_none());
     }

@@ -26,7 +26,11 @@ fn package_table(l: &mut LuaState) -> crate::gc::GcPtr<LuaTable> {
     }
 }
 
-fn sub_table(l: &mut LuaState, t: crate::gc::GcPtr<LuaTable>, name: &[u8]) -> crate::gc::GcPtr<LuaTable> {
+fn sub_table(
+    l: &mut LuaState,
+    t: crate::gc::GcPtr<LuaTable>,
+    name: &[u8],
+) -> crate::gc::GcPtr<LuaTable> {
     let k = str_key(l, name);
     match t.as_ref().get_str(k).as_table() {
         Some(s) => s,
@@ -137,8 +141,11 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
                     Err(e) => {
                         loaded.as_mut().set(name_v, LuaValue::NIL);
                         return Err(l.runtime_error(
-                            format!("error loading module '{}': {}",
-                                String::from_utf8_lossy(&name), e)
+                            format!(
+                                "error loading module '{}': {}",
+                                String::from_utf8_lossy(&name),
+                                e
+                            )
                             .as_bytes(),
                         ));
                     }
@@ -153,8 +160,12 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
 
     loaded.as_mut().set(name_v, LuaValue::NIL);
     Err(l.runtime_error(
-        format!("module '{}' not found:{}", String::from_utf8_lossy(&name), tried.concat())
-            .as_bytes(),
+        format!(
+            "module '{}' not found:{}",
+            String::from_utf8_lossy(&name),
+            tried.concat()
+        )
+        .as_bytes(),
     ))
 }
 
@@ -176,7 +187,14 @@ pub fn open(l: &mut LuaState) {
     // Pre-register the built-in libraries (package.loaded.string etc).
     let g = l.global().globals;
     for lib in [
-        b"string" as &[u8], b"table", b"math", b"os", b"io", b"bit", b"coroutine", b"package",
+        b"string" as &[u8],
+        b"table",
+        b"math",
+        b"os",
+        b"io",
+        b"bit",
+        b"coroutine",
+        b"package",
     ] {
         let k = str_key(l, lib);
         let v = g.as_ref().get_str(k);

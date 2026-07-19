@@ -22,7 +22,11 @@ impl McodeArea {
     pub fn alloc(size: usize) -> Option<McodeArea> {
         let len = size.max(1).next_multiple_of(sys::page_size());
         let ptr = sys::alloc_rw(len)?;
-        Some(McodeArea { ptr, len, exec: false })
+        Some(McodeArea {
+            ptr,
+            len,
+            exec: false,
+        })
     }
 
     #[inline]
@@ -96,13 +100,22 @@ mod sys {
 
     pub fn alloc_rw(len: usize) -> Option<*mut u8> {
         let p = unsafe {
-            VirtualAlloc(std::ptr::null_mut(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                len,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
         };
         if p.is_null() { None } else { Some(p) }
     }
 
     pub fn protect(ptr: *mut u8, len: usize, exec: bool) -> bool {
-        let prot = if exec { PAGE_EXECUTE_READ } else { PAGE_READWRITE };
+        let prot = if exec {
+            PAGE_EXECUTE_READ
+        } else {
+            PAGE_READWRITE
+        };
         let mut old = 0u32;
         unsafe { VirtualProtect(ptr, len, prot, &mut old) != 0 }
     }
@@ -145,13 +158,28 @@ mod sys {
 
     pub fn alloc_rw(len: usize) -> Option<*mut u8> {
         let p = unsafe {
-            mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            )
         };
-        if p as isize == -1 || p.is_null() { None } else { Some(p) }
+        if p as isize == -1 || p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
     }
 
     pub fn protect(ptr: *mut u8, len: usize, exec: bool) -> bool {
-        let prot = if exec { PROT_READ | PROT_EXEC } else { PROT_READ | PROT_WRITE };
+        let prot = if exec {
+            PROT_READ | PROT_EXEC
+        } else {
+            PROT_READ | PROT_WRITE
+        };
         unsafe { mprotect(ptr, len, prot) == 0 }
     }
 

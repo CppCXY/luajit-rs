@@ -20,7 +20,10 @@ impl LuaString {
         let repr = if bytes.len() <= INLINE_CAP {
             let mut buf = [0u8; INLINE_CAP];
             buf[..bytes.len()].copy_from_slice(bytes);
-            Repr::Inline { len: bytes.len() as u8, buf }
+            Repr::Inline {
+                len: bytes.len() as u8,
+                buf,
+            }
         } else {
             Repr::Heap(bytes.into())
         };
@@ -41,12 +44,21 @@ impl LuaString {
         }
     }
 
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
-    pub fn sid(&self) -> StrId { self.sid }
-    pub fn hash(&self) -> u32 { self.hash }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn sid(&self) -> StrId {
+        self.sid
+    }
+    pub fn hash(&self) -> u32 {
+        self.hash
+    }
     pub fn gc_size(&self) -> usize {
         std::mem::size_of::<LuaString>()
-            + match &self.repr { Repr::Inline { .. } => 0, Repr::Heap(b) => b.len() }
+            + match &self.repr {
+                Repr::Inline { .. } => 0,
+                Repr::Heap(b) => b.len(),
+            }
     }
 }
 
@@ -95,18 +107,8 @@ impl Interner {
     const MAX_LOAD_DEN: usize = 10;
 
     #[inline]
-    fn slot_index(&self, hash: u32) -> usize {
-        (hash as usize) & (self.slots.len() - 1)
-    }
-
-    #[inline]
     fn should_grow(&self) -> bool {
         (self.nuse + self.ndead) * Self::MAX_LOAD_DEN >= self.slots.len() * Self::MAX_LOAD_NUM
-    }
-
-    #[inline]
-    fn hash_bytes(&self, s: &[u8]) -> u32 {
-        self.hasher.hash_one(s) as u32
     }
 
     pub fn intern(&mut self, s: &[u8]) -> StrId {
@@ -130,7 +132,9 @@ impl Interner {
                     return self.insert_new(s, hash, ins);
                 }
                 Slot::Tombstone => {
-                    if first_dead.is_none() { first_dead = Some(idx); }
+                    if first_dead.is_none() {
+                        first_dead = Some(idx);
+                    }
                 }
                 Slot::Occupied(p) => {
                     let ls = p.as_ref();
@@ -199,9 +203,7 @@ impl Interner {
     }
 
     pub fn lookup(&self, id: StrId) -> &LuaString {
-        self.by_id[id as usize]
-            .expect("dead string id")
-            .as_ref()
+        self.by_id[id as usize].expect("dead string id").as_ref()
     }
 
     pub fn lookup_ptr(&self, id: StrId) -> crate::gc::GcPtr<LuaString> {

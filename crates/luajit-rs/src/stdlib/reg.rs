@@ -99,7 +99,7 @@ impl<'a> LibBuilder<'a> {
             0,
             ((self.entries.len() + self.constants.len()) as u32)
                 .next_power_of_two()
-                .trailing_zeros() as u32,
+                .trailing_zeros(),
         ));
         for &(field, f) in &self.entries {
             let sid = self.l.heap().intern(field);
