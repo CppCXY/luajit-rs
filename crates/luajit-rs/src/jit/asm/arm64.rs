@@ -1716,6 +1716,137 @@ impl<'a> Asm<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Instruction-level verification tests (compile on any arch for inspection)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn dump_prologue_epilogue() {
+        let mut c = Vec::new();
+        // Prologue
+        sub_imm(&mut c, 31, 31, 256, 0);       // sub sp, sp, #256
+        stp_offset(&mut c, 29, 30, 31, 0);      // stp x29, x30, [sp, #0]
+        stp_offset(&mut c, 19, 20, 31, 16);
+        stp_offset(&mut c, 21, 22, 31, 32);
+        stp_offset(&mut c, 23, 24, 31, 48);
+        stp_offset(&mut c, 25, 26, 31, 64);
+        stp_offset(&mut c, 27, 28, 31, 80);
+        mov_reg(&mut c, 19, 0);                  // mov x19, x0
+        mov_reg(&mut c, 20, 1);                  // mov x20, x1
+        // Epilogue
+        mov_imm64(&mut c, 1, 0xFFFF_FFFF_FFFF_FFFFu64);
+        str_imm(&mut c, 19, 1, 0, 64);           // str x19, [x1]
+        ldp_offset(&mut c, 27, 28, 31, 80);
+        ldp_offset(&mut c, 25, 26, 31, 64);
+        ldp_offset(&mut c, 23, 24, 31, 48);
+        ldp_offset(&mut c, 21, 22, 31, 32);
+        ldp_offset(&mut c, 19, 20, 31, 16);
+        ldp_offset(&mut c, 29, 30, 31, 0);
+        add_imm(&mut c, 31, 31, 256, 0);         // add sp, sp, #256
+        ret(&mut c, 30);
+        for (i, chunk) in c.chunks(4).enumerate() {
+            let w = u32::from_le_bytes(chunk.try_into().unwrap());
+            eprintln!("  {:2}: {:02x?}  // {:08x}", i*4, chunk, w);
+        }
+        std::fs::write("dump_prologue.hex", &c).ok();
+    }
+
+    #[test]
+    fn dump_fp_ops() {
+        let mut c = Vec::new();
+        fmov_gpr_fp(&mut c, 0, 0);    // fmov d0, x0
+        fmov_fp_gpr(&mut c, 0, 0);    // fmov x0, d0
+        fmov_reg(&mut c, 1, 0);       // fmov d1, d0
+        fadd(&mut c, 0, 0, 1);        // fadd d0, d0, d1
+        fsub(&mut c, 0, 0, 1);        // fsub d0, d0, d1
+        fmul(&mut c, 0, 0, 1);        // fmul d0, d0, d1
+        fdiv(&mut c, 0, 0, 1);        // fdiv d0, d0, d1
+        fneg(&mut c, 0, 0);           // fneg d0, d0
+        fabs(&mut c, 0, 0);           // fabs d0, d0
+        fsqrt(&mut c, 0, 0);          // fsqrt d0, d0
+        frintm(&mut c, 0, 0);         // frintm d0, d0
+        frintp(&mut c, 0, 0);         // frintp d0, d0
+        frintz(&mut c, 0, 0);         // frintz d0, d0
+        fmin(&mut c, 0, 0, 1);        // fmin d0, d0, d1
+        fmax(&mut c, 0, 0, 1);        // fmax d0, d0, d1
+        fcmp(&mut c, 0, 1);           // fcmp d0, d1
+        fcmp_zero(&mut c, 0);         // fcmp d0, #0.0
+        fcvtzs_w(&mut c, 0, 0);       // fcvtzs w0, d0
+        fcvtns_w(&mut c, 0, 0);       // fcvtns w0, d0
+        scvtf_w(&mut c, 0, 0);        // scvtf d0, w0
+        for (i, chunk) in c.chunks(4).enumerate() {
+            let w = u32::from_le_bytes(chunk.try_into().unwrap());
+            eprintln!("  {:2}: {:02x?}  // {:08x}", i*4, chunk, w);
+        }
+        std::fs::write("dump_fpops.hex", &c).ok();
+    }
+
+    #[test]
+    fn dump_bit_ops() {
+        let mut c = Vec::new();
+        movz(&mut c, 0, 2, 0);            // movz x0, #2
+        movk(&mut c, 0, 1, 16);           // movk x0, #1, lsl #16
+        mov_imm64(&mut c, 0, 42);          // mov x0, #42
+        mov_reg(&mut c, 0, 1);             // mov x0, x1
+        add_reg_lsl(&mut c, 0, 0, 1, 3);  // add x0, x0, x1, lsl #3
+        cmp_reg(&mut c, 0, 1);             // cmp x0, x1
+        cmp_imm(&mut c, 0, 42, 0);        // cmp x0, #42
+        and_reg(&mut c, 0, 0, 1);         // and x0, x0, x1
+        eor_reg(&mut c, 0, 0, 1);         // eor x0, x0, x1
+        orr_reg(&mut c, 0, 0, 1);         // orr x0, x0, x1
+        lsl_reg(&mut c, 0, 0, 1);         // lsl x0, x0, x1
+        lsr_reg(&mut c, 0, 0, 1);         // lsr x0, x0, x1
+        asr_imm(&mut c, 0, 0, 47);        // asr x0, x0, #47
+        lsr_imm(&mut c, 0, 0, 32);        // lsr x0, x0, #32
+        rev32(&mut c, 0, 0);              // rev32 x0, x0
+        neg_w(&mut c, 1, 1);              // neg w1, w1
+        and_imm32(&mut c, 1, 1, 31);      // and w1, w1, #31
+        // ror w0, w0, w1 (32-bit inline)
+        emit32(&mut c, 0 | 0x1AC02C00 | ((1u32) << 16) | 0u32);
+        // asr w0, w0, w1 (32-bit inline)
+        emit32(&mut c, 0 | 0x1AC02800 | ((1u32) << 16) | 0u32);
+        for (i, chunk) in c.chunks(4).enumerate() {
+            let w = u32::from_le_bytes(chunk.try_into().unwrap());
+            eprintln!("  {:2}: {:02x?}  // {:08x}", i*4, chunk, w);
+        }
+        std::fs::write("dump_bitops.hex", &c).ok();
+    }
+
+    #[test]
+    fn dump_loads_stores_branches() {
+        let mut c = Vec::new();
+        ldr_imm(&mut c, 0, 19, 0, 64);          // ldr x0, [x19]
+        str_imm(&mut c, 0, 19, 0, 64);          // str x0, [x19]
+        ldr_imm(&mut c, 0, 19, 4, 32);          // ldr w0, [x19, #4]
+        str_imm(&mut c, 0, 19, 4, 32);          // str w0, [x19, #4]
+        ldr_fp(&mut c, 0, 20, 8);               // ldr d0, [x20, #8]
+        str_fp(&mut c, 0, 20, 8);               // str d0, [x20, #8]
+        ldr_reg_uxtw(&mut c, 0, 2, 1);          // ldr x0, [x2, w1, uxtw #3]
+        str_reg_uxtw(&mut c, 0, 2, 1);          // str x0, [x2, w1, uxtw #3]
+        ldr_reg_lsl3(&mut c, 0, 2, 1);          // ldr x0, [x2, x1, lsl #3]
+        str_reg_lsl3(&mut c, 0, 2, 1);          // str x0, [x2, x1, lsl #3]
+        ldr_literal(&mut c, 0, 16, 64);          // ldr x0, [pc, #16]
+        stp_offset(&mut c, 19, 20, 31, 16);      // stp x19, x20, [sp, #16]
+        ldp_offset(&mut c, 19, 20, 31, 16);      // ldp x19, x20, [sp, #16]
+        b_imm(&mut c, 16, false);                // b #16
+        b_imm(&mut c, 16, true);                 // bl #16
+        b_cond(&mut c, 0, 8);                    // b.eq #8
+        b_cond(&mut c, CC_VS, 8);                // b.vs #8
+        br_reg(&mut c, 0, false);                // br x0
+        br_reg(&mut c, 2, true);                 // blr x2
+        ret(&mut c, 30);                         // ret x30
+        for (i, chunk) in c.chunks(4).enumerate() {
+            let w = u32::from_le_bytes(chunk.try_into().unwrap());
+            eprintln!("  {:2}: {:02x?}  // {:08x}", i*4, chunk, w);
+        }
+        std::fs::write("dump_load_branch.hex", &c).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // External API
 // ---------------------------------------------------------------------------
 
