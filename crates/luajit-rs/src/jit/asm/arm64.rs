@@ -600,6 +600,8 @@ const RSCR3: u8 = 2;
 
 const RBASE: u8 = 19;
 const RENV: u8 = 20;
+/// Call-target scratch GPR (x3, not used for arguments).
+const RCALL: u8 = 3;
 
 /// Total frame size: 16 (fp+lr) + 10×8 (x21-x28, x19-x20) + 10×16 (v8-v15) = 256.
 const FRAME_SIZE: i32 = 256;
@@ -1513,8 +1515,8 @@ impl<'a> Asm<'a> {
         for (n, &r) in args.iter().enumerate() {
             self.gpr_load_ref(AARGS[n], r);
         }
-        mov_imm64(&mut self.code, RSCR2, addr);
-        br_reg(&mut self.code, RSCR2, true); // blr x2
+        mov_imm64(&mut self.code, RCALL, addr);
+        br_reg(&mut self.code, RCALL, true); // blr x3
     }
 
     /// GCSTEP guard: exit when a collection is due.
