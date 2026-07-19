@@ -305,9 +305,9 @@ fn eor_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u64) {
     eor_reg(code, rd, rn, 2);
 }
 
-/// ROR (immediate, 32-bit): `ror wd, wn, #imm`.
+/// ROR (immediate, 32-bit): `ror wd, wn, #imm`. Uses EXTR wd, wn, wn, #imm.
 fn ror_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
-    emit32(code, 0 | 0x13800000 | 0 | ((imm as u32) << 16) | (31u32 << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(code, 0 | 0x13800000 | 0 | ((rn as u32) << 16) | ((imm as u32) << 10) | ((rn as u32) << 5) | rd as u32);
 }
 
 /// NEG (32-bit): `neg wd, wn` (alias of SUB wd, WZR, wn).
@@ -528,7 +528,7 @@ fn fneg(code: &mut Vec<u8>, dd: u8, dn: u8) {
 
 /// FABS: `fabs dd, dn`.
 fn fabs(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E608000 | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E60C000 | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FSQRT: `fsqrt dd, dn`.
@@ -553,12 +553,12 @@ fn frintm(code: &mut Vec<u8>, dd: u8, dn: u8) {
 
 /// FRINTP (ceil): `frintp dd, dn`.
 fn frintp(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E648000 | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E64C000 | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FRINTZ (trunc): `frintz dd, dn`.
 fn frintz(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E658000 | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E65C000 | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FCVTZS (FP to int32, truncating): `fcvtzs wd, dn`. D-register
@@ -576,8 +576,8 @@ fn fcvtns_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
 /// SCVTF (int32 to FP, 64-bit): `scvtf dd, wn`. W-register source
 /// (32-bit), D-register destination (64-bit), signed.
 fn scvtf_w(code: &mut Vec<u8>, dd: u8, wn: u8) {
-    // A64I_FCVT_F64_S32 = 0x1E220000 (32-bit Wn → 64-bit Dd)
-    emit32(code, 0x1E220000 | ((wn as u32) << 5) | dd as u32);
+    // A64I_FCVT_F64_S32 = 0x1E620000 (32-bit Wn → 64-bit Dd)
+    emit32(code, 0x1E620000 | ((wn as u32) << 5) | dd as u32);
 }
 
 /// FCMP: `fcmp dn, dm`.
