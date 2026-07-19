@@ -258,6 +258,48 @@ fn ror_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     );
 }
 
+/// EOR (imm): `eor rd, rn, #imm` via GPR load + eor (bitmask const
+/// isn't always representable).
+fn eor_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u64) {
+    mov_imm64(code, 2, imm);
+    eor_reg(code, rd, rn, 2);
+}
+
+/// ROR (immediate, 32-bit): `ror wd, wn, #imm`.
+fn ror_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
+    emit32(code, 0 | 0x13800000 | 0 | ((imm as u32) << 16) | (31u32 << 10) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// NEG (32-bit): `neg wd, wn`.
+fn neg_w(code: &mut Vec<u8>, rd: u8, rn: u8) {
+    let sf = 0u32 << 31;
+    emit32(code, sf | 0x4B0003E0 | ((rn as u32) << 5) | rd as u32);
+}
+
+/// AND (immediate, 32-bit): `and wd, wn, #imm` (bitmask).
+fn and_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32) {
+    // Same issue: can't always encode as bitmask. Use GPR load + and_reg.
+    mov_imm64(code, 2, imm as u64);
+    let sf = 0u32 << 31;
+    emit32(code, sf | 0x0A000000 | ((2u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// LDR (register, scaled, zero-extended word): `ldr rd, [rn, rm, uxtw #3]`.
+fn ldr_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
+    let sf = 1u32 << 30; // 64-bit
+    let extend = 0b010u32 << 13; // UXTW
+    let shift = 3u32 << 12; // lsl #3
+    emit32(code, sf | 0x38604000 | extend | shift | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
+/// STR (register, scaled, zero-extended word): `str rd, [rn, rm, uxtw #3]`.
+fn str_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
+    let sf = 1u32 << 30; // 64-bit
+    let extend = 0b010u32 << 13;
+    let shift = 3u32 << 12;
+    emit32(code, sf | 0x38204000 | extend | shift | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+}
+
 /// REV32 (reverse bytes in 32-bit word, zero-extending).
 fn rev32(code: &mut Vec<u8>, rd: u8, rn: u8) {
     let sf = 1u32 << 31;
@@ -956,6 +998,130 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
+    // -- Bit ops / TOBIT / ALOAD-ASTORE / POW --------------------------------
+
+    /// Fused bit ops: convert the (range-guarded) FP operands with
+    /// fcvtzs (truncate), run the 32-bit ALU op, convert back with scvtf.
+    fn asm_bitop(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let op = ins.op();
+        let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        // Fetch both before converting: the second fetch may clobber
+        // scratch registers that the first conversion needs.
+        let sy = if !matches!(op, IROp::BNOT | IROp::BSWAP) {
+            if ins.op2 == ins.op1 { Some(sx) }
+            else { Some(self.fetch_fp(ins.op2 as IRRef, Self::pin(sx))?) }
+        } else { None };
+        fcvtzs_w(&mut self.code, 0, sx); // w0 = trunc(sx)
+        if let Some(s) = sy { fcvtzs_w(&mut self.code, 1, s); }
+        match op {
+            IROp::BNOT => eor_imm(&mut self.code, 0, 0, 0xFFFFFFFF),
+            IROp::BSWAP => rev32(&mut self.code, 0, 0),
+            IROp::BAND => and_reg(&mut self.code, 0, 0, 1),
+            IROp::BOR  => orr_reg(&mut self.code, 0, 0, 1),
+            IROp::BXOR => eor_reg(&mut self.code, 0, 0, 1),
+            IROp::BSHL => lsl_reg(&mut self.code, 0, 0, 1),
+            IROp::BSHR => lsr_reg(&mut self.code, 0, 0, 1),
+            IROp::BROL => {
+                neg_w(&mut self.code, 1, 1);     // w1 = -w1
+                and_imm32(&mut self.code, 1, 1, 31); // w1 &= 31
+                // 32-bit ror: sf=0
+                let sf_w = 0u32;
+                emit32(&mut self.code, sf_w | 0x1AC02C00 | ((1u32) << 16) | 0);
+            }
+            IROp::BROR => {
+                // ROR w0, w0, w1 (32-bit)
+                let sf_w = 0u32;
+                emit32(&mut self.code, sf_w | 0x1AC02C00 | ((1u32) << 16) | 0);
+            }
+            _ => { /* BSAR: asr w0, w0, w1 (32-bit) */
+                let sf_w = 0u32;
+                emit32(&mut self.code, sf_w | 0x1AC02800 | ((1u32) << 16) | 0);
+            }
+        }
+        let d = self.alloc(0)?;
+        scvtf_w(&mut self.code, d, 0);
+        self.def(d);
+        Ok(())
+    }
+
+    /// TOBIT: wrapping num -> int32 -> num (round-to-nearest-even, same
+    /// as num2bit in the guarded i32 range).
+    fn asm_tobit(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        fcvtns_w(&mut self.code, 0, sx);
+        let d = self.alloc(0)?;
+        scvtf_w(&mut self.code, d, 0);
+        self.def(d);
+        Ok(())
+    }
+
+    /// POW: vm_pow via a helper call.
+    fn asm_pow(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        self.helper_call(
+            super::super::exec::jit_pow as *const () as u64,
+            &[ins.op1 as IRRef, ins.op2 as IRRef],
+        );
+        let i = Self::iidx(self.cur);
+        if self.last_use[i] != 0 || self.needs_env[i] {
+            let d = self.alloc(0)?;
+            fmov_gpr_fp(&mut self.code, d, RSCR);
+            self.def(d);
+        }
+        Ok(())
+    }
+
+    // -- ALOAD / ASTORE (array inlining) -------------------------------------
+
+    /// Common head: load table pointer into x0, check key is exact int32
+    /// in array range. key is in FP register, result: x0=table, w1=index.
+    fn asm_array_head(&mut self, tab: IRRef, key: IRRef) -> Result<(), TraceError> {
+        const ASIZE_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, asize) as i32;
+        // Fetch key first (may use RAX/GPRs for constants).
+        let sk = self.fetch_fp(key, 0)?;
+        self.gpr_load_ref(0, tab);
+        mov_imm64(&mut self.code, 1, crate::value::LJ_GCVMASK);
+        and_reg(&mut self.code, 0, 0, 1);
+        fcvtzs_w(&mut self.code, 1, sk);       // w1 = trunc(key)
+        scvtf_w(&mut self.code, FP_SCRATCH, 1);
+        fcmp(&mut self.code, FP_SCRATCH, sk);
+        self.guard(CC_NE);                       // not exact int → exit
+        // Check w1 < asize (unsigned).
+        ldr_imm(&mut self.code, 2, 0, ASIZE_OFF, 32);
+        cmp_reg(&mut self.code, 1, 2);
+        self.guard(CC_CS);                       // unsigned >= → exit
+        Ok(())
+    }
+
+    fn asm_aload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
+        self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
+        // Load aptr, then value.
+        ldr_imm(&mut self.code, 2, 0, APTR_OFF, 64);
+        // ldr x3, [x2, w1, uxtw #3]
+        ldr_reg_uxtw(&mut self.code, 0, 2, 1);
+        self.ff_result(ins)
+    }
+
+    fn asm_astore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
+        let carg = *self.tr.ir.ir(ins.op2 as IRRef);
+        debug_assert_eq!(carg.op(), IROp::CARG);
+        self.asm_array_head(ins.op1 as IRRef, carg.op1 as IRRef)?;
+        // k > 0 guard (set_int requires).
+        cmp_imm(&mut self.code, 1, 0, 0);
+        self.guard(CC_EQ);
+        ldr_imm(&mut self.code, 2, 0, APTR_OFF, 64); // x2 = aptr
+        let val = carg.op2 as IRRef;
+        if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
+            fmov_fp_gpr(&mut self.code, 3, sv);
+            str_reg_uxtw(&mut self.code, 3, 2, 1);
+        } else {
+            self.gpr_load_ref(3, val);
+            str_reg_uxtw(&mut self.code, 3, 2, 1);
+        }
+        Ok(())
+    }
+
     // -- Emit loop -----------------------------------------------------------
 
     fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
@@ -1075,6 +1241,14 @@ impl<'a> Asm<'a> {
                     self.ff_result(&ins)?;
                 }
                 IROp::ULOAD => self.asm_uload(&ins)?,
+                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
+                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT | IROp::BSWAP => {
+                    self.asm_bitop(&ins)?;
+                }
+                IROp::TOBIT => self.asm_tobit(&ins)?,
+                IROp::POW => self.asm_pow(&ins)?,
+                IROp::ALOAD => self.asm_aload(&ins)?,
+                IROp::ASTORE => self.asm_astore(&ins)?,
                 _ => return Err(TraceError::NYIIR),
             }
             r += 1;
