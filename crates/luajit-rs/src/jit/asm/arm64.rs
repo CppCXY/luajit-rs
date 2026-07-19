@@ -1523,9 +1523,9 @@ impl<'a> Asm<'a> {
         let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
         area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code);
 
-        // Dump traces when LUAJIT_RS_ARM64_HEX is set (useful for CI debugging).
-        if let Ok(_) = std::env::var("LUAJIT_RS_ARM64_HEX") {
-            print!(
+        // Dump traces on aarch64 for debugging (TODO: remove after all fixed).
+        {
+            eprint!(
                 "[arm64] TRACE {} mcode={:5}B nins={} link={:?} hex=",
                 self.tr.traceno,
                 self.code.len(),
@@ -1534,10 +1534,10 @@ impl<'a> Asm<'a> {
             );
             for (i, chunk) in self.code.chunks(4).enumerate() {
                 let w = u32::from_le_bytes(chunk.try_into().unwrap());
-                if i > 0 { print!(","); }
-                print!("{:08x}", w);
+                if i > 0 { eprint!(","); }
+                eprint!("{:08x}", w);
             }
-            println!();
+            eprintln!();
         }
 
         if !area.protect_exec() { return Err(TraceError::MCODEAL); }
