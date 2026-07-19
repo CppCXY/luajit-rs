@@ -15,6 +15,7 @@
 
 pub mod parser;
 pub mod lib;
+pub mod clib;
 
 // ---------------------------------------------------------------------------
 // C type numbers (enum from lj_ctype.h)

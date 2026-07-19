@@ -1,4 +1,4 @@
-//! Lua FFI library — `ffi.*` API functions.
+//! Lua FFI library — loaded via `require("ffi")`.
 
 use crate::err::{LuaError, LuaResult};
 use crate::ffi::parser::parse;
@@ -6,156 +6,124 @@ use crate::runtime::cdata::CData;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 use crate::stdlib::{arg, push, nargs, err_bad_arg};
-use crate::lual_reg;
 
-fn get_cts(l: &mut LuaState) -> &mut crate::ffi::CTState {
-    l.global().cts.get_or_insert_with(|| crate::ffi::CTState::new())
-}
-
-fn quick_type_id(name: &str) -> Option<u32> {
-    Some(match name {
-        "void" => crate::ffi::CTypeID::Void as u32,
-        "bool"|"_Bool" => crate::ffi::CTypeID::Bool as u32,
-        "char" => crate::ffi::CTypeID::CChar as u32,
-        "signed char"|"int8_t" => crate::ffi::CTypeID::Int8 as u32,
-        "unsigned char"|"uint8_t" => crate::ffi::CTypeID::UInt8 as u32,
-        "short"|"int16_t" => crate::ffi::CTypeID::Int16 as u32,
-        "unsigned short"|"uint16_t" => crate::ffi::CTypeID::UInt16 as u32,
-        "int"|"signed"|"int32_t" => crate::ffi::CTypeID::Int32 as u32,
-        "unsigned"|"unsigned int"|"uint32_t" => crate::ffi::CTypeID::UInt32 as u32,
-        "long"|"int64_t" => crate::ffi::CTypeID::Int64 as u32,
-        "unsigned long"|"uint64_t" => crate::ffi::CTypeID::UInt64 as u32,
-        "long long" => crate::ffi::CTypeID::Int64 as u32,
-        "unsigned long long" => crate::ffi::CTypeID::UInt64 as u32,
-        "float" => crate::ffi::CTypeID::Float as u32,
-        "double" => crate::ffi::CTypeID::Double as u32,
-        _ => return None,
-    })
-}
+fn get_cts(l: &mut LuaState) -> &mut crate::ffi::CTState { l.global().cts.get_or_insert_with(|| crate::ffi::CTState::new()) }
+fn quick_type_id(n: &str) -> Option<u32> { Some(match n {
+    "void"=>crate::ffi::CTypeID::Void as u32,"bool"|"_Bool"=>crate::ffi::CTypeID::Bool as u32,"char"=>crate::ffi::CTypeID::CChar as u32,
+    "signed char"|"int8_t"=>crate::ffi::CTypeID::Int8 as u32,"unsigned char"|"uint8_t"=>crate::ffi::CTypeID::UInt8 as u32,
+    "short"|"int16_t"=>crate::ffi::CTypeID::Int16 as u32,"unsigned short"|"uint16_t"=>crate::ffi::CTypeID::UInt16 as u32,
+    "int"|"signed"|"int32_t"=>crate::ffi::CTypeID::Int32 as u32,"unsigned"|"unsigned int"|"uint32_t"=>crate::ffi::CTypeID::UInt32 as u32,
+    "long"|"int64_t"=>crate::ffi::CTypeID::Int64 as u32,"unsigned long"|"uint64_t"=>crate::ffi::CTypeID::UInt64 as u32,
+    "long long"=>crate::ffi::CTypeID::Int64 as u32,"unsigned long long"=>crate::ffi::CTypeID::UInt64 as u32,
+    "float"=>crate::ffi::CTypeID::Float as u32,"double"=>crate::ffi::CTypeID::Double as u32,_=>return None
+}) }
 
 fn ffi_checkctype(l: &mut LuaState) -> LuaResult<u32> {
-    let o = arg(l, 0);
-    if o.is_string() {
-        let sid = o.as_string_id().unwrap();
-        let name_v = { let b = l.heap().strings.get(sid).to_vec(); std::str::from_utf8(&b).map_err(|_| LuaError::Runtime)?.trim().to_string() };
-        let name = name_v.as_str();
-        if let Some(id) = quick_type_id(name) { return Ok(id); }
-        {
-            let g = l.global();
-            if let Some(cts) = g.cts.as_ref() { if let Some(&id) = cts.names.get(name) { return Ok(id); } }
-        }
-        let cts = get_cts(l); let prev = cts.top;
-        parse(cts, name).map_err(|_| LuaError::Runtime)?;
-        if cts.top > prev { Ok(cts.top - 1) } else { Err(err_bad_arg(l, 1, "ffi", "C type", "")) }
-    } else if o.is_cdata() { Ok(o.as_cdata().unwrap().as_ref().ctypeid) }
-    else { Err(err_bad_arg(l, 1, "ffi", "C type", "")) }
+    let o=arg(l,0); if o.is_string() {
+        let sid=o.as_string_id().unwrap();let n={let b=l.heap().strings.get(sid).to_vec();std::str::from_utf8(&b).map_err(|_|LuaError::Runtime)?.trim().to_string()};
+        if let Some(id)=quick_type_id(&n){return Ok(id)}if let Some(&id)=l.global().cts.as_ref().and_then(|c|c.names.get(&n)){return Ok(id)}
+        let cts=get_cts(l);let p=cts.top;parse(cts,&n).map_err(|_|LuaError::Runtime)?;if cts.top>p{Ok(cts.top-1)}else{Err(err_bad_arg(l,1,"ffi","C type",""))}
+    }else if o.is_cdata(){Ok(o.as_cdata().unwrap().as_ref().ctypeid)}else{Err(err_bad_arg(l,1,"ffi","C type",""))}
 }
-
-pub fn ffi_cdef(l: &mut LuaState) -> LuaResult<i32> {
-    let o = arg(l, 0); let sid = o.as_string_id().ok_or_else(|| err_bad_arg(l, 1, "ffi.cdef", "string", ""))?;
-    let s = l.heap().strings.get(sid).to_vec();
-    parse(get_cts(l), std::str::from_utf8(&s).map_err(|_| LuaError::Runtime)?).map_err(|_| LuaError::Runtime)?;
-    Ok(0)
-}
-
-pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
-    let id = ffi_checkctype(l)?;
-    let sz = { let c = get_cts(l); let t = c.raw(id); (t.size != u32::MAX).then_some(t.size as usize).unwrap_or(0) };
-    let ptr = { let g = l.global(); g.heap.cdatas.alloc(CData::new(id, sz.max(1))) };
-    push(l, LuaValue::cdata(ptr)); Ok(1)
-}
-
-pub fn ffi_sizeof(l: &mut LuaState) -> LuaResult<i32> {
-    let id = ffi_checkctype(l)?;
-    let sz;
-    { let cts = get_cts(l); sz = cts.raw(id).size; }
-    push(l, LuaValue::number(sz as f64)); Ok(1)
-}
-
-pub fn ffi_alignof(l: &mut LuaState) -> LuaResult<i32> {
-    let id = ffi_checkctype(l)?;
-    let al;
-    { let cts = get_cts(l); al = 1u32 << crate::ffi::ctype_align(cts.raw(id).info); }
-    push(l, LuaValue::number(al as f64)); Ok(1)
-}
-
-pub fn ffi_typeof(l: &mut LuaState) -> LuaResult<i32> {
-    let id = ffi_checkctype(l)?;
-    let mut cd = CData::new(crate::ffi::CTypeID::CTypeIDType as u32, 4);
-    cd.data[..4].copy_from_slice(&(id as u32).to_le_bytes());
-    let ptr = { let g = l.global(); g.heap.cdatas.alloc(cd) };
-    push(l, LuaValue::cdata(ptr)); Ok(1)
-}
-
-pub fn ffi_istype(l: &mut LuaState) -> LuaResult<i32> {
-    let id = ffi_checkctype(l)?;
-    push(l, if arg(l, 1).as_cdata().map_or(false, |cd| cd.as_ref().ctypeid == id) { LuaValue::TRUE } else { LuaValue::FALSE }); Ok(1)
-}
-
-pub fn ffi_string(l: &mut LuaState) -> LuaResult<i32> {
-    let cd = arg(l, 0).as_cdata().ok_or_else(|| err_bad_arg(l, 1, "ffi.string", "cdata", ""))?;
-    let ptr = cd.as_ref().get_ptr() as *const u8;
-    let len = if nargs(l) > 1 { arg(l, 1).as_number().unwrap_or(0.0) as usize } else {
-        let mut n = 0; while n < 4096 && !ptr.is_null() && unsafe { *ptr.add(n) } != 0 { n += 1; } n
-    };
-    if ptr.is_null() || len == 0 { push(l, LuaValue::NIL); return Ok(1); }
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
-    let v = { let h = l.heap(); let sid = h.strings.intern(&bytes); h.str_value(sid) };
-    push(l, v); Ok(1)
-}
-
-pub fn ffi_copy(l: &mut LuaState) -> LuaResult<i32> {
-    let dst = arg(l, 0).as_cdata().ok_or_else(|| err_bad_arg(l, 1, "ffi.copy", "cdata", ""))?;
-    let src = arg(l, 1).as_cdata().ok_or_else(|| err_bad_arg(l, 2, "ffi.copy", "cdata", ""))?;
-    let len = arg(l, 2).as_number().unwrap_or(0.0) as usize;
-    let (dp, sp) = (dst.as_ref().get_ptr() as *mut u8, src.as_ref().get_ptr() as *const u8);
-    if !dp.is_null() && !sp.is_null() && len > 0 { unsafe { std::ptr::copy_nonoverlapping(sp, dp, len); } }
-    Ok(0)
-}
-
-pub fn ffi_fill(l: &mut LuaState) -> LuaResult<i32> {
-    let dst = arg(l, 0).as_cdata().ok_or_else(|| err_bad_arg(l, 1, "ffi.fill", "cdata", ""))?;
-    let len = arg(l, 1).as_number().unwrap_or(0.0) as usize;
-    let byte = if nargs(l) > 2 { arg(l, 2).as_number().map(|n| n as u8).unwrap_or(0) } else { 0 };
-    let dp = dst.as_ref().get_ptr() as *mut u8;
-    if !dp.is_null() && len > 0 { unsafe { std::ptr::write_bytes(dp, byte, len); } }
-    Ok(0)
-}
+pub fn ffi_cdef(l:&mut LuaState)->LuaResult<i32>{let sid=arg(l,0).as_string_id().ok_or_else(||err_bad_arg(l,1,"ffi.cdef","string",""))?;let s=l.heap().strings.get(sid).to_vec();parse(get_cts(l),std::str::from_utf8(&s).map_err(|_|LuaError::Runtime)?).map_err(|_|LuaError::Runtime)?;Ok(0)}
+pub fn ffi_new(l:&mut LuaState)->LuaResult<i32>{let id=ffi_checkctype(l)?;let sz={let ct=get_cts(l).raw(id);(ct.size!=u32::MAX).then_some(ct.size as usize).unwrap_or(0)};let p={l.global().heap.cdatas.alloc(CData::new(id,sz.max(1)))};push(l,LuaValue::cdata(p));Ok(1)}
+pub fn ffi_sizeof(l:&mut LuaState)->LuaResult<i32>{let id=ffi_checkctype(l)?;let sz;{let c=get_cts(l);sz=c.raw(id).size}push(l,LuaValue::number(sz as f64));Ok(1)}
+pub fn ffi_alignof(l:&mut LuaState)->LuaResult<i32>{let id=ffi_checkctype(l)?;let al;{let c=get_cts(l);al=1u32<<crate::ffi::ctype_align(c.raw(id).info)}push(l,LuaValue::number(al as f64));Ok(1)}
+pub fn ffi_typeof(l:&mut LuaState)->LuaResult<i32>{let id=ffi_checkctype(l)?;let mut cd=CData::new(crate::ffi::CTypeID::CTypeIDType as u32,4);cd.data[..4].copy_from_slice(&(id as u32).to_le_bytes());let p={l.global().heap.cdatas.alloc(cd)};push(l,LuaValue::cdata(p));Ok(1)}
+pub fn ffi_istype(l:&mut LuaState)->LuaResult<i32>{let id=ffi_checkctype(l)?;push(l,if arg(l,1).as_cdata().map_or(false,|cd|cd.as_ref().ctypeid==id){LuaValue::TRUE}else{LuaValue::FALSE});Ok(1)}
+pub fn ffi_string(l:&mut LuaState)->LuaResult<i32>{let cd=arg(l,0).as_cdata().ok_or_else(||err_bad_arg(l,1,"ffi.string","cdata",""))?;let p=cd.as_ref().get_ptr()as*const u8;let len=if nargs(l)>1{arg(l,1).as_number().unwrap_or(0.0)as usize}else{let mut n=0;while n<4096&&!p.is_null()&&unsafe{*p.add(n)}!=0{n+=1}n};if p.is_null()||len==0{push(l,LuaValue::NIL);return Ok(1)}let v={let h=l.heap();let sid=h.strings.intern(unsafe{std::slice::from_raw_parts(p,len)});h.str_value(sid)};push(l,v);Ok(1)}
+pub fn ffi_copy(l:&mut LuaState)->LuaResult<i32>{let dp=arg(l,0).as_cdata().ok_or_else(||err_bad_arg(l,1,"ffi.copy","cdata",""))?.as_ref().get_ptr()as*mut u8;let sp=arg(l,1).as_cdata().ok_or_else(||err_bad_arg(l,2,"ffi.copy","cdata",""))?.as_ref().get_ptr()as*const u8;let len=arg(l,2).as_number().unwrap_or(0.0)as usize;if!dp.is_null()&&!sp.is_null()&&len>0{unsafe{std::ptr::copy_nonoverlapping(sp,dp,len)}}Ok(0)}
+pub fn ffi_fill(l:&mut LuaState)->LuaResult<i32>{let dp=arg(l,0).as_cdata().ok_or_else(||err_bad_arg(l,1,"ffi.fill","cdata",""))?.as_ref().get_ptr()as*mut u8;let len=arg(l,1).as_number().unwrap_or(0.0)as usize;let b=if nargs(l)>2{arg(l,2).as_number().map(|n|n as u8).unwrap_or(0)}else{0};if!dp.is_null()&&len>0{unsafe{std::ptr::write_bytes(dp,b,len)}}Ok(0)}
 
 pub fn open(l: &mut LuaState) {
-    lual_reg!(l, b"ffi", crate::stdlib::LibTarget::Global)
-        .func(b"cdef", ffi_cdef)
-        .func(b"new", ffi_new)
-        .func(b"sizeof", ffi_sizeof)
-        .func(b"alignof", ffi_alignof)
-        .func(b"typeid", ffi_typeof)
-        .func(b"istype", ffi_istype)
-        .func(b"string", ffi_string)
-        .func(b"copy", ffi_copy)
-        .func(b"fill", ffi_fill)
-        .build();
+    use crate::func::{CClosure, GcFunc};
+    use crate::table::LuaTable;
+    let g = l.global() as *mut crate::state::GlobalState;
+    let env = unsafe { (*g).globals };
+
+    // ---- phase 1: heap allocations ----
+    let tab = unsafe { (*g).heap.alloc_table(LuaTable::new(0, 16)) };
+    let funcs: [(&[u8], crate::func::CFunction); 9] = [(b"cdef",ffi_cdef),(b"new",ffi_new),(b"sizeof",ffi_sizeof),(b"alignof",ffi_alignof),(b"typeid",ffi_typeof),(b"istype",ffi_istype),(b"string",ffi_string),(b"copy",ffi_copy),(b"fill",ffi_fill)];
+    for &(n,f) in &funcs {
+        let sid = unsafe { (*g).heap.intern(n) };
+        let kv = unsafe { (*g).heap.str_value(sid) };
+        let fr = unsafe { (*g).heap.alloc_func(GcFunc::C(CClosure{f,env,upvals:vec![]})) };
+        tab.as_mut().set(kv, LuaValue::func(fr));
+    }
+    let ffi_k = unsafe { let s=(*g).heap.intern(b"ffi"); (*g).heap.str_value(s) };
+    let pk_k = unsafe { let s=(*g).heap.intern(b"package"); (*g).heap.str_value(s) };
+    let pr_k = unsafe { let s=(*g).heap.intern(b"preload"); (*g).heap.str_value(s) };
+    let pk_tab = unsafe { (*g).heap.alloc_table(LuaTable::new(2,1)) };
+    let pr_tab = unsafe { (*g).heap.alloc_table(LuaTable::new(8,3)) };
+    let ld = unsafe { (*g).heap.alloc_func(GcFunc::C(CClosure{f:preload_loader,env,upvals:vec![]})) };
+    let c_k = unsafe { let s=(*g).heap.intern(b"C"); (*g).heap.str_value(s) };
+    let c_tab = unsafe { (*g).heap.alloc_table(LuaTable::new(0,4)) };
+
+    // Load printf from default C library
+    let addr = resolve_printf();
+    if addr != 0.0 {
+        let printf_k = unsafe { let s=(*g).heap.intern(b"printf"); (*g).heap.str_value(s) };
+        let printf_f = unsafe { (*g).heap.alloc_func(GcFunc::C(CClosure{
+            f: call_printf, env, upvals: vec![LuaValue::number(addr)],
+        })) };
+        c_tab.as_mut().set(printf_k, LuaValue::func(printf_f));
+    }
+
+    // ---- phase 2: table mutations ----
+    unsafe { (*g).globals.as_mut() }.set(ffi_k, LuaValue::table(tab));
+    tab.as_mut().set(c_k, LuaValue::table(c_tab));
+    unsafe {
+        let gl = (*g).globals.as_mut();
+        if gl.get(pk_k).as_table().is_none() { gl.set(pk_k, LuaValue::table(pk_tab)); }
+    }
+    let pk = unsafe { (*g).globals.as_ref().get(pk_k).as_table().unwrap() };
+    { let t = pk.as_mut(); if t.get(pr_k).as_table().is_none() { t.set(pr_k, LuaValue::table(pr_tab)); } }
+    let pr = pk.as_ref().get(pr_k).as_table().unwrap();
+    pr.as_mut().set(ffi_k, LuaValue::func(ld));
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::state::Lua;
+fn preload_loader(l:&mut LuaState)->LuaResult<i32>{
+    let g=l.global();let sid=g.heap.intern(b"ffi");let k=g.heap.str_value(sid);
+    let t=g.globals.as_ref().get(k).as_table().unwrap();
+    l.stack[l.base]=LuaValue::table(t);l.top=l.base+1;Ok(1)
+}
 
-    fn run(l: &mut crate::state::LuaState, src: &[u8]) {
-        let f = crate::state::load(l, src.to_vec(), "@t").unwrap();
-        crate::vm::call(l, f, &[]).unwrap();
-    }
+// ---------------------------------------------------------------------------
+// Platform-specific printf loading
+// ---------------------------------------------------------------------------
 
-    #[test] fn ffi_sizeof() { let mut lua = Lua::new(); crate::open_libs(lua.main()); run(lua.main(), b"assert(ffi.sizeof('int')==4) assert(ffi.sizeof('double')==8)"); }
-    #[test] fn ffi_typedef() { let mut lua = Lua::new(); crate::open_libs(lua.main()); run(lua.main(), b"ffi.cdef('typedef int mi;') assert(ffi.sizeof('mi')==4)"); }
-    #[test] fn ffi_struct() { let mut lua = Lua::new(); crate::open_libs(lua.main()); run(lua.main(), b"ffi.cdef('typedef struct{int x;double y;}s;') assert(ffi.sizeof('s')==16) assert(ffi.alignof('s')==8)"); }
-    #[test] fn ffi_new() { let mut lua = Lua::new(); crate::open_libs(lua.main()); run(lua.main(), b"ffi.cdef('typedef int mi;') local o=ffi.new('int') assert(ffi.istype('int',o))"); }
-    #[test]
-    fn ffi_perf() {
-        let mut lua = Lua::new(); crate::open_libs(lua.main()); let l = lua.main();
-        let n = 200000u64; let code = format!("local t=ffi.sizeof('int')local s=0 for i=1,{} do s=t end return s", n);
-        let start = std::time::Instant::now();
-        let f = crate::state::load(l, code.into_bytes(), "@p").unwrap();
-        crate::vm::call(l, f, &[]).unwrap();
-        eprintln!("ffi_perf: {} ops {:.3?} = {:.0}/s", n, start.elapsed(), n as f64 / start.elapsed().as_secs_f64());
+fn resolve_printf() -> f64 {
+    #[cfg(windows)] unsafe {
+        let lib = LoadLibraryA(b"msvcrt.dll\0".as_ptr());
+        if lib == 0 { return 0.0; }
+        let cname = std::ffi::CString::new("printf").unwrap();
+        GetProcAddress(lib, cname.as_ptr() as *const u8) as usize as f64
     }
+    #[cfg(unix)] unsafe {
+        let p = libc::dlsym(libc::RTLD_DEFAULT, b"printf\0".as_ptr() as *const i8);
+        p as usize as f64
+    }
+    #[cfg(not(any(windows, unix)))] { 0.0 }
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn LoadLibraryA(name: *const u8) -> isize;
+    fn GetProcAddress(h: isize, name: *const u8) -> *const std::ffi::c_void;
+}
+
+fn call_printf(l: &mut LuaState) -> LuaResult<i32> {
+    let addr = l.upvalue(0).as_number().unwrap() as usize;
+    let fn_ptr: unsafe extern "system" fn(*const i8, ...) -> i32 = unsafe { std::mem::transmute(addr) };
+    let fmt_sid = arg(l,0).as_string_id().ok_or(LuaError::Runtime)?;
+    let fmt_bytes = l.heap().strings.get(fmt_sid).to_vec();
+    let fmt_cstr = std::ffi::CString::new(fmt_bytes).map_err(|_| LuaError::Runtime)?;
+    let mut cstrs: Vec<std::ffi::CString> = Vec::new();
+    for i in 1..(l.top - l.base) {
+        if let Some(sid) = arg(l, i as usize).as_string_id() {
+            cstrs.push(std::ffi::CString::new(l.heap().strings.get(sid).to_vec()).unwrap());
+        }
+    }
+    let r = match cstrs.len() { 0=>unsafe{fn_ptr(fmt_cstr.as_ptr())}, 1=>unsafe{fn_ptr(fmt_cstr.as_ptr(),cstrs[0].as_ptr())}, _=>unsafe{fn_ptr(fmt_cstr.as_ptr(),cstrs[0].as_ptr(),cstrs[1].as_ptr())} };
+    push(l, LuaValue::number(r as f64)); Ok(1)
 }
