@@ -788,6 +788,9 @@ impl<'a> Asm<'a> {
                     let inf = tr.ir.nins();
                     a.mark_use(ins.op1 as IRRef, inf);
                     a.mark_use(ins.op2 as IRRef, inf);
+                    // PHI result must be stored to env so the post-loop
+                    // body (after LOOP) can load it via fetch_fp.
+                    a.needs_env[Self::iidx(r)] = true;
                     let num = irt_isnum(ins.t());
                     a.phis.push(PhiInfo {
                         phi: r,
@@ -1279,8 +1282,14 @@ impl<'a> Asm<'a> {
                     if self.needs_env[Self::iidx(p.lref)] {
                         str_fp(&mut self.code, rg, RENV, Self::env_disp(p.lref));
                     }
+                    if self.needs_env[Self::iidx(p.phi)] {
+                        str_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
+                    }
                 } else {
                     str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
+                    if self.needs_env[Self::iidx(p.phi)] {
+                        str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
+                    }
                 }
             }
         } else if p.num && let Some(rg) = self.reg_of(p.rref) {
@@ -1289,10 +1298,16 @@ impl<'a> Asm<'a> {
             if self.needs_env[Self::iidx(p.lref)] {
                 str_fp(&mut self.code, d, RENV, Self::env_disp(p.lref));
             }
+            if self.needs_env[Self::iidx(p.phi)] {
+                str_fp(&mut self.code, d, RENV, Self::env_disp(p.phi));
+            }
         } else {
             debug_assert!(self.env_valid[Self::iidx(p.rref)]);
             ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.rref), 64);
             str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
+            if self.needs_env[Self::iidx(p.phi)] {
+                str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
+            }
         }
     }
 
