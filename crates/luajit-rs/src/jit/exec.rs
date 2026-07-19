@@ -41,6 +41,10 @@ pub struct ExitResult {
     /// the caller must reach a collection point. These exits must never
     /// be patched over.
     pub gcexit: bool,
+    /// Base shift (in slots) accumulated by recursive re-entries inside
+    /// `run_ir` (Uprec frames pushed on the Lua stack). The exit's
+    /// snapshot values are relative to `entry base + shift`.
+    pub shift: usize,
 }
 
 /// Execute trace `traceno` for the frame at `base` and follow the trace
@@ -64,7 +68,16 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
     }
     let hotexit = g.jit.param(JitParam::HotExit) as u8;
     let mut current = traceno;
+    // Current frame base: recursive traces (Uprec/Tailrec) and Root
+    // links into call frames shift it as frames are pushed on trace.
+    let mut cbase = base;
     let r = loop {
+        // The recursive machine-code tails check their stack headroom
+        // against this bound (re-bound each iteration: growth happens
+        // only here in Rust).
+        STACK_END.with(|c| {
+            c.set(unsafe { l.stack.as_ptr().add(l.stack.len()) } as u64)
+        });
         // The traces are owned by the registry inside GlobalState; the
         // executor additionally mutates the Lua stack. Split the borrows
         // via raw pointers — the registry never drops traces while one
@@ -88,9 +101,14 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             let entry: extern "C" fn(*mut LuaValue, *mut u64) -> u32 =
                 unsafe { std::mem::transmute(mc.ptr()) };
             let code = entry(
-                unsafe { l.stack.as_mut_ptr().add(base) },
+                unsafe { l.stack.as_mut_ptr().add(cbase) },
                 env.as_mut_ptr(),
             ) as usize;
+            // Recursive/call-link tails shift the base register inside
+            // the mcode chain: recover the actual exit base from the
+            // epilogue's report.
+            let exit_base = EXIT_BASE.with(|c| c.get());
+            cbase = (exit_base - l.stack.as_ptr() as u64) as usize / 8;
             let exit_trace = (code >> 16) as TraceNo;
             if exit_trace != current {
                 // The chain left from a linked trace: re-resolve.
@@ -104,7 +122,24 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             }
             (code & 0x7fff, false, code & 0x8000 != 0)
         } else {
-            let r = run_ir(l, base, tr, &mut env);
+            if execdump() {
+                eprintln!(
+                    "ENTER t{} cbase={} s0={:?} s2={:?} s3={:?}",
+                    current,
+                    cbase,
+                    fmtv(l.stack[cbase - 2]),
+                    fmtv(l.stack[cbase]),
+                    fmtv(l.stack[cbase + 1]),
+                );
+            }
+            let r = run_ir(l, cbase, tr, &mut env);
+            cbase += r.shift; // Recursive re-entries pushed frames.
+            if execdump() {
+                eprintln!(
+                    "EXIT  t{} exit#{} shift={} baseslot={} pc={}",
+                    current, r.exitno, r.shift, r.baseslot, r.pc
+                );
+            }
             (r.exitno, true, r.gcexit)
         };
 
@@ -112,17 +147,32 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             // GC-debt exit: no accounting, no side traces — return to
             // the interpreter, whose boundary check collects.
             if !restored {
-                restore_snapshot(l, base, tr, &env, exitno);
+                restore_snapshot(l, cbase, tr, &env, exitno);
             }
             break ExitResult {
                 pc: tr.snap[exitno].pc as usize,
                 exitno,
-                baseslot: tr.snap[exitno].baseslot as usize,
+                baseslot: (cbase - base) + tr.snap[exitno].baseslot as usize,
                 gcexit: true,
+                shift: cbase - base,
             };
         }
 
         let (nsnap, linktype, link) = (tr.snap.len(), tr.linktype, tr.link);
+        // A native recursive tail (Uprec/Tailrec) ran out of stack
+        // headroom and left through its final snapshot: grow the stack
+        // and re-enter at the advanced base.
+        if exitno == nsnap - 1
+            && matches!(linktype, TraceLink::Uprec | TraceLink::Tailrec)
+            && link == current
+        {
+            if !restored {
+                restore_snapshot(l, cbase, tr, &env, exitno);
+            }
+            cbase += tr.snap[exitno].baseslot as usize - 2;
+            l.stack_ensure(cbase + tr.startpt.as_ref().framesize as usize + 8);
+            continue;
+        }
         // Follow a side trace linked to this exit. (Machine-code parents
         // jump to machine-code sides directly through the patched stubs;
         // this path covers the portable tiers and mixed pairs. The side
@@ -138,17 +188,32 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             };
             if !side_native && !restored {
                 // The portable side tier reads the Lua stack: materialize.
-                restore_snapshot(l, base, tr, &env, exitno);
+                restore_snapshot(l, cbase, tr, &env, exitno);
             }
             current = sidetrace;
             continue;
         }
         if !restored {
-            restore_snapshot(l, base, tr, &env, exitno);
+            restore_snapshot(l, cbase, tr, &env, exitno);
         }
         // A Root-linked side trace fell through its tail: re-enter the
         // root trace (the restored stack is exactly its entry state).
+        // Call-linked tails (a compiled callee) enter the target in the
+        // just-materialized callee frame.
         if exitno == nsnap - 1 && linktype == TraceLink::Root && link != 0 {
+            cbase += tr.snap[exitno].baseslot as usize - 2;
+            if cbase != base {
+                let need = {
+                    let lk = unsafe {
+                        l.global().jit.trace[link as usize]
+                            .as_ref()
+                            .expect("link to a freed trace")
+                            .startpt
+                    };
+                    cbase + lk.as_ref().framesize as usize + 8
+                };
+                l.stack_ensure(need);
+            }
             current = link;
             continue;
         }
@@ -158,14 +223,15 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
         if snap.count != SNAPCOUNT_DONE {
             snap.count += 1;
             if snap.count >= hotexit {
-                super::trace::trace_hot_side(l, base, current, exitno);
+                super::trace::trace_hot_side(l, cbase, current, exitno);
             }
         }
         break ExitResult {
             pc: tr.snap[exitno].pc as usize,
             exitno,
-            baseslot: tr.snap[exitno].baseslot as usize,
+            baseslot: (cbase - base) + tr.snap[exitno].baseslot as usize,
             gcexit: false,
+            shift: cbase - base,
         };
     };
     let g = l.global();
@@ -178,6 +244,12 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
     let ir = &tr.ir;
     let nins = ir.nins();
     let looping = tr.linktype == TraceLink::Loop && tr.link == tr.traceno;
+    // Recursive self-links: the tail materializes the frames pushed on
+    // trace and re-enters from the top at the callee's base.
+    let recursing =
+        matches!(tr.linktype, TraceLink::Uprec | TraceLink::Tailrec) && tr.link == tr.traceno;
+    // Current base: advanced by the recursive tail as frames stack up.
+    let mut cbase = base;
     // Loop-optimized traces: re-enter at the LOOP instruction with the
     // PHI values carried over; legacy traces re-run from the top after a
     // final-snapshot restore.
@@ -212,10 +284,10 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 IROp::SLOAD => {
                     // op1 = absolute recorder slot (baseslot-based; 0 is
                     // the frame-0 function slot at base-2).
-                    let idx = (base as i64 + ins.op1 as i64 - 2) as usize;
+                    let idx = (cbase as i64 + ins.op1 as i64 - 2) as usize;
                     let v = l.stack[idx];
                     if ins.is_guard() && !typecheck(v, ins.t()) {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
                 }
@@ -224,7 +296,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let p = const_bits(ir, ins.op1 as IRRef) as *const LuaValue;
                     let v = unsafe { *p };
                     if ins.is_guard() && !typecheck(v, ins.t()) {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
                 }
@@ -234,7 +306,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
                     let mt = tv.as_table().expect("FLOAD on a non-table").as_ref().metatable;
                     if mt.is_some() {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                 }
                 IROp::HLOAD => {
@@ -243,7 +315,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         val(env, ins.op2 as IRRef),
                     ));
                     if ins.is_guard() && !typecheck(v, ins.t()) {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
                 }
@@ -255,11 +327,11 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let kn = f64::from_bits(val(env, ins.op2 as IRRef));
                     let ki = kn as i32;
                     if ki as f64 != kn || ki < 0 || (ki as u32) >= t.as_ref().asize {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     let v = unsafe { *t.as_ref().aptr.add(ki as usize) };
                     if !typecheck(v, ins.t()) {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
                 }
@@ -271,7 +343,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let kn = f64::from_bits(val(env, carg.op1 as IRRef));
                     let ki = kn as i32;
                     if ki as f64 != kn || ki <= 0 || (ki as u32) >= t.as_ref().asize {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     let v = LuaValue::from_bits(val(env, carg.op2 as IRRef));
                     unsafe { *t.as_ref().aptr.add(ki as usize) = v };
@@ -280,7 +352,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     // GC-debt guard: leave the trace when a collection
                     // is due (the boundary check then collects).
                     if l.global().heap.should_collect() {
-                        let mut r = exit_snapshot(l, base, tr, env, snapidx);
+                        let mut r = exit_snapshot(l, base, cbase, tr, env, snapidx);
                         r.gcexit = true;
                         return r;
                     }
@@ -345,7 +417,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     };
                     let v = LuaValue::from_bits(bits);
                     if ins.is_guard() && !typecheck(v, ins.t()) {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
                 }
@@ -426,7 +498,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     };
                     debug_assert!(ins.is_guard());
                     if !cond {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                 }
                 IROp::EQ | IROp::NE => {
@@ -442,7 +514,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     };
                     debug_assert!(ins.is_guard());
                     if !cond {
-                        return exit_snapshot(l, base, tr, env, snapidx);
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                 }
                 _ => unreachable!("unexpected IR op {:?} in phase-3 trace", op),
@@ -467,14 +539,27 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
             // the stack, then re-enter the trace head (the head SLOADs
             // re-read the just-written slots).
             let lastidx = tr.snap.len() - 1;
-            restore_snapshot(l, base, tr, env, lastidx);
+            restore_snapshot(l, cbase, tr, env, lastidx);
+            start = REF_FIRST;
+            continue 'trace;
+        }
+        if recursing {
+            // Recursive tail (Uprec/Tailrec): materialize the frames the
+            // trace pushed (the final snapshot covers the whole frame
+            // stack), advance the base to the new callee frame and
+            // re-enter from the top — the head SLOADs then read the new
+            // frame. Tail recursion has baseslot 2: same-base restart.
+            let lastidx = tr.snap.len() - 1;
+            restore_snapshot(l, cbase, tr, env, lastidx);
+            cbase += tr.snap[lastidx].baseslot as usize - 2;
+            l.stack_ensure(cbase + tr.startpt.as_ref().framesize as usize + 8);
             start = REF_FIRST;
             continue 'trace;
         }
         // Non-looping tail (TraceLink::None safety net): exit through the
         // final snapshot.
         let lastidx = tr.snap.len() - 1;
-        return exit_snapshot(l, base, tr, env, lastidx);
+        return exit_snapshot(l, base, cbase, tr, env, lastidx);
     }
 }
 
@@ -485,6 +570,43 @@ fn read_ref(ir: &IrBuf, env: &[u64], r: IRRef) -> u64 {
         env[(r - REF_BIAS) as usize]
     } else {
         const_bits(ir, r)
+    }
+}
+
+/// Debug: trace-execution event dump (LUAJIT_RS_EXECDUMP).
+fn execdump() -> bool {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static LEFT: AtomicI32 = AtomicI32::new(-2);
+    let left = LEFT.load(Ordering::Relaxed);
+    if left == -2 {
+        let v = std::env::var("LUAJIT_RS_EXECDUMP")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(-1);
+        LEFT.store(v, Ordering::Relaxed);
+        return v != -1 && v > 0;
+    }
+    if left <= 0 {
+        return false;
+    }
+    LEFT.store(left - 1, Ordering::Relaxed);
+    true
+}
+
+/// Debug: short value formatter for `execdump`.
+fn fmtv(v: LuaValue) -> String {
+    if let Some(n) = v.as_number() {
+        format!("{}", n)
+    } else if v.is_nil() {
+        "nil".into()
+    } else if v.is_table() {
+        format!("tab:{:x}", v.gc_addr())
+    } else if v.is_func() {
+        format!("fun:{:x}", v.gc_addr())
+    } else if v.is_string() {
+        "str".into()
+    } else {
+        format!("raw:{:x}", v.to_bits())
     }
 }
 
@@ -519,19 +641,23 @@ fn restore_snapshot(l: &mut LuaState, base: usize, tr: &GCtrace, env: &[u64], sn
 }
 
 /// Take exit `snapidx`: restore the stack and resume at the snapshot pc.
+/// `cbase` is the current frame base (recursive re-entries may have
+/// advanced it past the entry `base`).
 fn exit_snapshot(
     l: &mut LuaState,
     base: usize,
+    cbase: usize,
     tr: &GCtrace,
     env: &[u64],
     snapidx: usize,
 ) -> ExitResult {
-    restore_snapshot(l, base, tr, env, snapidx);
+    restore_snapshot(l, cbase, tr, env, snapidx);
     ExitResult {
         pc: tr.snap[snapidx].pc as usize,
         exitno: snapidx,
-        baseslot: tr.snap[snapidx].baseslot as usize,
+        baseslot: (cbase - base) + tr.snap[snapidx].baseslot as usize,
         gcexit: false,
+        shift: cbase - base,
     }
 }
 
@@ -628,6 +754,23 @@ thread_local! {
     /// Heap of the VM currently executing a trace (set by `trace_exec`).
     static JIT_HEAP: std::cell::Cell<*mut crate::state::GcHeap> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// One-past-the-end address of the current Lua stack buffer, for
+    /// the machine-code recursive tails' headroom check.
+    static STACK_END: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// BASE register value at the last machine-code exit: recursive and
+    /// call-link tails shift the base inside mcode chains, invisibly to
+    /// Rust — the epilogue reports it back through this cell.
+    static EXIT_BASE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Address of the stack-end cell (embedded in recursive mcode tails).
+pub(super) fn stack_end_cell_addr() -> u64 {
+    STACK_END.with(|c| c.as_ptr() as u64)
+}
+
+/// Address of the exit-base cell (embedded in the mcode epilogue).
+pub(super) fn exit_base_cell_addr() -> u64 {
+    EXIT_BASE.with(|c| c.as_ptr() as u64)
 }
 
 #[inline]

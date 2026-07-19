@@ -133,6 +133,7 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         js.param(JitParam::LoopUnroll),
         js.param(JitParam::InstUnroll),
         js.param(JitParam::CallUnroll),
+        js.param(JitParam::RecUnroll),
     );
 
     if js.parent != 0 {
@@ -401,6 +402,58 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         }
         trace
     };
+    if std::env::var("LUAJIT_RS_TRDUMP").is_ok() {
+        eprintln!(
+            "STOP {} {:?} link={} start={:?} line={} native={} snaps={:?}",
+            trace.traceno,
+            trace.linktype,
+            trace.link,
+            crate::bc::bc_op(trace.startins),
+            trace.startpt.as_ref().lines.get(trace.startpc).copied().unwrap_or(0),
+            trace.mcode.is_some(),
+            trace
+                .snap
+                .iter()
+                .map(|s| (s.iref - super::ir::REF_BIAS, s.pc, s.baseslot, s.nslots))
+                .collect::<Vec<_>>(),
+        );
+        if std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2") {
+            use super::ir::{IR_NAMES, REF_BIAS, REF_FIRST};
+            for r in REF_FIRST..trace.ir.nins() {
+                let i = trace.ir.ir(r);
+                eprintln!(
+                    "  {:04} {} {} {} t={:#x}",
+                    r - REF_BIAS,
+                    IR_NAMES[i.op() as usize],
+                    i.op1 as i32 - REF_BIAS as i32,
+                    i.op2 as i32 - REF_BIAS as i32,
+                    i.t(),
+                );
+            }
+            for (si, s) in trace.snap.iter().enumerate() {
+                let map = &trace.snapmap
+                    [s.mapofs as usize..s.mapofs as usize + s.nent as usize];
+                let ent: Vec<String> = map
+                    .iter()
+                    .map(|&sn| {
+                        format!(
+                            "{}={}{}",
+                            super::snap_slot(sn),
+                            super::snap_ref(sn) as i32 - REF_BIAS as i32,
+                            if sn & super::SNAP_NORESTORE != 0 { "!" } else { "" }
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "  snap#{} pc={} base={} [{}]",
+                    si,
+                    s.pc,
+                    s.baseslot,
+                    ent.join(" ")
+                );
+            }
+        }
+    }
     // Machine-code chains switch traces without resizing env in Rust:
     // keep the high-water mark over all stored traces.
     js.env_need = js.env_need.max((trace.ir.nins() - super::ir::REF_BIAS) as usize);
@@ -474,6 +527,14 @@ fn trace_abort(g: &mut GlobalState) {
             let startpc = js.startpc;
             if e == TraceError::RETRY {
                 js.hotcount_set(bc_addr(startpt, startpc + 1), 1); // Immediate retry.
+            } else if e == TraceError::NYIRETL && bc_op(js.startins) == BCOp::FUNCF {
+                // A recursive function recorded through its base case
+                // (return below the entry frame). Do not penalize: a
+                // later hot call through the recursive path stops with
+                // an up-recursion link instead.
+                let reset =
+                    (js.param(JitParam::HotLoop) as u32 * HOTCOUNT_LOOP as u32) as HotCount;
+                js.hotcount_set(bc_addr(startpt, startpc + 1), reset);
             } else {
                 penalty_pc(js, startpt, startpc, e);
             }

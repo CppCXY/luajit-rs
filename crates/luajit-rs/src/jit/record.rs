@@ -147,6 +147,8 @@ pub struct Record {
     pub instunroll: i32,
     /// Max. depth of same-function call inlining (JIT_P_callunroll).
     pub callunroll: i32,
+    /// Min. unroll depth before stopping true recursion (JIT_P_recunroll).
+    pub recunroll: i32,
     /// Number of recorded tailcalls (J->tailcalled).
     pub tailcalled: i32,
     /// The proto being recorded (single-frame traces: always startpt).
@@ -165,6 +167,7 @@ impl Record {
         loopunroll: i32,
         instunroll: i32,
         callunroll: i32,
+        recunroll: i32,
     ) -> Box<Record> {
         Box::new(Record {
             cur: GCtrace {
@@ -202,6 +205,7 @@ impl Record {
             loopunroll,
             instunroll,
             callunroll,
+            recunroll,
             tailcalled: 0,
             pt,
             pc,
@@ -822,7 +826,14 @@ impl Record {
     /// Record a fixed-result CALL: dispatch on the callee — Lua closures
     /// are inlined as a frame, recordable builtins as IR (lj_ffrecord).
     /// Everything else (metacalls, varargs, multres) aborts with NYIBC.
-    fn rec_call(&mut self, l: &LuaState, base: usize, pc: usize, ins: BCIns) -> Result<(), TraceError> {
+    /// A `Some` result stops the trace (recursion or a compiled callee).
+    fn rec_call(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        pc: usize,
+        ins: BCIns,
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
         let a = bc_a(ins);
         let want = bc_b(ins) as i32 - 1;
         let nargs = (bc_c(ins) as u32).wrapping_sub(1);
@@ -840,7 +851,8 @@ impl Record {
                 for i in 0..nargs {
                     self.getslot(l, base, a + 2 + i);
                 }
-                self.rec_callff_core(l, a, want, nargs, fv, cc.f, &argv)
+                self.rec_callff_core(l, a, want, nargs, fv, cc.f, &argv)?;
+                Ok(None)
             }
             crate::func::GcFunc::Lua(_) => self.rec_call_lua(l, base, pc, a, nargs, want, fv),
         }
@@ -848,7 +860,9 @@ impl Record {
 
     /// Inline a call to a plain Lua closure: guard the closure identity,
     /// lay down the frame slots (KFUNC + frame-link constant) and switch
-    /// the recorder into the callee frame.
+    /// the recorder into the callee frame. Stops the trace (`Some`) on
+    /// up-recursion to the trace head (`check_call_unroll`) or when the
+    /// callee is already compiled (`rec_func_jit`).
     fn rec_call_lua(
         &mut self,
         l: &LuaState,
@@ -858,7 +872,7 @@ impl Record {
         nargs: u32,
         want: i32,
         fv: LuaValue,
-    ) -> Result<(), TraceError> {
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
         if want < 0 {
             return Err(TraceError::NYIBC); // Multres call (CALLM context).
         }
@@ -868,10 +882,20 @@ impl Record {
         if cpt.as_ref().flags & crate::proto::PROTO_VARARG != 0 {
             return Err(TraceError::NYIBC);
         }
-        // Bound true recursion (JIT_P_callunroll).
-        if self.frames.iter().filter(|f| f.callee.addr() == cpt.addr()).count()
-            >= self.callunroll as usize
-        {
+        // Up-recursion to the trace head (check_call_unroll): stop the
+        // trace after `recunroll` inlined levels and link it to itself.
+        let is_head_call = self.parent == 0
+            && bc_op(self.cur.startins) == BCOp::FUNCF
+            && cpt.addr() == self.cur.startpt.addr();
+        let same_frames =
+            self.frames.iter().filter(|f| f.callee.addr() == cpt.addr()).count();
+        let stop_uprec = is_head_call && same_frames >= self.recunroll as usize;
+        // A compiled callee stops the trace with a link to its root
+        // trace (rec_func_jit) once the frame is laid down.
+        let callee_head = cpt.as_ref().bc[0];
+        let stop_root = !stop_uprec && bc_op(callee_head) == BCOp::JFUNCF;
+        // Bound plain recursion (JIT_P_callunroll).
+        if !stop_uprec && !stop_root && same_frames >= self.callunroll as usize {
             return Err(TraceError::CUNROLL);
         }
         let framesize = cpt.as_ref().framesize as usize;
@@ -914,13 +938,29 @@ impl Record {
             self.set_base(s, 0);
         }
         self.maxslot = numparams;
-        Ok(())
+        if stop_uprec || stop_root {
+            // The final snapshot describes "frame pushed, about to run
+            // the callee's first instruction" (snapshot pcs are relative
+            // to the innermost frame's proto).
+            self.pc = 1;
+            if stop_uprec {
+                return Ok(Some((TraceLink::Uprec, self.cur.traceno)));
+            }
+            return Ok(Some((TraceLink::Root, bc_d(callee_head) as TraceNo)));
+        }
+        Ok(None)
     }
 
     /// `rec_iterc`: mirror the interpreter's `iter_call` (copy the
     /// callable/state/control triple up), then dispatch like a CALL with
     /// two arguments.
-    fn rec_iterc(&mut self, l: &LuaState, base: usize, pc: usize, ins: BCIns) -> Result<(), TraceError> {
+    fn rec_iterc(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        pc: usize,
+        ins: BCIns,
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
         let a = bc_a(ins);
         let want = bc_b(ins) as i32 - 1;
         let func = self.getslot(l, base, a - 3);
@@ -937,7 +977,8 @@ impl Record {
         match gf.as_ref() {
             crate::func::GcFunc::C(cc) => {
                 let argv = [self.slot_val(l, base, a - 2), self.slot_val(l, base, a - 1)];
-                self.rec_callff_core(l, a, want, 2, fv, cc.f, &argv)
+                self.rec_callff_core(l, a, want, 2, fv, cc.f, &argv)?;
+                Ok(None)
             }
             crate::func::GcFunc::Lua(_) => self.rec_call_lua(l, base, pc, a, 2, want, fv),
         }
@@ -965,8 +1006,14 @@ impl Record {
 
     /// Record a tail call (`lj_record_tailcall`): replace the current
     /// frame in place — the pending return target (FrameInfo) stays.
-    /// Mirrors the interpreter's CALLT fast path conditions.
-    fn rec_callt(&mut self, l: &LuaState, base: usize, ins: BCIns) -> Result<(), TraceError> {
+    /// Mirrors the interpreter's CALLT fast path conditions. Tail
+    /// recursion to the trace head stops the trace (`Some`).
+    fn rec_callt(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        ins: BCIns,
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
         let a = bc_a(ins);
         let nargs = (bc_d(ins) as u32).wrapping_sub(1);
         let fv = self.slot_val(l, base, a);
@@ -980,7 +1027,13 @@ impl Record {
         if cpt.as_ref().flags & crate::proto::PROTO_VARARG != 0 {
             return Err(TraceError::NYIBC);
         }
-        if self.framedepth == 0 {
+        // Tail recursion back to the trace head: replace the entry frame
+        // in place and stop with a self link (TAILREC).
+        let stop_tailrec = self.framedepth == 0
+            && self.parent == 0
+            && bc_op(self.cur.startins) == BCOp::FUNCF
+            && cpt.addr() == self.cur.startpt.addr();
+        if self.framedepth == 0 && !stop_tailrec {
             // Replacing the trace's entry frame would leave exits with a
             // stale closure context (pc in the new proto, baseslot 2).
             return Err(TraceError::NYIBC);
@@ -1018,7 +1071,11 @@ impl Record {
         if let Some(fr) = self.frames.last_mut() {
             fr.callee = cpt; // The pending return now belongs to the new callee.
         }
-        Ok(())
+        if stop_tailrec {
+            self.pc = 1;
+            return Ok(Some((TraceLink::Tailrec, self.cur.traceno)));
+        }
+        Ok(None)
     }
 
     /// Record a RET0/RET1/RET from an inlined frame: move the results to
@@ -1836,14 +1893,17 @@ impl Record {
         pc: usize,
     ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
         // Need a snapshot before recording the next bytecode (e.g. after
-        // a loop condition guard).
+        // a loop condition guard). The pc must be updated first: the
+        // snapshot resumes at the instruction about to be recorded (the
+        // stale previous pc could point back at a comparison whose
+        // scratch operand slots are no longer covered by maxslot).
+        self.pc = pc;
         if self.needsnap {
             self.needsnap = false;
             self.snap_add();
             self.mergesnap = true;
         }
 
-        self.pc = pc;
         // Record only closed loops for root traces.
         if self.framedepth == 0 && pc.wrapping_sub(self.bc_min) >= self.bc_extent {
             return Err(TraceError::LLEAVE);
@@ -2130,7 +2190,11 @@ impl Record {
             // This VM never specializes ITERN at runtime (ISNEXT is a
             // plain jump, ITERN a generic iterator call), so both forms
             // record identically.
-            BCOp::ITERC | BCOp::ITERN => self.rec_iterc(l, base, pc, ins)?,
+            BCOp::ITERC | BCOp::ITERN => {
+                if let Some(link) = self.rec_iterc(l, base, pc, ins)? {
+                    return Ok(Some(link));
+                }
+            }
             BCOp::ISNEXT => {
                 if bc_a(ins) < self.maxslot {
                     self.maxslot = bc_a(ins);
@@ -2207,8 +2271,16 @@ impl Record {
             }
 
             // -- Calls and returns -------------------------------------------------
-            BCOp::CALL => self.rec_call(l, base, pc, ins)?,
-            BCOp::CALLT => self.rec_callt(l, base, ins)?,
+            BCOp::CALL => {
+                if let Some(link) = self.rec_call(l, base, pc, ins)? {
+                    return Ok(Some(link));
+                }
+            }
+            BCOp::CALLT => {
+                if let Some(link) = self.rec_callt(l, base, ins)? {
+                    return Ok(Some(link));
+                }
+            }
             BCOp::RET0 => self.rec_ret(l, base, bc_a(ins), 0)?,
             BCOp::RET1 => self.rec_ret(l, base, bc_a(ins), 1)?,
             BCOp::RET => self.rec_ret(l, base, bc_a(ins), bc_d(ins) - 1)?,

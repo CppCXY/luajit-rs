@@ -99,6 +99,9 @@ pub fn assemble(
     tr: &GCtrace,
     link: Option<*const u8>,
 ) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
+    if tr.linktype == TraceLink::Downrec {
+        return Err(TraceError::NYIIR); // Down-recursion tails NYI.
+    }
     Asm::new(tr, link)?.emit()
 }
 
@@ -488,11 +491,45 @@ impl<'a> Asm<'a> {
                 let rel = head as i64 - (self.code.len() as i64 + 4);
                 self.emit_u32(rel as i32 as u32);
             }
+        } else if matches!(self.tr.linktype, TraceLink::Uprec | TraceLink::Tailrec)
+            && self.tr.link == self.tr.traceno
+        {
+            // Recursive tail: materialize the frames pushed on trace,
+            // check the stack headroom (exit through the final snapshot
+            // when it runs out — the Rust executor grows and re-enters),
+            // advance BASE to the new callee frame and restart.
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
+            // rax = prospective frame top: max framesize (255) + margin.
+            self.mov_rr64(RAX, RBASE);
+            self.add_r64_imm32(RAX, delta + (255 + 8) * 8);
+            self.mov_r64_imm64(RCX, super::exec::stack_end_cell_addr());
+            self.cmp_r64_mem(RAX, RCX, 0);
+            self.guard(CC_A);
+            if delta != 0 {
+                self.add_r64_imm32(RBASE, delta);
+            }
+            self.code.push(0xE9); // jmp inner (re-enter from the top)
+            let rel = inner as i64 - (self.code.len() as i64 + 4);
+            self.emit_u32(rel as i32 as u32);
         } else if self.tr.linktype == TraceLink::Root && let Some(target) = self.link {
             // asm_tail_link: materialize the final snapshot into the Lua
             // stack (the root re-reads it through its SLOADs), then jump
-            // to the root's inner entry — no Rust round trip.
+            // to the root's inner entry — no Rust round trip. Call-frame
+            // tails (a compiled callee) advance BASE first, with the
+            // same headroom check as the recursive tails.
+            self.snapidx = lastsnap;
             self.tail_restore(lastsnap);
+            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
+            if delta != 0 {
+                self.mov_rr64(RAX, RBASE);
+                self.add_r64_imm32(RAX, delta + (255 + 8) * 8);
+                self.mov_r64_imm64(RCX, super::exec::stack_end_cell_addr());
+                self.cmp_r64_mem(RAX, RCX, 0);
+                self.guard(CC_A);
+                self.add_r64_imm32(RBASE, delta);
+            }
             self.mov_r64_imm64(RAX, target as u64);
             self.code.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
         } else {
@@ -504,9 +541,12 @@ impl<'a> Asm<'a> {
             self.mov_eax_imm(self.exit_code(lastsnap));
         }
 
-        // Common epilogue: restore the callee-saved xmm (Win64), return
-        // eax.
+        // Common epilogue: report the (possibly shifted) BASE register
+        // back to the executor, restore the callee-saved xmm (Win64),
+        // return eax.
         let epilogue = self.code.len();
+        self.mov_r64_imm64(RCX, super::exec::exit_base_cell_addr());
+        self.mov_mem_r64(RCX, 0, RBASE);
         #[cfg(windows)]
         {
             for k in 0..10u8 {
@@ -1684,6 +1724,13 @@ impl<'a> Asm<'a> {
         self.code.push(0x48 | (((reg >> 3) & 1) << 2) | ((base >> 3) & 1));
         self.code.push(0x03);
         self.mem(reg, base, disp);
+    }
+    /// add r64, imm32 (REX.W 81 /0 id).
+    fn add_r64_imm32(&mut self, reg: u8, imm: i32) {
+        self.code.push(0x48 | ((reg >> 3) & 1));
+        self.code.push(0x81);
+        self.modrm(3, 0, reg);
+        self.emit_u32(imm as u32);
     }
     /// ModRM+SIB for [base + index*8] (both registers below r8, disp 0).
     fn sib8(&mut self, reg: u8, base: u8, index: u8) {

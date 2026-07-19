@@ -1091,11 +1091,38 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
+                            let head = pt.bc[0];
+                            // A compiled callee (JFUNCF): enter its trace
+                            // from the fresh frame.
+                            if !REC && bc_op(head) == BCOp::JFUNCF {
+                                sync!();
+                                let r = crate::jit::exec::trace_exec(
+                                    self.l(),
+                                    self.base,
+                                    bc_d(head),
+                                );
+                                self.sp = self.l().stack.as_mut_ptr();
+                                self.pc = r.pc;
+                                if r.baseslot != 2 {
+                                    self.trace_exit_frame(r.baseslot);
+                                } else {
+                                    let bp2 = unsafe { self.sp.add(self.base) };
+                                    self.reload_at(bp2);
+                                    self.l().top =
+                                        self.base + self.proto().framesize as usize;
+                                }
+                                if self.rec_started() {
+                                    return Ok(Flow::Rec); // Hot exit side trace.
+                                }
+                                self.gc_check();
+                                resync!();
+                                continue;
+                            }
                             // hotcall (vm_hotcall): count the FUNCF header.
                             // The other Lua-entry paths do not count until
                             // call recording lands (Phase 3).
                             if !REC
-                                && bc_op(pt.bc[0]) == BCOp::FUNCF
+                                && bc_op(head) == BCOp::FUNCF
                                 && self.hot_count(ip as usize, HOTCOUNT_CALL)
                             {
                                 sync!();
@@ -1153,6 +1180,30 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
+                            let head = pt.bc[0];
+                            if !REC && bc_op(head) == BCOp::JFUNCF {
+                                sync!();
+                                let r = crate::jit::exec::trace_exec(
+                                    self.l(),
+                                    self.base,
+                                    bc_d(head),
+                                );
+                                self.sp = self.l().stack.as_mut_ptr();
+                                self.pc = r.pc;
+                                if r.baseslot != 2 {
+                                    self.trace_exit_frame(r.baseslot);
+                                } else {
+                                    let bp2 = unsafe { self.sp.add(self.base) };
+                                    self.reload_at(bp2);
+                                    self.l().top =
+                                        self.base + self.proto().framesize as usize;
+                                }
+                                if self.rec_started() {
+                                    return Ok(Flow::Rec); // Hot exit side trace.
+                                }
+                                self.gc_check();
+                                resync!();
+                            }
                             continue;
                         }
                     }
@@ -1315,6 +1366,7 @@ impl Interp {
                             let jforl = (self.pc as i64 - 1 + bc_j(ins)) as usize;
                             let tno = bc_d(self.proto().bc[jforl]);
                             let r = crate::jit::exec::trace_exec(self.l(), self.base, tno);
+                            self.sp = self.l().stack.as_mut_ptr();
                             self.pc = r.pc;
                             if r.baseslot != 2 {
                                 self.trace_exit_frame(r.baseslot);
@@ -1370,6 +1422,7 @@ impl Interp {
                         setreg!(a + FORL_EXT, nv);
                         sync!();
                         let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                        self.sp = self.l().stack.as_mut_ptr();
                         self.pc = r.pc;
                         if r.baseslot != 2 {
                             self.trace_exit_frame(r.baseslot);
@@ -1399,6 +1452,7 @@ impl Interp {
                     // whatever snapshot the trace exits through.
                     sync!();
                     let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                    self.sp = self.l().stack.as_mut_ptr();
                     self.pc = r.pc;
                     if r.baseslot != 2 {
                         self.trace_exit_frame(r.baseslot);
@@ -1440,6 +1494,7 @@ impl Interp {
                         setreg!(a - 1, first);
                         sync!();
                         let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                        self.sp = self.l().stack.as_mut_ptr();
                         self.pc = r.pc;
                         if r.baseslot != 2 {
                             self.trace_exit_frame(r.baseslot);
