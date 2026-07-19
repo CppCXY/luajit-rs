@@ -1180,6 +1180,8 @@ impl<'a> Asm<'a> {
             };
             if dead { self.steal_quiet(rg); }
         }
+        // Spill all live non-PHI regs into their env slots so the
+        // post-loop body can find values even if registers were stolen.
         for rg in 0..NREG as u8 {
             if let Owner::Ins(o) = self.owner[rg as usize] {
                 if self.phis.iter().any(|p| p.num && p.lref == o) { continue; }
@@ -1190,20 +1192,32 @@ impl<'a> Asm<'a> {
                 }
             }
         }
-        // Make PHI refs share the lref's register so that post-loop
-        // fetch_fp on the PHI ref finds the value without an env load.
-        for pi in 0..self.phis.len() {
-            let p = self.phis[pi];
-            let i = Self::iidx(p.lref);
-            let pi = Self::iidx(p.phi);
-            if p.num && self.loc[i].is_some() {
-                self.loc[pi] = self.loc[i];
+        // Pre-fill PHI env slots with the current register value so
+        // the post-loop body's first iteration can find the value.
+        for p in &self.phis {
+            let ii = Self::iidx(p.phi);
+            if p.num && !self.env_valid[ii] {
+                if let Some(lr) = self.loc[Self::iidx(p.lref)] {
+                    // lref still has a register — store to phi env
+                    str_fp(&mut self.code, lr, RENV, Self::env_disp(p.phi));
+                    self.env_valid[ii] = true;
+                } else {
+                    // lref stolen — search all regs for a live value
+                    for rg in 0..NREG as u8 {
+                        if let Owner::Ins(_) = self.owner[rg as usize] {
+                            str_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
+                            self.env_valid[ii] = true;
+                            break;
+                        }
+                    }
+                }
             }
-            if p.num && self.env_valid[i] {
-                self.env_valid[pi] = true;
-            }
-            if p.num && self.loc[i].is_some() && !self.needs_env[i] {
-                self.env_valid[i] = false;
+        }
+        // Reset PHI lref env_valid so the back-edge sees them as dirty.
+        for p in &self.phis {
+            let li = Self::iidx(p.lref);
+            if p.num && self.loc[li].is_some() && !self.needs_env[li] {
+                self.env_valid[li] = false;
             }
         }
         self.s0 = self.owner;
