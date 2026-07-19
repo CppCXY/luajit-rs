@@ -1496,6 +1496,19 @@ impl<'a> Asm<'a> {
 
         let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
         area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code);
+
+        // Write hex dump when LUAJIT_RS_ARM64_DUMP is set
+        if let Ok(path) = std::env::var("LUAJIT_RS_ARM64_DUMP") {
+            let fname = format!("{}_tr{}.hex", path, self.tr.traceno);
+            if let Ok(mut f) = std::fs::File::create(&fname) {
+                use std::io::Write;
+                for (i, chunk) in self.code.chunks(4).enumerate() {
+                    let _ = writeln!(f, "  {:4}: {:02x?}", i * 4, chunk);
+                }
+                eprintln!("[arm64] dumped {} bytes to {}", self.code.len(), fname);
+            }
+        }
+
         if !area.protect_exec() { return Err(TraceError::MCODEAL); }
         Ok((area, inner, std::mem::take(&mut self.stub_tails)))
     }
