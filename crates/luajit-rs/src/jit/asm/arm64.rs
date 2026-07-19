@@ -169,20 +169,46 @@ fn encode_bitmask(imm: u64) -> Option<(u8, u32, u32)> {
     if imm == 0 || imm == u64::MAX {
         return Some((0, 0, 63));
     }
-    // Find the repeating pattern.
-    for size in [2, 4, 8, 16, 32, 64u32] {
-        let ones = imm.count_ones();
-        let len = ones;
-        if len > size {
-            continue;
-        }
-        // Try consecutive ones then consecutive zeros.
-        let r = imm.trailing_zeros();
-        let _s = (size - r - len) % size;
-        if (imm >> r).wrapping_shl(size - len) == (1u64 << len) - 1 {
-            let n = if size == 64 { 1 } else { 0 };
-            return Some((n, r as u32, (size - len) as u32));
-        }
+    // ARM64 bitmask immediates are a pattern of consecutive ones,
+    // right-rotated by some amount, replicated across 2/4/8/16/32/64 bits.
+    let ones = imm.count_ones();
+    if ones == 0 { return None; }
+    let r = imm.trailing_zeros();
+    let len = 64 - imm.leading_zeros() - r;
+    // The pattern must be a string of 1s of length `ones`, padded.
+    if (len as u32) != ones { return None; }
+    // Check that the 1s are consecutive and the rest is the repeating pattern.
+    let mask = (1u64 << ones) - 1;
+    let pattern = imm >> r;
+    if pattern & mask != mask { return None; }
+    // Find the smallest element size that fits the period.
+    for &esize in &[2u32, 4, 8, 16, 32, 64] {
+        if ones > esize { continue; }
+        let period = esize;
+        // Check that the pattern repeats every `period` bits.
+        let repeating = (0..64).step_by(period as usize).all(|s| {
+            (imm >> s) & ((1u64 << period) - 1) == (imm & ((1u64 << period) - 1))
+        });
+        if !repeating { continue; }
+        let n = if esize == 64 { 1 } else { 0 };
+        // imms encodes element-size and S (ones-1) in a single 6-bit field:
+        //   esize=64: N=1, imms = ones-1
+        //   esize=32: imms[5]=0,       imms[4:0] = ones-1
+        //   esize=16: imms[5:4]=0b10,  imms[3:0] = ones-1
+        //   esize=8:  imms[5:3]=0b100, imms[2:0] = ones-1
+        //   esize=4:  imms[5:2]=0b1000,imms[1:0] = ones-1
+        //   esize=2:  imms[5:1]=0b10000,imms[0]= ones-1
+        let imms: u32 = match esize {
+            64 => (ones - 1) & 0x3F,            // N=1 already
+            32 => (ones - 1) & 0x1F,            // bit 5 = 0
+            16 => 0x20 | ((ones - 1) & 0xF),    // bit[5:4] = 10
+            8  => 0x30 | ((ones - 1) & 0x7),    // bit[5:3] = 100
+            4  => 0x38 | ((ones - 1) & 0x3),    // bit[5:2] = 1000
+            2  => 0x3C | ((ones - 1) & 0x1),    // bit[5:1] = 10000
+            _  => unreachable!(),
+        };
+        let immr = (r as u32) % esize;
+        return Some((n, immr, imms));
     }
     None
 }
