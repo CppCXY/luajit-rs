@@ -1526,16 +1526,31 @@ impl<'a> Asm<'a> {
         // Dump traces on aarch64 for debugging (TODO: remove after all fixed).
         {
             eprint!(
-                "[arm64] TRACE {} mcode={:5}B nins={} link={:?} hex=",
+                "[arm64] TRACE {} mcode={:5}B nins={} inner={} link={:?}",
                 self.tr.traceno,
                 self.code.len(),
                 self.tr.ir.nins() - REF_BIAS,
+                inner,
                 self.tr.linktype,
             );
+            if let Some(lp) = self.loop_pos {
+                eprint!(" loop_pos={}", lp);
+            }
+            eprint!(" hex=");
             for (i, chunk) in self.code.chunks(4).enumerate() {
                 let w = u32::from_le_bytes(chunk.try_into().unwrap());
                 if i > 0 { eprint!(","); }
                 eprint!("{:08x}", w);
+            }
+            // Also dump IR for context
+            eprint!(" ir=");
+            for r in REF_FIRST..self.tr.ir.nins() {
+                let ins = self.tr.ir.ir(r);
+                eprint!("{:?}", ins.op());
+                if ins.op() != IROp::NOP {
+                    // skip NOP details
+                }
+                if r + 1 < self.tr.ir.nins() { eprint!(","); }
             }
             eprintln!();
         }
