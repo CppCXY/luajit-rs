@@ -502,7 +502,7 @@ fn fneg(code: &mut Vec<u8>, dd: u8, dn: u8) {
 
 /// FABS: `fabs dd, dn`.
 fn fabs(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E60C000 | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E608000 | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FSQRT: `fsqrt dd, dn`.
@@ -512,12 +512,12 @@ fn fsqrt(code: &mut Vec<u8>, dd: u8, dn: u8) {
 
 /// FMIN: `fmin dd, dn, dm`.
 fn fmin(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E606800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E605800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FMAX: `fmax dd, dn, dm`.
 fn fmax(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E606C00 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E604800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FRINTM (floor): `frintm dd, dn`.
@@ -527,12 +527,12 @@ fn frintm(code: &mut Vec<u8>, dd: u8, dn: u8) {
 
 /// FRINTP (ceil): `frintp dd, dn`.
 fn frintp(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E64C000 | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E648000 | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FRINTZ (trunc): `frintz dd, dn`.
 fn frintz(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E65C000 | ((dn as u32) << 5) | dd as u32);
+    emit32(code, 0x1E658000 | ((dn as u32) << 5) | dd as u32);
 }
 
 /// FCVTZS (FP to int32, truncating): `fcvtzs wd, dn`. D-register
