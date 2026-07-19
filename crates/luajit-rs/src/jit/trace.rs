@@ -417,7 +417,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             None
         };
         let no_asm = std::env::var("LUAJIT_RS_NOASM").is_ok();
-        if !no_asm && let Ok((mc, inner, tails)) = super::asm_x64::assemble(&trace, link_target) {
+        if !no_asm && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target) {
             if std::env::var("LUAJIT_RS_TRDUMP").is_ok() {
                 eprintln!(
                     "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",
@@ -547,7 +547,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                     let pt_ = js.trace[parent as usize].as_mut().unwrap();
                     let tails = std::mem::take(&mut pt_.stub_tails);
                     if let Some(area) = &mut pt_.mcode {
-                        super::asm_x64::patch_exit(area, &tails, exitno as u32, target);
+                        super::asm::patch_exit(area, &tails, exitno as u32, target);
                     }
                     pt_.stub_tails = tails;
                 }

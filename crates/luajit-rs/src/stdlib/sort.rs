@@ -162,25 +162,23 @@ fn sift_down(
 }
 
 /// Call the Lua comparator `comp(a, b)` and return `true` iff `a < b`.
-/// The stack is arranged for a C call, executed, and the result read back.
 fn compare_lua(
     l: &mut LuaState,
-    _comp: crate::gc::GcPtr<crate::func::GcFunc>,
+    comp: crate::gc::GcPtr<crate::func::GcFunc>,
     a: LuaValue,
     b: LuaValue,
 ) -> LuaResult<bool> {
-    l.stack[l.top] = a;
-    l.stack[l.top + 1] = b;
-    l.top += 2;
+    let func_slot = l.top;
+    l.stack[func_slot] = LuaValue::func(comp);
+    l.stack[func_slot + 1] = LuaValue::NIL;
+    l.stack[func_slot + 2] = a;
+    l.stack[func_slot + 3] = b;
+    l.top = func_slot + 4;
     let saved_base = l.base;
-    l.base = l.top - 2;
+    l.base = func_slot;
     let nret = crate::vm::execute(l, l.base, 2, 1)?;
+    let r = if nret > 0 { l.stack[func_slot].is_truthy() } else { false };
     l.top = l.base + nret;
     l.base = saved_base;
-    let r = if nret > 0 {
-        l.stack[l.base].is_truthy()
-    } else {
-        false
-    };
     Ok(r)
 }

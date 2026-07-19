@@ -11,8 +11,9 @@
 //! * `record`: the bytecode recorder for numeric single-frame traces
 //!   (lj_record.c + lj_snap.c subsets),
 //! * `trace`: the trace compiler state machine (lj_trace.c),
-//! * `asm_x64`: the x86-64 machine code backend (lj_asm subset); traces
-//!   it cannot assemble run on the portable IR executor in `exec`.
+//! * `asm/`: native code generation backends (x86-64, ARM64) behind a
+//!   unified API; traces they cannot handle fall back to the portable
+//!   IR executor in `exec`.
 //!
 //! Differences from LuaJIT, by design:
 //! * The hotcount table lives in `JitState` (LuaJIT puts it in `GG_State`
@@ -26,8 +27,7 @@
 //!   bytecode to the non-counting I* variants, which removes the check
 //!   from the hot path for good.
 
-#[cfg(target_arch = "x86_64")]
-pub mod asm_x64;
+pub mod asm;
 pub mod exec;
 pub mod ir;
 pub mod mcode;

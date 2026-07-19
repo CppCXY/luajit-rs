@@ -329,22 +329,17 @@ impl Interp {
                 while o > bottom && concat_ok(self.at(o - 1)) {
                     o -= 1;
                 }
-                let mut buf: [u8; 256] = [0u8; 256];
-                let mut bpos = 0usize;
+                let mut buf: Vec<u8> = Vec::with_capacity(512);
                 for i in o..=top {
                     let v = self.at(i);
                     if let Some(sid) = v.as_string_id() {
-                        let bytes = self.l().str_static(sid);
-                        buf[bpos..bpos + bytes.len()].copy_from_slice(bytes);
-                        bpos += bytes.len();
+                        buf.extend_from_slice(self.l().str_static(sid));
                     } else {
                         let s = crate::strfmt::g14(v.num());
-                        let bytes = s.as_bytes();
-                        buf[bpos..bpos + bytes.len()].copy_from_slice(bytes);
-                        bpos += bytes.len();
+                        buf.extend_from_slice(s.as_bytes());
                     }
                 }
-                let sid = self.l().heap().intern(&buf[..bpos]);
+                let sid = self.l().heap().intern(&buf);
                 let v = self.l().heap().str_value(sid);
                 self.set_at(o, v);
                 top = o;

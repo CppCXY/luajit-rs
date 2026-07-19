@@ -786,11 +786,13 @@ thread_local! {
 }
 
 /// Address of the stack-end cell (embedded in recursive mcode tails).
+#[allow(dead_code)]
 pub(super) fn stack_end_cell_addr() -> u64 {
     STACK_END.with(|c| c.as_ptr() as u64)
 }
 
 /// Address of the exit-base cell (embedded in the mcode epilogue).
+#[allow(dead_code)]
 pub(super) fn exit_base_cell_addr() -> u64 {
     EXIT_BASE.with(|c| c.as_ptr() as u64)
 }
