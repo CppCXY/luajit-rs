@@ -260,6 +260,12 @@ pub struct CTState {
     pub names: std::collections::HashMap<String, u32>,
 }
 
+impl Default for CTState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CTState {
     pub fn new() -> Self {
         let mut cts = CTState {

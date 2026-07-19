@@ -1,8 +1,7 @@
 # luajit-rs
 
 A LuaJIT-style Lua implementation written from scratch in Rust — bytecode
-compiler, NaN-boxed interpreter, and a tracing JIT compiler — with **no
-`unsafe`-heavy FFI dependencies** (one small dependency: `ahash`).
+compiler, NaN-boxed interpreter, and a tracing JIT compiler
 
 The entire codebase was written by **DeepSeek**, with a human providing
 direction and review.

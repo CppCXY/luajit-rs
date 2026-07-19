@@ -132,7 +132,7 @@ impl<'a> Lexer<'a> {
                 self.buf.push(c);
                 self.ident_tail()
             }
-            b'0'..=b'9' => { self.buf.clear(); self.buf.push(c); return self.number_tail(); }
+            b'0'..=b'9' => { self.buf.clear(); self.buf.push(c); self.number_tail()}
             _ => Token::Eof,
         }
     }
@@ -187,7 +187,7 @@ impl<'a> Parser<'a> {
                 Token::KwSigned => { self.next(); }
                 Token::KwLong => {
                     self.next();
-                    if self.tok == Token::KwLong { self.next(); decl.flags |= ctinfo::LONG | ctinfo::LONG; /* ll */ }
+                    if self.tok == Token::KwLong { self.next(); decl.flags |= ctinfo::LONG; /* 'long long' same as 'long' for now */ }
                     else { decl.flags |= ctinfo::LONG; }
                 }
                 Token::KwBool => {
@@ -253,7 +253,7 @@ impl<'a> Parser<'a> {
         }
         self.next(); // {
 
-        let first_field_id = self.cts.top as u32;
+        let first_field_id = self.cts.top;
         let mut total_size: u32 = 0;
         let mut max_align: u32 = 1;
 
@@ -295,7 +295,7 @@ impl<'a> Parser<'a> {
         total_size = (total_size + max_align - 1) & !(max_align - 1);
 
         // Link field siblings
-        let num_fields = self.cts.top as u32 - first_field_id;
+        let num_fields = self.cts.top - first_field_id;
         for i in 0..num_fields {
             let idx = (first_field_id + i) as usize;
             let sib = if i + 1 < num_fields { (first_field_id + i + 1) as u16 } else { 0 };
@@ -305,7 +305,7 @@ impl<'a> Parser<'a> {
         // The struct type itself (insert at end, after fields)
         let sinfo = ct_info(CT::Struct, if is_union { ctinfo::UNION } else { 0 })
             | first_field_id
-            | ((max_align.trailing_zeros() as u32) << ctinfo::SHIFT_ALIGN);
+            | (max_align.trailing_zeros() << ctinfo::SHIFT_ALIGN);
         self.cts.tab.push(CType { info: sinfo, size: total_size, sib: 0, next: 0, name: 0 });
         self.cts.top += 1;
         Ok(self.cts.top - 1)
@@ -360,7 +360,7 @@ impl<'a> Parser<'a> {
             match self.tok {
                 Token::Semicolon | Token::Eof => { if depth == 0 { if self.tok == Token::Semicolon { self.next(); } return; } }
                 Token::LParen | Token::LBrace | Token::LBracket => { depth += 1; self.next(); }
-                Token::RParen | Token::RBrace | Token::RBracket => { if depth > 0 { depth -= 1; } self.next(); }
+                Token::RParen | Token::RBrace | Token::RBracket => { depth = depth.saturating_sub(1); self.next(); }
                 _ => { self.next(); }
             }
         }
