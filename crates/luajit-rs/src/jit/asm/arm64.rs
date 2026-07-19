@@ -126,6 +126,20 @@ fn mov_imm64(code: &mut Vec<u8>, rd: u8, val: u64) {
     }
 }
 
+/// Load a 64-bit immediate into rd using movz + 3 × movk (always 16 bytes).
+fn mov_imm64_full(code: &mut Vec<u8>, rd: u8, val: u64) {
+    let mut v = val;
+    for shift in [0u8, 16, 32, 48] {
+        let chunk = (v & 0xFFFF) as u16;
+        if shift == 0 {
+            movz(code, rd, chunk, shift);
+        } else {
+            movk(code, rd, chunk, shift);
+        }
+        v >>= 16;
+    }
+}
+
 /// CMP (immediate): `cmp rn, #imm` (alias of SUBS with zero register).
 fn cmp_imm(code: &mut Vec<u8>, rn: u8, imm: u32, shift: u8) {
     debug_assert!(imm < 4096 && shift <= 1);
@@ -239,6 +253,16 @@ fn asr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
     emit32(code, sf | 0x13000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
 }
 
+/// UBFX (unsigned bitfield extract): extract `width` bits starting at `lsb`,
+/// zero-extended. `lsb + width <= 64`. Uses 64-bit UBFM.
+fn ubfx(code: &mut Vec<u8>, rd: u8, rn: u8, lsb: u8, width: u8) {
+    let sf = 1u32 << 31;
+    let n = 1u32 << 22;
+    let immr = lsb as u32;
+    let imms = (lsb + width - 1) as u32;
+    emit32(code, sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
+}
+
 /// ROR (register): `ror rd, rn, rm`.
 fn ror_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     let sf = 1u32 << 31;
@@ -339,7 +363,7 @@ fn str_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
 /// STP (store pair, offset): `stp rt1, rt2, [rn, #offset]`.
 fn stp_offset(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
     debug_assert!(offset % 8 == 0 && offset >= -512 && offset <= 504);
-    let imm7 = ((offset.abs() / 8) as u32) << 15;
+    let imm7 = ((offset / 8) as u32 & 0x7F) << 15;
     let sf = 1u32 << 31;
     emit32(
         code,
@@ -350,7 +374,7 @@ fn stp_offset(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
 /// LDP (load pair, offset): `ldp rt1, rt2, [rn, #offset]`.
 fn ldp_offset(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
     debug_assert!(offset % 8 == 0 && offset >= -512 && offset <= 504);
-    let imm7 = ((offset.abs() / 8) as u32) << 15;
+    let imm7 = ((offset / 8) as u32 & 0x7F) << 15;
     let sf = 1u32 << 31;
     emit32(
         code,
@@ -1403,22 +1427,27 @@ impl<'a> Asm<'a> {
         ret(&mut self.code, 30);
 
         // -- Guard-exit stubs --
+        // Stub layout (matches x64 convention for patch_exit):
+        //   [flush instructions...]  variable — live FP regs to env
+        //   [patch tail: 20 bytes]   fixed — exit-code movz+k+b, patched by patch_exit
+        // stubpos[i] → start of stub (guard b.cond target)
+        // stub_tails.push((snapidx, tail)) where tail = position right after flush
         let stubs = std::mem::take(&mut self.stubs);
         let mut stubpos = Vec::with_capacity(stubs.len());
         for st in &stubs {
-            stubpos.push(self.code.len());
+            stubpos.push(self.code.len());                           // guard branch target
             for (rg, rref) in &st.flush {
                 str_fp(&mut self.code, *rg, RENV, Self::env_disp(*rref));
             }
-            let ec = if st.gc { self.exit_code(st.snapidx) | 0x8000 } else { self.exit_code(st.snapidx) };
-            mov_imm64(&mut self.code, 0, ec as u64);
-            let epi_off = epilogue as i32 - self.code.len() as i32;
-            b_imm(&mut self.code, epi_off, false);
-            // 12-byte patch space for side-trace target
-            while self.code.len() < stubpos.last().unwrap() + 12 + 4 {
-                self.code.push(0x00);
+            let tail = self.code.len();                              // patch-exit point
+            if !st.gc {
+                self.stub_tails.push((st.snapidx as u32, tail as u32));
             }
-            self.stub_tails.push((st.snapidx as u32, *stubpos.last().unwrap() as u32));
+            let ec = if st.gc { self.exit_code(st.snapidx) | 0x8000 } else { self.exit_code(st.snapidx) };
+            mov_imm64_full(&mut self.code, 0, ec as u64);            // 16 bytes (4 × movz/movk)
+            let epi_off = epilogue as i32 - self.code.len() as i32;
+            b_imm(&mut self.code, epi_off, false);                   // 4 bytes
+            // Total mov+b = 20 bytes; patch_exit overwrites this region.
         }
         self.stub_positions = stubpos;
 
@@ -1583,8 +1612,8 @@ impl<'a> Asm<'a> {
             cmp_reg(&mut self.code, RSCR, RSCR2);
             self.guard(CC_NE);
         } else {
-            asr_imm(&mut self.code, RSCR2, RSCR, 47);
-            cmp_imm(&mut self.code, RSCR2, (!(ty as u32)) as u32, 0);
+            ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
+            cmp_imm(&mut self.code, RSCR2, (!(ty as u32) & 0xFF) as u32, 0);
             self.guard(CC_NE);
         }
         Ok(())
@@ -1611,7 +1640,7 @@ impl<'a> Asm<'a> {
         mov_imm64(&mut self.code, RSCR, addr);
         ldr_imm(&mut self.code, RSCR, RSCR, 0, 64);
         if ins.is_guard() {
-            asr_imm(&mut self.code, RSCR2, RSCR, 47);
+            ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
             let expected = (!(irt_type(ins.t()) as u32)) as u8;
             cmp_imm(&mut self.code, RSCR2, expected as u32, 0);
             self.guard(CC_NE);
@@ -1629,10 +1658,7 @@ impl<'a> Asm<'a> {
         let r = self.cur;
         ldr_imm(&mut self.code, RSCR, RBASE, idx * 8, 64);
         if ins.is_guard() && !irt_isnum(ins.t()) {
-            // Type guard: arithmetic-shift-right 47 extracts the itype
-            // (NaN-boxed: high 17 bits = ~itype). Compare against the
-            // expected negation of the specialized type.
-            asr_imm(&mut self.code, RSCR2, RSCR, 47);
+            ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
             let expected = (!(irt_type(ins.t()) as u32)) as u8;
             cmp_imm(&mut self.code, RSCR2, expected as u32, 0);
             self.guard(CC_NE);
@@ -1862,6 +1888,31 @@ pub fn assemble(
 }
 
 /// Retarget an exit stub to jump directly to a compiled side trace.
-pub fn patch_exit(_area: &mut McodeArea, _tails: &[(u32, u32)], _exitno: u32, _target: *const u8) {
-    // NYI
+pub fn patch_exit(area: &mut McodeArea, tails: &[(u32, u32)], exitno: u32, target: *const u8) {
+    if !area.protect_rw() {
+        return;
+    }
+    let code = area.as_mut_slice();
+    for &(si, ofs) in tails {
+        if si == exitno {
+            let p = ofs as usize;
+            // Overwrite the exit-code movz+k+b (20 bytes) with:
+            //   movz x9, #lo16; movk x9, #hi16, lsl #16;
+            //   movk x9, #hi32, lsl #32; movk x9, #hi48, lsl #48; br x9
+            let taddr = target as u64;
+            let mut v = taddr;
+            for (i, shift) in [0u32, 16, 32, 48].iter().enumerate() {
+                let chunk = (v & 0xFFFF) as u16;
+                let insn = if i == 0 {
+                    0xD2800000u32 | ((*shift / 16) << 21) | ((chunk as u32) << 5) | 9u32
+                } else {
+                    0xF2800000u32 | ((*shift / 16) << 21) | ((chunk as u32) << 5) | 9u32
+                };
+                code[p + i * 4..p + i * 4 + 4].copy_from_slice(&insn.to_le_bytes());
+                v >>= 16;
+            }
+            code[p + 16..p + 20].copy_from_slice(&0xD61F0120u32.to_le_bytes());
+        }
+    }
+    area.protect_exec();
 }
