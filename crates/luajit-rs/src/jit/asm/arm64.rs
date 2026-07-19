@@ -95,7 +95,7 @@ fn movz(code: &mut Vec<u8>, rd: u8, imm: u16, shift: u8) {
     debug_assert!(shift % 16 == 0 && shift < 64);
     let sf = 1u32 << 31;
     let hw = (shift as u32 / 16) << 21;
-    emit32(code, sf | 0x12800000 | hw | ((imm as u32) << 5) | rd as u32);
+    emit32(code, sf | 0x52800000 | hw | ((imm as u32) << 5) | rd as u32);
 }
 
 /// MOVK: `movk rd, #imm16, lsl #shift`.
@@ -228,17 +228,6 @@ fn lsr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
     let imms = 63u32;
     // UBFM: sf|10|100110|N|immr|imms|Rn|Rd  (LSR allocates UBFM, not SBFM!)
     emit32(code, sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
-}
-
-/// ASR (immediate): `asr rd, rn, #imm`.
-fn asr_reg_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
-    debug_assert!(imm > 0 && imm <= 64);
-    let sf = 1u32 << 31;
-    let immr = imm as u32;
-    emit32(code, sf | 0x13000000 | (0x3F << 16) | (immr << 10) | ((rn as u32) << 5) | rd as u32);
-    // UBFM with appropriate fields → ASR alias
-    // Actually ASR immediate encoding: sf | 0x13000000 | (immr << 16) | (63 << 10) | rn << 5 | rd
-    // Wait, the encoding needs N=1 (bit 22) for 64-bit and the imms=63.
 }
 
 /// ASR (immediate): `asr rd, rn, #imm` (proper encoding).
