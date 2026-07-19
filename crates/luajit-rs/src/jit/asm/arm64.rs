@@ -1190,9 +1190,18 @@ impl<'a> Asm<'a> {
                 }
             }
         }
+        // Make PHI refs share the lref's register so that post-loop
+        // fetch_fp on the PHI ref finds the value without an env load.
         for pi in 0..self.phis.len() {
             let p = self.phis[pi];
             let i = Self::iidx(p.lref);
+            let pi = Self::iidx(p.phi);
+            if p.num && self.loc[i].is_some() {
+                self.loc[pi] = self.loc[i];
+            }
+            if p.num && self.env_valid[i] {
+                self.env_valid[pi] = true;
+            }
             if p.num && self.loc[i].is_some() && !self.needs_env[i] {
                 self.env_valid[i] = false;
             }
