@@ -550,8 +550,8 @@ fn fcvtns_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
 /// SCVTF (int32 to FP, 64-bit): `scvtf dd, wn`. W-register source
 /// (32-bit), D-register destination (64-bit), signed.
 fn scvtf_w(code: &mut Vec<u8>, dd: u8, wn: u8) {
-    // A64I_FCVT_F64_S32 = 0x1e620000
-    emit32(code, 0x1E620000 | ((wn as u32) << 5) | dd as u32);
+    // A64I_FCVT_F64_S32 = 0x1E220000 (32-bit Wn → 64-bit Dd)
+    emit32(code, 0x1E220000 | ((wn as u32) << 5) | dd as u32);
 }
 
 /// FCMP: `fcmp dn, dm`.
@@ -691,17 +691,40 @@ impl<'a> Asm<'a> {
                 | IROp::BASE
                 | IROp::LOOP
                 | IROp::SLOAD
-                | IROp::ULOAD
-                | IROp::FLOAD
-                | IROp::HLOAD
-                | IROp::CARG
-                | IROp::CALLL
-                | IROp::TNEW
-                | IROp::TDUP
-                | IROp::GCSTEP
-                | IROp::ALOAD
-                | IROp::ASTORE
-                | IROp::HSTORE => {}
+                | IROp::ULOAD => {}
+                IROp::FLOAD | IROp::HLOAD | IROp::CARG => {
+                    // Helper-call arguments are read from env as raw bits.
+                    for op in [ins.op1 as IRRef, ins.op2 as IRRef] {
+                        if op >= REF_BIAS {
+                            a.needs_env[Self::iidx(op)] = true;
+                        }
+                    }
+                }
+                IROp::HSTORE => {
+                    if ins.op1 as IRRef >= REF_BIAS {
+                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                    }
+                }
+                IROp::CALLL => {
+                    if super::super::record::ircall_arity(ins.op2 as u32) == 1
+                        && ins.op1 as IRRef >= REF_BIAS
+                    {
+                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                    }
+                }
+                IROp::ALOAD => {
+                    if ins.op1 as IRRef >= REF_BIAS {
+                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                    }
+                    a.mark_use(ins.op2 as IRRef, r);
+                }
+                IROp::ASTORE => {
+                    if ins.op1 as IRRef >= REF_BIAS {
+                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                    }
+                }
+                IROp::TNEW | IROp::TDUP
+                | IROp::GCSTEP => {}
                 IROp::POW | IROp::TOBIT | IROp::BSWAP => {
                     a.mark_use(ins.op1 as IRRef, r);
                 }
@@ -726,6 +749,14 @@ impl<'a> Asm<'a> {
                 IROp::EQ | IROp::NE => {
                     a.mark_use(ins.op1 as IRRef, r);
                     a.mark_use(ins.op2 as IRRef, r);
+                    if !irt_isnum(ins.t()) {
+                        if ins.op1 as IRRef >= REF_BIAS {
+                            a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
+                        }
+                        if ins.op2 as IRRef >= REF_BIAS {
+                            a.needs_env[Self::iidx(ins.op2 as IRRef)] = true;
+                        }
+                    }
                 }
                 IROp::PHI => {
                     let inf = tr.ir.nins();
@@ -1658,7 +1689,13 @@ impl<'a> Asm<'a> {
     fn asm_sload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let idx = ins.op1 as i32 - 2;
         let r = self.cur;
-        ldr_imm(&mut self.code, RSCR, RBASE, idx * 8, 64);
+        let offset = idx as i64 * 8;
+        if offset >= 0 && offset % 8 == 0 && offset <= 32760 {
+            ldr_imm(&mut self.code, RSCR, RBASE, offset as i32, 64);
+        } else {
+            mov_imm64(&mut self.code, RSCR2, idx as u64);
+            ldr_reg_lsl3(&mut self.code, RSCR, RBASE, RSCR2);
+        }
         if ins.is_guard() && !irt_isnum(ins.t()) {
             ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
             let expected = (!(irt_type(ins.t()) as u32)) as u8;
