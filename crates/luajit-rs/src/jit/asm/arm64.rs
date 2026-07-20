@@ -1349,6 +1349,11 @@ impl<'a> Asm<'a> {
             }
         } else {
             debug_assert!(self.env_valid[Self::iidx(p.rref)]);
+            if p.num && let Some(rg) = home {
+                ldr_fp(&mut self.code, rg, RENV, Self::env_disp(p.rref));
+                self.loc[Self::iidx(p.lref)] = Some(rg);
+                self.owner[rg as usize] = Owner::Ins(p.lref);
+            }
             ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.rref), 64);
             str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
             if self.needs_env[Self::iidx(p.phi)] {
