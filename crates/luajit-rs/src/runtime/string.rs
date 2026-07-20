@@ -202,6 +202,14 @@ impl Interner {
         self.lookup(id).as_bytes()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    pub fn try_lookup(&self, id: StrId) -> Option<crate::gc::GcPtr<LuaString>> {
+        self.by_id.get(id as usize).and_then(|o| *o)
+    }
+
     pub fn lookup(&self, id: StrId) -> &LuaString {
         self.by_id[id as usize].expect("dead string id").as_ref()
     }

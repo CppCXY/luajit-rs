@@ -636,7 +636,11 @@ impl<'g> Marker<'g> {
                 Gray::Proto(p) => {
                     for k in &p.as_ref().kgc {
                         match k {
-                            KGc::Str(sid) => self.strings.lookup_ptr(*sid).set_marked(),
+                            KGc::Str(sid) => {
+                                if let Some(ptr) = self.strings.try_lookup(*sid) {
+                                    ptr.set_marked();
+                                }
+                            }
                             KGc::ProtoRef(child) => self.mark_proto(*child),
                             // Template tables are owned by the proto (not
                             // heap objects); mark their contents in place.
