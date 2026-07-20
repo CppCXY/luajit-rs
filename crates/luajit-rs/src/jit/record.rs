@@ -938,6 +938,17 @@ impl Record {
         if cpt.as_ref().flags & crate::proto::PROTO_VARARG != 0 {
             return Err(TraceError::NYIBC);
         }
+        // Root traces cannot safely inline closure calls with closed
+        // upvalues: closures re-created by FNEW on each outer loop
+        // iteration get fresh upvalue cells whose addresses differ from
+        // the recording-time constants, producing hangs or crashes.
+        if self.parent == 0 {
+            for &uv in &cl.upvals {
+                if !uv.as_ref().is_open() {
+                    return Err(TraceError::BLACKL);
+                }
+            }
+        }
         // Up-recursion to the trace head (check_call_unroll): stop the
         // trace after `recunroll` inlined levels and link it to itself.
         let is_head_call = self.parent == 0
@@ -1274,6 +1285,10 @@ impl Record {
         }
         self.specialize_curfn(l, base, fnval)?;
         if uvp.is_open() {
+            // Open upvalue: if it aliases a slot of the recorded frames,
+            // forward the slot. The closure-identity guard pins the
+            // activation, so the alias is stable for this trace.
+            let sp = l.stack.as_ptr() as usize;
             // Open upvalue: if it aliases a slot of the recorded frames,
             // forward the slot. The closure-identity guard pins the
             // activation, so the alias is stable for this trace.
@@ -2536,6 +2551,11 @@ impl Record {
                     IRCALL_CAT,
                 ));
             }
+
+            // FNEW creates new closures with unstable identities inside
+            // hot loops, making compiled traces with closure identity guards
+            // useless. Immediately blacklist the parent trace.
+            BCOp::FNEW => return Err(TraceError::BLACKL),
 
             // Everything else is NYI in Phase 2: calls, returns, tables,
             // upvalues, iterators, varargs, concat, bit ops, lengths.
