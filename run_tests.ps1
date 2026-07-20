@@ -16,9 +16,6 @@ if (-not (Test-Path $Bin)) {
 
 # Tests that are expected to fail (unsupported features)
 $ExpectedFail = @{
-    "ffi_expr_bit.lua"        = "LL/ULL cdata literal syntax not supported"
-    "ffi_expr_bit_bit64.lua"  = "LL/ULL cdata literal syntax not supported"
-    "ffi_expr_bit_bitop.lua"  = "LL/ULL cdata literal syntax not supported"
 }
 
 $Passed = 0

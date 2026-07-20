@@ -143,6 +143,9 @@ const LEX_EOF: i32 = -1;
 pub struct TokVal {
     pub num: f64,
     pub str: StrId,
+    pub is_cdata: bool,
+    pub cdata_bits: u64,
+    pub cdata_is_ull: bool,
 }
 
 pub struct LexState<'a> {
@@ -290,7 +293,6 @@ impl<'a> LexState<'a> {
                 xp = b'p' as i32;
             }
             if (c | 0x20) == b'b' as i32 {
-                // binary literal 0b...
                 loop {
                     c = self.next_char();
                     if c == b'0' as i32 || c == b'1' as i32 || c == b'_' as i32 {
@@ -299,8 +301,36 @@ impl<'a> LexState<'a> {
                     }
                     break;
                 }
-                let n = crate::strscan::scan_bin(&self.sb);
-                return n.unwrap_or_else(|| self.error("malformed binary number"));
+                // Collect suffix letters (L, U, l, u) for binary literals
+                while c == b'L' as i32 || c == b'l' as i32 || c == b'U' as i32 || c == b'u' as i32 {
+                    self.save(c);
+                    c = self.next_char();
+                }
+                let s = self.sb.as_slice();
+                let mut body_len = s.len();
+                let mut suffix = crate::strscan::NumSuffix::None;
+                if body_len >= 3 && (s[body_len-3] == b'U' || s[body_len-3] == b'u')
+                    && (s[body_len-2] == b'L' || s[body_len-2] == b'l')
+                    && (s[body_len-1] == b'L' || s[body_len-1] == b'l') {
+                    suffix = crate::strscan::NumSuffix::ULL;
+                    body_len -= 3;
+                } else if body_len >= 2 && (s[body_len-2] == b'L' || s[body_len-2] == b'l')
+                    && (s[body_len-1] == b'L' || s[body_len-1] == b'l') {
+                    suffix = crate::strscan::NumSuffix::LL;
+                    body_len -= 2;
+                }
+                let n = crate::strscan::scan_bin_to_u64(&s[..body_len]);
+                match n {
+                    Some(u) => {
+                        if suffix != crate::strscan::NumSuffix::None {
+                            self.tokval.is_cdata = true;
+                            self.tokval.cdata_bits = u;
+                            self.tokval.cdata_is_ull = suffix == crate::strscan::NumSuffix::ULL;
+                        }
+                        return u as f64;
+                    }
+                    None => self.error("malformed binary number"),
+                }
             }
         }
         while is_ident(self.c)
@@ -313,8 +343,16 @@ impl<'a> LexState<'a> {
             }
             self.next_char();
         }
-        match crate::strscan::scan_number(&self.sb) {
-            Some(n) => n,
+        let result = crate::strscan::scan_number_full(&self.sb);
+        match result {
+            Some(r) => {
+                if r.suffix != crate::strscan::NumSuffix::None {
+                    self.tokval.is_cdata = true;
+                    self.tokval.cdata_bits = r.u;
+                    self.tokval.cdata_is_ull = r.suffix == crate::strscan::NumSuffix::ULL;
+                }
+                r.n
+            }
             None => self.error("malformed number"),
         }
     }
@@ -517,7 +555,7 @@ impl<'a> LexState<'a> {
             .iter()
             .find(|(kw, _)| *kw == self.sb.as_slice())
             .map_or(Tok::Name, |&(_, t)| t);
-        (tok, TokVal { num: 0.0, str: id })
+        (tok, TokVal { num: 0.0, str: id, ..Default::default() })
     }
 
     /// Skip a `--` comment (short or long). The leading `--` is consumed.
@@ -541,7 +579,13 @@ impl<'a> LexState<'a> {
         loop {
             if is_digit(self.c) {
                 let n = self.lex_number();
-                return (Tok::Number, TokVal { num: n, str: 0 });
+                let cd = self.tokval.is_cdata;
+                let bits = self.tokval.cdata_bits;
+                let is_ull = self.tokval.cdata_is_ull;
+                self.tokval.is_cdata = false;
+                self.tokval.cdata_bits = 0;
+                self.tokval.cdata_is_ull = false;
+                return (Tok::Number, TokVal { num: n, str: 0, is_cdata: cd, cdata_bits: bits, cdata_is_ull: is_ull, ..Default::default() });
             }
             if is_ident(self.c) {
                 return self.scan_name_or_keyword();
@@ -573,7 +617,7 @@ impl<'a> LexState<'a> {
                 b'[' => match self.skip_eq() {
                     sep @ 0.. => {
                         let id = self.long_string(true, sep).unwrap();
-                        return (Tok::Str, TokVal { num: 0.0, str: id });
+                        return (Tok::Str, TokVal { num: 0.0, str: id, ..Default::default() });
                     }
                     -1 => Tok::Char(b'['),
                     _ => self.error("invalid long string delimiter"),
@@ -663,7 +707,7 @@ impl<'a> LexState<'a> {
                 }
                 b'"' | b'\'' => {
                     let id = self.string();
-                    return (Tok::Str, TokVal { num: 0.0, str: id });
+                    return (Tok::Str, TokVal { num: 0.0, str: id, ..Default::default() });
                 }
                 b'.' => {
                     if self.save_next() == b'.' as i32 {
@@ -675,7 +719,13 @@ impl<'a> LexState<'a> {
                         }
                     } else if is_digit(self.c) {
                         let n = self.lex_number();
-                        return (Tok::Number, TokVal { num: n, str: 0 });
+                        let cd = self.tokval.is_cdata;
+                        let bits = self.tokval.cdata_bits;
+                        let is_ull = self.tokval.cdata_is_ull;
+                        self.tokval.is_cdata = false;
+                        self.tokval.cdata_bits = 0;
+                        self.tokval.cdata_is_ull = false;
+                        return (Tok::Number, TokVal { num: n, str: 0, is_cdata: cd, cdata_bits: bits, cdata_is_ull: is_ull, ..Default::default() });
                     } else {
                         Tok::Char(b'.')
                     }

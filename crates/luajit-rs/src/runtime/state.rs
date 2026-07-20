@@ -78,6 +78,11 @@ impl GcHeap {
         self.threads.alloc(th)
     }
 
+    pub fn alloc_cdata(&mut self, cd: crate::runtime::cdata::CData) -> GcPtr<crate::runtime::cdata::CData> {
+        self.total += std::mem::size_of::<crate::runtime::cdata::CData>() + cd.data.len();
+        self.cdatas.alloc(cd)
+    }
+
     pub fn intern(&mut self, s: &[u8]) -> StrId {
         self.strings.intern(s)
     }

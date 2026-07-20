@@ -22,9 +22,6 @@ fi
 
 # Tests expected to fail (unsupported features / NYI)
 declare -A EXPECTED_FAIL=(
-    ["ffi_expr_bit.lua"]="LL/ULL cdata literal syntax not supported"
-    ["ffi_expr_bit_bit64.lua"]="LL/ULL cdata literal syntax not supported"
-    ["ffi_expr_bit_bitop.lua"]="LL/ULL cdata literal syntax not supported"
 )
 
 passed=0

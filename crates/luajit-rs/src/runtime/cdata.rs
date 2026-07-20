@@ -11,7 +11,7 @@ pub type CTypeID = u32;
 // ---------------------------------------------------------------------------
 
 /// GC-managed cdata object. The payload holds raw C value bytes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CData {
     pub ctypeid: CTypeID,
     pub data: Box<[u8]>,

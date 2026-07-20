@@ -2223,7 +2223,7 @@ impl Record {
             }
 
             // -- Constants -------------------------------------------------------------
-            BCOp::KSTR | BCOp::KNUM | BCOp::KPRI => result = rc,
+            BCOp::KSTR | BCOp::KNUM | BCOp::KPRI | BCOp::KCDATA => result = rc,
             BCOp::KSHORT => result = self.cur.ir.knum(bc_d(ins) as i16 as f64),
             BCOp::KNIL => {
                 let mut s = bc_a(ins);

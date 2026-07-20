@@ -3,8 +3,8 @@ mod funcstate;
 use crate::bc::*;
 use crate::lex::*;
 use crate::proto::{
-    KGc, PROTO_BITOP, PROTO_CHILD, PROTO_FIXUP_RETURN, PROTO_HAS_RETURN, PROTO_UV_IMMUTABLE,
-    PROTO_UV_LOCAL, PROTO_VARARG, Proto,
+    KGc, PROTO_BITOP, PROTO_CHILD, PROTO_FFI, PROTO_FIXUP_RETURN, PROTO_HAS_RETURN,
+    PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto,
 };
 use crate::table::LuaTable;
 use crate::value::LuaValue;
@@ -43,6 +43,7 @@ enum ExpKind {
     VKTrue,
     VKStr,
     VKNum,
+    VKCData,
     VLocal,
     VUpval,
     VGlobal,
@@ -369,6 +370,20 @@ impl<'a> Parser<'a> {
         idx
     }
 
+    fn const_cdata(&mut self, e: &ExpDesc) -> u32 {
+        let fs = self.cur_mut();
+        let ctypeid = if e.aux == 1 {
+            crate::ffi::CTypeID::UInt64 as u32
+        } else {
+            crate::ffi::CTypeID::Int64 as u32
+        };
+        let mut cd = crate::runtime::cdata::CData::new(ctypeid, 8);
+        cd.data[..8].copy_from_slice(&e.nval.to_bits().to_le_bytes());
+        let idx = fs.kgc.len() as u32;
+        fs.kgc.push(KGc::CData(Box::new(cd)));
+        idx
+    }
+
     fn const_str(&mut self, e: &ExpDesc) -> u32 {
         debug_assert!(e.isstrk() || e.k == VGlobal);
         self.const_str_id(e.sval)
@@ -655,6 +670,10 @@ impl<'a> Parser<'a> {
                 let idx = self.const_num(e);
                 ins = bcins_ad(BCOp::KNUM, reg, idx);
             }
+        } else if e.k == VKCData {
+            let idx = self.const_cdata(e);
+            self.cur_mut().flags |= PROTO_FFI;
+            ins = bcins_ad(BCOp::KCDATA, reg, idx);
         } else if e.k == VRelocable {
             let pc = e.info;
             setbc_a(self.ins_mut(pc), reg);
@@ -1779,6 +1798,10 @@ impl<'a> Parser<'a> {
             }
         } else if e.k == VKStr {
             LuaValue::string(self.ls.strs.lookup_ptr(e.sval))
+        } else if e.k == VKCData {
+            // CData values are not representable as simple LuaValues;
+            // use the raw u64 as a number for compile-time folding.
+            LuaValue::number(e.nval)
         } else {
             debug_assert!(e.k == VKNum);
             LuaValue::number(e.nval)
@@ -2170,8 +2193,14 @@ impl<'a> Parser<'a> {
     fn expr_simple(&mut self, v: &mut ExpDesc, eflags: u32) {
         match self.ls.tok {
             Tok::Number => {
-                *v = ExpDesc::init(VKNum, 0);
-                v.nval = self.ls.tokval.num;
+                if self.ls.tokval.is_cdata {
+                    *v = ExpDesc::init(VKCData, 0);
+                    v.nval = f64::from_bits(self.ls.tokval.cdata_bits);
+                    v.aux = if self.ls.tokval.cdata_is_ull { 1 } else { 0 };
+                } else {
+                    *v = ExpDesc::init(VKNum, 0);
+                    v.nval = self.ls.tokval.num;
+                }
             }
             Tok::Str => {
                 *v = ExpDesc::init(VKStr, 0);

@@ -90,6 +90,24 @@ pub fn tostring_bytes(l: &mut LuaState, v: LuaValue) -> Vec<u8> {
     if v.is_false() {
         return b"false".to_vec();
     }
+    if let Some(cd) = v.as_cdata() {
+        let ctypeid = cd.as_ref().ctypeid;
+        if ctypeid == crate::ffi::CTypeID::Int64 as u32 {
+            if cd.as_ref().data.len() >= 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&cd.as_ref().data[..8]);
+                let val = i64::from_le_bytes(buf);
+                return format!("{}LL", val).into_bytes();
+            }
+        } else if ctypeid == crate::ffi::CTypeID::UInt64 as u32 {
+            if cd.as_ref().data.len() >= 8 {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&cd.as_ref().data[..8]);
+                let val = u64::from_le_bytes(buf);
+                return format!("{}ULL", val).into_bytes();
+            }
+        }
+    }
     let kind = if v.is_table() {
         "table"
     } else if v.is_func() {

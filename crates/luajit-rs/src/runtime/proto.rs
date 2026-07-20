@@ -1,6 +1,7 @@
 use crate::bc::{BCIns, BCLine};
 use crate::gc::GcPtr;
 use crate::lex::StrId;
+use crate::runtime::cdata::CData;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 
@@ -17,6 +18,8 @@ pub enum KGc {
     Table(Box<LuaTable>),
     /// Template table in the GC pool (post-registration).
     TableRef(GcPtr<LuaTable>),
+    /// C data constant (for LL/ULL suffixed integer literals, etc.).
+    CData(Box<CData>),
 }
 
 /// A function prototype: the output of the bytecode compiler, corresponding

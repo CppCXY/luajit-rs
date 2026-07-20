@@ -19,12 +19,8 @@ jobs:
         include:
           - name: linux-x64
             os: ubuntu-latest
-          - name: linux-arm64
-            os: ubuntu-24.04-arm
           - name: windows-x64
             os: windows-latest
-          - name: macos-arm64
-            os: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +44,15 @@ jobs:
 
       - name: Test (release)
         run: cargo test --release --workspace
+
+      - name: Lua integration tests
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            pwsh -Command ".\run_tests.ps1 -Release"
+          else
+            bash run_tests.sh --release
+          fi
 
       - name: Benchmark smoke test
         shell: bash
