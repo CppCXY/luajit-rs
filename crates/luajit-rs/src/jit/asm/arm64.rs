@@ -820,6 +820,15 @@ impl<'a> Asm<'a> {
         for &(own, _) in &tr.parentmap {
             a.env_valid[Self::iidx(own as IRRef)] = true;
         }
+        // The PHI result env slot doubles as the back-edge scratch buffer.
+        // A PHI that is referenced by a later instruction (last_use != 0)
+        // requires a more elaborate loop-carried-value machinery that NYI
+        // for now (portable executor runs the trace instead). Match x64.
+        for p in &a.phis {
+            if a.last_use[Self::iidx(p.phi)] != 0 {
+                return Err(TraceError::NYIIR);
+            }
+        }
 
         Ok(a)
     }
@@ -1805,13 +1814,17 @@ impl<'a> Asm<'a> {
             mov_imm64(&mut self.code, RSCR2, idx as u64);
             ldr_reg_lsl3(&mut self.code, RSCR, RBASE, RSCR2);
         }
-        if ins.is_guard() && !irt_isnum(ins.t()) {
-            ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
-            let expected = (!(irt_type(ins.t()) as u32)) as u8;
-            cmp_imm(&mut self.code, RSCR2, expected as u32, 0);
-            self.guard(CC_NE);
-        }
         if irt_isnum(ins.t()) {
+            if ins.is_guard() {
+                // LuaJIT GC64 NaN-boxing: the low 32 bits of a number
+                // are the IEEE-754 payload; the high 32 bits must be
+                // less than 0xFFF9_0000 (the smallest GC-tagged value).
+                // cmp dword [BASE+disp+4], LJ_TISNUM<<15; jae ->exit
+                lsr_imm(&mut self.code, RSCR2, RSCR, 32);
+                mov_imm64(&mut self.code, RSCR3, 0xFFF9_0000u64);
+                cmp_reg(&mut self.code, RSCR2, RSCR3);
+                self.guard(CC_CS);
+            }
             let d = self.alloc(0)?;
             fmov_gpr_fp(&mut self.code, d, RSCR);
             self.owner[d as usize] = Owner::Ins(r);
@@ -1821,6 +1834,12 @@ impl<'a> Asm<'a> {
                 self.env_valid[Self::iidx(r)] = true;
             }
         } else {
+            if ins.is_guard() {
+                ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
+                let expected = (!(irt_type(ins.t()) as u32)) as u8;
+                cmp_imm(&mut self.code, RSCR2, expected as u32, 0);
+                self.guard(CC_NE);
+            }
             str_imm(&mut self.code, RSCR, RENV, Self::env_disp(r), 64);
             self.env_valid[Self::iidx(r)] = true;
         }
