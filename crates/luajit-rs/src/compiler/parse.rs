@@ -2022,9 +2022,6 @@ impl<'a> Parser<'a> {
         let mut args = ExpDesc::init(VVoid, 0);
         let line = self.ls.linenumber;
         if self.ls.tok == Tok::Char(b'(') {
-            if line != self.ls.lastline {
-                self.err_syntax("ambiguous syntax (function call x new statement)");
-            }
             self.ls.next();
             if self.ls.tok == Tok::Char(b')') {
                 args.k = VVoid;
@@ -2170,72 +2167,24 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse suffix operations after a value atom: `[expr]`, `.field`,
-    /// `:method(args)`, `(args)`.
-    fn expr_suffix(&mut self, v: &mut ExpDesc, eflags: u32) {
-        while self.suffix_follows() {
-            if self.ls.tok == Tok::Char(b'[') {
-                self.expr_toanyreg(v);
-                let mut key = ExpDesc::init(VVoid, 0);
-                self.expr_bracket(&mut key);
-                self.expr_index(v, &mut key);
-            } else if self.ls.tok == Tok::Char(b':') {
-                if (eflags & EXPR_F_NOCOLON) != 0 {
-                    break;
-                }
-                self.ls.next();
-                let mut key = ExpDesc::init(VVoid, 0);
-                self.expr_str_tok(&mut key);
-                self.bcemit_method(v, &key);
-                self.parse_args(v);
-            } else if self.ls.tok == Tok::Char(b'(')
-                || self.ls.tok == Tok::Str
-                || self.ls.tok == Tok::Char(b'{')
-            {
-                self.expr_tonextreg(v);
-                if self.fr2 != 0 {
-                    self.bcreg_reserve(1);
-                }
-                self.parse_args(v);
-            } else {
-                self.expr_field(v);
-            }
-        }
-    }
-
     fn expr_simple(&mut self, v: &mut ExpDesc, eflags: u32) {
         match self.ls.tok {
             Tok::Number => {
                 *v = ExpDesc::init(VKNum, 0);
                 v.nval = self.ls.tokval.num;
-                self.ls.next();
-                self.expr_suffix(v, eflags);
-                return;
             }
             Tok::Str => {
                 *v = ExpDesc::init(VKStr, 0);
                 v.sval = self.ls.tokval.str;
-                self.ls.next();
-                self.expr_suffix(v, eflags);
-                return;
             }
             Tok::Nil => {
                 *v = ExpDesc::init(VKNil, 0);
-                self.ls.next();
-                self.expr_suffix(v, eflags);
-                return;
             }
             Tok::True => {
                 *v = ExpDesc::init(VKTrue, 0);
-                self.ls.next();
-                self.expr_suffix(v, eflags);
-                return;
             }
             Tok::False => {
                 *v = ExpDesc::init(VKFalse, 0);
-                self.ls.next();
-                self.expr_suffix(v, eflags);
-                return;
             }
             Tok::Dots => {
                 if (self.cur().flags & PROTO_VARARG) == 0 {

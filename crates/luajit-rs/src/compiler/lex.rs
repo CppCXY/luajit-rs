@@ -372,8 +372,8 @@ impl<'a> LexState<'a> {
         self.save_next();
         while self.c != delim {
             match self.c {
-                LEX_EOF => self.error("unfinished string"),
-                c if c == b'\n' as i32 || c == b'\r' as i32 => self.error("unfinished string"),
+                LEX_EOF => self.error("unfinished string near '<eof>'"),
+                c if c == b'\n' as i32 || c == b'\r' as i32 => self.error("unfinished string near '<string>'"),
                 c if c == b'\\' as i32 => {
                     let mut c = self.next_char();
                     match c as u8 {
