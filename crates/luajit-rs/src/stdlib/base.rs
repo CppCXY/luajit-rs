@@ -315,6 +315,45 @@ fn lib_getmetatable(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
+fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
+    let src = arg(l, 0);
+    if let Some(s) = src.as_string() {
+        let code = s.as_ref().as_bytes().to_vec();
+        let chunkname = if nargs(l) >= 2 {
+            let v = arg(l, 1);
+            if let Some(s2) = v.as_string() { String::from_utf8_lossy(s2.as_ref().as_bytes()).into_owned() }
+            else { "=(load)".to_string() }
+        } else { "=(load)".to_string() };
+        match crate::state::load(l, code, &chunkname) {
+            Ok(v) => { push(l, v); Ok(1) }
+            Err(msg) => { push(l, LuaValue::NIL); push(l, l.global().heap.str_value(l.global().heap.intern(msg.as_bytes()))); Ok(2) }
+        }
+    } else if src.is_func() {
+        push(l, LuaValue::NIL);
+        push(l, l.global().heap.str_value(l.global().heap.intern(b"reader function not supported")));
+        Ok(2)
+    } else {
+        Err(err_bad_arg(l, 1, "load", "string or function", ""))
+    }
+}
+
+fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
+    let v = arg(l, 0);
+    let code = match v.as_string() {
+        Some(s) => s.as_ref().as_bytes().to_vec(),
+        None => return Err(err_bad_arg(l, 1, "loadstring", "string", "")),
+    };
+    let chunkname = if nargs(l) >= 2 {
+        let nv = arg(l, 1);
+        if let Some(s) = nv.as_string() { String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned() }
+        else { "=(loadstring)".to_string() }
+    } else { "=(loadstring)".to_string() };
+    match crate::state::load(l, code, &chunkname) {
+        Ok(v) => { push(l, v); Ok(1) }
+        Err(msg) => { push(l, LuaValue::NIL); push(l, l.global().heap.str_value(l.global().heap.intern(msg.as_bytes()))); Ok(2) }
+    }
+}
+
 pub fn open(l: &mut LuaState) {
     lual_reg!(l, b"", LibTarget::BaseLib)
         .func(b"print", lib_print)
@@ -336,6 +375,8 @@ pub fn open(l: &mut LuaState) {
         .func(b"pcall", lib_pcall)
         .func(b"xpcall", lib_xpcall)
         .func(b"getmetatable", lib_getmetatable)
+        .func(b"loadstring", lib_loadstring)
+        .func(b"load", lib_load)
         .build();
 
     let gsid = l.heap().intern(b"_G");

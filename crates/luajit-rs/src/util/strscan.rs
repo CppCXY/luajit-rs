@@ -109,3 +109,16 @@ fn scan_hex(s: &[u8]) -> Option<f64> {
     }
     Some((mant as f64) * (exp as f64).exp2())
 }
+
+pub fn scan_bin(s: &[u8]) -> Option<f64> {
+    let mut val: u64 = 0;
+    for &c in s {
+        match c {
+            b'0' => val = val.wrapping_mul(2),
+            b'1' => val = val.wrapping_mul(2).wrapping_add(1),
+            b'_' => continue,
+            _ => return None,
+        }
+    }
+    Some(val as f64)
+}

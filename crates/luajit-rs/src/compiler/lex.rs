@@ -305,6 +305,19 @@ impl LexState {
             if (c | 0x20) == b'x' as i32 {
                 xp = b'p' as i32;
             }
+            if (c | 0x20) == b'b' as i32 {
+                // binary literal 0b...
+                loop {
+                    c = self.next_char();
+                    if c == b'0' as i32 || c == b'1' as i32 || c == b'_' as i32 {
+                        if c != b'_' as i32 { self.save(c); }
+                        continue;
+                    }
+                    break;
+                }
+                let n = crate::strscan::scan_bin(&self.sb);
+                return n.unwrap_or_else(|| self.error("malformed binary number"));
+            }
         }
         while is_ident(self.c)
             || self.c == b'.' as i32
