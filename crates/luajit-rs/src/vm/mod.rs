@@ -93,8 +93,6 @@ pub fn call(l: &mut LuaState, func: LuaValue, args: &[LuaValue]) -> LuaResult<Ve
 /// and returns their count.
 pub fn execute(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
     l.c_depth += 1;
-    // Ensure the stack can hold the entry frame (FR2: 2-slot header +
-    // framesize, plus extra for call_c's arg region).
     l.stack_ensure(func_slot + nargs + STACK_SAFETY);
     let r = execute_inner(l, func_slot, nargs, want);
     l.c_depth -= 1;
@@ -104,6 +102,25 @@ pub fn execute(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> L
 /// Safety margin added to every stack_ensure: protects against a few
 /// extra slots written by CALL/VARG/TSETM frame setup.
 const STACK_SAFETY: usize = 64;
+
+/// Check if a value is a NULL cdata (void pointer with null address).
+fn is_cdata_null(v: LuaValue) -> bool {
+    if let Some(cd) = v.as_cdata() {
+        let c = cd.as_ref();
+        // PVoid is CTypeID::PVoid as u32
+        if c.ctypeid != crate::ffi::CTypeID::PVoid as u32 {
+            return false;
+        }
+        // Check that the pointer is null (all data bytes are zero)
+        c.data.iter().all(|&b| b == 0)
+    } else {
+        false
+    }
+}
+#[inline(always)]
+fn num2bit(n: f64) -> i32 {
+    (n as i64) as u32 as i32
+}
 
 fn execute_inner(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
     let mut nargs = nargs;
@@ -145,10 +162,8 @@ fn call_c(
     }
     let r = f(l);
     let n = match r {
-        Ok(n) => n as usize,
+        Ok(nv) => nv as usize,
         Err(e) => {
-            // Restore the frame even on error, so protected callers
-            // (pcall) see a consistent base/top.
             l.base = saved_base;
             l.top = saved_top;
             return Err(e);
@@ -774,11 +789,22 @@ impl Interp {
                     branch!(cond);
                 }
                 BCOp::ISEQP => {
-                    let cond = val_eq(reg!(a), PRI[bc_d(ins) as usize]);
+                    let v = reg!(a);
+                    let cond = if bc_d(ins) == 0 {
+                        v.is_nil() || is_cdata_null(v)
+                    } else {
+                        val_eq(v, PRI[bc_d(ins) as usize])
+                    };
                     branch!(cond);
                 }
                 BCOp::ISNEP => {
-                    let cond = !val_eq(reg!(a), PRI[bc_d(ins) as usize]);
+                    let v = reg!(a);
+                    let cond = if bc_d(ins) == 0 {
+                        // Primitive 0 = nil; for ?? operator also treat NULL cdata as nil.
+                        !v.is_nil() && !is_cdata_null(v)
+                    } else {
+                        !val_eq(v, PRI[bc_d(ins) as usize])
+                    };
                     branch!(cond);
                 }
                 BCOp::ISTC => {
@@ -1658,39 +1684,91 @@ impl Interp {
                 // -- Bitwise ops (Lua 5.3+), lj_num2bit / lj_vm_tobit --
                 BCOp::BNOT => {
                     let v = reg!(bc_d(ins));
-                    let n = if v.is_number() { v.num() as i32 } else { 0 };
+                    if !v.is_number() {
+                        sync!();
+                        let l = self.l();
+                        l.runtime_error(b"attempt to perform arithmetic on a non-number value");
+                        return Err(LuaError::Runtime);
+                    }
+                    let n = num2bit(v.num());
                     setreg!(a, LuaValue::number(!n as f64));
                 }
                 BCOp::BAND => {
                     let xv = reg!(bc_b(ins));
                     let yv = reg!(bc_c(ins));
-                    let x = if xv.is_number() { xv.num() as i32 } else { 0 };
-                    let y = if yv.is_number() { yv.num() as i32 } else { 0 };
+                    if !xv.is_number() || !yv.is_number() {
+                        sync!();
+                        let l = self.l();
+                        l.runtime_error(b"attempt to perform arithmetic on a non-number value");
+                        return Err(LuaError::Runtime);
+                    }
+                    let x = num2bit(xv.num());
+                    let y = num2bit(yv.num());
                     setreg!(a, LuaValue::number((x & y) as f64));
                 }
                 BCOp::BOR => {
-                    let x = reg!(bc_b(ins)).num() as i32;
-                    let y = reg!(bc_c(ins)).num() as i32;
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    if !xv.is_number() || !yv.is_number() {
+                        sync!();
+                        let l = self.l();
+                        l.runtime_error(b"attempt to perform arithmetic on a non-number value");
+                        return Err(LuaError::Runtime);
+                    }
+                    let x = num2bit(xv.num());
+                    let y = num2bit(yv.num());
                     setreg!(a, LuaValue::number((x | y) as f64));
                 }
                 BCOp::BXOR => {
-                    let x = reg!(bc_b(ins)).num() as i32;
-                    let y = reg!(bc_c(ins)).num() as i32;
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    if !xv.is_number() || !yv.is_number() {
+                        sync!();
+                        let l = self.l();
+                        l.runtime_error(b"attempt to perform arithmetic on a non-number value");
+                        return Err(LuaError::Runtime);
+                    }
+                    let x = num2bit(xv.num());
+                    let y = num2bit(yv.num());
                     setreg!(a, LuaValue::number((x ^ y) as f64));
                 }
                 BCOp::BSHL => {
-                    let x = reg!(bc_b(ins)).num() as i32;
-                    let y = (reg!(bc_c(ins)).num() as u32) & 31;
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    if !xv.is_number() || !yv.is_number() {
+                        sync!();
+                        let l = self.l();
+                        l.runtime_error(b"attempt to perform arithmetic on a non-number value");
+                        return Err(LuaError::Runtime);
+                    }
+                    let x = num2bit(xv.num());
+                    let y = (num2bit(yv.num()) as u32) & 31;
                     setreg!(a, LuaValue::number((x << y) as f64));
                 }
                 BCOp::BSHR => {
-                    let x = reg!(bc_b(ins)).num() as i32;
-                    let y = (reg!(bc_c(ins)).num() as u32) & 31;
-                    setreg!(a, LuaValue::number(((x as u32) >> y) as f64));
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    if !xv.is_number() || !yv.is_number() {
+                        sync!();
+                        let l = self.l();
+                        l.runtime_error(b"attempt to perform arithmetic on a non-number value");
+                        return Err(LuaError::Runtime);
+                    }
+                    let x = num2bit(xv.num());
+                    let y = (num2bit(yv.num()) as u32) & 31;
+                    setreg!(a, LuaValue::number((((x as u32) >> y) as i32) as f64));
                 }
                 BCOp::BSAR => {
-                    let x = reg!(bc_b(ins)).num() as i32;
-                    let y = (reg!(bc_c(ins)).num() as u32) & 31;
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    if !xv.is_number() || !yv.is_number() {
+                        sync!();
+                        let l = self.l();
+                        l.runtime_error(b"attempt to perform arithmetic on a non-number value");
+                        return Err(LuaError::Runtime);
+                    }
+                    let x = num2bit(xv.num());
+                    let y = (num2bit(yv.num()) as u32) & 31;
                     setreg!(a, LuaValue::number((x >> y) as f64));
                 }
 
@@ -1942,7 +2020,7 @@ impl Interp {
         }
         let r = f(l);
         let n = match r {
-            Ok(n) => n as usize,
+            Ok(nv) => nv as usize,
             Err(e) => {
                 l.base = saved_base;
                 l.top = saved_top;

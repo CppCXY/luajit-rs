@@ -15,7 +15,8 @@ fn quick_type_id(n: &str) -> Option<u32> { Some(match n {
     "int"|"signed"|"int32_t"=>crate::ffi::CTypeID::Int32 as u32,"unsigned"|"unsigned int"|"uint32_t"=>crate::ffi::CTypeID::UInt32 as u32,
     "long"|"int64_t"=>crate::ffi::CTypeID::Int64 as u32,"unsigned long"|"uint64_t"=>crate::ffi::CTypeID::UInt64 as u32,
     "long long"=>crate::ffi::CTypeID::Int64 as u32,"unsigned long long"=>crate::ffi::CTypeID::UInt64 as u32,
-    "float"=>crate::ffi::CTypeID::Float as u32,"double"=>crate::ffi::CTypeID::Double as u32,_=>return None
+    "float"=>crate::ffi::CTypeID::Float as u32,"double"=>crate::ffi::CTypeID::Double as u32,
+    "void *"|"void*"=>crate::ffi::CTypeID::PVoid as u32,_=>return None
 }) }
 
 fn ffi_checkctype(l: &mut LuaState) -> LuaResult<u32> {

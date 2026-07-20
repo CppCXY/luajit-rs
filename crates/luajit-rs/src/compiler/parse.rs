@@ -2170,24 +2170,72 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse suffix operations after a value atom: `[expr]`, `.field`,
+    /// `:method(args)`, `(args)`.
+    fn expr_suffix(&mut self, v: &mut ExpDesc, eflags: u32) {
+        while self.suffix_follows() {
+            if self.ls.tok == Tok::Char(b'[') {
+                self.expr_toanyreg(v);
+                let mut key = ExpDesc::init(VVoid, 0);
+                self.expr_bracket(&mut key);
+                self.expr_index(v, &mut key);
+            } else if self.ls.tok == Tok::Char(b':') {
+                if (eflags & EXPR_F_NOCOLON) != 0 {
+                    break;
+                }
+                self.ls.next();
+                let mut key = ExpDesc::init(VVoid, 0);
+                self.expr_str_tok(&mut key);
+                self.bcemit_method(v, &key);
+                self.parse_args(v);
+            } else if self.ls.tok == Tok::Char(b'(')
+                || self.ls.tok == Tok::Str
+                || self.ls.tok == Tok::Char(b'{')
+            {
+                self.expr_tonextreg(v);
+                if self.fr2 != 0 {
+                    self.bcreg_reserve(1);
+                }
+                self.parse_args(v);
+            } else {
+                self.expr_field(v);
+            }
+        }
+    }
+
     fn expr_simple(&mut self, v: &mut ExpDesc, eflags: u32) {
         match self.ls.tok {
             Tok::Number => {
                 *v = ExpDesc::init(VKNum, 0);
                 v.nval = self.ls.tokval.num;
+                self.ls.next();
+                self.expr_suffix(v, eflags);
+                return;
             }
             Tok::Str => {
                 *v = ExpDesc::init(VKStr, 0);
                 v.sval = self.ls.tokval.str;
+                self.ls.next();
+                self.expr_suffix(v, eflags);
+                return;
             }
             Tok::Nil => {
                 *v = ExpDesc::init(VKNil, 0);
+                self.ls.next();
+                self.expr_suffix(v, eflags);
+                return;
             }
             Tok::True => {
                 *v = ExpDesc::init(VKTrue, 0);
+                self.ls.next();
+                self.expr_suffix(v, eflags);
+                return;
             }
             Tok::False => {
                 *v = ExpDesc::init(VKFalse, 0);
+                self.ls.next();
+                self.expr_suffix(v, eflags);
+                return;
             }
             Tok::Dots => {
                 if (self.cur().flags & PROTO_VARARG) == 0 {
@@ -2613,6 +2661,9 @@ impl<'a> Parser<'a> {
 
     fn parse_break(&mut self) {
         let fs = self.cur_mut();
+        if !fs.scopes.iter().any(|s| (s.flags & FSCOPE_LOOP) != 0) {
+            self.ls.error("no loop to break");
+        }
         fs.scopes.last_mut().unwrap().flags |= FSCOPE_BREAK;
         let pc = self.bcemit_jmp();
         self.gola_new(VName::Break, VSTACK_GOTO, pc);
@@ -2620,6 +2671,9 @@ impl<'a> Parser<'a> {
 
     fn parse_continue(&mut self) {
         let fs = self.cur_mut();
+        if !fs.scopes.iter().any(|s| (s.flags & FSCOPE_LOOP) != 0) {
+            self.ls.error("no loop to continue");
+        }
         fs.scopes.last_mut().unwrap().flags |= FSCOPE_CONT;
         let pc = self.bcemit_jmp();
         self.gola_new(VName::Cont, VSTACK_GOTO, pc);
@@ -2955,6 +3009,11 @@ impl<'a> Parser<'a> {
                 }
                 self.ls.next();
                 self.parse_continue();
+                // continue must be the last statement in a block;
+                // reject a trailing ';' that would allow another stmt.
+                if matches!(self.ls.tok, Tok::Char(b';')) {
+                    self.err_token(Tok::End);
+                }
                 return false;
             }
             Tok::Label => {

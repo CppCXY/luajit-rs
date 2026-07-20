@@ -10,6 +10,7 @@
 pub mod base;
 pub mod bit;
 pub mod coroutine;
+pub mod debug;
 pub mod io;
 pub mod math;
 pub mod os;
@@ -27,7 +28,9 @@ use crate::ffi;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
-/// `lua_push` a single result value.
+/// `lua_push` a single result value. Writes into the result area
+/// at `base` and sets `top = base + 1`. Only safe for one-value
+/// returns; for multiple results write directly to `stack[base..]`.
 #[inline]
 pub fn push(l: &mut LuaState, v: LuaValue) {
     l.stack_ensure(l.base + 1);
@@ -35,14 +38,19 @@ pub fn push(l: &mut LuaState, v: LuaValue) {
     l.top = l.base + 1;
 }
 
-/// `lua_push` multiple results.
+/// `lua_push` multiple results. Writes at `base + i` and sets
+/// `top = base + n`.
 #[inline]
 pub fn pushv(l: &mut LuaState, vs: &[LuaValue]) {
-    l.stack_ensure(l.base + vs.len().max(1));
+    let n = vs.len();
+    if n == 0 {
+        return;
+    }
+    l.stack_ensure(l.base + n);
     for (i, &v) in vs.iter().enumerate() {
         l.stack[l.base + i] = v;
     }
-    l.top = l.base + vs.len();
+    l.top = l.base + n;
 }
 
 /// Argument `i` (0-based) of the current C call, or nil.
@@ -169,5 +177,6 @@ pub fn open_libs(l: &mut LuaState) {
     os::open(l);
     io::open(l);
     package::open(l);
+    debug::open(l);
     ffi::lib::open(l);
 }

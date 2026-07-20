@@ -326,11 +326,17 @@ fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
         } else { "=(load)".to_string() };
         match crate::state::load(l, code, &chunkname) {
             Ok(v) => { push(l, v); Ok(1) }
-            Err(msg) => { push(l, LuaValue::NIL); push(l, l.global().heap.str_value(l.global().heap.intern(msg.as_bytes()))); Ok(2) }
+            Err(msg) => {
+                l.stack[l.base] = LuaValue::NIL;
+                l.stack[l.base + 1] = l.global().heap.str_value(l.global().heap.intern(msg.as_bytes()));
+                l.top = l.base + 2;
+                Ok(2)
+            }
         }
     } else if src.is_func() {
-        push(l, LuaValue::NIL);
-        push(l, l.global().heap.str_value(l.global().heap.intern(b"reader function not supported")));
+        l.stack[l.base] = LuaValue::NIL;
+        l.stack[l.base + 1] = l.global().heap.str_value(l.global().heap.intern(b"reader function not supported"));
+        l.top = l.base + 2;
         Ok(2)
     } else {
         Err(err_bad_arg(l, 1, "load", "string or function", ""))
@@ -350,7 +356,12 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
     } else { "=(loadstring)".to_string() };
     match crate::state::load(l, code, &chunkname) {
         Ok(v) => { push(l, v); Ok(1) }
-        Err(msg) => { push(l, LuaValue::NIL); push(l, l.global().heap.str_value(l.global().heap.intern(msg.as_bytes()))); Ok(2) }
+        Err(msg) => {
+            l.stack[l.base] = LuaValue::NIL;
+            l.stack[l.base + 1] = l.global().heap.str_value(l.global().heap.intern(msg.as_bytes()));
+            l.top = l.base + 2;
+            Ok(2)
+        }
     }
 }
 
