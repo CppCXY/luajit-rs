@@ -55,13 +55,14 @@ pub const IRCALL_TAB_LEN: u32 = 7;
 pub const IRCALL_TAB_CONCAT: u32 = 8;
 pub const IRCALL_CAT: u32 = 9;
 pub const IRCALL_USET: u32 = 10;
+pub const IRCALL_VARG: u32 = 11;
 
 /// Argument count of an IRCALL: 1 = op1 is the argument, 2 = op1 is a
 /// CARG pair, 3 = op1 is CARG(CARG(a, b), c).
 pub fn ircall_arity(idx: u32) -> u32 {
     match idx {
         IRCALL_STR_LEN | IRCALL_STR_CHAR | IRCALL_TAB_LEN => 1,
-        IRCALL_STR_SUB => 3,
+        IRCALL_STR_SUB | IRCALL_VARG => 3,
         _ => 2,
     }
 }
@@ -2371,6 +2372,39 @@ impl Record {
 
             // -- Upvalues ----------------------------------------------------------
             BCOp::UGET => result = self.rec_uget(l, base, bc_d(ins))?,
+
+            BCOp::VARG => {
+                let bp = unsafe { l.stack.as_ptr().add(base) };
+                let link = unsafe { (*bp.sub(1)).to_bits() };
+                use crate::vm::FRAME_TYPE_MASK;
+                use crate::vm::FRAME_VARG;
+                if link & FRAME_TYPE_MASK != FRAME_VARG {
+                    return Err(TraceError::NYIBC);
+                }
+                let delta = (link >> 3) as usize;
+                let nparams = self.pt.as_ref().numparams as usize;
+                let nvarg = (delta - 2).saturating_sub(nparams);
+                let dst = bc_a(ins) as u32;
+                let want = if bc_b(ins) == 0 { nvarg as u32 } else { (bc_b(ins) - 1) as u32 };
+                let packed = ((nparams as u32) << 16) | ((dst as u32) << 8) | want;
+                let k_link = self.cur.ir.kint64(link);
+                let k_packed = self.cur.ir.kint64(packed as u64);
+                let c1 = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, irt_type(IRT_NIL)),
+                    REF_BIAS,        // → base pointer via RBASE register
+                    tref_ref(k_link),
+                ));
+                let carg = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, irt_type(IRT_NIL)),
+                    tref_ref(c1),
+                    tref_ref(k_packed),
+                ));
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_NIL),
+                    tref_ref(carg),
+                    IRCALL_VARG,
+                ));
+            }
 
             BCOp::USETV | BCOp::USETS | BCOp::USETN | BCOp::USETP => {
                 let fnval = l.stack[base - 2];

@@ -413,6 +413,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                             );
                             match idx {
                                 super::record::IRCALL_STR_SUB => jit_str_sub(x, y, z),
+                                super::record::IRCALL_VARG => jit_varg(x, y, z),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -975,4 +976,32 @@ pub extern "C" fn jit_uset(cell_ptr: u64, val_bits: u64) -> u64 {
         *(cell_ptr as *mut u64) = val_bits;
     }
     0
+}
+
+/// Vararg copy: reads `nvarg` values from the caller's frame and
+/// writes them to slots at `dst`. `frame_link` is the link word at
+/// bp-1, packed = (numparams<<16)|(dst<<8)|want.
+pub extern "C" fn jit_varg(base_ptr: u64, frame_link: u64, packed: u64) -> u64 {
+    use crate::vm::FRAME_TYPE_MASK;
+    use crate::vm::FRAME_VARG;
+    if frame_link & FRAME_TYPE_MASK != FRAME_VARG {
+        return u64::MAX;
+    }
+    let numparams = (packed >> 16) as u32;
+    let dst = ((packed >> 8) & 0xFF) as u32;
+    let want = (packed & 0xFF) as u32;
+    let delta = (frame_link >> 3) as usize;
+    let nvarg = (delta - 2).saturating_sub(numparams as usize);
+    let base = base_ptr as *mut LuaValue;
+    let src = unsafe { base.sub(delta).add(numparams as usize) };
+    let actual = if want == 0 { nvarg } else { nvarg.min(want as usize) };
+    for i in 0..actual {
+        unsafe { *base.add(dst as usize + i) = *src.add(i) };
+    }
+    if want > 0 {
+        for i in actual..(want as usize) {
+            unsafe { *base.add(dst as usize + i) = LuaValue::NIL };
+        }
+    }
+    actual as u64
 }

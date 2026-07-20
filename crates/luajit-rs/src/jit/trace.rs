@@ -1587,4 +1587,84 @@ mod tests {
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(42.0));
     }
+
+    #[test]
+    fn vararg_records() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local function f(...) local a,b = ...; return a + b end; return f(3, 4)",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(7.0));
+    }
+
+    // -- JIT correctness suite: run programs through JIT, verify results ---
+
+    fn jit_run(lua: &mut Lua, src: &str) -> LuaValue {
+        let (f, _pt) = load_proto(lua, src);
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        r[0]
+    }
+
+    fn assert_num(v: LuaValue, expected: f64) {
+        assert_eq!(v.as_number(), Some(expected), "got {:?}", v);
+    }
+
+    fn assert_str(v: LuaValue, expected: &[u8]) {
+        assert!(v.is_string());
+        assert_eq!(v.as_string().unwrap().as_ref().as_bytes(), expected);
+    }
+
+    #[test]
+    fn jit_correctness_arithmetic() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_num(jit_run(&mut lua, "local s=0 for i=1,50000 do s=s+i end return s"), 1250025000.0);
+        assert_num(jit_run(&mut lua, "local r=1.0 for i=1,100 do r=r*1.0001 end return r"), 1.0001f64.powi(100));
+        assert_num(jit_run(&mut lua, "local x=0 for i=1,1000 do x=i+5 end return x"), 1005.0);
+    }
+
+    #[test]
+    fn jit_correctness_strcat() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_str(jit_run(&mut lua, r#"local a,b="hello","world" return a..b"#), b"helloworld");
+        assert_str(jit_run(&mut lua, "local s='' for i=1,10 do s=s..i end return s"), b"12345678910");
+    }
+
+    #[test]
+    fn jit_correctness_vararg() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_num(
+            jit_run(&mut lua, "local function f(...) local a,b=...; return a+b end; return f(10, 20)"),
+            30.0,
+        );
+    }
+
+    #[test]
+    fn jit_correctness_control_flow() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_num(
+            jit_run(&mut lua, "local c=0 for i=1,2000 do if i%2==0 then c=c+1 else c=c-1 end end return c"),
+            0.0,
+        );
+        assert_num(
+            jit_run(&mut lua, "local s=0 for i=1,1000 do if i<500 then s=s+1 end end return s"),
+            499.0,
+        );
+    }
+
+    #[test]
+    fn jit_correctness_tables() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_num(
+            jit_run(&mut lua, "local t={} for i=1,100 do t[i]=i*2 end; local s=0 for i=1,100 do s=s+t[i] end return s"),
+            10100.0,
+        );
+    }
 }

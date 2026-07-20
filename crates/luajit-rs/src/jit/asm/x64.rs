@@ -811,6 +811,7 @@ impl<'a> Asm<'a> {
             rec::IRCALL_STR_CMP => super::super::exec::jit_str_cmp as *const () as u64,
             rec::IRCALL_STR_BYTE => super::super::exec::jit_str_byte as *const () as u64,
             rec::IRCALL_STR_SUB => super::super::exec::jit_str_sub as *const () as u64,
+            rec::IRCALL_VARG => super::super::exec::jit_varg as *const () as u64,
             rec::IRCALL_STR_CHAR => super::super::exec::jit_str_char as *const () as u64,
             rec::IRCALL_TAB_LEN => super::super::exec::jit_alen as *const () as u64,
             rec::IRCALL_TAB_CONCAT => super::super::exec::jit_tconcat as *const () as u64,
@@ -1535,7 +1536,10 @@ impl<'a> Asm<'a> {
 
     /// Raw 64-bit value of an operand into a GPR (GC-identity compares).
     fn gpr_load_ref(&mut self, gpr: u8, r: IRRef) {
-        if r >= REF_BIAS {
+        if r == REF_BIAS {
+            // REF_BASE: load the Lua stack base pointer (r10).
+            self.mov_rr64(gpr, RBASE);
+        } else if r >= REF_BIAS {
             debug_assert!(self.env_valid[Self::iidx(r)]);
             self.mov_r64_mem(gpr, RENV, Self::env_disp(r));
         } else {
