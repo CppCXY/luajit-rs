@@ -53,6 +53,8 @@ pub const IRCALL_STR_SUB: u32 = 5;
 pub const IRCALL_STR_CHAR: u32 = 6;
 pub const IRCALL_TAB_LEN: u32 = 7;
 pub const IRCALL_TAB_CONCAT: u32 = 8;
+pub const IRCALL_CAT: u32 = 9;
+pub const IRCALL_USET: u32 = 10;
 
 /// Argument count of an IRCALL: 1 = op1 is the argument, 2 = op1 is a
 /// CARG pair, 3 = op1 is CARG(CARG(a, b), c).
@@ -2370,6 +2372,32 @@ impl Record {
             // -- Upvalues ----------------------------------------------------------
             BCOp::UGET => result = self.rec_uget(l, base, bc_d(ins))?,
 
+            BCOp::USETV | BCOp::USETS | BCOp::USETN | BCOp::USETP => {
+                let fnval = l.stack[base - 2];
+                let Some(gf) = fnval.as_func() else { return Err(TraceError::NYIBC); };
+                let crate::func::GcFunc::Lua(cl) = gf.as_ref() else { return Err(TraceError::NYIBC); };
+                let Some(&uv) = cl.upvals.get(bc_a(ins) as usize) else { return Err(TraceError::NYIBC); };
+                let cell = uv.as_ref().value_ptr() as u64;
+                self.specialize_curfn(l, base, fnval)?;
+                let ptr_k = self.cur.ir.kint64(cell);
+                // rb is preloaded as Var for USETV; rc/D is preloaded for
+                // USETS (str), USETN (num), USETP (pri).
+                let val_ref = match op {
+                    BCOp::USETV => rb,
+                    _ => rc,
+                };
+                let carg = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, irt_type(IRT_NIL)),
+                    tref_ref(ptr_k),
+                    tref_ref(val_ref),
+                ));
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_NIL),
+                    tref_ref(carg),
+                    IRCALL_USET,
+                ));
+            }
+
             // -- Table indexing ----------------------------------------------------
             BCOp::TNEW => {
                 // Mirror the interpreter: a fresh empty table (the size
@@ -2453,6 +2481,26 @@ impl Record {
                 // Reached only through the slow call paths (the fast path
                 // enters at bc[1]); those shapes are not recorded yet.
                 return Err(TraceError::NYIBC);
+            }
+
+            BCOp::CAT => {
+                // Two-value concatenation via jit_cat helper.
+                // rb=first source, rc=second source (both already typed).
+                if !(tref_isstr(rb) || tref_isnum(rb))
+                    || !(tref_isstr(rc) || tref_isnum(rc))
+                {
+                    return Err(TraceError::NYIBC);
+                }
+                let carg = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, irt_type(IRT_NIL)),
+                    tref_ref(rb),
+                    tref_ref(rc),
+                ));
+                result = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_STR),
+                    tref_ref(carg),
+                    IRCALL_CAT,
+                ));
             }
 
             // Everything else is NYI in Phase 2: calls, returns, tables,

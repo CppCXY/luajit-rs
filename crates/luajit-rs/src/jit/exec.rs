@@ -396,6 +396,8 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                                 super::record::IRCALL_STR_CMP => jit_str_cmp(x, y),
                                 super::record::IRCALL_STR_BYTE => jit_str_byte(x, y),
                                 super::record::IRCALL_TAB_CONCAT => jit_tconcat(x, y),
+                                super::record::IRCALL_CAT => jit_cat(x, y),
+                                super::record::IRCALL_USET => jit_uset(x, y),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -944,4 +946,33 @@ pub extern "C" fn jit_tconcat(tab_bits: u64, sep_bits: u64) -> u64 {
         i += 1;
     }
     jit_intern(&out)
+}
+
+/// String concatenation (.. operator) for two Lua values. Returns a
+/// string GCref on success, or LuaValue::NIL if either operand is
+/// neither a string nor a number (guard exit → interpreter).
+pub extern "C" fn jit_cat(a_bits: u64, b_bits: u64) -> u64 {
+    let a = LuaValue::from_bits(a_bits);
+    let b = LuaValue::from_bits(b_bits);
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    match a.as_string() {
+        Some(s) => buf.extend_from_slice(s.as_ref().as_bytes()),
+        None if a.is_number() => buf.extend_from_slice(crate::strfmt::g14(a.num()).as_bytes()),
+        _ => return LuaValue::NIL.to_bits(),
+    }
+    match b.as_string() {
+        Some(s) => buf.extend_from_slice(s.as_ref().as_bytes()),
+        None if b.is_number() => buf.extend_from_slice(crate::strfmt::g14(b.num()).as_bytes()),
+        _ => return LuaValue::NIL.to_bits(),
+    }
+    jit_intern(&buf)
+}
+
+/// Upvalue write: store `val_bits` into the cell at `cell_ptr`.
+/// The cell pointer is a stable heap address of an upvalue slot.
+pub extern "C" fn jit_uset(cell_ptr: u64, val_bits: u64) -> u64 {
+    unsafe {
+        *(cell_ptr as *mut u64) = val_bits;
+    }
+    0
 }

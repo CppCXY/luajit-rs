@@ -1548,4 +1548,43 @@ mod tests {
         assert_eq!(TraceError::BLACKL.message(), "blacklisted");
         const _: () = assert!(std::mem::size_of::<BCIns>() == 4);
     }
+
+    #[test]
+    fn string_concat_records() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        let (f, _pt) = load_proto(
+            &mut lua,
+            r#"local function f(a, b) return a .. b end return f("hello", "world")"#,
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert!(r[0].is_string());
+        assert_eq!(r[0].as_string().unwrap().as_ref().as_bytes(), b"helloworld");
+    }
+
+    #[test]
+    fn string_concat_number() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local s = '' for i = 1, 100 do s = s .. i end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert!(r[0].is_string());
+        let expected: String = (1..=100).map(|n| n.to_string()).collect();
+        assert_eq!(r[0].as_string().unwrap().as_ref().as_bytes(), expected.as_bytes());
+    }
+
+    #[test]
+    fn upvalue_write_records() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        let (f, _pt) = load_proto(
+            &mut lua,
+            "local x = 0; local function set(v) x = v end; set(42); return x",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(42.0));
+    }
 }
