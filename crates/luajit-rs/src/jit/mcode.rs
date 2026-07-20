@@ -50,6 +50,7 @@ impl McodeArea {
     }
 
     /// Flip the area to executable (W^X) and flush the icache.
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn protect_exec(&mut self) -> bool {
         if !self.exec && !sys::protect(self.ptr, self.len, true) {
             return false;
@@ -60,8 +61,30 @@ impl McodeArea {
     }
 
     /// Flip the area back to writable (for exit-branch patching).
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn protect_rw(&mut self) -> bool {
         if self.exec && !sys::protect(self.ptr, self.len, false) {
+            return false;
+        }
+        self.exec = false;
+        true
+    }
+
+    /// macOS ARM64: pthread_jit_write_protect_np is process-wide, so
+    /// always toggle regardless of the current tracked state.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn protect_exec(&mut self) -> bool {
+        sys::flush_icache(self.ptr, self.len);
+        if !sys::protect(self.ptr, self.len, true) {
+            return false;
+        }
+        self.exec = true;
+        true
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn protect_rw(&mut self) -> bool {
+        if !sys::protect(self.ptr, self.len, false) {
             return false;
         }
         self.exec = false;
@@ -152,10 +175,10 @@ mod sys {
     }
 
     pub fn page_size() -> usize {
-        // Common page size; areas are merely rounded up by it.
         16384
     }
 
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn alloc_rw(len: usize) -> Option<*mut u8> {
         let p = unsafe {
             mmap(
@@ -167,13 +190,28 @@ mod sys {
                 0,
             )
         };
-        if p as isize == -1 || p.is_null() {
-            None
-        } else {
-            Some(p)
-        }
+        if p as isize == -1 || p.is_null() { None } else { Some(p) }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn alloc_rw(len: usize) -> Option<*mut u8> {
+        // macOS ARM64 hardened runtime: MAP_JIT is required to create
+        // memory that pthread_jit_write_protect_np can toggle.
+        const MAP_JIT: i32 = 0x800;
+        let p = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANON | MAP_JIT,
+                -1,
+                0,
+            )
+        };
+        if p as isize == -1 || p.is_null() { None } else { Some(p) }
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn protect(ptr: *mut u8, len: usize, exec: bool) -> bool {
         let prot = if exec {
             PROT_READ | PROT_EXEC
@@ -183,6 +221,18 @@ mod sys {
         unsafe { mprotect(ptr, len, prot) == 0 }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn protect(_ptr: *mut u8, _len: usize, exec: bool) -> bool {
+        unsafe extern "C" {
+            fn pthread_jit_write_protect_np(enabled: i32);
+        }
+        // pthread_jit_write_protect_np(0) allows write;
+        // pthread_jit_write_protect_np(1) restricts to execute-only.
+        unsafe { pthread_jit_write_protect_np(if exec { 1 } else { 0 }) };
+        true
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn flush_icache(ptr: *const u8, len: usize) {
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         {
@@ -193,8 +243,16 @@ mod sys {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            let _ = (ptr, len); // Coherent icache on x86.
+            let _ = (ptr, len);
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn flush_icache(ptr: *const u8, len: usize) {
+        unsafe extern "C" {
+            fn sys_icache_invalidate(addr: *const u8, size: usize);
+        }
+        unsafe { sys_icache_invalidate(ptr, len) };
     }
 
     pub fn free(ptr: *mut u8, len: usize) {
