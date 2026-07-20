@@ -37,7 +37,7 @@ fn jit_status(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn open(l: &mut LuaState) {
-    let version_str = l.heap().intern(b"LuaJIT 2.1.0-beta3");
+    let version_str = l.heap().intern(b"LuaJIT 2.1.0-rs");
     let version_val = l.heap().str_value(version_str);
     lual_reg!(l, b"jit", LibTarget::Global)
         .func(b"on", jit_on)

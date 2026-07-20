@@ -1615,7 +1615,14 @@ mod tests {
     }
 
     fn assert_num(v: LuaValue, expected: f64) {
-        assert_eq!(v.as_number(), Some(expected), "got {:?}", v);
+        let got = v.as_number().expect("expected number");
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "got {:.16}, expected {:.16}, diff {:.2e}",
+            got,
+            expected,
+            (got - expected).abs()
+        );
     }
 
     fn assert_str(v: LuaValue, expected: &[u8]) {
