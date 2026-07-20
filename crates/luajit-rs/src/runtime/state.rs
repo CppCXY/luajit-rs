@@ -479,16 +479,32 @@ impl Default for Box<Lua> {
     }
 }
 
-/// Load a Lua source chunk: compile it to bytecode, register the prototype in
-/// the heap and build the top-level vararg closure. Returns the closure value
-/// (not yet executed).
 pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue, String> {
     let g = l.global();
-    let strs = std::mem::take(&mut g.heap.strings);
-    let parser = crate::parse::Parser::with_interner(src, chunkname.to_string(), strs);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || parser.parse()));
-    let (proto, strs) = match result {
-        Ok(out) => out,
+    // Avoid taking ownership of the interner so nested loadstring
+    // calls during parsing share the same instance. Use a raw pointer
+    // with AssertUnwindSafe since the borrow checker can't express
+    // "owned by caller, lent to parser, retrieved on unwind".
+    let ptr = &raw mut g.heap.strings as *mut Interner;
+    let parser = crate::parse::Parser::with_interner(
+        src,
+        chunkname.to_string(),
+        unsafe { &mut *ptr },
+    );
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        parser.parse()
+    }));
+    match result {
+        Ok((proto, _strs)) => {
+            let proto_ref = register_proto(&mut g.heap, proto);
+            let env = g.globals;
+            let fref = g.heap.alloc_func(GcFunc::Lua(LuaClosure {
+                proto: proto_ref,
+                env,
+                upvals: Vec::new(),
+            }));
+            Ok(LuaValue::func(fref))
+        }
         Err(e) => {
             let msg = if let Some(ce) = e.downcast_ref::<crate::lex::CompileError>() {
                 ce.0.clone()
@@ -499,21 +515,9 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
             } else {
                 "unknown compile error".to_string()
             };
-            g.heap.strings = Interner::default();
-            return Err(msg);
+            Err(msg)
         }
-    };
-    g.heap.strings = strs;
-
-    debug_assert!(proto.uv.is_empty(), "main chunk must have no upvalues");
-    let proto_ref = register_proto(&mut g.heap, proto);
-    let env = g.globals;
-    let fref = g.heap.alloc_func(GcFunc::Lua(LuaClosure {
-        proto: proto_ref,
-        env,
-        upvals: Vec::new(),
-    }));
-    Ok(LuaValue::func(fref))
+    }
 }
 
 /// Recursively register a prototype tree in the heap, turning each child

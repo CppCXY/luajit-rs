@@ -265,7 +265,7 @@ fn lex_isname(tok: Tok) -> bool {
 fn parse_isend(tok: Tok) -> bool {
     matches!(
         tok,
-        Tok::Else | Tok::Elseif | Tok::End | Tok::Until | Tok::Eof
+        Tok::Else | Tok::Elseif | Tok::End | Tok::Until | Tok::Eof | Tok::Char(b';')
     )
 }
 
@@ -2950,7 +2950,7 @@ impl Parser {
             Tok::Break => {
                 self.ls.next();
                 self.parse_break();
-                return true;
+                return false;
             }
             Tok::Continue => {
                 if !parse_isend(self.ls.peek()) {
@@ -2959,7 +2959,7 @@ impl Parser {
                 }
                 self.ls.next();
                 self.parse_continue();
-                return true;
+                return false;
             }
             Tok::Label => {
                 self.parse_label();
