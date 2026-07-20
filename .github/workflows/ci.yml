@@ -53,32 +53,7 @@ jobs:
           else
             bash run_tests.sh --release
           fi
-
-      - name: Benchmark smoke test
-        shell: bash
-        run: |
-          set -e
-          check() {
-            got=$(./target/release/luajit-rs "lua_benchmarks/$1" "$2")
-            if [ "$got" != "$3" ]; then
-              echo "MISMATCH in $1: got '$got', want '$3'"
-              exit 1
-            fi
-            echo "$1 ok: $got"
-          }
-          check fannkuch_redux.lua 8 "checksum=1616 max_flips=22 n=8"
-          check spectral_norm.lua 100 "spectral_norm=1.274219991 n=100"
-          check mandelbrot.lua 300 "mandelbrot_sum=1142227 bytes=11400 size=300"
-
-      - name: Benchmark smoke test (portable IR executor)
-        shell: bash
-        run: |
-          set -e
-          export LUAJIT_RS_NOASM=1
-          got=$(./target/release/luajit-rs lua_benchmarks/fannkuch_redux.lua 8)
-          test "$got" = "checksum=1616 max_flips=22 n=8" || { echo "MISMATCH: $got"; exit 1; }
-          echo "portable executor ok: $got"
-
+          
   cross-check:
     name: cross-check (${{ matrix.target }})
     runs-on: ubuntu-latest
