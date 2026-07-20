@@ -16,6 +16,8 @@ use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::exit;
 
+use luajit_rs::state::Lua;
+
 const LUA_PROMPT: &str = "> ";
 const LUA_PROMPT2: &str = ">> ";
 const VERSION: &str = "luajit-rs (LuaJIT-compatible interpreter)";
@@ -426,7 +428,7 @@ fn main() {
         }
     };
 
-    let mut lua = luajit_rs::state::Lua::new();
+    let mut lua = Lua::new();
     luajit_rs::open_libs(lua.main());
     if std::env::var("LUAJIT_RS_JIT").as_deref() == Ok("off") {
         lua.global().jit.set_on(false);
