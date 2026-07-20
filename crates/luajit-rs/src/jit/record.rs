@@ -1289,10 +1289,6 @@ impl Record {
             // forward the slot. The closure-identity guard pins the
             // activation, so the alias is stable for this trace.
             let sp = l.stack.as_ptr() as usize;
-            // Open upvalue: if it aliases a slot of the recorded frames,
-            // forward the slot. The closure-identity guard pins the
-            // activation, so the alias is stable for this trace.
-            let sp = l.stack.as_ptr() as usize;
             let ptr = uvp.value_ptr() as usize;
             let frame0 = base - (self.baseslot - 2);
             if ptr >= sp && ptr < sp + l.stack.len() * 8 && (ptr - sp).is_multiple_of(8) {

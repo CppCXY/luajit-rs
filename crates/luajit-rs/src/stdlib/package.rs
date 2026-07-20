@@ -195,6 +195,7 @@ pub fn open(l: &mut LuaState) {
         b"bit",
         b"coroutine",
         b"package",
+        b"jit",
     ] {
         let k = str_key(l, lib);
         let v = g.as_ref().get_str(k);

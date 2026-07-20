@@ -10,7 +10,7 @@
 //! code backend. Until then the start instruction's hot counter is parked
 //! at 0xffff so a finished loop only re-checks its registry entry rarely.
 
-use crate::bc::{BCIns, BCOp, bc_isret, bc_j, bc_op, setbc_d, setbc_op};
+use crate::bc::{BCOp, bc_isret, bc_j, bc_op, setbc_d, setbc_op};
 use crate::gc::GcPtr;
 use crate::proto::{PROTO_ILOOP, PROTO_NOJIT, Proto};
 use crate::state::{GlobalState, LuaState};
@@ -89,34 +89,6 @@ pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: us
 fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
     let g = l.global();
     let js = &mut g.jit;
-
-    // If the proto contains FNEW inside a loop body, creating closures
-    // with unstable upvalue addresses, permanently disable JIT for it.
-    // This check is done lazily on first trace-start so compile-time cost
-    // is zero; the proto flag is sticky.
-    if js.parent == 0 && pt.as_ref().flags & PROTO_NOJIT == 0 {
-        let bc = &pt.as_ref().bc;
-        for (i, &ins) in bc.iter().enumerate() {
-            let o = bc_op(ins);
-            match o {
-                // FORL/ITERL/LOOP are loop back-edges: the instruction itself
-                // is at the end of the body, jumping backward to the body start.
-                BCOp::FORL | BCOp::ITERL | BCOp::LOOP => {
-                    let target = (i as i64 + 1 + bc_j(ins)) as usize;
-                    for j in target..=i {
-                        if bc_op(bc[j]) == BCOp::FNEW {
-                            pt.as_mut().flags |= PROTO_NOJIT;
-                            break;
-                        }
-                    }
-                    if pt.as_ref().flags & PROTO_NOJIT != 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
     // Side traces start as a pseudo-JMP: `pc` may lie inside an inlined
     // callee, so the root proto's bytecode must not be indexed with it.
     let startins = if js.parent != 0 {
@@ -697,58 +669,6 @@ fn blacklist_pc(pt: GcPtr<Proto>, pc: usize) {
     } else {
         setbc_op(&mut p.bc[pc], op.offset(1) as u32);
         p.flags |= PROTO_ILOOP;
-    }
-}
-
-/// When FNEW is hit inside a hot loop, blacklist ALL loop bytecodes in the
-/// bytecode extent of the recorded trace, not just the start PC.  This prevents
-/// inner ITERL/LOOP instructions from compiling traces whose closure-identity
-/// guards would fail on every outer-loop iteration (the closure is re-created
-/// each time via FNEW).
-fn blacklist_loop_body(pt: GcPtr<Proto>, startpc: usize, startins: BCIns) {
-    let p = pt.as_mut();
-    let op = bc_op(startins);
-    let mut pc = startpc;
-    // FORL/ITERL/LOOP: the next instruction is the jump target that
-    // closes the loop.  Scan between startpc and that boundary.
-    let end = if op == BCOp::FORL || op == BCOp::ITERL || op == BCOp::LOOP {
-        pc + 1 + bc_j(p.bc[pc + 1]) as usize
-    } else {
-        // FUNCF etc. — scan to end of proto.
-        p.bc.len()
-    };
-    while pc < end && pc < p.bc.len() {
-        let o = bc_op(p.bc[pc]);
-        match o {
-            BCOp::FORL | BCOp::JFORL => {
-                setbc_op(&mut p.bc[pc], BCOp::IFORL as u32);
-                p.flags |= PROTO_ILOOP;
-            }
-            BCOp::ITERL | BCOp::JITERL => {
-                setbc_op(&mut p.bc[pc], BCOp::IITERL as u32);
-                p.flags |= PROTO_ILOOP;
-            }
-            BCOp::LOOP | BCOp::JLOOP => {
-                setbc_op(&mut p.bc[pc], BCOp::ILOOP as u32);
-                p.flags |= PROTO_ILOOP;
-            }
-            BCOp::ITERN => {
-                setbc_op(&mut p.bc[pc], BCOp::ITERC as u32);
-                let t = (pc as i64 + 1 + bc_j(p.bc[pc + 1])) as usize;
-                setbc_op(&mut p.bc[t], BCOp::JMP as u32);
-            }
-            BCOp::UCLO | BCOp::FNEW | BCOp::FUNCF
-            | BCOp::IFUNCF | BCOp::JFUNCF
-            | BCOp::FUNCV | BCOp::IFUNCV | BCOp::JFUNCV
-            | BCOp::CALL | BCOp::CALLM | BCOp::CALLT | BCOp::CALLMT
-            | BCOp::ITERC => {
-                // Control flow boundaries — stop scanning this linear
-                // segment.  Nested loops beyond a CALL or FUNCF are
-                // separate functions; their hotcount is independent.
-            }
-            _ => {}
-        }
-        pc += 1;
     }
 }
 

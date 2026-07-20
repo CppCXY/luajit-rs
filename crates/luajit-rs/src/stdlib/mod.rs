@@ -12,6 +12,7 @@ pub mod bit;
 pub mod coroutine;
 pub mod debug;
 pub mod io;
+pub mod jit;
 pub mod math;
 pub mod os;
 pub mod package;
@@ -91,21 +92,75 @@ pub fn tostring_bytes(l: &mut LuaState, v: LuaValue) -> Vec<u8> {
         return b"false".to_vec();
     }
     if let Some(cd) = v.as_cdata() {
-        let ctypeid = cd.as_ref().ctypeid;
-        if ctypeid == crate::ffi::CTypeID::Int64 as u32 {
-            if cd.as_ref().data.len() >= 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&cd.as_ref().data[..8]);
-                let val = i64::from_le_bytes(buf);
-                return format!("{}LL", val).into_bytes();
+        let id = cd.as_ref().ctypeid;
+        match id {
+            id if id == crate::ffi::CTypeID::Int8 as u32 => {
+                let val = cd.as_ref().data.first().copied().unwrap_or(0) as i8;
+                return format!("{}", val).into_bytes();
             }
-        } else if ctypeid == crate::ffi::CTypeID::UInt64 as u32 {
-            if cd.as_ref().data.len() >= 8 {
-                let mut buf = [0u8; 8];
-                buf.copy_from_slice(&cd.as_ref().data[..8]);
-                let val = u64::from_le_bytes(buf);
-                return format!("{}ULL", val).into_bytes();
+            id if id == crate::ffi::CTypeID::UInt8 as u32 => {
+                let val = cd.as_ref().data.first().copied().unwrap_or(0);
+                return format!("{}", val).into_bytes();
             }
+            id if id == crate::ffi::CTypeID::Int16 as u32 => {
+                let val = i16::from_le_bytes(cd.as_ref().data[..2].try_into().unwrap_or([0;2]));
+                return format!("{}", val).into_bytes();
+            }
+            id if id == crate::ffi::CTypeID::UInt16 as u32 => {
+                let val = u16::from_le_bytes(cd.as_ref().data[..2].try_into().unwrap_or([0;2]));
+                return format!("{}", val).into_bytes();
+            }
+            id if id == crate::ffi::CTypeID::Int32 as u32 => {
+                let val = i32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0;4]));
+                return format!("{}", val).into_bytes();
+            }
+            id if id == crate::ffi::CTypeID::UInt32 as u32 => {
+                let val = u32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0;4]));
+                return format!("{}", val).into_bytes();
+            }
+            id if id == crate::ffi::CTypeID::Int64 as u32 => {
+                if cd.as_ref().data.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&cd.as_ref().data[..8]);
+                    let val = i64::from_le_bytes(buf);
+                    return format!("{}LL", val).into_bytes();
+                }
+            }
+            id if id == crate::ffi::CTypeID::UInt64 as u32 => {
+                if cd.as_ref().data.len() >= 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&cd.as_ref().data[..8]);
+                    let val = u64::from_le_bytes(buf);
+                    return format!("{}ULL", val).into_bytes();
+                }
+            }
+            id if id == crate::ffi::CTypeID::Float as u32 => {
+                let val = f32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0;4]));
+                return crate::strfmt::g14(val as f64).into_bytes();
+            }
+            id if id == crate::ffi::CTypeID::Double as u32 => {
+                let val = f64::from_le_bytes(cd.as_ref().data[..8].try_into().unwrap_or([0;8]));
+                return crate::strfmt::g14(val).into_bytes();
+            }
+            id if id == crate::ffi::CTypeID::Bool as u32 => {
+                let val = cd.as_ref().data.first().copied().unwrap_or(0) != 0;
+                return if val { b"true".to_vec() } else { b"false".to_vec() };
+            }
+            id if id == crate::ffi::CTypeID::Void as u32 || id == crate::ffi::CTypeID::None as u32 => {
+                return b"cdata<void>"[..].into();
+            }
+            id if id == crate::ffi::CTypeID::PVoid as u32
+                || id == crate::ffi::CTypeID::PCVoid as u32
+                || id == crate::ffi::CTypeID::PCChar as u32
+                || id == crate::ffi::CTypeID::PUInt8 as u32 =>
+            {
+                let ptr = cd.as_ref().get_ptr();
+                if ptr == 0 {
+                    return b"cdata<void *>: NULL"[..].into();
+                }
+                return format!("cdata<void *>: {:#x}", ptr).into_bytes();
+            }
+            _ => {}
         }
     }
     let kind = if v.is_table() {
@@ -192,6 +247,7 @@ pub fn open_libs(l: &mut LuaState) {
     table::open(l);
     math::open(l);
     bit::open(l);
+    jit::open(l);
     os::open(l);
     io::open(l);
     package::open(l);
