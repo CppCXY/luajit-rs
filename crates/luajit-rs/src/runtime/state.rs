@@ -481,20 +481,10 @@ impl Default for Box<Lua> {
 
 pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue, String> {
     let g = l.global();
-    // Detect nested load: if the global interner is empty, the outer
-    // load already took it. In that case, use a fresh interner for the
-    // inner parse so we don't block the outer parse.
-    let is_nested = g.heap.strings.is_empty();
-    let strs = if is_nested {
-        Interner::default()
-    } else {
-        std::mem::take(&mut g.heap.strings)
-    };
-    
-    let parser = crate::parse::Parser::with_interner(src, chunkname.to_string(), strs);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || parser.parse()));
-    let (proto, strs) = match result {
-        Ok(out) => out,
+    let mut parser = crate::parse::Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));
+    let proto = match result {
+        Ok(p) => p,
         Err(e) => {
             let msg = if let Some(ce) = e.downcast_ref::<crate::lex::CompileError>() {
                 ce.0.clone()
@@ -505,15 +495,9 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
             } else {
                 "unknown compile error".to_string()
             };
-            if !is_nested {
-                g.heap.strings = Interner::default();
-            }
             return Err(msg);
         }
     };
-    if !is_nested {
-        g.heap.strings = strs;
-    }
 
     debug_assert!(proto.uv.is_empty(), "main chunk must have no upvalues");
     let proto_ref = register_proto(&mut g.heap, proto);

@@ -269,8 +269,8 @@ fn parse_isend(tok: Tok) -> bool {
     )
 }
 
-pub struct Parser {
-    ls: LexState,
+pub struct Parser<'a> {
+    ls: LexState<'a>,
     vstack: Vec<VarInfo>,
     bcstack: Vec<BCInsLine>,
     vhash: [u16; 32],
@@ -279,14 +279,10 @@ pub struct Parser {
     fs: Vec<FuncState>,
 }
 
-impl Parser {
-    pub fn new(src: Vec<u8>, chunkname: String) -> Parser {
-        Parser::with_interner(src, chunkname, Interner::default())
-    }
-
-    pub fn with_interner(src: Vec<u8>, chunkname: String, strs: Interner) -> Parser {
+impl<'a> Parser<'a> {
+    pub fn new(src: Vec<u8>, chunkname: String, strs: &'a mut Interner) -> Parser<'a> {
         Parser {
-            ls: LexState::with_interner(src, chunkname, strs),
+            ls: LexState::new(src, chunkname, strs),
             vstack: Vec::new(),
             bcstack: Vec::new(),
             vhash: [VINDEX_NONE; 32],
@@ -2997,7 +2993,7 @@ impl Parser {
         self.synlevel_end();
     }
 
-    pub fn parse(mut self) -> (Proto, Interner) {
+    pub fn parse(&mut self) -> Proto {
         self.level = 0;
         self.fs_init();
         self.cur_mut().linedefined = 0;
@@ -3015,7 +3011,7 @@ impl Parser {
         let pt = self.fs_finish(line);
         debug_assert!(self.fs.is_empty());
         debug_assert!(pt.uv.is_empty());
-        (pt, self.ls.strs)
+        pt
     }
 }
 

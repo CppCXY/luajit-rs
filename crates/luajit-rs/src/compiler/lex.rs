@@ -145,7 +145,7 @@ pub struct TokVal {
     pub str: StrId,
 }
 
-pub struct LexState {
+pub struct LexState<'a> {
     src: Vec<u8>,
     pos: usize,
     pub c: i32,
@@ -157,7 +157,7 @@ pub struct LexState {
     pub linenumber: u32,
     pub lastline: u32,
     pub chunkname: String,
-    pub strs: Interner,
+    pub strs: &'a mut Interner,
 }
 
 #[inline]
@@ -183,12 +183,8 @@ fn is_space(c: i32) -> bool {
     (9..=13).contains(&c) || c == 32
 }
 
-impl LexState {
-    pub fn new(src: Vec<u8>, chunkname: String) -> LexState {
-        LexState::with_interner(src, chunkname, Interner::default())
-    }
-
-    pub fn with_interner(src: Vec<u8>, chunkname: String, strs: Interner) -> LexState {
+impl<'a> LexState<'a> {
+    pub fn new(src: Vec<u8>, chunkname: String, strs: &'a mut Interner) -> LexState<'a> {
         let mut ls = LexState {
             src,
             pos: 0,
@@ -211,18 +207,6 @@ impl LexState {
         {
             ls.pos += 2;
             ls.next_char();
-        }
-        if ls.c == b'#' as i32 {
-            loop {
-                ls.next_char();
-                if ls.c == LEX_EOF {
-                    return ls;
-                }
-                if ls.is_eol() {
-                    break;
-                }
-            }
-            ls.newline();
         }
         ls
     }
@@ -375,7 +359,8 @@ impl LexState {
         if is_str {
             let start = 2 + sep as usize;
             let end = self.sb.len() - start;
-            let id = self.strs.intern(&self.sb[start..end]);
+            let s = &self.sb[start..end];
+            let id = self.strs.intern(s);
             Some(id)
         } else {
             None
@@ -507,7 +492,8 @@ impl LexState {
             }
         }
         self.save_next();
-        self.strs.intern(&self.sb[1..self.sb.len() - 1])
+        let s = &self.sb[1..self.sb.len() - 1];
+        self.strs.intern(s)
     }
 
     /// Consume the current character if it equals `c`.
@@ -525,7 +511,8 @@ impl LexState {
         while is_ident(self.c) {
             self.save_next();
         }
-        let id = self.strs.intern(&self.sb);
+        let s = &self.sb;
+        let id = self.strs.intern(s);
         let tok = KEYWORDS
             .iter()
             .find(|(kw, _)| *kw == self.sb.as_slice())
@@ -723,3 +710,5 @@ impl LexState {
         tok
     }
 }
+
+

@@ -13,12 +13,15 @@ pub use util::{strfmt, strscan};
 pub use vm::err;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use runtime::string::Interner;
 
-pub fn compile(src: Vec<u8>, chunkname: &str) -> Result<(proto::Proto, lex::Interner), String> {
+pub fn compile(src: Vec<u8>, chunkname: &str) -> Result<(proto::Proto, Interner), String> {
     let name = chunkname.to_string();
     let result = catch_unwind(AssertUnwindSafe(move || {
-        let parser = parse::Parser::new(src, name);
-        parser.parse()
+        let mut strs = Interner::default();
+        let mut parser = parse::Parser::new(src, name, &mut strs);
+        let pt = parser.parse();
+        (pt, strs)
     }));
     match result {
         Ok(out) => Ok(out),
