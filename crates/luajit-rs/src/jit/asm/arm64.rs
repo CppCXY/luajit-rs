@@ -1273,6 +1273,8 @@ impl<'a> Asm<'a> {
                     if self.needs_env[Self::iidx(p.lref)] {
                         str_fp(&mut self.code, rg, RENV, Self::env_disp(p.lref));
                     }
+                    self.owner[rg as usize] = Owner::Ins(p.lref);
+                    self.loc[Self::iidx(p.lref)] = Some(rg);
                 } else {
                     ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
                     str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
