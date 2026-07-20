@@ -1211,13 +1211,14 @@ impl<'a> Asm<'a> {
                     str_fp(&mut self.code, lr, RENV, Self::env_disp(p.phi));
                     self.env_valid[ii] = true;
                 } else {
-                    // lref stolen — search all regs for a live value
-                    for rg in 0..NREG as u8 {
-                        if let Owner::Ins(_) = self.owner[rg as usize] {
-                            str_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
-                            self.env_valid[ii] = true;
-                            break;
-                        }
+                    // lref stolen — its value was spilled to env when
+                    // the register was evicted. Load from env[lref] and
+                    // store to env[phi] instead of picking a random
+                    // live register.
+                    if self.env_valid[Self::iidx(p.lref)] {
+                        ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
+                        str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
+                        self.env_valid[ii] = true;
                     }
                 }
             }
