@@ -182,6 +182,7 @@ struct Asm<'a> {
     loc: Vec<Option<u8>>, owner: [Owner; NREG],
     fixups: Vec<(usize, usize)>, stubs: Vec<Stub>,
     phis: Vec<PhiInfo>, loop_pos: Option<usize>, s0: [Owner; NREG],
+    phi_homes: Vec<(IRRef, u8)>,
     link: Option<*const u8>, stub_tails: Vec<(u32, u32)>,
 }
 
@@ -206,7 +207,8 @@ impl<'a> Asm<'a> {
             needs_env: vec![false; nins], env_valid: vec![false; nins],
             loc: vec![None; nins], owner: [Owner::None; NREG],
             fixups: Vec::new(), stubs: Vec::new(), phis: Vec::new(),
-            loop_pos: None, s0: [Owner::None; NREG], link, stub_tails: Vec::new() };
+            loop_pos: None, s0: [Owner::None; NREG], phi_homes: Vec::new(),
+            link, stub_tails: Vec::new() };
         for r in REF_FIRST..tr.ir.nins() {
             let ins = tr.ir.ir(r);
             match ins.op() {
@@ -389,8 +391,8 @@ impl<'a> Asm<'a> {
     }
 
     // HSTORE: table set via helper
-    fn asm_hstore(&mut self, _ins: &IRIns) {
-        self.code.brk(0x02);
+    fn asm_hstore(&mut self, _ins: &IRIns) -> Result<(), TraceError> {
+        Err(TraceError::NYIIR)
     }
 
     // CALLL: guarded helper call
@@ -403,10 +405,26 @@ impl<'a> Asm<'a> {
     fn asm_aload(&mut self, _ins: &IRIns) -> Result<(), TraceError> { self.code.brk(0x04); Err(TraceError::NYIIR) }
     fn asm_astore(&mut self, _ins: &IRIns) -> Result<(), TraceError> { self.code.brk(0x05); Err(TraceError::NYIIR) }
 
-    // GCSTEP: GC debt check
-    fn asm_gcstep(&mut self, _ins: &IRIns) {
-        // guard_gc(cond::VS) equivalent — but NYI for now
-        self.code.nop();
+    // GCSTEP: GC debt check — exit to interpreter when collection is due.
+    // Mirrors x64: heap.total + TABLE_EXTRA >= heap.threshold → exit with GC flag.
+    fn asm_gcstep(&mut self, ins: &IRIns) {
+        let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
+        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
+        // Load heap.total
+        self.code.mov64(RSCRATCH, total_addr);
+        self.code.ldr(RSCRATCH2, RSCRATCH, 0);
+        // Load TABLE_EXTRA
+        self.code.mov64(RSCRATCH3, extra_addr);
+        self.code.ldr(RSCRATCH, RSCRATCH3, 0);
+        // total + extra
+        self.code.add_rr(RSCRATCH2, RSCRATCH2, RSCRATCH);
+        // Load heap.threshold
+        self.code.mov64(RSCRATCH, thres_addr);
+        self.code.ldr(RSCRATCH, RSCRATCH, 0);
+        // Compare and guard
+        self.code.cmp_rr(RSCRATCH2, RSCRATCH);
+        self.guard_gc(cond::CS); // b.hs → exit if total+extra >= threshold
     }
 
     // TOBIT: wrapping num→int32→num
@@ -631,14 +649,21 @@ impl<'a> Asm<'a> {
             let ins = *self.tr.ir.ir(r);
             match ins.op() {
                 IROp::NOP|IROp::BASE => {}
-                IROp::LOOP => { if self.loop_pos.is_none() { self.loop_pos = Some(self.code.len()); } }
+                IROp::LOOP => {
+                    if self.loop_pos.is_none() {
+                        self.loop_pos = Some(self.code.len());
+                        self.phi_homes = self.phis.iter().filter_map(|p| {
+                            self.reg_of(p.lref).map(|rg| (p.lref, rg))
+                        }).collect();
+                    }
+                }
                 IROp::PHI => {}
                 IROp::SLOAD => self.asm_sload(&ins)?,
                 IROp::ULOAD => self.asm_uload(&ins)?,
                 IROp::FLOAD => self.asm_meta_guard(&ins),
                 IROp::HLOAD => self.asm_hload(&ins)?,
                 IROp::CARG => {}
-                IROp::HSTORE => self.asm_hstore(&ins),
+                IROp::HSTORE => self.asm_hstore(&ins)?,
                 IROp::CALLL => self.asm_calll(&ins)?,
                 IROp::TNEW|IROp::TDUP => return Err(TraceError::NYIIR), // needs helper_call
                 IROp::ALOAD => self.asm_aload(&ins)?,
@@ -649,13 +674,16 @@ impl<'a> Asm<'a> {
                     let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
                     self.code.fcvtzs_w(RSCRATCH, sx);
                     let d = self.alloc(0)?;
-                    self.code.scvtf_w(d, RSCRATCH);
+                    self.code.scvtf_x(d, RSCRATCH);
                     self.def(d);
                 }
                 IROp::BAND|IROp::BOR|IROp::BXOR|IROp::BSHL|IROp::BSHR|IROp::BSAR|IROp::BNOT|IROp::BSWAP => self.asm_bitop(&ins)?,
                 IROp::ADD|IROp::SUB|IROp::MUL|IROp::DIV => {
                     let op = ins.op(); let (mut a,mut b)=(ins.op1 as IRRef,ins.op2 as IRRef);
-                    if matches!(op,IROp::ADD|IROp::MUL) && !self.dying(a)&&self.dying(b)&&self.reg_of(b).is_some() { std::mem::swap(&mut a,&mut b); }
+                    // Only swap when both are refs: swapping a constant into
+                    // the destination position causes the destination register
+                    // to hold stale constant bits on loop re-entry.
+                    if matches!(op,IROp::ADD|IROp::MUL) && b>=REF_BIAS && !self.dying(a)&&self.dying(b)&&self.reg_of(b).is_some() { std::mem::swap(&mut a,&mut b); }
                     let d=self.into_dst(a)?; let rhs=if b==a {d}else{self.fetch_fp(b,pin(d))?};
                     match op { IROp::ADD=>self.code.fadd(d,d,rhs), IROp::SUB=>self.code.fsub(d,d,rhs), IROp::MUL=>self.code.fmul(d,d,rhs), IROp::DIV=>self.code.fdiv(d,d,rhs), _=>{} }
                     self.def(d);
@@ -696,6 +724,13 @@ impl<'a> Asm<'a> {
                             self.code.str_d(rval, RENV, Self::env_ofs(p.lref));
                             self.env_valid[Self::iidx(p.lref)] = true;
                         }
+                    }
+                }
+                // Reload loop-carried register homes: they may have been
+                // stolen by later instruction's constant loads.
+                for &(lref, rg) in &self.phi_homes {
+                    if self.reg_of(lref).is_none() && self.env_valid[Self::iidx(lref)] {
+                        self.code.ldr_d(rg, RENV, Self::env_ofs(lref));
                     }
                 }
                 let off = (lp as i64 - self.code.len() as i64) as i32 / 4;
