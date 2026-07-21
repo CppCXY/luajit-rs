@@ -29,14 +29,6 @@ const HOTCOUNT_PARKED: HotCount = 0xffff;
 /// ITERL / LOOP or a FUNCF header). Reset the counter and start a root
 /// trace unless the compiler is busy.
 pub fn trace_hot(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // ARM64 JIT is disabled: loop back-edge and side-trace linking
-        // are not yet stable on this architecture.
-        let _ = (l, base, pt, pc);
-        return;
-    }
-    #[cfg(not(target_arch = "aarch64"))]
     {
         let g = l.global();
         let js = &mut g.jit;
@@ -59,12 +51,6 @@ pub fn trace_hot(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
 /// resume point. The caller (the trace executor) has already restored
 /// the snapshot to the Lua stack.
 pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = (l, base, parent, exitno);
-        return;
-    }
-    #[cfg(not(target_arch = "aarch64"))]
     {
         let g = l.global();
         let js = &mut g.jit;
