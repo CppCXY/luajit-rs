@@ -436,18 +436,6 @@ impl<'a> Asm<'a> {
             }
             self.cur = r;
             let ins = *self.tr.ir.ir(r);
-            if std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2") {
-                eprintln!(
-                    "  tr{} {:#05x} {:04} {:?} {} {} t={}",
-                    self.tr.traceno,
-                    self.code.len(),
-                    r - REF_BIAS,
-                    ins.op(),
-                    ins.op1 as i32 - REF_BIAS as i32,
-                    ins.op2 as i32 - REF_BIAS as i32,
-                    ins.t(),
-                );
-            }
             match ins.op() {
                 IROp::NOP | IROp::BASE => {}
                 IROp::LOOP => self.asm_loop_head(),

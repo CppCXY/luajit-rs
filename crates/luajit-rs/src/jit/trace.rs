@@ -12,7 +12,6 @@
 
 use crate::bc::{self, BCOp, bc_isret, bc_j, bc_op, setbc_d, setbc_op};
 use crate::gc::GcPtr;
-use crate::jit::asm::jit_arch;
 use crate::jit::ir::IrBuf;
 use crate::jit::{GCtrace, record};
 use crate::proto::{PROTO_ILOOP, PROTO_NOJIT, Proto};
@@ -422,10 +421,9 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         } else {
             None
         };
-        let arch = jit_arch();
-        let no_asm = std::env::var("LUAJIT_RS_NOASM").is_ok();
-        if !no_asm && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target, arch) {
-            if std::env::var("LUAJIT_RS_TRDUMP").is_ok() {
+        let arch = js.arch;
+        if !js.no_asm && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target, arch) {
+            if js.trace_dump {
                 eprintln!(
                     "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",
                     trace.traceno,
@@ -450,7 +448,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         }
         trace
     };
-    if std::env::var("LUAJIT_RS_TRDUMP").is_ok() {
+    if js.trace_dump {
         eprintln!(
             "STOP {} {:?} link={} start={:?} line={} native={} snaps={:?}",
             trace.traceno,
@@ -471,7 +469,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                 .map(|s| (s.iref - super::ir::REF_BIAS, s.pc, s.baseslot, s.nslots))
                 .collect::<Vec<_>>(),
         );
-        if std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2") {
+        if js.trace_dump2 {
             use super::ir::{IR_NAMES, REF_BIAS, REF_FIRST};
             for r in REF_FIRST..trace.ir.nins() {
                 let i = trace.ir.ir(r);
@@ -553,7 +551,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                     let pt_ = js.trace[parent as usize].as_mut().unwrap();
                     let tails = std::mem::take(&mut pt_.stub_tails);
                     if let Some(area) = &mut pt_.mcode {
-                        super::asm::patch_exit(area, &tails, exitno as u32, target, super::asm::jit_arch());
+                        super::asm::patch_exit(area, &tails, exitno as u32, target, js.arch);
                     }
                     pt_.stub_tails = tails;
                 }

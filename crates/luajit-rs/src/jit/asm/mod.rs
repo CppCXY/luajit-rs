@@ -20,16 +20,6 @@ pub enum Arch {
 /// The native arch for the current compilation target.
 pub const HOST_ARCH: Arch = if cfg!(target_arch = "aarch64") { Arch::Arm64 } else { Arch::X64 };
 
-/// Returns the JIT target architecture.  Defaults to `HOST_ARCH`, but can
-/// be overridden with `LUAJIT_RS_JIT_ARCH=x64|arm64` for cross-debugging.
-pub fn jit_arch() -> Arch {
-    match std::env::var("LUAJIT_RS_JIT_ARCH").as_deref() {
-        Ok("x64") | Ok("x86_64") => Arch::X64,
-        Ok("arm64") | Ok("aarch64") => Arch::Arm64,
-        _ => HOST_ARCH,
-    }
-}
-
 /// Assemble a completed trace for `arch`. On error the caller keeps
 /// `mcode = None` and the portable executor runs the trace.
 pub fn assemble(
