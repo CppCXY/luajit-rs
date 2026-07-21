@@ -680,19 +680,12 @@ impl<'a> Asm<'a> {
         let lastsnap = self.tr.snap.len()-1;
         let looping = self.tr.linktype==TraceLink::Loop && self.tr.link==self.tr.traceno;
         if looping {
-            if let Some(lp) = self.loop_pos {
-                // Loop back (optimized): write snapshot to stack, jump to loop head
-                self.snapidx = lastsnap;
-                self.tail_restore(lastsnap);
-                let off = (lp as i64 - self.code.len() as i64) as i32 / 4;
-                self.code.b(off);
-            } else {
-                // Legacy loop: write snapshot to stack, jump to head
-                self.snapidx = lastsnap;
-                self.tail_restore(lastsnap);
-                let off = (head as i64 - self.code.len() as i64) as i32 / 4;
-                self.code.b(off);
-            }
+            // Always use legacy path: write snapshot to stack, jump to head.
+            // The optimized path (loop_pos + phi_move) NYI.
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            let off = (head as i64 - self.code.len() as i64) as i32 / 4;
+            self.code.b(off);
         } else if matches!(self.tr.linktype, TraceLink::Uprec|TraceLink::Tailrec) && self.tr.link==self.tr.traceno {
             return Err(TraceError::NYIIR); // recursive tail NYI
         } else if self.tr.linktype==TraceLink::Root && let Some(target)=self.link {
