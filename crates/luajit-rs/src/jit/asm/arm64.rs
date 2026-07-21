@@ -681,9 +681,9 @@ impl<'a> Asm<'a> {
         let looping = self.tr.linktype==TraceLink::Loop && self.tr.link==self.tr.traceno;
         if looping {
             if let Some(lp) = self.loop_pos {
-                // Loop back: flush snapshot, jump to loop head
+                // Loop back (optimized): write snapshot to stack, jump to loop head
                 self.snapidx = lastsnap;
-                for (rg, fr) in self.exit_flush_set(lastsnap) { self.code.str_d(rg,RENV,Self::env_ofs(fr)); }
+                self.tail_restore(lastsnap);
                 let off = (lp as i64 - self.code.len() as i64) as i32 / 4;
                 self.code.b(off);
             } else {
