@@ -214,7 +214,10 @@ impl<'a> Asm<'a> {
             link,
             stub_tails: Vec::new(),
         };
+        #[cfg(target_arch = "x86_64")]
         let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
+        #[cfg(not(target_arch = "x86_64"))]
+        let sse41 = false;
         for r in REF_FIRST..tr.ir.nins() {
             let ins = tr.ir.ir(r);
             match ins.op() {

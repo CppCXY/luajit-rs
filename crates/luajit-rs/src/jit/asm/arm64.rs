@@ -80,8 +80,8 @@ impl Emit {
     fn ldp(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=((off/8)as u32)&0x7F; self.u32(0xA940_0000|(o<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
     fn stp_d(&mut self, dt1: u8, dt2: u8, rn: u8, off: i32) { let o=((off/8)as u32)&0x7F; self.u32(0x6D00_0000|(o<<15)|((dt2 as u32)<<10)|((rn as u32)<<5)|(dt1 as u32)); }
     fn ldp_d(&mut self, dt1: u8, dt2: u8, rn: u8, off: i32) { let o=((off/8)as u32)&0x7F; self.u32(0x6D40_0000|(o<<15)|((dt2 as u32)<<10)|((rn as u32)<<5)|(dt1 as u32)); }
-    fn stp_pre(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=((off/8)as i32); let imm7=((o as u32)&0x7F); self.u32(0xA980_0000|(imm7<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
-    fn ldp_post(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=((off/8)as i32); let imm7=((o as u32)&0x7F); self.u32(0xA8C0_0000|(imm7<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
+    fn stp_pre(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=(off/8) as i32; let imm7=(o as u32)&0x7F; self.u32(0xA980_0000|(imm7<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
+    fn ldp_post(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=(off/8) as i32; let imm7=(o as u32)&0x7F; self.u32(0xA8C0_0000|(imm7<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
 
     // ── load/store register ──
     fn ldr(&mut self, rt: u8, rn: u8, off: i32) { self.u32(0xF940_0000|((((off/8)as u32)&0xFFF)<<10)|((rn as u32)<<5)|(rt as u32)); }
@@ -92,12 +92,11 @@ impl Emit {
     fn str_d(&mut self, dt: u8, rn: u8, off: i32) { self.u32(0xFD00_0000|((((off/8)as u32)&0xFFF)<<10)|((rn as u32)<<5)|(dt as u32)); }
 
     /// 32-bit immediate store via temp register
-    fn str_imm32(&mut self, rt: u8, rn: u8, off: i32, imm: u32) {
+    fn str_imm32(&mut self, rn: u8, off: i32, imm: u32) {
         self.mov32(RSCRATCH, imm);
         self.str_w(RSCRATCH, rn, off);
     }
-    /// 64-bit immediate store via temp register
-    fn str_imm64(&mut self, rt: u8, rn: u8, off: i32, imm: u64) {
+    fn str_imm64(&mut self, rn: u8, off: i32, imm: u64) {
         self.mov64(RSCRATCH, imm);
         self.str(RSCRATCH, rn, off);
     }
@@ -384,7 +383,7 @@ impl<'a> Asm<'a> {
     }
 
     // HLOAD: table get via helper
-    fn asm_hload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+    fn asm_hload(&mut self, _ins: &IRIns) -> Result<(), TraceError> {
         self.code.brk(0x01); // NYI — needs helper_call infrastructure
         Err(TraceError::NYIIR)
     }
@@ -580,7 +579,7 @@ impl<'a> Asm<'a> {
     // ═══ emit: main loop ════════════════════════════════════════════════════
     fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
         // ── prologue ──
-        self.code.stp(29, 30, 31, -FRAME as i32); // stp fp,lr,[sp,#-FRAME]!
+        self.code.stp(29, 30, 31, -(FRAME as i32));
         self.code.add_rr(29, 31, 0);               // mov fp, sp
         for i in 0..SAVED_GPR_PAIRS {
             let off = 16 + (i as i32) * 16;
