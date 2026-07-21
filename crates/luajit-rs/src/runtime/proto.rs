@@ -47,6 +47,8 @@ pub struct Proto {
     pub numline: BCLine,
     /// Upvalue names for debug info and listings.
     pub uvnames: Vec<String>,
+    /// Chunk name / source identifier (from load chunkname argument).
+    pub source: Option<StrId>,
 }
 
 impl Proto {

@@ -422,8 +422,7 @@ impl LuaState {
         self.stack[self.top]
     }
 
-    /// Raise a runtime error carrying a string message. Includes line/chunk
-    /// location when debug_pc is set.
+    /// Raise a runtime error carrying a string message with source location.
     pub fn runtime_error(&mut self, msg: impl AsRef<[u8]>) -> crate::err::LuaError {
         let mut full = msg.as_ref().to_vec();
         if self.debug_pc != 0 {
@@ -434,12 +433,14 @@ impl LuaState {
                 let pt = cl.proto.as_ref();
                 if self.debug_pc < pt.lines.len() {
                     let line = pt.lines[self.debug_pc] as usize + pt.firstline as usize;
-                    if !self.debug_chunkname.is_empty() {
-                        let cn = String::from_utf8_lossy(&self.debug_chunkname);
-                        full.extend(format!("\n  at {}:{}", cn, line).bytes());
-                    } else {
-                        full.extend(format!("\n  at line {}", line).bytes());
-                    }
+                    let src = pt.source.and_then(|sid| {
+                        self.heap().strings.try_lookup(sid).map(|_ptr| {
+                            let bytes = self.heap().strings.get(sid);
+                            String::from_utf8_lossy(bytes).into_owned()
+                        })
+                    }).unwrap_or_else(|| "=?".to_string());
+                    let msg_str = String::from_utf8_lossy(&full);
+                    full = format!("@{}:{}: {}", src, line, msg_str).into_bytes();
                 }
             }
         }
@@ -515,7 +516,7 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
     let g = l.global();
     let mut parser = crate::parse::Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));
-    let proto = match result {
+    let mut proto = match result {
         Ok(p) => p,
         Err(e) => {
             let msg = if let Some(ce) = e.downcast_ref::<crate::lex::CompileError>() {
@@ -532,6 +533,10 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
     };
 
     debug_assert!(proto.uv.is_empty(), "main chunk must have no upvalues");
+    if !chunkname.is_empty() && !chunkname.starts_with('=') {
+        let source_sid = g.heap.strings.intern(chunkname.as_bytes());
+        proto.source = Some(source_sid);
+    }
     let proto_ref = register_proto(&mut g.heap, proto);
     let env = g.globals;
     let fref = g.heap.alloc_func(GcFunc::Lua(LuaClosure {

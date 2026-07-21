@@ -241,10 +241,14 @@ fn lib_rawequal(l: &mut LuaState) -> LuaResult<i32> {
 
 fn lib_error(l: &mut LuaState) -> LuaResult<i32> {
     let msg = arg(l, 0);
-    let level = arg(l, 1).as_number().unwrap_or(1.0) as i32;
-    let _ = level; // stack-trace level not yet implemented
-    l.errval = if msg.is_nil() { LuaValue::NIL } else { msg };
-    Err(LuaError::Runtime)
+    let _level = arg(l, 1).as_number().unwrap_or(1.0) as i32;
+    if let Some(sid) = msg.as_string_id() {
+        let bytes = l.heap().strings.get(sid).to_vec();
+        Err(l.runtime_error(&bytes))
+    } else {
+        l.errval = if msg.is_nil() { LuaValue::NIL } else { msg };
+        Err(LuaError::Runtime)
+    }
 }
 
 /// `pcall(f [, arg...])` — protected call. The callee may be any value:

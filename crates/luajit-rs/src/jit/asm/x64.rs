@@ -904,10 +904,10 @@ impl<'a> Asm<'a> {
             } else {
                 self.fetch_xmm(ins.op2 as IRRef, pin(sx))?
             };
-            self.cvttsd2si_r32(RAX, sx);
-            self.cvttsd2si_r32(RCX, sy);
+            self.cvttsd2si_r64(RAX, sx);
+            self.cvttsd2si_r64(RCX, sy);
         } else {
-            self.cvttsd2si_r32(RAX, sx);
+            self.cvttsd2si_r64(RAX, sx);
         }
         match op {
             IROp::BNOT => self.code.extend_from_slice(&[0xF7, 0xD0]), // not eax
@@ -1670,6 +1670,16 @@ impl<'a> Asm<'a> {
         if rex != 0x40 {
             self.code.push(rex);
         }
+        self.code.push(0x0F);
+        self.code.push(0x2C);
+        self.modrm(3, dst, src);
+    }
+
+    /// cvttsd2si r64, xmm (F2 REX.W 0F 2C /r): f64 -> i64, truncating.
+    fn cvttsd2si_r64(&mut self, dst: u8, src: u8) {
+        self.code.push(0xF2);
+        let rex = 0x48 | (((dst >> 3) & 1) << 2) | ((src >> 3) & 1);
+        self.code.push(rex);
         self.code.push(0x0F);
         self.code.push(0x2C);
         self.modrm(3, dst, src);

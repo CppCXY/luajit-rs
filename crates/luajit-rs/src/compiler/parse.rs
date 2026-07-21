@@ -1721,7 +1721,7 @@ impl<'a> Parser<'a> {
             lines,
             kgc,
             kn: fs.kn,
-            kstrv: Vec::new(), // resolved when the proto is registered
+            kstrv: Vec::new(),
             uv,
             flags: fs.flags & !(PROTO_HAS_RETURN | PROTO_FIXUP_RETURN),
             numparams: fs.numparams,
@@ -1729,6 +1729,7 @@ impl<'a> Parser<'a> {
             firstline: fs.linedefined,
             numline,
             uvnames,
+            source: None,
         }
     }
 
