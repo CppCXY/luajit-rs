@@ -151,9 +151,9 @@ const RSCRATCH: u8 = 9;
 const RSCRATCH2:u8 = 10;
 const RSCRATCH3:u8 = 11;
 
-const SAVED_GPR_PAIRS: u32 = 6;
-const SAVED_FP_PAIRS:  u32 = 4;
-const FRAME: u32 = SAVED_GPR_PAIRS * 16 + SAVED_FP_PAIRS * 16;
+const SAVED_GPR_PAIRS: u32 = 5; // x19-x28 (10 regs), x29/x30 saved separately at frame bottom
+const SAVED_FP_PAIRS:  u32 = 4; // d8-d15 (8 regs)
+const FRAME: u32 = 16 + SAVED_GPR_PAIRS * 16 + SAVED_FP_PAIRS * 16; // 16 + 80 + 64 = 160
 
 mod cond {
     pub const EQ: u32 = 0x0; pub const NE: u32 = 0x1;
