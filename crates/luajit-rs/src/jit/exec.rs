@@ -1038,7 +1038,11 @@ pub extern "C" fn jit_varg(base_ptr: u64, frame_link: u64, packed: u64) -> u64 {
     let nvarg = (delta - 2).saturating_sub(numparams as usize);
     let base = base_ptr as *mut LuaValue;
     let src = unsafe { base.sub(delta).add(numparams as usize) };
-    let actual = if want == 0 { nvarg } else { nvarg.min(want as usize) };
+    let actual = if want == 0 {
+        nvarg
+    } else {
+        nvarg.min(want as usize)
+    };
     for i in 0..actual {
         unsafe { *base.add(dst as usize + i) = *src.add(i) };
     }

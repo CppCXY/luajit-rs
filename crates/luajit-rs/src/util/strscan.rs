@@ -245,7 +245,7 @@ pub fn scan_bin_to_u64(s: &[u8]) -> Option<u64> {
     let mut val: Wrapping<u64> = Wrapping(0);
     for &c in s {
         match c {
-            b'0' => val = val * Wrapping(2),
+            b'0' => val *= Wrapping(2),
             b'1' => val = val * Wrapping(2) + Wrapping(1),
             b'_' => continue,
             _ => return None,

@@ -199,7 +199,11 @@ impl LuaValue {
     }
 
     pub fn as_cdata(self) -> Option<GcPtr<crate::runtime::cdata::CData>> {
-        if self.is_cdata() { GcPtr::from_addr(self.gc_addr()) } else { None }
+        if self.is_cdata() {
+            GcPtr::from_addr(self.gc_addr())
+        } else {
+            None
+        }
     }
 
     pub fn cdata(p: GcPtr<crate::runtime::cdata::CData>) -> LuaValue {

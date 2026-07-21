@@ -19,7 +19,10 @@ pub struct CData {
 
 impl CData {
     pub fn new(ctypeid: CTypeID, sz: usize) -> Self {
-        CData { ctypeid, data: vec![0u8; sz].into_boxed_slice() }
+        CData {
+            ctypeid,
+            data: vec![0u8; sz].into_boxed_slice(),
+        }
     }
 
     /// Read a pointer from offset 0. Supports 32-bit ptrs on 64-bit.

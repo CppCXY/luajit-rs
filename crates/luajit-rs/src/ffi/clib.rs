@@ -38,16 +38,26 @@ pub unsafe fn init_default_libs() {
     let handles = &raw mut CLIB_DEF_HANDLES;
     unsafe {
         GetModuleHandleExA(2, std::ptr::null(), &mut (*handles)[CLIB_HANDLE_EXE]);
-        GetModuleHandleExA(6, init_default_libs as *const u8, &mut (*handles)[CLIB_HANDLE_DLL]);
-        let msvcrt = cstr("msvcrt.dll"); (*handles)[CLIB_HANDLE_CRT] = LoadLibraryA(msvcrt.as_ptr() as *const u8);
-        let k32 = cstr("kernel32.dll"); (*handles)[CLIB_HANDLE_KERNEL32] = LoadLibraryA(k32.as_ptr() as *const u8);
-        let u32 = cstr("user32.dll"); (*handles)[CLIB_HANDLE_USER32] = LoadLibraryA(u32.as_ptr() as *const u8);
-        let g32 = cstr("gdi32.dll"); (*handles)[CLIB_HANDLE_GDI32] = LoadLibraryA(g32.as_ptr() as *const u8);
+        GetModuleHandleExA(
+            6,
+            init_default_libs as *const u8,
+            &mut (*handles)[CLIB_HANDLE_DLL],
+        );
+        let msvcrt = cstr("msvcrt.dll");
+        (*handles)[CLIB_HANDLE_CRT] = LoadLibraryA(msvcrt.as_ptr() as *const u8);
+        let k32 = cstr("kernel32.dll");
+        (*handles)[CLIB_HANDLE_KERNEL32] = LoadLibraryA(k32.as_ptr() as *const u8);
+        let u32 = cstr("user32.dll");
+        (*handles)[CLIB_HANDLE_USER32] = LoadLibraryA(u32.as_ptr() as *const u8);
+        let g32 = cstr("gdi32.dll");
+        (*handles)[CLIB_HANDLE_GDI32] = LoadLibraryA(g32.as_ptr() as *const u8);
     }
 }
 
 #[cfg(windows)]
-fn cstr(s: &str) -> std::ffi::CString { std::ffi::CString::new(s).unwrap() }
+fn cstr(s: &str) -> std::ffi::CString {
+    std::ffi::CString::new(s).unwrap()
+}
 
 /// Resolve a symbol from the default C library.
 /// Cross-platform: Windows searches all default handles; Unix uses RTLD_DEFAULT.
@@ -60,19 +70,24 @@ pub fn resolve_symbol(name: &str) -> Option<usize> {
         for &h in handles.iter() {
             if h != 0 {
                 let p = GetProcAddress(h, cname.as_ptr() as *const u8);
-                if !p.is_null() { return Some(p as usize); }
+                if !p.is_null() {
+                    return Some(p as usize);
+                }
             }
         }
     }
     #[cfg(unix)]
     unsafe {
         let p = dlsym(std::ptr::null_mut(), cname.as_ptr());
-        if !p.is_null() { return Some(p as usize); }
+        if !p.is_null() {
+            return Some(p as usize);
+        }
     }
     None
 }
 
 #[cfg(unix)]
 unsafe extern "C" {
-    fn dlsym(handle: *mut std::ffi::c_void, name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    fn dlsym(handle: *mut std::ffi::c_void, name: *const std::ffi::c_char)
+    -> *mut std::ffi::c_void;
 }

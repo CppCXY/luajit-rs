@@ -24,7 +24,7 @@ pub use arm64::{assemble, patch_exit};
 /// portable IR executor.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod stub {
-    use super::super::super::{mcode::McodeArea, TraceError, GCtrace};
+    use super::super::super::{GCtrace, TraceError, mcode::McodeArea};
 
     pub fn assemble(
         _tr: &GCtrace,

@@ -647,7 +647,7 @@ impl<'g> Marker<'g> {
                             KGc::Table(t) => t.gc_traverse(|v| self.mark_value(v)),
                             KGc::TableRef(t) => t.as_ref().gc_traverse(|v| self.mark_value(v)),
                             KGc::Proto(_) => unreachable!("unregistered child proto in heap"),
-                            KGc::CData(_) => {}, // raw byte data, no GC references
+                            KGc::CData(_) => {} // raw byte data, no GC references
                         }
                     }
                 }

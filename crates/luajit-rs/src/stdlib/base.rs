@@ -321,21 +321,35 @@ fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
         let code = s.as_ref().as_bytes().to_vec();
         let chunkname = if nargs(l) >= 2 {
             let v = arg(l, 1);
-            if let Some(s2) = v.as_string() { String::from_utf8_lossy(s2.as_ref().as_bytes()).into_owned() }
-            else { "=(load)".to_string() }
-        } else { "=(load)".to_string() };
+            if let Some(s2) = v.as_string() {
+                String::from_utf8_lossy(s2.as_ref().as_bytes()).into_owned()
+            } else {
+                "=(load)".to_string()
+            }
+        } else {
+            "=(load)".to_string()
+        };
         match crate::state::load(l, code, &chunkname) {
-            Ok(v) => { push(l, v); Ok(1) }
+            Ok(v) => {
+                push(l, v);
+                Ok(1)
+            }
             Err(msg) => {
                 l.stack[l.base] = LuaValue::NIL;
-                l.stack[l.base + 1] = l.global().heap.str_value(l.global().heap.intern(msg.as_bytes()));
+                l.stack[l.base + 1] = l
+                    .global()
+                    .heap
+                    .str_value(l.global().heap.intern(msg.as_bytes()));
                 l.top = l.base + 2;
                 Ok(2)
             }
         }
     } else if src.is_func() {
         l.stack[l.base] = LuaValue::NIL;
-        l.stack[l.base + 1] = l.global().heap.str_value(l.global().heap.intern(b"reader function not supported"));
+        l.stack[l.base + 1] = l
+            .global()
+            .heap
+            .str_value(l.global().heap.intern(b"reader function not supported"));
         l.top = l.base + 2;
         Ok(2)
     } else {
@@ -351,14 +365,25 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
     };
     let chunkname = if nargs(l) >= 2 {
         let nv = arg(l, 1);
-        if let Some(s) = nv.as_string() { String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned() }
-        else { "=(loadstring)".to_string() }
-    } else { "=(loadstring)".to_string() };
+        if let Some(s) = nv.as_string() {
+            String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned()
+        } else {
+            "=(loadstring)".to_string()
+        }
+    } else {
+        "=(loadstring)".to_string()
+    };
     match crate::state::load(l, code, &chunkname) {
-        Ok(v) => { push(l, v); Ok(1) }
+        Ok(v) => {
+            push(l, v);
+            Ok(1)
+        }
         Err(msg) => {
             l.stack[l.base] = LuaValue::NIL;
-            l.stack[l.base + 1] = l.global().heap.str_value(l.global().heap.intern(msg.as_bytes()));
+            l.stack[l.base + 1] = l
+                .global()
+                .heap
+                .str_value(l.global().heap.intern(msg.as_bytes()));
             l.top = l.base + 2;
             Ok(2)
         }

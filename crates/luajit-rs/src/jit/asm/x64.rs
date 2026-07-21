@@ -457,7 +457,10 @@ impl<'a> Asm<'a> {
                 IROp::HSTORE => self.asm_hstore(&ins),
                 IROp::CALLL => self.asm_calll(&ins)?,
                 IROp::TNEW => {
-                    self.helper_call(super::super::exec::jit_tnew as *const () as usize as u64, &[]);
+                    self.helper_call(
+                        super::super::exec::jit_tnew as *const () as usize as u64,
+                        &[],
+                    );
                     self.ff_result(&ins)?;
                 }
                 IROp::TDUP => {

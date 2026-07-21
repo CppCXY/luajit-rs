@@ -167,7 +167,11 @@ mod sys {
                 0,
             )
         };
-        if p as isize == -1 || p.is_null() { None } else { Some(p) }
+        if p as isize == -1 || p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -186,7 +190,11 @@ mod sys {
                 0,
             )
         };
-        if p as isize == -1 || p.is_null() { None } else { Some(p) }
+        if p as isize == -1 || p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
     }
 
     pub fn protect(ptr: *mut u8, len: usize, exec: bool) -> bool {
@@ -206,8 +214,11 @@ mod sys {
             }
             unsafe { sys_icache_invalidate(ptr, len) };
         }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64",
-                      all(target_os = "macos", target_arch = "aarch64"))))]
+        #[cfg(not(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            all(target_os = "macos", target_arch = "aarch64")
+        )))]
         {
             unsafe extern "C" {
                 fn __clear_cache(start: *const u8, end: *const u8);

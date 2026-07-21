@@ -368,7 +368,7 @@ pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
     let a = if i < 0 {
         (len + i).max(0) as usize
     } else {
-        (i - 1).max(0).min(len as i64) as usize
+        (i - 1).max(0).min(len) as usize
     };
     let b = match j {
         Some(j) => {

@@ -38,19 +38,19 @@ pub fn trace_hot(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-    let g = l.global();
-    let js = &mut g.jit;
-    // Reset hotcount. The hash slot is keyed by the offset-by-1 PC, the
-    // same one the interpreter decremented.
-    let reset = (js.param(JitParam::HotLoop) as u32 * HOTCOUNT_LOOP as u32) as HotCount;
-    js.hotcount_set(bc_addr(pt, pc + 1), reset);
-    // Only start a new trace if not recording.
-    if js.state == TraceState::Idle {
-        js.parent = 0; // Root trace.
-        js.exitno = 0;
-        js.state = TraceState::Start;
-        trace_start(l, base, pt, pc);
-    }
+        let g = l.global();
+        let js = &mut g.jit;
+        // Reset hotcount. The hash slot is keyed by the offset-by-1 PC, the
+        // same one the interpreter decremented.
+        let reset = (js.param(JitParam::HotLoop) as u32 * HOTCOUNT_LOOP as u32) as HotCount;
+        js.hotcount_set(bc_addr(pt, pc + 1), reset);
+        // Only start a new trace if not recording.
+        if js.state == TraceState::Idle {
+            js.parent = 0; // Root trace.
+            js.exitno = 0;
+            js.state = TraceState::Start;
+            trace_start(l, base, pt, pc);
+        }
     }
 }
 
@@ -66,21 +66,21 @@ pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: us
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-    let g = l.global();
-    let js = &mut g.jit;
-    if js.state != TraceState::Idle {
-        return;
-    }
-    let t = js.trace[parent as usize]
-        .as_ref()
-        .expect("hot exit of a freed trace");
-    // Deep exits record from within the inlined frame: snap_replay
-    // rebuilds the frame stack and rec.pt from the snapshot constants.
-    let (pt, pc) = (t.startpt, t.snap[exitno].pc as usize);
-    js.parent = parent;
-    js.exitno = exitno as u32;
-    js.state = TraceState::Start;
-    trace_start(l, base, pt, pc);
+        let g = l.global();
+        let js = &mut g.jit;
+        if js.state != TraceState::Idle {
+            return;
+        }
+        let t = js.trace[parent as usize]
+            .as_ref()
+            .expect("hot exit of a freed trace");
+        // Deep exits record from within the inlined frame: snap_replay
+        // rebuilds the frame stack and rec.pt from the snapshot constants.
+        let (pt, pc) = (t.startpt, t.snap[exitno].pc as usize);
+        js.parent = parent;
+        js.exitno = exitno as u32;
+        js.state = TraceState::Start;
+        trace_start(l, base, pt, pc);
     }
 }
 
@@ -554,7 +554,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             // entry (lj_asm_patchexit) — the whole tree then runs in
             // machine code without Rust round trips.
             debug_assert!(parent != 0 && root != 0, "not a side trace");
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             {
                 let target = js.trace[traceno as usize].as_ref().and_then(|t| {
                     t.mcode
@@ -675,7 +675,7 @@ fn blacklist_pc(pt: GcPtr<Proto>, pc: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bc::{bc_d, bc_op, BCIns, BCOp};
+    use crate::bc::{BCIns, BCOp, bc_d, bc_op};
     use crate::jit::ir::IROp;
     use crate::state::Lua;
     use crate::value::LuaValue;
@@ -1042,11 +1042,15 @@ mod tests {
         let jitted = find_op(pt, BCOp::IFORL).is_none();
         if jitted {
             // IFORL was replaced — make sure it wasn't blacklisted by mistake.
-            assert!(pt.as_ref().flags & PROTO_ILOOP == 0,
-                "JIT-compiled loop should not have ILOOP flag");
+            assert!(
+                pt.as_ref().flags & PROTO_ILOOP == 0,
+                "JIT-compiled loop should not have ILOOP flag"
+            );
         } else {
-            assert!(pt.as_ref().flags & PROTO_ILOOP != 0,
-                "blacklisted loop must have ILOOP flag set");
+            assert!(
+                pt.as_ref().flags & PROTO_ILOOP != 0,
+                "blacklisted loop must have ILOOP flag set"
+            );
         }
         assert_eq!(lua.global().jit.state, TraceState::Idle);
     }
@@ -1579,7 +1583,10 @@ mod tests {
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert!(r[0].is_string());
         let expected: String = (1..=100).map(|n| n.to_string()).collect();
-        assert_eq!(r[0].as_string().unwrap().as_ref().as_bytes(), expected.as_bytes());
+        assert_eq!(
+            r[0].as_string().unwrap().as_ref().as_bytes(),
+            expected.as_bytes()
+        );
     }
 
     #[test]
@@ -1706,17 +1713,35 @@ mod tests {
     fn jit_correctness_arithmetic() {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
-        assert_num(jit_run(&mut lua, "local s=0 for i=1,50000 do s=s+i end return s"), 1250025000.0);
-        assert_num(jit_run(&mut lua, "local r=1.0 for i=1,100 do r=r*1.0001 end return r"), 1.0001f64.powi(100));
-        assert_num(jit_run(&mut lua, "local x=0 for i=1,1000 do x=i+5 end return x"), 1005.0);
+        assert_num(
+            jit_run(&mut lua, "local s=0 for i=1,50000 do s=s+i end return s"),
+            1250025000.0,
+        );
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local r=1.0 for i=1,100 do r=r*1.0001 end return r",
+            ),
+            1.0001f64.powi(100),
+        );
+        assert_num(
+            jit_run(&mut lua, "local x=0 for i=1,1000 do x=i+5 end return x"),
+            1005.0,
+        );
     }
 
     #[test]
     fn jit_correctness_strcat() {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
-        assert_str(jit_run(&mut lua, r#"local a,b="hello","world" return a..b"#), b"helloworld");
-        assert_str(jit_run(&mut lua, "local s='' for i=1,10 do s=s..i end return s"), b"12345678910");
+        assert_str(
+            jit_run(&mut lua, r#"local a,b="hello","world" return a..b"#),
+            b"helloworld",
+        );
+        assert_str(
+            jit_run(&mut lua, "local s='' for i=1,10 do s=s..i end return s"),
+            b"12345678910",
+        );
     }
 
     #[test]
@@ -1724,7 +1749,10 @@ mod tests {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
         assert_num(
-            jit_run(&mut lua, "local function f(...) local a,b=...; return a+b end; return f(10, 20)"),
+            jit_run(
+                &mut lua,
+                "local function f(...) local a,b=...; return a+b end; return f(10, 20)",
+            ),
             30.0,
         );
     }
@@ -1734,11 +1762,17 @@ mod tests {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
         assert_num(
-            jit_run(&mut lua, "local c=0 for i=1,2000 do if i%2==0 then c=c+1 else c=c-1 end end return c"),
+            jit_run(
+                &mut lua,
+                "local c=0 for i=1,2000 do if i%2==0 then c=c+1 else c=c-1 end end return c",
+            ),
             0.0,
         );
         assert_num(
-            jit_run(&mut lua, "local s=0 for i=1,1000 do if i<500 then s=s+1 end end return s"),
+            jit_run(
+                &mut lua,
+                "local s=0 for i=1,1000 do if i<500 then s=s+1 end end return s",
+            ),
             499.0,
         );
     }
@@ -1748,7 +1782,10 @@ mod tests {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
         assert_num(
-            jit_run(&mut lua, "local t={} for i=1,100 do t[i]=i*2 end; local s=0 for i=1,100 do s=s+t[i] end return s"),
+            jit_run(
+                &mut lua,
+                "local t={} for i=1,100 do t[i]=i*2 end; local s=0 for i=1,100 do s=s+t[i] end return s",
+            ),
             10100.0,
         );
     }

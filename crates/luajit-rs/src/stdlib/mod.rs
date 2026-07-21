@@ -103,19 +103,19 @@ pub fn tostring_bytes(l: &mut LuaState, v: LuaValue) -> Vec<u8> {
                 return format!("{}", val).into_bytes();
             }
             id if id == crate::ffi::CTypeID::Int16 as u32 => {
-                let val = i16::from_le_bytes(cd.as_ref().data[..2].try_into().unwrap_or([0;2]));
+                let val = i16::from_le_bytes(cd.as_ref().data[..2].try_into().unwrap_or([0; 2]));
                 return format!("{}", val).into_bytes();
             }
             id if id == crate::ffi::CTypeID::UInt16 as u32 => {
-                let val = u16::from_le_bytes(cd.as_ref().data[..2].try_into().unwrap_or([0;2]));
+                let val = u16::from_le_bytes(cd.as_ref().data[..2].try_into().unwrap_or([0; 2]));
                 return format!("{}", val).into_bytes();
             }
             id if id == crate::ffi::CTypeID::Int32 as u32 => {
-                let val = i32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0;4]));
+                let val = i32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0; 4]));
                 return format!("{}", val).into_bytes();
             }
             id if id == crate::ffi::CTypeID::UInt32 as u32 => {
-                let val = u32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0;4]));
+                let val = u32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0; 4]));
                 return format!("{}", val).into_bytes();
             }
             id if id == crate::ffi::CTypeID::Int64 as u32 => {
@@ -135,18 +135,24 @@ pub fn tostring_bytes(l: &mut LuaState, v: LuaValue) -> Vec<u8> {
                 }
             }
             id if id == crate::ffi::CTypeID::Float as u32 => {
-                let val = f32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0;4]));
+                let val = f32::from_le_bytes(cd.as_ref().data[..4].try_into().unwrap_or([0; 4]));
                 return crate::strfmt::g14(val as f64).into_bytes();
             }
             id if id == crate::ffi::CTypeID::Double as u32 => {
-                let val = f64::from_le_bytes(cd.as_ref().data[..8].try_into().unwrap_or([0;8]));
+                let val = f64::from_le_bytes(cd.as_ref().data[..8].try_into().unwrap_or([0; 8]));
                 return crate::strfmt::g14(val).into_bytes();
             }
             id if id == crate::ffi::CTypeID::Bool as u32 => {
                 let val = cd.as_ref().data.first().copied().unwrap_or(0) != 0;
-                return if val { b"true".to_vec() } else { b"false".to_vec() };
+                return if val {
+                    b"true".to_vec()
+                } else {
+                    b"false".to_vec()
+                };
             }
-            id if id == crate::ffi::CTypeID::Void as u32 || id == crate::ffi::CTypeID::None as u32 => {
+            id if id == crate::ffi::CTypeID::Void as u32
+                || id == crate::ffi::CTypeID::None as u32 =>
+            {
                 return b"cdata<void>"[..].into();
             }
             id if id == crate::ffi::CTypeID::PVoid as u32

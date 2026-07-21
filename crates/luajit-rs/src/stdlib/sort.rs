@@ -177,7 +177,11 @@ fn compare_lua(
     let saved_base = l.base;
     l.base = func_slot;
     let nret = crate::vm::execute(l, l.base, 2, 1)?;
-    let r = if nret > 0 { l.stack[func_slot].is_truthy() } else { false };
+    let r = if nret > 0 {
+        l.stack[func_slot].is_truthy()
+    } else {
+        false
+    };
     l.top = l.base + nret;
     l.base = saved_base;
     Ok(r)

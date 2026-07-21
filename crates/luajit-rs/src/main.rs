@@ -92,7 +92,7 @@ fn collectargs(argv: &[String]) -> Result<Args, String> {
 fn create_arg_table(l: &mut luajit_rs::state::LuaState, args: &[String], argn: usize) {
     let g = l.global();
     let script_idx = argn.min(args.len().saturating_sub(1));
-    let total = args.len() - script_idx.max(0);
+    let total = args.len() - script_idx;
     let t = g
         .heap
         .alloc_table(luajit_rs::runtime::table::LuaTable::new(0, 1));

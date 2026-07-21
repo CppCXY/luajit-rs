@@ -1,9 +1,13 @@
 use crate::err::LuaResult;
 use crate::state::LuaState;
+use crate::stdlib::{arg, err_bad_arg, push};
 use crate::value::LuaValue;
-use crate::stdlib::{arg, push, err_bad_arg};
 
-fn set_basemt_for(l: &mut LuaState, o: &LuaValue, mt: Option<crate::gc::GcPtr<crate::table::LuaTable>>) {
+fn set_basemt_for(
+    l: &mut LuaState,
+    o: &LuaValue,
+    mt: Option<crate::gc::GcPtr<crate::table::LuaTable>>,
+) {
     let g = l.global();
     g.set_basemt(o.itype(), mt);
     // Boolean: false and true share the same base metatable in LuaJIT.

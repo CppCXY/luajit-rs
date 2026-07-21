@@ -889,10 +889,7 @@ impl Record {
                     .ir
                     .emitir(irti(IROp::MOD), tref_ref(rb), tref_ref(rc));
             }
-            return self
-                .cur
-                .ir
-                .emitir(irti(op), tref_ref(rb), tref_ref(rc));
+            return self.cur.ir.emitir(irti(op), tref_ref(rb), tref_ref(rc));
         }
         if op == IROp::MOD {
             let tmp = self
@@ -2437,13 +2434,17 @@ impl Record {
                 let nparams = self.pt.as_ref().numparams as usize;
                 let nvarg = (delta - 2).saturating_sub(nparams);
                 let dst = bc_a(ins) as u32;
-                let want = if bc_b(ins) == 0 { nvarg as u32 } else { (bc_b(ins) - 1) as u32 };
+                let want = if bc_b(ins) == 0 {
+                    nvarg as u32
+                } else {
+                    (bc_b(ins) - 1) as u32
+                };
                 let packed = ((nparams as u32) << 16) | ((dst as u32) << 8) | want;
                 let k_link = self.cur.ir.kint64(link);
                 let k_packed = self.cur.ir.kint64(packed as u64);
                 let c1 = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CARG, irt_type(IRT_NIL)),
-                    REF_BIAS,        // → base pointer via RBASE register
+                    REF_BIAS, // → base pointer via RBASE register
                     tref_ref(k_link),
                 ));
                 let carg = self.cur.ir.emit_ins(IRIns::new(
@@ -2460,9 +2461,15 @@ impl Record {
 
             BCOp::USETV | BCOp::USETS | BCOp::USETN | BCOp::USETP => {
                 let fnval = l.stack[base - 2];
-                let Some(gf) = fnval.as_func() else { return Err(TraceError::NYIBC); };
-                let crate::func::GcFunc::Lua(cl) = gf.as_ref() else { return Err(TraceError::NYIBC); };
-                let Some(&uv) = cl.upvals.get(bc_a(ins) as usize) else { return Err(TraceError::NYIBC); };
+                let Some(gf) = fnval.as_func() else {
+                    return Err(TraceError::NYIBC);
+                };
+                let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
+                    return Err(TraceError::NYIBC);
+                };
+                let Some(&uv) = cl.upvals.get(bc_a(ins) as usize) else {
+                    return Err(TraceError::NYIBC);
+                };
                 let cell = uv.as_ref().value_ptr() as u64;
                 self.specialize_curfn(l, base, fnval)?;
                 let ptr_k = self.cur.ir.kint64(cell);
@@ -2572,9 +2579,7 @@ impl Record {
             BCOp::CAT => {
                 // Two-value concatenation via jit_cat helper.
                 // rb=first source, rc=second source (both already typed).
-                if !(tref_isstr(rb) || tref_isnum(rb))
-                    || !(tref_isstr(rc) || tref_isnum(rc))
-                {
+                if !(tref_isstr(rb) || tref_isnum(rb)) || !(tref_isstr(rc) || tref_isnum(rc)) {
                     return Err(TraceError::NYIBC);
                 }
                 let carg = self.cur.ir.emit_ins(IRIns::new(

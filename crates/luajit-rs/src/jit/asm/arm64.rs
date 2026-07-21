@@ -64,14 +64,20 @@ fn emit64(code: &mut Vec<u8>, val: u64) {
 fn add_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32, shift: u8) {
     debug_assert!(imm < 4096 && shift <= 1);
     let sf = 1u32 << 31; // 64-bit
-    emit32(code, sf | 0x11000000 | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x11000000 | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// SUB (immediate): `sub rd, rn, #imm`.
 fn sub_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32, shift: u8) {
     debug_assert!(imm < 4096 && shift <= 1);
     let sf = 1u32 << 31;
-    emit32(code, sf | 0x51000000 | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x51000000 | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// ADD (shifted register): `add rd, rn, rm, lsl #shift`.
@@ -80,7 +86,11 @@ fn add_reg_lsl(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8, shift: u8) {
     let sf = 1u32 << 31;
     emit32(
         code,
-        sf | 0x0B000000 | ((shift as u32) << 10) | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
+        sf | 0x0B000000
+            | ((shift as u32) << 10)
+            | ((rm as u32) << 16)
+            | ((rn as u32) << 5)
+            | rd as u32,
     );
 }
 
@@ -144,13 +154,19 @@ fn mov_imm64_full(code: &mut Vec<u8>, rd: u8, val: u64) {
 fn cmp_imm(code: &mut Vec<u8>, rn: u8, imm: u32, shift: u8) {
     debug_assert!(imm < 4096 && shift <= 1);
     let sf = 1u32 << 31;
-    emit32(code, sf | 0x7100001F | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5));
+    emit32(
+        code,
+        sf | 0x7100001F | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5),
+    );
 }
 
 /// CMP (register): `cmp rn, rm` (alias of SUBS with zero rd).
 fn cmp_reg(code: &mut Vec<u8>, rn: u8, rm: u8) {
     let sf = 1u32 << 31;
-    emit32(code, sf | 0x6B00001F | ((rm as u32) << 16) | ((rn as u32) << 5));
+    emit32(
+        code,
+        sf | 0x6B00001F | ((rm as u32) << 16) | ((rn as u32) << 5),
+    );
 }
 
 /// AND (immediate): `and rd, rn, #imm` (bitmask immediate).
@@ -172,24 +188,34 @@ fn encode_bitmask(imm: u64) -> Option<(u8, u32, u32)> {
     // ARM64 bitmask immediates are a pattern of consecutive ones,
     // right-rotated by some amount, replicated across 2/4/8/16/32/64 bits.
     let ones = imm.count_ones();
-    if ones == 0 { return None; }
+    if ones == 0 {
+        return None;
+    }
     let r = imm.trailing_zeros();
     let len = 64 - imm.leading_zeros() - r;
     // The pattern must be a string of 1s of length `ones`, padded.
-    if (len as u32) != ones { return None; }
+    if (len as u32) != ones {
+        return None;
+    }
     // Check that the 1s are consecutive and the rest is the repeating pattern.
     let mask = (1u64 << ones) - 1;
     let pattern = imm >> r;
-    if pattern & mask != mask { return None; }
+    if pattern & mask != mask {
+        return None;
+    }
     // Find the smallest element size that fits the period.
     for &esize in &[2u32, 4, 8, 16, 32, 64] {
-        if ones > esize { continue; }
+        if ones > esize {
+            continue;
+        }
         let period = esize;
         // Check that the pattern repeats every `period` bits.
-        let repeating = (0..64).step_by(period as usize).all(|s| {
-            (imm >> s) & ((1u64 << period) - 1) == (imm & ((1u64 << period) - 1))
-        });
-        if !repeating { continue; }
+        let repeating = (0..64)
+            .step_by(period as usize)
+            .all(|s| (imm >> s) & ((1u64 << period) - 1) == (imm & ((1u64 << period) - 1)));
+        if !repeating {
+            continue;
+        }
         let n = if esize == 64 { 1 } else { 0 };
         // imms encodes element-size and S (ones-1) in a single 6-bit field:
         //   esize=64: N=1, imms = ones-1
@@ -199,13 +225,13 @@ fn encode_bitmask(imm: u64) -> Option<(u8, u32, u32)> {
         //   esize=4:  imms[5:2]=0b1000,imms[1:0] = ones-1
         //   esize=2:  imms[5:1]=0b10000,imms[0]= ones-1
         let imms: u32 = match esize {
-            64 => (ones - 1) & 0x3F,            // N=1 already
-            32 => (ones - 1) & 0x1F,            // bit 5 = 0
-            16 => 0x20 | ((ones - 1) & 0xF),    // bit[5:4] = 10
-            8  => 0x30 | ((ones - 1) & 0x7),    // bit[5:3] = 100
-            4  => 0x38 | ((ones - 1) & 0x3),    // bit[5:2] = 1000
-            2  => 0x3C | ((ones - 1) & 0x1),    // bit[5:1] = 10000
-            _  => unreachable!(),
+            64 => (ones - 1) & 0x3F,         // N=1 already
+            32 => (ones - 1) & 0x1F,         // bit 5 = 0
+            16 => 0x20 | ((ones - 1) & 0xF), // bit[5:4] = 10
+            8 => 0x30 | ((ones - 1) & 0x7),  // bit[5:3] = 100
+            4 => 0x38 | ((ones - 1) & 0x3),  // bit[5:2] = 1000
+            2 => 0x3C | ((ones - 1) & 0x1),  // bit[5:1] = 10000
+            _ => unreachable!(),
         };
         let immr = (r as u32) % esize;
         return Some((n, immr, imms));
@@ -227,19 +253,28 @@ fn orr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u64) {
 /// AND (shifted register): `and rd, rn, rm, lsl/lsr/asr #shift`.
 fn and_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     let sf = 1u32 << 31;
-    emit32(code, sf | 0x0A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x0A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// ORR (shifted register): `orr rd, rn, rm`.
 fn orr_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     let sf = 1u32 << 31;
-    emit32(code, sf | 0x2A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x2A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// EOR (shifted register): `eor rd, rn, rm`.
 fn eor_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     let sf = 1u32 << 31;
-    emit32(code, sf | 0x4A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x4A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// LSL (register): `lsl rd, rn, rm`.
@@ -267,7 +302,10 @@ fn lsr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
     let immr = imm as u32;
     let imms = 63u32;
     // UBFM: sf|10|100110|N|immr|imms|Rn|Rd  (LSR allocates UBFM, not SBFM!)
-    emit32(code, sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// ASR (immediate): `asr rd, rn, #imm` (proper encoding).
@@ -276,7 +314,10 @@ fn asr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
     let n = 1u32 << 22; // 64-bit
     let immr = imm as u32;
     let imms = 63u32; // sign extension
-    emit32(code, sf | 0x13000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x13000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// UBFX (unsigned bitfield extract): extract `width` bits starting at `lsb`,
@@ -286,7 +327,10 @@ fn ubfx(code: &mut Vec<u8>, rd: u8, rn: u8, lsb: u8, width: u8) {
     let n = 1u32 << 22;
     let immr = lsb as u32;
     let imms = (lsb + width - 1) as u32;
-    emit32(code, sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// ROR (register): `ror rd, rn, rm`.
@@ -307,7 +351,15 @@ fn eor_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u64) {
 
 /// ROR (immediate, 32-bit): `ror wd, wn, #imm`. Uses EXTR wd, wn, wn, #imm.
 fn ror_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
-    emit32(code, 0 | 0x13800000 | 0 | ((rn as u32) << 16) | ((imm as u32) << 10) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        0 | 0x13800000
+            | 0
+            | ((rn as u32) << 16)
+            | ((imm as u32) << 10)
+            | ((rn as u32) << 5)
+            | rd as u32,
+    );
 }
 
 /// NEG (32-bit): `neg wd, wn` (alias of SUB wd, WZR, wn).
@@ -323,19 +375,28 @@ fn and_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32) {
     // Same issue: can't always encode as bitmask. Use GPR load + and_reg.
     mov_imm64(code, 2, imm as u64);
     let sf = 0u32 << 31;
-    emit32(code, sf | 0x0A000000 | ((2u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        sf | 0x0A000000 | ((2u32) << 16) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// LDR (register, 64-bit, uxtw scaled): `ldr rd, [rn, rm, uxtw #3]`.
 fn ldr_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     // (A64I_LDRx ^ A64I_LS_R) | A64I_LS_UXTWx | A64I_LS_SH = 0xF8605800
-    emit32(code, 0xF8605800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        0xF8605800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// STR (register, 64-bit, uxtw scaled): `str rd, [rn, rm, uxtw #3]`.
 fn str_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     // (A64I_STRx ^ A64I_LS_R) | A64I_LS_UXTWx | A64I_LS_SH = 0xF8205800
-    emit32(code, 0xF8205800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        0xF8205800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// REV32 (reverse bytes in 32-bit word, zero-extending).
@@ -348,42 +409,68 @@ fn rev32(code: &mut Vec<u8>, rd: u8, rn: u8) {
 fn ldr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
     let scale = (size / 8) as i32;
     debug_assert!(offset >= 0 && offset % scale == 0 && offset <= 32760);
-    let base = if size == 64 { 0xF9400000u32 } else { 0xB9400000u32 };
-    emit32(code, base | ((offset as u32 / scale as u32) << 10) | ((rn as u32) << 5) | rd as u32);
+    let base = if size == 64 {
+        0xF9400000u32
+    } else {
+        0xB9400000u32
+    };
+    emit32(
+        code,
+        base | ((offset as u32 / scale as u32) << 10) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// STR (FP, unsigned offset): `str dn, [rn, #offset]`.
 fn str_fp(code: &mut Vec<u8>, dn: u8, rn: u8, offset: i32) {
     debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
     // SIMD&FP store, unsigned offset, 64-bit: A64I_STRd = 0xFD000000
-    emit32(code, 0xFD000000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dn as u32);
+    emit32(
+        code,
+        0xFD000000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dn as u32,
+    );
 }
 
 /// LDR (FP, unsigned offset): `ldr dd, [rn, #offset]`.
 fn ldr_fp(code: &mut Vec<u8>, dd: u8, rn: u8, offset: i32) {
     debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
     // SIMD&FP load, unsigned offset, 64-bit: A64I_LDRd = 0xFD400000
-    emit32(code, 0xFD400000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dd as u32);
+    emit32(
+        code,
+        0xFD400000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dd as u32,
+    );
 }
 
 /// STR (GPR, unsigned offset): `str rd, [rn, #offset]`.
 fn str_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
     let scale = (size / 8) as i32;
     debug_assert!(offset >= 0 && offset % scale == 0 && offset <= 32760);
-    let base = if size == 64 { 0xF9000000u32 } else { 0xB9000000u32 };
-    emit32(code, base | ((offset as u32 / scale as u32) << 10) | ((rn as u32) << 5) | rd as u32);
+    let base = if size == 64 {
+        0xF9000000u32
+    } else {
+        0xB9000000u32
+    };
+    emit32(
+        code,
+        base | ((offset as u32 / scale as u32) << 10) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// LDR (register, 64-bit, lsl scaled): `ldr rd, [rn, rm, lsl #3]`.
 fn ldr_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     // (A64I_LDRx ^ A64I_LS_R) | A64I_LS_SXTXx | A64I_LS_SH = 0xF860F800
-    emit32(code, 0xF860F800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        0xF860F800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// STR (register, 64-bit, lsl scaled): `str rd, [rn, rm, lsl #3]`.
 fn str_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
     // (A64I_STRx ^ A64I_LS_R) | A64I_LS_SXTXx | A64I_LS_SH = 0xF820F800
-    emit32(code, 0xF820F800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32);
+    emit32(
+        code,
+        0xF820F800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
+    );
 }
 
 /// STP (store pair, offset): `stp rt1, rt2, [rn, #offset]`.
@@ -437,7 +524,10 @@ fn b_cond(code: &mut Vec<u8>, cond: u8, offset: i32) {
 /// CSET: `cset rd, cond` (conditional set).
 fn cset(code: &mut Vec<u8>, rd: u8, cond: u8) {
     let sf = 1u32 << 31;
-    emit32(code, sf | 0x1A9F07E0 | ((cond as u32 - 1) << 12) | rd as u32);
+    emit32(
+        code,
+        sf | 0x1A9F07E0 | ((cond as u32 - 1) << 12) | rd as u32,
+    );
 }
 
 /// Condition codes (ARM64, matching x86 convention).
@@ -503,22 +593,34 @@ fn fmov_fp_gpr(code: &mut Vec<u8>, xd: u8, dn: u8) {
 
 /// FADD: `fadd dd, dn, dm`.
 fn fadd(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E602800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(
+        code,
+        0x1E602800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
+    );
 }
 
 /// FSUB: `fsub dd, dn, dm`.
 fn fsub(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E603800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(
+        code,
+        0x1E603800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
+    );
 }
 
 /// FMUL: `fmul dd, dn, dm`.
 fn fmul(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E600800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(
+        code,
+        0x1E600800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
+    );
 }
 
 /// FDIV: `fdiv dd, dn, dm`.
 fn fdiv(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E601800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(
+        code,
+        0x1E601800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
+    );
 }
 
 /// FNEG: `fneg dd, dn`.
@@ -538,12 +640,18 @@ fn fsqrt(code: &mut Vec<u8>, dd: u8, dn: u8) {
 
 /// FMIN: `fmin dd, dn, dm`.
 fn fmin(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E605800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(
+        code,
+        0x1E605800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
+    );
 }
 
 /// FMAX: `fmax dd, dn, dm`.
 fn fmax(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(code, 0x1E604800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32);
+    emit32(
+        code,
+        0x1E604800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
+    );
 }
 
 /// FRINTM (floor): `frintm dd, dn`.
@@ -595,7 +703,11 @@ fn csinc(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8, cond: u8) {
     let sf = 1u32 << 31;
     emit32(
         code,
-        sf | 0x1A800400 | ((rm as u32) << 16) | ((cond as u32 - 1) << 12) | ((rn as u32) << 5) | rd as u32,
+        sf | 0x1A800400
+            | ((rm as u32) << 16)
+            | ((cond as u32 - 1) << 12)
+            | ((rn as u32) << 5)
+            | rd as u32,
     );
 }
 
@@ -713,11 +825,7 @@ impl<'a> Asm<'a> {
         for r in REF_FIRST..nins {
             let ins = tr.ir.ir(r);
             match ins.op() {
-                IROp::NOP
-                | IROp::BASE
-                | IROp::LOOP
-                | IROp::SLOAD
-                | IROp::ULOAD => {}
+                IROp::NOP | IROp::BASE | IROp::LOOP | IROp::SLOAD | IROp::ULOAD => {}
                 IROp::FLOAD | IROp::HLOAD | IROp::CARG => {
                     // Helper-call arguments are read from env as raw bits.
                     for op in [ins.op1 as IRRef, ins.op2 as IRRef] {
@@ -749,26 +857,44 @@ impl<'a> Asm<'a> {
                         a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
                     }
                 }
-                IROp::TNEW | IROp::TDUP
-                | IROp::GCSTEP => {}
+                IROp::TNEW | IROp::TDUP | IROp::GCSTEP => {}
                 IROp::POW | IROp::TOBIT | IROp::BSWAP => {
                     a.mark_use(ins.op1 as IRRef, r);
                 }
-                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
-                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT => {
+                IROp::BAND
+                | IROp::BOR
+                | IROp::BXOR
+                | IROp::BSHL
+                | IROp::BSHR
+                | IROp::BSAR
+                | IROp::BROL
+                | IROp::BROR
+                | IROp::BNOT => {
                     a.mark_use(ins.op1 as IRRef, r);
                     if ins.op2 != 0 {
                         a.mark_use(ins.op2 as IRRef, r);
                     }
                 }
-                IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX
-                | IROp::NEG | IROp::ABS => {
+                IROp::ADD
+                | IROp::SUB
+                | IROp::MUL
+                | IROp::DIV
+                | IROp::MIN
+                | IROp::MAX
+                | IROp::NEG
+                | IROp::ABS => {
                     a.mark_use(ins.op1 as IRRef, r);
                     a.mark_use(ins.op2 as IRRef, r);
                 }
                 IROp::FPMATH => a.mark_use(ins.op1 as IRRef, r),
-                IROp::LT | IROp::GE | IROp::LE | IROp::GT | IROp::ULT | IROp::UGE
-                | IROp::ULE | IROp::UGT => {
+                IROp::LT
+                | IROp::GE
+                | IROp::LE
+                | IROp::GT
+                | IROp::ULT
+                | IROp::UGE
+                | IROp::ULE
+                | IROp::UGT => {
                     a.mark_use(ins.op1 as IRRef, r);
                     a.mark_use(ins.op2 as IRRef, r);
                 }
@@ -844,11 +970,17 @@ impl<'a> Asm<'a> {
     // -- Register allocator (ARM64 ports of x64.rs equivalents) --------------
 
     #[inline]
-    fn pin(rg: u8) -> u16 { 1u16 << (rg as u32) }
+    fn pin(rg: u8) -> u16 {
+        1u16 << (rg as u32)
+    }
 
     #[inline]
     fn reg_of(&self, r: IRRef) -> Option<u8> {
-        if r >= REF_BIAS { self.loc[Self::iidx(r)] } else { None }
+        if r >= REF_BIAS {
+            self.loc[Self::iidx(r)]
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -875,25 +1007,36 @@ impl<'a> Asm<'a> {
             }
         }
         for &rg in &Self::ALLOC_REGS {
-            if pinned & Self::pin(rg) != 0 { continue; }
+            if pinned & Self::pin(rg) != 0 {
+                continue;
+            }
             let dead = match self.owner[rg as usize] {
                 Owner::Ins(o) => self.last_use[Self::iidx(o)] < self.cur,
                 Owner::Konst(o) => self.klast_use[Self::kidx(o)] < self.cur,
                 Owner::None => unreachable!(),
             };
-            if dead { self.steal_quiet(rg); return Ok(rg); }
+            if dead {
+                self.steal_quiet(rg);
+                return Ok(rg);
+            }
         }
         let mut best: Option<(u8, IRRef)> = None;
         for &rg in &Self::ALLOC_REGS {
-            if pinned & Self::pin(rg) != 0 { continue; }
+            if pinned & Self::pin(rg) != 0 {
+                continue;
+            }
             let lu = match self.owner[rg as usize] {
                 Owner::Ins(o) => self.last_use[Self::iidx(o)],
                 Owner::Konst(o) => self.klast_use[Self::kidx(o)],
                 Owner::None => unreachable!(),
             };
-            if best.is_none_or(|(_, b)| lu > b) { best = Some((rg, lu)); }
+            if best.is_none_or(|(_, b)| lu > b) {
+                best = Some((rg, lu));
+            }
         }
-        let Some((rg, _)) = best else { return Err(TraceError::BADRA); };
+        let Some((rg, _)) = best else {
+            return Err(TraceError::BADRA);
+        };
         if let Owner::Ins(o) = self.owner[rg as usize] {
             let i = Self::iidx(o);
             if !self.env_valid[i] {
@@ -907,7 +1050,9 @@ impl<'a> Asm<'a> {
 
     /// Bring an operand into an FP register.
     fn fetch_fp(&mut self, r: IRRef, pinned: u16) -> Result<u8, TraceError> {
-        if let Some(rg) = self.reg_of(r) { return Ok(rg); }
+        if let Some(rg) = self.reg_of(r) {
+            return Ok(rg);
+        }
         let rg = self.alloc(pinned)?;
         if r >= REF_BIAS {
             let i = Self::iidx(r);
@@ -927,8 +1072,10 @@ impl<'a> Asm<'a> {
     /// Fetch op1 as the (destroyed) destination of a two-address op.
     fn into_dst(&mut self, a: IRRef) -> Result<u8, TraceError> {
         let r1 = self.fetch_fp(a, 0)?;
-        if self.dying(a) { self.steal_quiet(r1); Ok(r1) }
-        else {
+        if self.dying(a) {
+            self.steal_quiet(r1);
+            Ok(r1)
+        } else {
             let d = self.alloc(Self::pin(r1))?;
             fmov_reg(&mut self.code, d, r1);
             Ok(d)
@@ -955,13 +1102,19 @@ impl<'a> Asm<'a> {
             debug_assert!(self.env_valid[Self::iidx(r)]);
             ldr_imm(&mut self.code, gpr, RENV, Self::env_disp(r), 64);
         } else {
-            mov_imm64(&mut self.code, gpr, super::super::exec::const_bits(&self.tr.ir, r));
+            mov_imm64(
+                &mut self.code,
+                gpr,
+                super::super::exec::const_bits(&self.tr.ir, r),
+            );
         }
     }
 
     /// S-register (GPR) view of an FP register — not needed with str_fp/ldr_fp.
     #[allow(dead_code)]
-    fn sreg_of(fp: u8) -> u8 { fp }
+    fn sreg_of(fp: u8) -> u8 {
+        fp
+    }
 
     // -- Exit stub helpers ---------------------------------------------------
 
@@ -988,7 +1141,11 @@ impl<'a> Asm<'a> {
 
     fn make_stub(&mut self, gc: bool) -> usize {
         let flush = self.exit_flush_set(self.snapidx);
-        self.stubs.push(StubIdx { snapidx: self.snapidx, flush, gc });
+        self.stubs.push(StubIdx {
+            snapidx: self.snapidx,
+            flush,
+            gc,
+        });
         self.stubs.len() - 1
     }
 
@@ -1015,7 +1172,9 @@ impl<'a> Asm<'a> {
         let snap = &self.tr.snap[snapidx];
         let ofs = snap.mapofs as usize;
         for &sn in &self.tr.snapmap[ofs..ofs + snap.nent as usize] {
-            if sn & SNAP_NORESTORE != 0 { continue; }
+            if sn & SNAP_NORESTORE != 0 {
+                continue;
+            }
             let disp = (snap_slot(sn) as i32 - 2) * 8;
             let rref = snap_ref(sn);
             if rref >= REF_BIAS {
@@ -1028,7 +1187,11 @@ impl<'a> Asm<'a> {
                     str_imm(&mut self.code, RSCR, RBASE, disp, 64);
                 }
             } else {
-                mov_imm64(&mut self.code, RSCR, super::super::exec::const_bits(&self.tr.ir, rref));
+                mov_imm64(
+                    &mut self.code,
+                    RSCR,
+                    super::super::exec::const_bits(&self.tr.ir, rref),
+                );
                 str_imm(&mut self.code, RSCR, RBASE, disp, 64);
             }
         }
@@ -1040,10 +1203,18 @@ impl<'a> Asm<'a> {
         let op = ins.op();
         let (mut a, mut b) = (ins.op1 as IRRef, ins.op2 as IRRef);
         if matches!(op, IROp::ADD | IROp::MUL)
-            && !self.dying(a) && self.dying(b) && self.reg_of(b).is_some()
-        { std::mem::swap(&mut a, &mut b); }
+            && !self.dying(a)
+            && self.dying(b)
+            && self.reg_of(b).is_some()
+        {
+            std::mem::swap(&mut a, &mut b);
+        }
         let d = self.into_dst(a)?;
-        let rhs = if b == a { d } else { self.fetch_fp(b, Self::pin(d))? };
+        let rhs = if b == a {
+            d
+        } else {
+            self.fetch_fp(b, Self::pin(d))?
+        };
         match op {
             IROp::ADD => fadd(&mut self.code, d, d, rhs),
             IROp::SUB => fsub(&mut self.code, d, d, rhs),
@@ -1067,21 +1238,28 @@ impl<'a> Asm<'a> {
         // Fetch both before converting: the second fetch may clobber
         // scratch registers that the first conversion needs.
         let sy = if !matches!(op, IROp::BNOT | IROp::BSWAP) {
-            if ins.op2 == ins.op1 { Some(sx) }
-            else { Some(self.fetch_fp(ins.op2 as IRRef, Self::pin(sx))?) }
-        } else { None };
+            if ins.op2 == ins.op1 {
+                Some(sx)
+            } else {
+                Some(self.fetch_fp(ins.op2 as IRRef, Self::pin(sx))?)
+            }
+        } else {
+            None
+        };
         fcvtzs_w(&mut self.code, 0, sx); // w0 = trunc(sx)
-        if let Some(s) = sy { fcvtzs_w(&mut self.code, 1, s); }
+        if let Some(s) = sy {
+            fcvtzs_w(&mut self.code, 1, s);
+        }
         match op {
             IROp::BNOT => eor_imm(&mut self.code, 0, 0, 0xFFFFFFFF),
             IROp::BSWAP => rev32(&mut self.code, 0, 0),
             IROp::BAND => and_reg(&mut self.code, 0, 0, 1),
-            IROp::BOR  => orr_reg(&mut self.code, 0, 0, 1),
+            IROp::BOR => orr_reg(&mut self.code, 0, 0, 1),
             IROp::BXOR => eor_reg(&mut self.code, 0, 0, 1),
             IROp::BSHL => lsl_reg(&mut self.code, 0, 0, 1),
             IROp::BSHR => lsr_reg(&mut self.code, 0, 0, 1),
             IROp::BROL => {
-                neg_w(&mut self.code, 1, 1);     // w1 = -w1
+                neg_w(&mut self.code, 1, 1); // w1 = -w1
                 and_imm32(&mut self.code, 1, 1, 31); // w1 &= 31
                 // 32-bit ror: sf=0
                 let sf_w = 0u32;
@@ -1092,7 +1270,8 @@ impl<'a> Asm<'a> {
                 let sf_w = 0u32;
                 emit32(&mut self.code, sf_w | 0x1AC02C00 | ((1u32) << 16) | 0);
             }
-            _ => { /* BSAR: asr w0, w0, w1 (32-bit) */
+            _ => {
+                /* BSAR: asr w0, w0, w1 (32-bit) */
                 let sf_w = 0u32;
                 emit32(&mut self.code, sf_w | 0x1AC02800 | ((1u32) << 16) | 0);
             }
@@ -1140,14 +1319,14 @@ impl<'a> Asm<'a> {
         self.gpr_load_ref(0, tab);
         mov_imm64(&mut self.code, 1, crate::value::LJ_GCVMASK);
         and_reg(&mut self.code, 0, 0, 1);
-        fcvtzs_w(&mut self.code, 1, sk);       // w1 = trunc(key)
+        fcvtzs_w(&mut self.code, 1, sk); // w1 = trunc(key)
         scvtf_w(&mut self.code, FP_SCRATCH, 1);
         fcmp(&mut self.code, FP_SCRATCH, sk);
-        self.guard(CC_NE);                       // not exact int → exit
+        self.guard(CC_NE); // not exact int → exit
         // Check w1 < asize (unsigned).
         ldr_imm(&mut self.code, 2, 0, ASIZE_OFF, 32);
         cmp_reg(&mut self.code, 1, 2);
-        self.guard(CC_CS);                       // unsigned >= → exit
+        self.guard(CC_CS); // unsigned >= → exit
         Ok(())
     }
 
@@ -1171,7 +1350,9 @@ impl<'a> Asm<'a> {
         self.guard(CC_EQ);
         ldr_imm(&mut self.code, 2, 0, APTR_OFF, 64); // x2 = aptr
         let val = carg.op2 as IRRef;
-        if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
+        if val >= REF_BIAS
+            && let Some(sv) = self.reg_of(val)
+        {
             fmov_fp_gpr(&mut self.code, 3, sv);
             str_reg_uxtw(&mut self.code, 3, 2, 1);
         } else {
@@ -1190,13 +1371,17 @@ impl<'a> Asm<'a> {
                 Owner::Konst(k) => self.klast_use[Self::kidx(k)] <= self.cur,
                 Owner::None => false,
             };
-            if dead { self.steal_quiet(rg); }
+            if dead {
+                self.steal_quiet(rg);
+            }
         }
         // Spill all live non-PHI regs into their env slots so the
         // post-loop body can find values even if registers were stolen.
         for rg in 0..NREG as u8 {
             if let Owner::Ins(o) = self.owner[rg as usize] {
-                if self.phis.iter().any(|p| p.num && p.lref == o) { continue; }
+                if self.phis.iter().any(|p| p.num && p.lref == o) {
+                    continue;
+                }
                 let i = Self::iidx(o);
                 if !self.env_valid[i] {
                     str_fp(&mut self.code, rg, RENV, Self::env_disp(o));
@@ -1240,13 +1425,18 @@ impl<'a> Asm<'a> {
     fn asm_loop_back(&mut self, loop_pos: usize) {
         let s0 = self.s0;
         let phis = std::mem::take(&mut self.phis);
-        let homes: Vec<Option<u8>> = phis.iter()
+        let homes: Vec<Option<u8>> = phis
+            .iter()
             .map(|p| (0..NREG as u8).find(|&rg| s0[rg as usize] == Owner::Ins(p.lref)))
             .collect();
         let dstset: u16 = homes.iter().flatten().fold(0, |m, &rg| m | Self::pin(rg));
         let direct = phis.iter().all(|p| {
-            if p.rref < REF_BIAS { return true; }
-            if let Some(rg) = self.reg_of(p.rref) && p.num {
+            if p.rref < REF_BIAS {
+                return true;
+            }
+            if let Some(rg) = self.reg_of(p.rref)
+                && p.num
+            {
                 return dstset & Self::pin(rg) == 0;
             }
             !phis.iter().any(|q| q.lref == p.rref)
@@ -1259,20 +1449,27 @@ impl<'a> Asm<'a> {
             // Buffered: read right values into PHI env slots, then land.
             for p in &phis {
                 if p.rref >= REF_BIAS {
-                    if p.num && let Some(rg) = self.reg_of(p.rref) {
+                    if p.num
+                        && let Some(rg) = self.reg_of(p.rref)
+                    {
                         str_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
                     } else {
                         ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.rref), 64);
                         str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
                     }
                 } else {
-                    mov_imm64(&mut self.code, RSCR,
-                        super::super::exec::const_bits(&self.tr.ir, p.rref));
+                    mov_imm64(
+                        &mut self.code,
+                        RSCR,
+                        super::super::exec::const_bits(&self.tr.ir, p.rref),
+                    );
                     str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
                 }
             }
             for (p, home) in phis.iter().zip(homes.iter()) {
-                if p.num && let Some(rg) = *home {
+                if p.num
+                    && let Some(rg) = *home
+                {
                     ldr_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
                     if self.needs_env[Self::iidx(p.lref)] {
                         str_fp(&mut self.code, rg, RENV, Self::env_disp(p.lref));
@@ -1288,8 +1485,12 @@ impl<'a> Asm<'a> {
         // Restore invariants from env.
         for rg in 0..NREG as u8 {
             let so = s0[rg as usize];
-            if so == Owner::None || so == self.owner[rg as usize] { continue; }
-            if phis.iter().any(|p| so == Owner::Ins(p.lref)) { continue; }
+            if so == Owner::None || so == self.owner[rg as usize] {
+                continue;
+            }
+            if phis.iter().any(|p| so == Owner::Ins(p.lref)) {
+                continue;
+            }
             match so {
                 Owner::Ins(x) => {
                     ldr_fp(&mut self.code, rg, RENV, Self::env_disp(x));
@@ -1297,8 +1498,11 @@ impl<'a> Asm<'a> {
                     self.loc[Self::iidx(x)] = Some(rg);
                 }
                 Owner::Konst(k) => {
-                    mov_imm64(&mut self.code, RSCR,
-                        super::super::exec::const_bits(&self.tr.ir, k));
+                    mov_imm64(
+                        &mut self.code,
+                        RSCR,
+                        super::super::exec::const_bits(&self.tr.ir, k),
+                    );
                     fmov_gpr_fp(&mut self.code, rg, RSCR);
                     self.owner[rg as usize] = Owner::Konst(k);
                 }
@@ -1312,8 +1516,11 @@ impl<'a> Asm<'a> {
 
     fn phi_move(&mut self, p: &PhiInfo, home: Option<u8>) {
         if p.rref < REF_BIAS {
-            mov_imm64(&mut self.code, RSCR,
-                super::super::exec::const_bits(&self.tr.ir, p.rref));
+            mov_imm64(
+                &mut self.code,
+                RSCR,
+                super::super::exec::const_bits(&self.tr.ir, p.rref),
+            );
             if p.num {
                 if let Some(rg) = home {
                     fmov_gpr_fp(&mut self.code, rg, RSCR);
@@ -1330,9 +1537,13 @@ impl<'a> Asm<'a> {
                     }
                 }
             }
-        } else if p.num && let Some(rg) = self.reg_of(p.rref) {
+        } else if p.num
+            && let Some(rg) = self.reg_of(p.rref)
+        {
             let d = home.unwrap_or(0);
-            if d != rg { fmov_reg(&mut self.code, d, rg); }
+            if d != rg {
+                fmov_reg(&mut self.code, d, rg);
+            }
             if self.needs_env[Self::iidx(p.lref)] {
                 str_fp(&mut self.code, d, RENV, Self::env_disp(p.lref));
             }
@@ -1353,7 +1564,9 @@ impl<'a> Asm<'a> {
             }
         } else {
             debug_assert!(self.env_valid[Self::iidx(p.rref)]);
-            if p.num && let Some(rg) = home {
+            if p.num
+                && let Some(rg) = home
+            {
                 ldr_fp(&mut self.code, rg, RENV, Self::env_disp(p.rref));
                 self.loc[Self::iidx(p.lref)] = Some(rg);
                 self.owner[rg as usize] = Owner::Ins(p.lref);
@@ -1371,8 +1584,8 @@ impl<'a> Asm<'a> {
     fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
         // AAPCS64 prologue: x0=base, x1=env
         const FRAME: i32 = 256;
-        sub_imm(&mut self.code, 31, 31, FRAME as u32, 0);   // sub sp, sp, #256
-        stp_offset(&mut self.code, 29, 30, 31, 0);           // stp x29, x30, [sp, #0]
+        sub_imm(&mut self.code, 31, 31, FRAME as u32, 0); // sub sp, sp, #256
+        stp_offset(&mut self.code, 29, 30, 31, 0); // stp x29, x30, [sp, #0]
         // Save x19-x28 at [sp + 16*k]
         stp_offset(&mut self.code, 19, 20, 31, 16);
         stp_offset(&mut self.code, 21, 22, 31, 32);
@@ -1381,8 +1594,8 @@ impl<'a> Asm<'a> {
         stp_offset(&mut self.code, 27, 28, 31, 80);
         // v8-v15: saved in area [sp+96..sp+256] — skip saves for now (traces
         // don't use callee-saved FP regs yet; all FP state is in v0-v4).
-        mov_reg(&mut self.code, RBASE, 0);   // x19 = x0 (base)
-        mov_reg(&mut self.code, RENV, 1);    // x20 = x1 (env)
+        mov_reg(&mut self.code, RBASE, 0); // x19 = x0 (base)
+        mov_reg(&mut self.code, RENV, 1); // x20 = x1 (env)
         let inner = self.code.len() as u32;
 
         // Parentmap handover
@@ -1393,9 +1606,10 @@ impl<'a> Asm<'a> {
         let nins = self.tr.ir.nins();
         let mut r = REF_FIRST;
         while r < nins {
-            while self.snapidx + 1 < self.tr.snap.len()
-                && self.tr.snap[self.snapidx + 1].iref <= r
-            { self.snapidx += 1; }
+            while self.snapidx + 1 < self.tr.snap.len() && self.tr.snap[self.snapidx + 1].iref <= r
+            {
+                self.snapidx += 1;
+            }
             self.cur = r;
             let ins = *self.tr.ir.ir(r);
             match ins.op() {
@@ -1418,7 +1632,8 @@ impl<'a> Asm<'a> {
                 IROp::FPMATH => {
                     let src = self.fetch_fp(ins.op1 as IRRef, 0)?;
                     let d = if self.dying(ins.op1 as IRRef) {
-                        self.steal_quiet(src); src
+                        self.steal_quiet(src);
+                        src
                     } else {
                         let d2 = self.alloc(Self::pin(src))?;
                         fmov_reg(&mut self.code, d2, src);
@@ -1433,8 +1648,14 @@ impl<'a> Asm<'a> {
                     }
                     self.def(d);
                 }
-                IROp::LT | IROp::GE | IROp::LE | IROp::GT
-                | IROp::ULT | IROp::UGE | IROp::ULE | IROp::UGT => {
+                IROp::LT
+                | IROp::GE
+                | IROp::LE
+                | IROp::GT
+                | IROp::ULT
+                | IROp::UGE
+                | IROp::ULE
+                | IROp::UGT => {
                     self.asm_comp(&ins)?;
                 }
                 IROp::EQ | IROp::NE => self.asm_equal(&ins)?,
@@ -1469,8 +1690,16 @@ impl<'a> Asm<'a> {
                     self.ff_result(&ins)?;
                 }
                 IROp::ULOAD => self.asm_uload(&ins)?,
-                IROp::BAND | IROp::BOR | IROp::BXOR | IROp::BSHL | IROp::BSHR
-                | IROp::BSAR | IROp::BROL | IROp::BROR | IROp::BNOT | IROp::BSWAP => {
+                IROp::BAND
+                | IROp::BOR
+                | IROp::BXOR
+                | IROp::BSHL
+                | IROp::BSHR
+                | IROp::BSAR
+                | IROp::BROL
+                | IROp::BROR
+                | IROp::BNOT
+                | IROp::BSWAP => {
                     self.asm_bitop(&ins)?;
                 }
                 IROp::TOBIT => self.asm_tobit(&ins)?,
@@ -1512,7 +1741,9 @@ impl<'a> Asm<'a> {
             }
             let inner_ofs = inner as i32 - self.code.len() as i32;
             b_imm(&mut self.code, inner_ofs, false);
-        } else if self.tr.linktype == TraceLink::Root && let Some(target) = self.link {
+        } else if self.tr.linktype == TraceLink::Root
+            && let Some(target) = self.link
+        {
             self.snapidx = lastsnap;
             self.tail_restore(lastsnap);
             let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
@@ -1544,7 +1775,11 @@ impl<'a> Asm<'a> {
         // x0 (w0) holds the exit code from the exit path above.
         // Report BASE back through the cell, then restore and return.
         let epilogue = self.code.len();
-        mov_imm64(&mut self.code, RSCR2, super::super::exec::exit_base_cell_addr());
+        mov_imm64(
+            &mut self.code,
+            RSCR2,
+            super::super::exec::exit_base_cell_addr(),
+        );
         str_imm(&mut self.code, RBASE, RSCR2, 0, 64);
         ldp_offset(&mut self.code, 27, 28, 31, 80);
         ldp_offset(&mut self.code, 25, 26, 31, 64);
@@ -1552,7 +1787,7 @@ impl<'a> Asm<'a> {
         ldp_offset(&mut self.code, 21, 22, 31, 32);
         ldp_offset(&mut self.code, 19, 20, 31, 16);
         ldp_offset(&mut self.code, 29, 30, 31, 0);
-        add_imm(&mut self.code, 31, 31, FRAME as u32, 0);    // add sp, sp, #256
+        add_imm(&mut self.code, 31, 31, FRAME as u32, 0); // add sp, sp, #256
         ret(&mut self.code, 30);
 
         // -- Guard-exit stubs --
@@ -1564,18 +1799,22 @@ impl<'a> Asm<'a> {
         let stubs = std::mem::take(&mut self.stubs);
         let mut stubpos = Vec::with_capacity(stubs.len());
         for st in &stubs {
-            stubpos.push(self.code.len());                           // guard branch target
+            stubpos.push(self.code.len()); // guard branch target
             for (rg, rref) in &st.flush {
                 str_fp(&mut self.code, *rg, RENV, Self::env_disp(*rref));
             }
-            let tail = self.code.len();                              // patch-exit point
+            let tail = self.code.len(); // patch-exit point
             if !st.gc {
                 self.stub_tails.push((st.snapidx as u32, tail as u32));
             }
-            let ec = if st.gc { self.exit_code(st.snapidx) | 0x8000 } else { self.exit_code(st.snapidx) };
-            mov_imm64_full(&mut self.code, 0, ec as u64);            // 16 bytes (4 × movz/movk)
+            let ec = if st.gc {
+                self.exit_code(st.snapidx) | 0x8000
+            } else {
+                self.exit_code(st.snapidx)
+            };
+            mov_imm64_full(&mut self.code, 0, ec as u64); // 16 bytes (4 × movz/movk)
             let epi_off = epilogue as i32 - self.code.len() as i32;
-            b_imm(&mut self.code, epi_off, false);                   // 4 bytes
+            b_imm(&mut self.code, epi_off, false); // 4 bytes
             // Total mov+b = 20 bytes; patch_exit overwrites this region.
         }
         self.stub_positions = stubpos;
@@ -1584,10 +1823,10 @@ impl<'a> Asm<'a> {
         for (pos, si) in std::mem::take(&mut self.fixups) {
             let target = self.stub_positions[si];
             let offset = target as i32 - pos as i32;
-            let insn = u32::from_le_bytes(self.code[pos..pos+4].try_into().unwrap());
+            let insn = u32::from_le_bytes(self.code[pos..pos + 4].try_into().unwrap());
             let imm19 = ((offset >> 2) as u32) & 0x7FFFF;
             let new_insn = (insn & 0xFF00001F) | (imm19 << 5);
-            self.code[pos..pos+4].copy_from_slice(&new_insn.to_le_bytes());
+            self.code[pos..pos + 4].copy_from_slice(&new_insn.to_le_bytes());
         }
 
         let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
@@ -1609,7 +1848,9 @@ impl<'a> Asm<'a> {
             eprint!(" hex=");
             for (i, chunk) in self.code.chunks(4).enumerate() {
                 let w = u32::from_le_bytes(chunk.try_into().unwrap());
-                if i > 0 { eprint!(","); }
+                if i > 0 {
+                    eprint!(",");
+                }
                 eprint!("{:08x}", w);
             }
             // Also dump IR for context
@@ -1620,12 +1861,16 @@ impl<'a> Asm<'a> {
                 if ins.op() != IROp::NOP {
                     // skip NOP details
                 }
-                if r + 1 < self.tr.ir.nins() { eprint!(","); }
+                if r + 1 < self.tr.ir.nins() {
+                    eprint!(",");
+                }
             }
             eprintln!();
         }
 
-        if !area.protect_exec() { return Err(TraceError::MCODEAL); }
+        if !area.protect_exec() {
+            return Err(TraceError::MCODEAL);
+        }
         Ok((area, inner, std::mem::take(&mut self.stub_tails)))
     }
 
@@ -1633,14 +1878,16 @@ impl<'a> Asm<'a> {
 
     fn emit_handover(&mut self) {
         let mut pending: Vec<(IRRef, IRRef)> = self
-            .tr.parentmap.iter()
+            .tr
+            .parentmap
+            .iter()
             .map(|&(o, p)| (o as IRRef, p as IRRef))
             .filter(|&(o, p)| o != p)
             .collect();
         while !pending.is_empty() {
-            let ready = pending.iter().position(|&(d, _)| {
-                !pending.iter().any(|&(_, s)| s == d)
-            });
+            let ready = pending
+                .iter()
+                .position(|&(d, _)| !pending.iter().any(|&(_, s)| s == d));
             let Some(i) = ready else {
                 // Cycle: use scratch register to break
                 let (d, s) = pending.remove(0);
@@ -1868,15 +2115,30 @@ impl<'a> Asm<'a> {
     fn asm_comp(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         debug_assert!(irt_isnum(ins.t()) && ins.is_guard());
         let x = self.fetch_fp(ins.op1 as IRRef, 0)?;
-        let y = if ins.op2 == ins.op1 { x }
-                else { self.fetch_fp(ins.op2 as IRRef, Self::pin(x))? };
+        let y = if ins.op2 == ins.op1 {
+            x
+        } else {
+            self.fetch_fp(ins.op2 as IRRef, Self::pin(x))?
+        };
         fcmp(&mut self.code, x, y);
         match ins.op() {
             // Ordered: guard fails on NaN.
-            IROp::LT => { self.guard(CC_VS); self.guard(CC_GE); }
-            IROp::GE => { self.guard(CC_VS); self.guard(CC_MI); }
-            IROp::LE => { self.guard(CC_VS); self.guard(CC_GT); }
-            IROp::GT => { self.guard(CC_VS); self.guard(CC_LS); }
+            IROp::LT => {
+                self.guard(CC_VS);
+                self.guard(CC_GE);
+            }
+            IROp::GE => {
+                self.guard(CC_VS);
+                self.guard(CC_MI);
+            }
+            IROp::LE => {
+                self.guard(CC_VS);
+                self.guard(CC_GT);
+            }
+            IROp::GT => {
+                self.guard(CC_VS);
+                self.guard(CC_LS);
+            }
             // Unordered: NaN passes the guard.
             IROp::ULT => self.guard(CC_GE),
             IROp::UGE => self.guard(CC_MI),
@@ -1894,8 +2156,11 @@ impl<'a> Asm<'a> {
         let eq = ins.op() == IROp::EQ;
         if irt_isnum(ins.t()) {
             let x = self.fetch_fp(ins.op1 as IRRef, 0)?;
-            let y = if ins.op2 == ins.op1 { x }
-                    else { self.fetch_fp(ins.op2 as IRRef, Self::pin(x))? };
+            let y = if ins.op2 == ins.op1 {
+                x
+            } else {
+                self.fetch_fp(ins.op2 as IRRef, Self::pin(x))?
+            };
             fcmp(&mut self.code, x, y);
             if eq {
                 self.guard(CC_VS);
@@ -1909,8 +2174,9 @@ impl<'a> Asm<'a> {
                 b_cond(&mut self.code, CC_EQ, 0); // placeholder → patched later
                 // Fix up the first b.vs to skip past this b.eq
                 let after = self.code.len() as i32 - pos as i32;
-                self.code[pos..pos+4].copy_from_slice(
-                    &(0x54000000 | (((after >> 2) as u32 & 0x7FFFF) << 5) | CC_VS as u32).to_le_bytes()
+                self.code[pos..pos + 4].copy_from_slice(
+                    &(0x54000000 | (((after >> 2) as u32 & 0x7FFFF) << 5) | CC_VS as u32)
+                        .to_le_bytes(),
                 );
                 self.fixups.push((stub_pos, stub));
             }
@@ -1936,29 +2202,29 @@ mod tests {
     fn dump_prologue_epilogue() {
         let mut c = Vec::new();
         // Prologue
-        sub_imm(&mut c, 31, 31, 256, 0);       // sub sp, sp, #256
-        stp_offset(&mut c, 29, 30, 31, 0);      // stp x29, x30, [sp, #0]
+        sub_imm(&mut c, 31, 31, 256, 0); // sub sp, sp, #256
+        stp_offset(&mut c, 29, 30, 31, 0); // stp x29, x30, [sp, #0]
         stp_offset(&mut c, 19, 20, 31, 16);
         stp_offset(&mut c, 21, 22, 31, 32);
         stp_offset(&mut c, 23, 24, 31, 48);
         stp_offset(&mut c, 25, 26, 31, 64);
         stp_offset(&mut c, 27, 28, 31, 80);
-        mov_reg(&mut c, 19, 0);                  // mov x19, x0
-        mov_reg(&mut c, 20, 1);                  // mov x20, x1
+        mov_reg(&mut c, 19, 0); // mov x19, x0
+        mov_reg(&mut c, 20, 1); // mov x20, x1
         // Epilogue
         mov_imm64(&mut c, 1, 0xFFFF_FFFF_FFFF_FFFFu64);
-        str_imm(&mut c, 19, 1, 0, 64);           // str x19, [x1]
+        str_imm(&mut c, 19, 1, 0, 64); // str x19, [x1]
         ldp_offset(&mut c, 27, 28, 31, 80);
         ldp_offset(&mut c, 25, 26, 31, 64);
         ldp_offset(&mut c, 23, 24, 31, 48);
         ldp_offset(&mut c, 21, 22, 31, 32);
         ldp_offset(&mut c, 19, 20, 31, 16);
         ldp_offset(&mut c, 29, 30, 31, 0);
-        add_imm(&mut c, 31, 31, 256, 0);         // add sp, sp, #256
+        add_imm(&mut c, 31, 31, 256, 0); // add sp, sp, #256
         ret(&mut c, 30);
         for (i, chunk) in c.chunks(4).enumerate() {
             let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            eprintln!("  {:2}: {:02x?}  // {:08x}", i*4, chunk, w);
+            eprintln!("  {:2}: {:02x?}  // {:08x}", i * 4, chunk, w);
         }
         std::fs::write("dump_prologue.hex", &c).ok();
     }
@@ -1966,29 +2232,29 @@ mod tests {
     #[test]
     fn dump_fp_ops() {
         let mut c = Vec::new();
-        fmov_gpr_fp(&mut c, 0, 0);    // fmov d0, x0
-        fmov_fp_gpr(&mut c, 0, 0);    // fmov x0, d0
-        fmov_reg(&mut c, 1, 0);       // fmov d1, d0
-        fadd(&mut c, 0, 0, 1);        // fadd d0, d0, d1
-        fsub(&mut c, 0, 0, 1);        // fsub d0, d0, d1
-        fmul(&mut c, 0, 0, 1);        // fmul d0, d0, d1
-        fdiv(&mut c, 0, 0, 1);        // fdiv d0, d0, d1
-        fneg(&mut c, 0, 0);           // fneg d0, d0
-        fabs(&mut c, 0, 0);           // fabs d0, d0
-        fsqrt(&mut c, 0, 0);          // fsqrt d0, d0
-        frintm(&mut c, 0, 0);         // frintm d0, d0
-        frintp(&mut c, 0, 0);         // frintp d0, d0
-        frintz(&mut c, 0, 0);         // frintz d0, d0
-        fmin(&mut c, 0, 0, 1);        // fmin d0, d0, d1
-        fmax(&mut c, 0, 0, 1);        // fmax d0, d0, d1
-        fcmp(&mut c, 0, 1);           // fcmp d0, d1
-        fcmp_zero(&mut c, 0);         // fcmp d0, #0.0
-        fcvtzs_w(&mut c, 0, 0);       // fcvtzs w0, d0
-        fcvtns_w(&mut c, 0, 0);       // fcvtns w0, d0
-        scvtf_w(&mut c, 0, 0);        // scvtf d0, w0
+        fmov_gpr_fp(&mut c, 0, 0); // fmov d0, x0
+        fmov_fp_gpr(&mut c, 0, 0); // fmov x0, d0
+        fmov_reg(&mut c, 1, 0); // fmov d1, d0
+        fadd(&mut c, 0, 0, 1); // fadd d0, d0, d1
+        fsub(&mut c, 0, 0, 1); // fsub d0, d0, d1
+        fmul(&mut c, 0, 0, 1); // fmul d0, d0, d1
+        fdiv(&mut c, 0, 0, 1); // fdiv d0, d0, d1
+        fneg(&mut c, 0, 0); // fneg d0, d0
+        fabs(&mut c, 0, 0); // fabs d0, d0
+        fsqrt(&mut c, 0, 0); // fsqrt d0, d0
+        frintm(&mut c, 0, 0); // frintm d0, d0
+        frintp(&mut c, 0, 0); // frintp d0, d0
+        frintz(&mut c, 0, 0); // frintz d0, d0
+        fmin(&mut c, 0, 0, 1); // fmin d0, d0, d1
+        fmax(&mut c, 0, 0, 1); // fmax d0, d0, d1
+        fcmp(&mut c, 0, 1); // fcmp d0, d1
+        fcmp_zero(&mut c, 0); // fcmp d0, #0.0
+        fcvtzs_w(&mut c, 0, 0); // fcvtzs w0, d0
+        fcvtns_w(&mut c, 0, 0); // fcvtns w0, d0
+        scvtf_w(&mut c, 0, 0); // scvtf d0, w0
         for (i, chunk) in c.chunks(4).enumerate() {
             let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            eprintln!("  {:2}: {:02x?}  // {:08x}", i*4, chunk, w);
+            eprintln!("  {:2}: {:02x?}  // {:08x}", i * 4, chunk, w);
         }
         std::fs::write("dump_fpops.hex", &c).ok();
     }
@@ -1996,30 +2262,30 @@ mod tests {
     #[test]
     fn dump_bit_ops() {
         let mut c = Vec::new();
-        movz(&mut c, 0, 2, 0);            // movz x0, #2
-        movk(&mut c, 0, 1, 16);           // movk x0, #1, lsl #16
-        mov_imm64(&mut c, 0, 42);          // mov x0, #42
-        mov_reg(&mut c, 0, 1);             // mov x0, x1
-        add_reg_lsl(&mut c, 0, 0, 1, 3);  // add x0, x0, x1, lsl #3
-        cmp_reg(&mut c, 0, 1);             // cmp x0, x1
-        cmp_imm(&mut c, 0, 42, 0);        // cmp x0, #42
-        and_reg(&mut c, 0, 0, 1);         // and x0, x0, x1
-        eor_reg(&mut c, 0, 0, 1);         // eor x0, x0, x1
-        orr_reg(&mut c, 0, 0, 1);         // orr x0, x0, x1
-        lsl_reg(&mut c, 0, 0, 1);         // lsl x0, x0, x1
-        lsr_reg(&mut c, 0, 0, 1);         // lsr x0, x0, x1
-        asr_imm(&mut c, 0, 0, 47);        // asr x0, x0, #47
-        lsr_imm(&mut c, 0, 0, 32);        // lsr x0, x0, #32
-        rev32(&mut c, 0, 0);              // rev32 x0, x0
-        neg_w(&mut c, 1, 1);              // neg w1, w1
-        and_imm32(&mut c, 1, 1, 31);      // and w1, w1, #31
+        movz(&mut c, 0, 2, 0); // movz x0, #2
+        movk(&mut c, 0, 1, 16); // movk x0, #1, lsl #16
+        mov_imm64(&mut c, 0, 42); // mov x0, #42
+        mov_reg(&mut c, 0, 1); // mov x0, x1
+        add_reg_lsl(&mut c, 0, 0, 1, 3); // add x0, x0, x1, lsl #3
+        cmp_reg(&mut c, 0, 1); // cmp x0, x1
+        cmp_imm(&mut c, 0, 42, 0); // cmp x0, #42
+        and_reg(&mut c, 0, 0, 1); // and x0, x0, x1
+        eor_reg(&mut c, 0, 0, 1); // eor x0, x0, x1
+        orr_reg(&mut c, 0, 0, 1); // orr x0, x0, x1
+        lsl_reg(&mut c, 0, 0, 1); // lsl x0, x0, x1
+        lsr_reg(&mut c, 0, 0, 1); // lsr x0, x0, x1
+        asr_imm(&mut c, 0, 0, 47); // asr x0, x0, #47
+        lsr_imm(&mut c, 0, 0, 32); // lsr x0, x0, #32
+        rev32(&mut c, 0, 0); // rev32 x0, x0
+        neg_w(&mut c, 1, 1); // neg w1, w1
+        and_imm32(&mut c, 1, 1, 31); // and w1, w1, #31
         // ror w0, w0, w1 (32-bit inline)
         emit32(&mut c, 0 | 0x1AC02C00 | ((1u32) << 16) | 0u32);
         // asr w0, w0, w1 (32-bit inline)
         emit32(&mut c, 0 | 0x1AC02800 | ((1u32) << 16) | 0u32);
         for (i, chunk) in c.chunks(4).enumerate() {
             let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            eprintln!("  {:2}: {:02x?}  // {:08x}", i*4, chunk, w);
+            eprintln!("  {:2}: {:02x?}  // {:08x}", i * 4, chunk, w);
         }
         std::fs::write("dump_bitops.hex", &c).ok();
     }
@@ -2027,29 +2293,29 @@ mod tests {
     #[test]
     fn dump_loads_stores_branches() {
         let mut c = Vec::new();
-        ldr_imm(&mut c, 0, 19, 0, 64);          // ldr x0, [x19]
-        str_imm(&mut c, 0, 19, 0, 64);          // str x0, [x19]
-        ldr_imm(&mut c, 0, 19, 4, 32);          // ldr w0, [x19, #4]
-        str_imm(&mut c, 0, 19, 4, 32);          // str w0, [x19, #4]
-        ldr_fp(&mut c, 0, 20, 8);               // ldr d0, [x20, #8]
-        str_fp(&mut c, 0, 20, 8);               // str d0, [x20, #8]
-        ldr_reg_uxtw(&mut c, 0, 2, 1);          // ldr x0, [x2, w1, uxtw #3]
-        str_reg_uxtw(&mut c, 0, 2, 1);          // str x0, [x2, w1, uxtw #3]
-        ldr_reg_lsl3(&mut c, 0, 2, 1);          // ldr x0, [x2, x1, lsl #3]
-        str_reg_lsl3(&mut c, 0, 2, 1);          // str x0, [x2, x1, lsl #3]
-        ldr_literal(&mut c, 0, 16, 64);          // ldr x0, [pc, #16]
-        stp_offset(&mut c, 19, 20, 31, 16);      // stp x19, x20, [sp, #16]
-        ldp_offset(&mut c, 19, 20, 31, 16);      // ldp x19, x20, [sp, #16]
-        b_imm(&mut c, 16, false);                // b #16
-        b_imm(&mut c, 16, true);                 // bl #16
-        b_cond(&mut c, 0, 8);                    // b.eq #8
-        b_cond(&mut c, CC_VS, 8);                // b.vs #8
-        br_reg(&mut c, 0, false);                // br x0
-        br_reg(&mut c, 2, true);                 // blr x2
-        ret(&mut c, 30);                         // ret x30
+        ldr_imm(&mut c, 0, 19, 0, 64); // ldr x0, [x19]
+        str_imm(&mut c, 0, 19, 0, 64); // str x0, [x19]
+        ldr_imm(&mut c, 0, 19, 4, 32); // ldr w0, [x19, #4]
+        str_imm(&mut c, 0, 19, 4, 32); // str w0, [x19, #4]
+        ldr_fp(&mut c, 0, 20, 8); // ldr d0, [x20, #8]
+        str_fp(&mut c, 0, 20, 8); // str d0, [x20, #8]
+        ldr_reg_uxtw(&mut c, 0, 2, 1); // ldr x0, [x2, w1, uxtw #3]
+        str_reg_uxtw(&mut c, 0, 2, 1); // str x0, [x2, w1, uxtw #3]
+        ldr_reg_lsl3(&mut c, 0, 2, 1); // ldr x0, [x2, x1, lsl #3]
+        str_reg_lsl3(&mut c, 0, 2, 1); // str x0, [x2, x1, lsl #3]
+        ldr_literal(&mut c, 0, 16, 64); // ldr x0, [pc, #16]
+        stp_offset(&mut c, 19, 20, 31, 16); // stp x19, x20, [sp, #16]
+        ldp_offset(&mut c, 19, 20, 31, 16); // ldp x19, x20, [sp, #16]
+        b_imm(&mut c, 16, false); // b #16
+        b_imm(&mut c, 16, true); // bl #16
+        b_cond(&mut c, 0, 8); // b.eq #8
+        b_cond(&mut c, CC_VS, 8); // b.vs #8
+        br_reg(&mut c, 0, false); // br x0
+        br_reg(&mut c, 2, true); // blr x2
+        ret(&mut c, 30); // ret x30
         for (i, chunk) in c.chunks(4).enumerate() {
             let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            eprintln!("  {:2}: {:02x?}  // {:08x}", i*4, chunk, w);
+            eprintln!("  {:2}: {:02x?}  // {:08x}", i * 4, chunk, w);
         }
         std::fs::write("dump_load_branch.hex", &c).ok();
     }

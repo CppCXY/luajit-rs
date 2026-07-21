@@ -296,7 +296,9 @@ impl<'a> LexState<'a> {
                 loop {
                     c = self.next_char();
                     if c == b'0' as i32 || c == b'1' as i32 || c == b'_' as i32 {
-                        if c != b'_' as i32 { self.save(c); }
+                        if c != b'_' as i32 {
+                            self.save(c);
+                        }
                         continue;
                     }
                     break;
@@ -309,13 +311,17 @@ impl<'a> LexState<'a> {
                 let s = self.sb.as_slice();
                 let mut body_len = s.len();
                 let mut suffix = crate::strscan::NumSuffix::None;
-                if body_len >= 3 && (s[body_len-3] == b'U' || s[body_len-3] == b'u')
-                    && (s[body_len-2] == b'L' || s[body_len-2] == b'l')
-                    && (s[body_len-1] == b'L' || s[body_len-1] == b'l') {
+                if body_len >= 3
+                    && (s[body_len - 3] == b'U' || s[body_len - 3] == b'u')
+                    && (s[body_len - 2] == b'L' || s[body_len - 2] == b'l')
+                    && (s[body_len - 1] == b'L' || s[body_len - 1] == b'l')
+                {
                     suffix = crate::strscan::NumSuffix::ULL;
                     body_len -= 3;
-                } else if body_len >= 2 && (s[body_len-2] == b'L' || s[body_len-2] == b'l')
-                    && (s[body_len-1] == b'L' || s[body_len-1] == b'l') {
+                } else if body_len >= 2
+                    && (s[body_len - 2] == b'L' || s[body_len - 2] == b'l')
+                    && (s[body_len - 1] == b'L' || s[body_len - 1] == b'l')
+                {
                     suffix = crate::strscan::NumSuffix::LL;
                     body_len -= 2;
                 }
@@ -411,7 +417,9 @@ impl<'a> LexState<'a> {
         while self.c != delim {
             match self.c {
                 LEX_EOF => self.error("unfinished string near '<eof>'"),
-                c if c == b'\n' as i32 || c == b'\r' as i32 => self.error("unfinished string near '<string>'"),
+                c if c == b'\n' as i32 || c == b'\r' as i32 => {
+                    self.error("unfinished string near '<string>'")
+                }
                 c if c == b'\\' as i32 => {
                     let mut c = self.next_char();
                     match c as u8 {
@@ -555,7 +563,14 @@ impl<'a> LexState<'a> {
             .iter()
             .find(|(kw, _)| *kw == self.sb.as_slice())
             .map_or(Tok::Name, |&(_, t)| t);
-        (tok, TokVal { num: 0.0, str: id, ..Default::default() })
+        (
+            tok,
+            TokVal {
+                num: 0.0,
+                str: id,
+                ..Default::default()
+            },
+        )
     }
 
     /// Skip a `--` comment (short or long). The leading `--` is consumed.
@@ -585,7 +600,16 @@ impl<'a> LexState<'a> {
                 self.tokval.is_cdata = false;
                 self.tokval.cdata_bits = 0;
                 self.tokval.cdata_is_ull = false;
-                return (Tok::Number, TokVal { num: n, str: 0, is_cdata: cd, cdata_bits: bits, cdata_is_ull: is_ull, ..Default::default() });
+                return (
+                    Tok::Number,
+                    TokVal {
+                        num: n,
+                        str: 0,
+                        is_cdata: cd,
+                        cdata_bits: bits,
+                        cdata_is_ull: is_ull,
+                    },
+                );
             }
             if is_ident(self.c) {
                 return self.scan_name_or_keyword();
@@ -617,7 +641,14 @@ impl<'a> LexState<'a> {
                 b'[' => match self.skip_eq() {
                     sep @ 0.. => {
                         let id = self.long_string(true, sep).unwrap();
-                        return (Tok::Str, TokVal { num: 0.0, str: id, ..Default::default() });
+                        return (
+                            Tok::Str,
+                            TokVal {
+                                num: 0.0,
+                                str: id,
+                                ..Default::default()
+                            },
+                        );
                     }
                     -1 => Tok::Char(b'['),
                     _ => self.error("invalid long string delimiter"),
@@ -707,7 +738,14 @@ impl<'a> LexState<'a> {
                 }
                 b'"' | b'\'' => {
                     let id = self.string();
-                    return (Tok::Str, TokVal { num: 0.0, str: id, ..Default::default() });
+                    return (
+                        Tok::Str,
+                        TokVal {
+                            num: 0.0,
+                            str: id,
+                            ..Default::default()
+                        },
+                    );
                 }
                 b'.' => {
                     if self.save_next() == b'.' as i32 {
@@ -725,7 +763,16 @@ impl<'a> LexState<'a> {
                         self.tokval.is_cdata = false;
                         self.tokval.cdata_bits = 0;
                         self.tokval.cdata_is_ull = false;
-                        return (Tok::Number, TokVal { num: n, str: 0, is_cdata: cd, cdata_bits: bits, cdata_is_ull: is_ull, ..Default::default() });
+                        return (
+                            Tok::Number,
+                            TokVal {
+                                num: n,
+                                str: 0,
+                                is_cdata: cd,
+                                cdata_bits: bits,
+                                cdata_is_ull: is_ull,
+                            },
+                        );
                     } else {
                         Tok::Char(b'.')
                     }
@@ -760,5 +807,3 @@ impl<'a> LexState<'a> {
         tok
     }
 }
-
-

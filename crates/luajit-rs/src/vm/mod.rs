@@ -723,17 +723,41 @@ impl Interp {
                         // x is unsigned, y is signed: compare after sign check
                         let y_s = y as i64;
                         if y_s < 0 {
-                            match $op { 0 => false, 1 => true, 2 => false, 3 => true, _ => unreachable!() }
+                            match $op {
+                                0 => false,
+                                1 => true,
+                                2 => false,
+                                3 => true,
+                                _ => unreachable!(),
+                            }
                         } else {
-                            match $op { 0 => x < y, 1 => !(x < y), 2 => x <= y, 3 => !(x <= y), _ => unreachable!() }
+                            match $op {
+                                0 => x < y,
+                                1 => !(x < y),
+                                2 => x <= y,
+                                3 => !(x <= y),
+                                _ => unreachable!(),
+                            }
                         }
                     } else {
                         // x is signed, y is unsigned
                         let x_s = x as i64;
                         if x_s < 0 {
-                            match $op { 0 => true, 1 => false, 2 => true, 3 => false, _ => unreachable!() }
+                            match $op {
+                                0 => true,
+                                1 => false,
+                                2 => true,
+                                3 => false,
+                                _ => unreachable!(),
+                            }
                         } else {
-                            match $op { 0 => x < y, 1 => !(x < y), 2 => x <= y, 3 => !(x <= y), _ => unreachable!() }
+                            match $op {
+                                0 => x < y,
+                                1 => !(x < y),
+                                2 => x <= y,
+                                3 => !(x <= y),
+                                _ => unreachable!(),
+                            }
                         }
                     };
                     let jmp = unsafe { *ip };
@@ -965,7 +989,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Add, xv, yv, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -982,7 +1009,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Sub, xv, yv, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -999,7 +1029,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Mul, xv, yv, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1926,15 +1959,15 @@ impl Interp {
                     let yv = reg!(bc_c(ins));
                     let x_cd = cdata_u64(xv);
                     let y_cd = cdata_u64(yv);
-                    if x_cd.is_some() {
-                        let x = x_cd.unwrap();
+                    if let Some(x) = x_cd {
                         let y = y_cd.unwrap_or_else(|| num2bit(yv.num()) as u64) & 63;
                         let is_ull = cdata_is_ull(xv);
                         let r = make_cdata_result(self.l(), x << y, is_ull);
                         setreg!(a, r);
                     } else if xv.is_number() && (yv.is_number() || y_cd.is_some()) {
                         let x = num2bit(xv.num());
-                        let y = y_cd.map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
+                        let y = y_cd
+                            .map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
                         setreg!(a, LuaValue::number((x << y) as f64));
                     } else {
                         sync!();
@@ -1948,15 +1981,15 @@ impl Interp {
                     let yv = reg!(bc_c(ins));
                     let x_cd = cdata_u64(xv);
                     let y_cd = cdata_u64(yv);
-                    if x_cd.is_some() {
-                        let x = x_cd.unwrap();
+                    if let Some(x) = x_cd {
                         let y = y_cd.unwrap_or_else(|| num2bit(yv.num()) as u64) & 63;
                         let is_ull = cdata_is_ull(xv);
                         let r = make_cdata_result(self.l(), x >> y, is_ull);
                         setreg!(a, r);
                     } else if xv.is_number() && (yv.is_number() || y_cd.is_some()) {
                         let x = num2bit(xv.num());
-                        let y = y_cd.map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
+                        let y = y_cd
+                            .map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
                         setreg!(a, LuaValue::number((((x as u32) >> y) as i32) as f64));
                     } else {
                         sync!();
@@ -1970,8 +2003,7 @@ impl Interp {
                     let yv = reg!(bc_c(ins));
                     let x_cd = cdata_u64(xv);
                     let y_cd = cdata_u64(yv);
-                    if x_cd.is_some() {
-                        let x = x_cd.unwrap();
+                    if let Some(x) = x_cd {
                         let y = y_cd.unwrap_or_else(|| num2bit(yv.num()) as u64) & 63;
                         let is_ull = cdata_is_ull(xv);
                         let x_signed = x as i64;
@@ -1979,7 +2011,8 @@ impl Interp {
                         setreg!(a, r);
                     } else if xv.is_number() && (yv.is_number() || y_cd.is_some()) {
                         let x = num2bit(xv.num());
-                        let y = y_cd.map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
+                        let y = y_cd
+                            .map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
                         setreg!(a, LuaValue::number((x >> y) as f64));
                     } else {
                         sync!();
@@ -2518,11 +2551,11 @@ fn val_eq(a: LuaValue, b: LuaValue) -> bool {
     if a.is_number() && b.is_number() {
         a.num() == b.num()
     } else if let (Some(ca), _) = (a.as_cdata(), b.is_number()) {
-        if b.is_number() {
-            if let Some(bits) = cdata_u64(a) {
-                let bv = num2bit(b.num()) as u64;
-                return bits == bv;
-            }
+        if b.is_number()
+            && let Some(bits) = cdata_u64(a)
+        {
+            let bv = num2bit(b.num()) as u64;
+            return bits == bv;
         }
         if let Some(cb) = b.as_cdata() {
             if ca.as_ref().ctypeid != cb.as_ref().ctypeid {

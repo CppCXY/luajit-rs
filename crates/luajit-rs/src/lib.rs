@@ -12,8 +12,8 @@ pub use stdlib::open_libs;
 pub use util::{strfmt, strscan};
 pub use vm::err;
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use runtime::string::Interner;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub fn compile(src: Vec<u8>, chunkname: &str) -> Result<(proto::Proto, Interner), String> {
     let name = chunkname.to_string();

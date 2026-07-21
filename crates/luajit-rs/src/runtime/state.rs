@@ -78,7 +78,10 @@ impl GcHeap {
         self.threads.alloc(th)
     }
 
-    pub fn alloc_cdata(&mut self, cd: crate::runtime::cdata::CData) -> GcPtr<crate::runtime::cdata::CData> {
+    pub fn alloc_cdata(
+        &mut self,
+        cd: crate::runtime::cdata::CData,
+    ) -> GcPtr<crate::runtime::cdata::CData> {
         self.total += std::mem::size_of::<crate::runtime::cdata::CData>() + cd.data.len();
         self.cdatas.alloc(cd)
     }
@@ -425,17 +428,17 @@ impl LuaState {
         let mut full = msg.as_ref().to_vec();
         if self.debug_pc != 0 {
             let func_slot = self.base.saturating_sub(2);
-            if let Some(fv) = self.stack[func_slot].as_func() {
-                if let crate::func::GcFunc::Lua(cl) = fv.as_ref() {
-                    let pt = cl.proto.as_ref();
-                    if self.debug_pc < pt.lines.len() {
-                        let line = pt.lines[self.debug_pc] as usize + pt.firstline as usize;
-                        if !self.debug_chunkname.is_empty() {
-                            let cn = String::from_utf8_lossy(&self.debug_chunkname);
-                            full.extend(format!("\n  at {}:{}", cn, line).bytes());
-                        } else {
-                            full.extend(format!("\n  at line {}", line).bytes());
-                        }
+            if let Some(fv) = self.stack[func_slot].as_func()
+                && let crate::func::GcFunc::Lua(cl) = fv.as_ref()
+            {
+                let pt = cl.proto.as_ref();
+                if self.debug_pc < pt.lines.len() {
+                    let line = pt.lines[self.debug_pc] as usize + pt.firstline as usize;
+                    if !self.debug_chunkname.is_empty() {
+                        let cn = String::from_utf8_lossy(&self.debug_chunkname);
+                        full.extend(format!("\n  at {}:{}", cn, line).bytes());
+                    } else {
+                        full.extend(format!("\n  at line {}", line).bytes());
                     }
                 }
             }
