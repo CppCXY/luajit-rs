@@ -333,7 +333,7 @@ impl<'a> Asm<'a> {
         } else {
             self.code.ldr(RSCRATCH, RBASE, disp);
             // lsr x9, x9, #47  (UBFM x9, x9, #47, #63)
-            self.code.u32(0xD34F_FC00 | (RSCRATCH as u32));
+            self.code.u32(0xD36F_FC00 | ((RSCRATCH as u32) << 5) | (RSCRATCH as u32));
             self.code.mov64(RSCRATCH2, (!(ty as u32)) as u64);
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
@@ -367,7 +367,7 @@ impl<'a> Asm<'a> {
             self.code.ldr_w(RSCRATCH2,RSCRATCH,4); self.code.mov64(RSCRATCH3,bits);
             self.code.cmp_rr(RSCRATCH2,RSCRATCH3); self.guard(cond::NE);
         } else {
-            self.code.ldr(RSCRATCH2,RSCRATCH,0); self.code.u32(0xD34F_FC00|(RSCRATCH2 as u32));
+            self.code.ldr(RSCRATCH2,RSCRATCH,0); self.code.u32(0xD36F_FC00|((RSCRATCH2 as u32)<<5)|(RSCRATCH2 as u32));
             self.code.mov64(RSCRATCH3,(!(ty as u32)) as u64); self.code.cmp_rr(RSCRATCH2,RSCRATCH3); self.guard(cond::NE);
         }
         Ok(())
@@ -384,26 +384,150 @@ impl<'a> Asm<'a> {
         self.guard(cond::NE);
     }
 
+    // ── helper_call: emit a call to an extern "C" helper ──────────────────
+    // Parks volatile FP registers (v0-v7, v16-v31) to env, loads up to 3
+    // u64 arguments into x0-x2, calls the helper via blr, and returns
+    // with the helper's result in x0. RBASE/RENV are callee-saved (x19/x20)
+    // and survive the call automatically.
+    fn helper_call(&mut self, addr: u64, args: &[IRRef]) {
+        // Park allocatable volatile FP registers that are still live.
+        for &rg in ALLOC_REGS.iter() {
+            if rg > 7 && rg < 16 { continue; } // callee-saved
+            if let Owner::Ins(o) = self.owner[rg as usize] {
+                let i = Self::iidx(o);
+                if self.last_use[i] > self.cur && !self.env_valid[i] {
+                    self.code.str_d(rg, RENV, Self::env_ofs(o));
+                    self.env_valid[i] = true;
+                }
+            }
+            self.steal_quiet(rg);
+        }
+        // Load arguments into x0-x2 (ARM64 calling convention).
+        debug_assert!(args.len() <= 3);
+        for (n, &r) in args.iter().enumerate() {
+            self.gpr_load_ref(n as u8, r);
+        }
+        // Call the helper: blr RSCRATCH.
+        self.code.mov64(RSCRATCH, addr);
+        self.code.blr(RSCRATCH);
+    }
+
+    // ── ff_result: typecheck + land a helper result from x0 ─────────────
+    fn ff_result(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let t = ins.t();
+        let i = Self::iidx(self.cur);
+        if irt_isnum(t) {
+            if ins.is_guard() {
+                // Check hi 32 bits < 0xFFF9_0000 (i.e. value is a double, not GC-tagged).
+                // ubfm x9, x0, #32, #63  →  extract bits 63:32 of x0 into x9
+                self.code.u32(0xD360_FC00 | (RSCRATCH as u32)); // lsr x9, x0, #32
+                self.code.mov64(RSCRATCH2, 0xFFF9_0000_u64);
+                self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+                self.guard(cond::CS); // b.hs → exit if hi >= 0xFFF90000
+            }
+            if self.last_use[i] != 0 || self.needs_env[i] {
+                let d = self.alloc(0)?;
+                self.code.fmov_fp(d, 0); // fmov d_dst, x0
+                self.def(d);
+            }
+            return Ok(());
+        }
+        // Non-number: store to env, then typecheck.
+        if self.needs_env[i] {
+            self.code.str(0, RENV, Self::env_ofs(self.cur));
+            self.env_valid[i] = true;
+        }
+        if !ins.is_guard() {
+            return Ok(());
+        }
+        let ty = irt_type(t);
+        if ty <= IRT_TRUE {
+            let bits = match ty {
+                IRT_NIL => crate::value::LuaValue::NIL.to_bits(),
+                IRT_FALSE => crate::value::LuaValue::FALSE.to_bits(),
+                _ => crate::value::LuaValue::TRUE.to_bits(),
+            };
+            self.code.mov64(RSCRATCH2, bits);
+            self.code.cmp_rr(0, RSCRATCH2);
+            self.guard(cond::NE);
+        } else {
+            // Extract itype: ubfm x9, x0, #47, #63
+            self.code.u32(0xD36F_FC00 | (RSCRATCH as u32)); // lsr x9, x0, #47
+            self.code.mov64(RSCRATCH2, (!(ty as u32)) as u64);
+            self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+            self.guard(cond::NE);
+        }
+        Ok(())
+    }
+
     // HLOAD: table get via helper
-    fn asm_hload(&mut self, _ins: &IRIns) -> Result<(), TraceError> {
-        self.code.brk(0x01); // NYI — needs helper_call infrastructure
-        Err(TraceError::NYIIR)
+    fn asm_hload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let addr = super::super::exec::jit_tget as *const () as usize as u64;
+        self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
+        self.ff_result(ins)
     }
 
     // HSTORE: table set via helper
-    fn asm_hstore(&mut self, _ins: &IRIns) -> Result<(), TraceError> {
-        Err(TraceError::NYIIR)
+    fn asm_hstore(&mut self, ins: &IRIns) {
+        let carg = *self.tr.ir.ir(ins.op2 as IRRef);
+        debug_assert_eq!(carg.op(), IROp::CARG);
+        let addr = super::super::exec::jit_tset as *const () as usize as u64;
+        self.helper_call(addr, &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef]);
     }
 
-    // CALLL: guarded helper call
-    fn asm_calll(&mut self, _ins: &IRIns) -> Result<(), TraceError> {
-        self.code.brk(0x03);
-        Err(TraceError::NYIIR)
+    // CALLL: guarded helper call — dispatches by IRCALL index
+    fn asm_calll(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        use super::super::record as rec;
+        let idx = ins.op2 as u32;
+        let addr = match idx {
+            rec::IRCALL_TAB_NEXTK => super::super::exec::jit_tnextk as *const () as u64,
+            rec::IRCALL_FMOD => super::super::exec::jit_fmod as *const () as u64,
+            rec::IRCALL_STR_LEN => super::super::exec::jit_str_len as *const () as u64,
+            rec::IRCALL_STR_CMP => super::super::exec::jit_str_cmp as *const () as u64,
+            rec::IRCALL_STR_BYTE => super::super::exec::jit_str_byte as *const () as u64,
+            rec::IRCALL_STR_SUB => super::super::exec::jit_str_sub as *const () as u64,
+            rec::IRCALL_VARG => super::super::exec::jit_varg as *const () as u64,
+            rec::IRCALL_STR_CHAR => super::super::exec::jit_str_char as *const () as u64,
+            rec::IRCALL_TAB_LEN => super::super::exec::jit_alen as *const () as u64,
+            rec::IRCALL_TAB_CONCAT => super::super::exec::jit_tconcat as *const () as u64,
+            rec::IRCALL_CAT => super::super::exec::jit_cat as *const () as u64,
+            rec::IRCALL_USET => super::super::exec::jit_uset as *const () as u64,
+            _ => return Err(TraceError::NYIIR),
+        };
+        match rec::ircall_arity(idx) {
+            1 => self.helper_call(addr, &[ins.op1 as IRRef]),
+            2 => {
+                let carg = *self.tr.ir.ir(ins.op1 as IRRef);
+                debug_assert_eq!(carg.op(), IROp::CARG);
+                self.helper_call(addr, &[carg.op1 as IRRef, carg.op2 as IRRef]);
+            }
+            _ => {
+                let cargj = *self.tr.ir.ir(ins.op1 as IRRef);
+                debug_assert_eq!(cargj.op(), IROp::CARG);
+                let cargi = *self.tr.ir.ir(cargj.op1 as IRRef);
+                debug_assert_eq!(cargi.op(), IROp::CARG);
+                self.helper_call(addr, &[cargi.op1 as IRRef, cargi.op2 as IRRef, cargj.op2 as IRRef]);
+            }
+        }
+        self.ff_result(ins)
     }
 
-    // ALOAD/ASTORE: array load/store via helper
-    fn asm_aload(&mut self, _ins: &IRIns) -> Result<(), TraceError> { self.code.brk(0x04); Err(TraceError::NYIIR) }
-    fn asm_astore(&mut self, _ins: &IRIns) -> Result<(), TraceError> { self.code.brk(0x05); Err(TraceError::NYIIR) }
+    // ALOAD: array load via helper
+    fn asm_aload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        // Fallback: use the shared helper jit_tget for now.
+        // TODO: inline fast path when array bounds are guarded.
+        let addr = super::super::exec::jit_tget as *const () as usize as u64;
+        self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
+        self.ff_result(ins)
+    }
+    // ASTORE: array store via helper
+    fn asm_astore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let carg = *self.tr.ir.ir(ins.op2 as IRRef);
+        debug_assert_eq!(carg.op(), IROp::CARG);
+        let addr = super::super::exec::jit_tset as *const () as usize as u64;
+        self.helper_call(addr, &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef]);
+        Ok(())
+    }
 
     // GCSTEP: GC debt check — exit to interpreter when collection is due.
     // Mirrors x64: heap.total + TABLE_EXTRA >= heap.threshold → exit with GC flag.
@@ -663,13 +787,28 @@ impl<'a> Asm<'a> {
                 IROp::FLOAD => self.asm_meta_guard(&ins),
                 IROp::HLOAD => self.asm_hload(&ins)?,
                 IROp::CARG => {}
-                IROp::HSTORE => self.asm_hstore(&ins)?,
+                IROp::HSTORE => self.asm_hstore(&ins),
                 IROp::CALLL => self.asm_calll(&ins)?,
-                IROp::TNEW|IROp::TDUP => return Err(TraceError::NYIIR), // needs helper_call
+                IROp::TNEW => {
+                    self.helper_call(
+                        super::super::exec::jit_tnew as *const () as usize as u64, &[]);
+                    self.ff_result(&ins)?;
+                }
+                IROp::TDUP => {
+                    self.helper_call(
+                        super::super::exec::jit_tdup as *const () as usize as u64,
+                        &[ins.op1 as IRRef]);
+                    self.ff_result(&ins)?;
+                }
                 IROp::ALOAD => self.asm_aload(&ins)?,
                 IROp::ASTORE => self.asm_astore(&ins)?,
                 IROp::GCSTEP => self.asm_gcstep(&ins),
-                IROp::POW => return Err(TraceError::NYIIR),
+                IROp::POW => {
+                    self.helper_call(
+                        super::super::exec::jit_pow as *const () as usize as u64,
+                        &[ins.op1 as IRRef, ins.op2 as IRRef]);
+                    self.ff_result(&ins)?;
+                }
                 IROp::TOBIT => {
                     let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
                     self.code.fcvtzs_w(RSCRATCH, sx);
