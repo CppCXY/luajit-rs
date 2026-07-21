@@ -81,7 +81,7 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
                     // For previous frames, get line from frame link (return PC).
                     let pc = if slot == l.base {
                         l.debug_pc
-                    } else if link_bits & 0x3 == 0 {
+                    } else if (link_bits & 0x3) == 0 {
                         let ret_pc = link_bits as usize;
                         if ret_pc >= 4 && ret_pc <= pt.bc.len() * 4 {
                             (ret_pc / 4).saturating_sub(1)

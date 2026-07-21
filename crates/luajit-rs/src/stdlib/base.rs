@@ -260,6 +260,7 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
     for i in (0..n).rev() {
         l.stack[l.base + 2 + i] = arg(l, i + 1);
     }
+    let saved_base = l.base;
     match crate::vm::execute(l, l.base, n, -1) {
         Ok(nret) => {
             // Shift results down so the true/false header can go first.
@@ -270,6 +271,7 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
             Ok(nret as i32 + 1)
         }
         Err(LuaError::Runtime) => {
+            l.base = saved_base;
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
             Ok(2)

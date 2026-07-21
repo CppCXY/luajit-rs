@@ -6,6 +6,7 @@ use crate::proto::Proto;
 use crate::string::{Interner, StrId};
 use crate::table::LuaTable;
 use crate::value::{GcRef, LJ_TFUNC, LJ_TTAB, LuaValue};
+use crate::vm::FRAME_TYPE_MASK;
 
 /// The GC heap: stable-address object pools.
 ///
@@ -425,25 +426,45 @@ impl LuaState {
     /// Raise a runtime error carrying a string message with source location.
     pub fn runtime_error(&mut self, msg: impl AsRef<[u8]>) -> crate::err::LuaError {
         let mut full = msg.as_ref().to_vec();
-        if self.debug_pc != 0 {
-            let func_slot = self.base.saturating_sub(2);
-            if let Some(fv) = self.stack[func_slot].as_func()
-                && let crate::func::GcFunc::Lua(cl) = fv.as_ref()
-            {
-                let pt = cl.proto.as_ref();
-                if self.debug_pc < pt.lines.len() {
-                    let line = pt.lines[self.debug_pc] as usize + pt.firstline as usize;
-                    let src = pt.source.and_then(|sid| {
-                        self.heap().strings.try_lookup(sid).map(|_ptr| {
-                            let bytes = self.heap().strings.get(sid);
-                            String::from_utf8_lossy(bytes).into_owned()
-                        })
-                    }).unwrap_or_else(|| "=?".to_string());
-                    let msg_str = String::from_utf8_lossy(&full);
-                    full = format!("@{}:{}: {}", src, line, msg_str).into_bytes();
+
+        let mut slot = self.base;
+        for _ in 0..8 {
+            if slot < 2 {
+                break;
+            }
+            let func = self.stack[slot - 2];
+            let link_bits = self.stack[slot - 1].to_bits();
+            if let Some(fv) = func.as_func() {
+                match fv.as_ref() {
+                    crate::func::GcFunc::Lua(cl) => {
+                        let pt = cl.proto.as_ref();
+                        let pc = self.debug_pc.saturating_sub(1).min(pt.lines.len().saturating_sub(1));
+                        if pc < pt.lines.len() {
+                            let line = pt.lines[pc] as usize + pt.firstline as usize;
+                            let src = pt.source.and_then(|sid| {
+                                self.heap().strings.try_lookup(sid).map(|_ptr| {
+                                    let bytes = self.heap().strings.get(sid);
+                                    String::from_utf8_lossy(bytes).into_owned()
+                                })
+                            }).unwrap_or_else(|| "=?".to_string());
+                            let msg_str = String::from_utf8_lossy(&full);
+                            full = format!("@{}:{}: {}", src, line, msg_str).into_bytes();
+                        }
+                        break;
+                    }
+                    crate::func::GcFunc::C(_) => {
+                        // C function: walk to caller via frame link.
+                        if (link_bits & FRAME_TYPE_MASK) == 0 {
+                            slot = (link_bits >> 3) as usize;
+                            continue;
+                        }
+                        break;
+                    }
                 }
             }
+            break;
         }
+
         let sid = self.heap().intern(&full);
         self.errval = self.heap().str_value(sid);
         crate::err::LuaError::Runtime

@@ -628,7 +628,7 @@ impl Record {
         let step_val = self.slot_val(l, base, ra + FORL_STEP).num();
         let int_step = num_isint(step_val);
         let int_stop = num_isint(stop_val);
-        let narrow = int_step && int_stop;
+        let narrow = int_step && int_stop && tref_isk(step) && tref_isk(stop);
         if narrow {
             let step_int = self.cur.ir.kint(step_val as i32);
             let stop_int = self.cur.ir.kint(stop_val as i32);

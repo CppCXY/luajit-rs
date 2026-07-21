@@ -381,11 +381,11 @@ impl Interp {
         mut bp: *const LuaValue,
     ) -> Option<(*const LuaValue, i32, *const BCIns, i32)> {
         let mut link = unsafe { (*bp.sub(1)).to_bits() };
-        while link & FRAME_TYPE_MASK == FRAME_VARG {
+        while (link & FRAME_TYPE_MASK) == FRAME_VARG {
             bp = unsafe { bp.sub((link >> 3) as usize) };
             link = unsafe { (*bp.sub(1)).to_bits() };
         }
-        if link & FRAME_TYPE_MASK == FRAME_LUA && self.l().openuv.is_empty() {
+        if (link & FRAME_TYPE_MASK) == FRAME_LUA && self.l().openuv.is_empty() {
             let ret_ip = link as *const BCIns;
             let call_ins = unsafe { *ret_ip.sub(1) };
             let want = bc_b(call_ins) as i32 - 1;
@@ -402,7 +402,7 @@ impl Interp {
     #[inline(always)]
     fn ret_fast(&self, bp: *const LuaValue) -> Option<i32> {
         let link = unsafe { (*bp.sub(1)).to_bits() };
-        if link & FRAME_TYPE_MASK == FRAME_LUA && self.l().openuv.is_empty() {
+        if (link & FRAME_TYPE_MASK) == FRAME_LUA && self.l().openuv.is_empty() {
             let ret_ip = link as *const BCIns;
             let call_ins = unsafe { *ret_ip.sub(1) };
             Some(bc_b(call_ins) as i32 - 1)
@@ -594,7 +594,9 @@ impl Interp {
             () => {{
                 self.base = cur_base!();
                 self.pc = unsafe { ip.offset_from(self.bcp) as usize };
-                self.l().debug_pc = self.pc;
+                let l = self.l();
+                l.debug_pc = self.pc;
+                l.base = self.base;
             }};
         }
         macro_rules! resync {
@@ -832,6 +834,8 @@ impl Interp {
             }
             let ins = unsafe { *ip };
             ip = unsafe { ip.add(1) };
+            // Always keep debug_pc current so error messages have source info.
+            self.l().debug_pc = unsafe { ip.offset_from(self.bcp) as usize };
             let a = bc_a(ins);
             match bc_op(ins) {
                 // -- Comparisons (ORDER matters; see bc.rs) --
@@ -1490,7 +1494,7 @@ impl Interp {
                     {
                         let pt = cl.proto.as_ref();
                         let link = unsafe { (*bp.sub(1)).to_bits() };
-                        if (pt.flags & PROTO_VARARG) == 0 && link & FRAME_TYPE_MASK != FRAME_VARG {
+                        if (pt.flags & PROTO_VARARG) == 0 && (link & FRAME_TYPE_MASK) != FRAME_VARG {
                             let nargs = bc_d(ins) as usize - 1;
                             let fs_need = cur_base!()
                                 + a.max(nargs as u32) as usize
@@ -2186,7 +2190,7 @@ impl Interp {
                 // Frame link = the return PC; `want` is re-read from the
                 // CALL/CALLM/ITERC instruction at `pc[-1]` on return.
                 let link = unsafe { self.bcp.add(self.pc) } as u64;
-                debug_assert!(link & FRAME_TYPE_MASK == FRAME_LUA);
+                debug_assert!((link & FRAME_TYPE_MASK) == FRAME_LUA);
                 self.enter_lua(gf, func_slot, nargs, link);
                 Ok(())
             }
@@ -2259,6 +2263,8 @@ impl Interp {
         let l = self.l();
         let saved_base = l.base;
         let saved_top = l.top;
+        // Set a frame link so error walkers can find the caller's Lua frame.
+        l.stack[args_base - 1] = LuaValue::from_bits(((saved_base as u64) << 3) | FRAME_LUA);
         l.base = args_base;
         l.top = args_base + nargs;
         // C-call boundary is a GC safe point (args anchored, frames below).
@@ -2366,7 +2372,7 @@ impl Interp {
         }
         let mut base = self.base;
         let mut link = self.at(base - 1).to_bits();
-        while link & FRAME_TYPE_MASK == FRAME_VARG {
+        while (link & FRAME_TYPE_MASK) == FRAME_VARG {
             base -= (link >> 3) as usize;
             link = self.at(base - 1).to_bits();
         }
@@ -2376,7 +2382,7 @@ impl Interp {
         }
         self.multres = n;
 
-        if link & FRAME_TYPE_MASK == FRAME_CONT {
+        if (link & FRAME_TYPE_MASK) == FRAME_CONT {
             return self.cont_dispatch(base, link, n);
         }
 
@@ -2659,7 +2665,7 @@ pub fn resume_finish(
 ) -> LuaResult<usize> {
     co.c_depth += 1;
     let link = co.stack[slot + 1].to_bits();
-    if link & FRAME_TYPE_MASK != FRAME_C && link & FRAME_TYPE_MASK != FRAME_LUA {
+    if (link & FRAME_TYPE_MASK) != FRAME_C && (link & FRAME_TYPE_MASK) != FRAME_LUA {
         co.stack[slot + 1] = LuaValue::from_bits(FRAME_C);
     }
     for i in 0..nargs {
