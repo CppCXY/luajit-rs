@@ -61,9 +61,9 @@ pub fn tab_insert(l: &mut LuaState) -> LuaResult<i32> {
     };
     let n = nargs(l);
     if n == 2 {
-        t.as_mut()
-            .set(LuaValue::number(t.as_ref().len() as f64 + 1.0), arg(l, 1));
-    } else {
+        let pos = (t.as_ref().len() as i32) + 1;
+        t.as_mut().set_int(pos, arg(l, 1));
+    } else if n >= 3 {
         let pos = arg(l, 1).as_number().unwrap_or(1.0) as i32;
         let val = arg(l, 2);
         t.as_mut().set_int(pos, val);

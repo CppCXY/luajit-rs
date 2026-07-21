@@ -343,6 +343,7 @@ impl LuaTable {
 
     /// Table length (a border), ported from `lj_tab_len`.
     #[allow(clippy::len_without_is_empty)]
+    #[inline]
     pub fn len(&self) -> u32 {
         let mut hi = self.asize;
         hi = hi.saturating_sub(1);
