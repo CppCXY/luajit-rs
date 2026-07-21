@@ -84,13 +84,21 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
     let raw_str = std::str::from_utf8(&raw).map_err(|_| LuaError::Runtime)?;
     let name = raw_str.trim().to_string();
 
+    // First try the full name including pointer/array suffixes.
+    if let Some(id) = quick_type_id(&name) {
+        return Ok(id);
+    }
+    if let Some(&id) = l.global().cts.as_ref().and_then(|c| c.names.get(&name)) {
+        return Ok(id);
+    }
+
     // Strip `[...]` suffix (VLA or fixed-size array).
     let base = name
         .find('[')
         .map(|i| name[..i].trim().to_string())
         .unwrap_or_else(|| name.clone());
 
-    // Strip `*` suffix (pointer).
+    // Strip `*` suffix for pointer to custom types.
     let (base, is_ptr) = if let Some(s) = base.strip_suffix('*') {
         (s.trim().to_string(), true)
     } else if let Some(s) = base.strip_suffix(" *") {

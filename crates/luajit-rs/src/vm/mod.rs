@@ -107,11 +107,9 @@ const STACK_SAFETY: usize = 64;
 fn is_cdata_null(v: LuaValue) -> bool {
     if let Some(cd) = v.as_cdata() {
         let c = cd.as_ref();
-        // PVoid is CTypeID::PVoid as u32
         if c.ctypeid != crate::ffi::CTypeID::PVoid as u32 {
             return false;
         }
-        // Check that the pointer is null (all data bytes are zero)
         c.data.iter().all(|&b| b == 0)
     } else {
         false
