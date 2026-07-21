@@ -783,15 +783,72 @@ pub fn patch_exit(area: &mut McodeArea, stub_tails: &[(u32, u32)], exitno: u32, 
 }
 
 fn hex_dump(buf: &[u8]) -> String {
-    let mut s = String::with_capacity(buf.len() * 4);
+    let mut s = String::with_capacity(buf.len() * 6);
     for (off, chunk) in buf.chunks(16).enumerate() {
         use std::fmt::Write;
         let _ = write!(s, "{:04x}: ", off * 16);
-        for (i, &b) in chunk.iter().enumerate() {
-            if i == 8 { s.push(' '); }
+        for b in chunk {
             let _ = write!(s, "{:02x} ", b);
+        }
+        // Decode first instruction in this row
+        if chunk.len() >= 4 {
+            let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            s.push_str("  ");
+            s.push_str(&disasm_a64(w, off * 16));
         }
         s.push('\n');
     }
     s
+}
+
+/// Quick A64 disassembler for debugging. Covers the instructions we emit.
+fn disasm_a64(w: u32, _addr: usize) -> String {
+    let rd = (w & 0x1F) as u8;
+    let rn = ((w >> 5) & 0x1F) as u8;
+    let rm = ((w >> 16) & 0x1F) as u8;
+    let imm12 = ((w >> 10) & 0xFFF) as i32;
+    let imm19 = ((w >> 5) & 0x7FFFF) as i32;
+    let imm26 = (w & 0x3FF_FFFF) as i32;
+
+    if w & 0xFF00_0000 == 0xD100_0000 { return format!("sub x{}, x{}, #{}", rd, rn, imm12); }
+    if w & 0xFF00_0000 == 0x9100_0000 { return format!("add x{}, x{}, #{}", rd, rn, imm12); }
+    if w & 0xFFE0_0000 == 0x8B00_0000 { return format!("add x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0xCB00_0000 { return format!("sub x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0x8A00_0000 { return format!("and x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0x0A00_0000 { return format!("and w{}, w{}, w{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0xAA00_0000 { return format!("orr x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0x2A00_0000 { return format!("orr w{}, w{}, w{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0xCA00_0000 { return format!("eor x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0xEB00_001F { return format!("cmp x{}, x{}", rn, rm); }
+    if w & 0xFC00_0000 == 0xA900_0000 { let o=((w>>15)&0x7F)*8; return format!("stp x{}, x{}, [x{}, #{}]", rd, rm>>5/*rt2 is bits 14-10*/, rn, o); }
+    // rt2 is bits 14-10 for STP
+    let rt2 = ((w >> 10) & 0x1F) as u8;
+    if w & 0xFC00_0000 == 0xA940_0000 { let o=((w>>15)&0x7F)*8; return format!("ldp x{}, x{}, [x{}, #{}]", rd, rt2, rn, o); }
+    if w & 0xFFC0_0000 == 0xF940_0000 { return format!("ldr x{}, [x{}, #{}]", rd, rn, imm12*8); }
+    if w & 0xFFC0_0000 == 0xF900_0000 { return format!("str x{}, [x{}, #{}]", rd, rn, imm12*8); }
+    if w & 0xFFC0_0000 == 0xFD400000 { return format!("ldr d{}, [x{}, #{}]", rd, rn, imm12*8); }
+    if w & 0xFFC0_0000 == 0xFD000000 { return format!("str d{}, [x{}, #{}]", rd, rn, imm12*8); }
+    if w & 0xFFC0_0000 == 0xB9400000 { return format!("ldr w{}, [x{}, #{}]", rd, rn, imm12*4); }
+    if w & 0xFFFF_FC00 == 0xD280_0000 { return format!("movz x{}, #0x{:x}", rd, (w>>5)&0xFFFF); }
+    if w & 0xFFFF_FC00 == 0xF280_0000 { return format!("movk x{}, #0x{:x} lsl#{}", rd, (w>>5)&0xFFFF, ((w>>21)&3)*16); }
+    if w & 0xFF20_0000 == 0x1E60_2800 { return format!("fadd d{}, d{}, d{}", rd, rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_3800 { return format!("fsub d{}, d{}, d{}", rd, rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_0800 { return format!("fmul d{}, d{}, d{}", rd, rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_1800 { return format!("fdiv d{}, d{}, d{}", rd, rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_2000 { return format!("fcmp d{}, d{}", rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_4000 { return format!("fmov d{}, d{}", rd, rn); }
+    if w & 0xFF20_0000 == 0x1E61_4000 { return format!("fneg d{}, d{}", rd, rn); }
+    if w & 0xFC00_0000 == 0x5400_0000 { return format!("b.cond #{}", imm19); }
+    if w & 0xFC00_0000 == 0x1400_0000 { let off = if imm26&0x2000000!=0 {(imm26 as i32)-0x4000000}else{imm26 as i32}; return format!("b {}", off); }
+    if w & 0xFFFF_FC00 == 0x9E220_000 { return format!("scvtf d{}, w{}", rd, rn); }
+    if w & 0xFFFF_FC00 == 0x9E380_000 { return format!("fcvtzs x{}, d{}", rd, rn); }
+    if w & 0xFFFF_FC00 == 0x1E220_000 { return format!("scvtf d{}, w{}", rd, rn); }
+    if w & 0xFFFF_FC00 == 0x1E380_000 { return format!("fcvtzs w{}, d{}", rd, rn); }
+    if w & 0xFFFF_FC00 == 0x9E670_000 { return format!("fmov d{}, x{}", rd, rn); }
+    if w == 0xD65F_03C0 { return "ret".into(); }
+    if w & 0xFFFF_FC00 == 0xD63F_0000 { return format!("blr x{}", rn); }
+    if w & 0xFFE0_0000 == 0x6D00_0000 { let o=((w>>15)&0x7F)*8; return format!("stp d{}, d{}, [x{}, #{}]", rd, rt2, rn, o); }
+    if w & 0xFFE0_0000 == 0x6D40_0000 { let o=((w>>15)&0x7F)*8; return format!("ldp d{}, d{}, [x{}, #{}]", rd, rt2, rn, o); }
+    if w == 0xD503_201F { return "nop".into(); }
+    format!("??? 0x{:08x}", w)
 }
