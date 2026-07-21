@@ -447,7 +447,7 @@ impl<'a> Asm<'a> {
             _ => {}
         }
         let d = self.alloc(0)?;
-        self.code.scvtf_x(d, RSCRATCH);  // signed i64 → double (w was zero-extended to x)
+        self.code.scvtf_w(d, RSCRATCH as u8); // Wn → Dd signed i32→f64
         self.def(d);
         Ok(())
     }
@@ -578,9 +578,10 @@ impl<'a> Asm<'a> {
 
     // ═══ emit: main loop ════════════════════════════════════════════════════
     fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
-        // ── prologue ──
-        self.code.stp(29, 30, 31, -(FRAME as i32));
-        self.code.add_rr(29, 31, 0);               // mov fp, sp
+        // ── prologue: allocate frame, save callee-saved regs ──
+        self.code.sub_imm(31, 31, FRAME);               // sub sp, sp, #FRAME
+        self.code.stp(29, 30, 31, 0);                   // stp fp, lr, [sp]
+        self.code.add_rr(29, 31, 31);                   // mov fp, sp  (add fp, sp, xzr)
         for i in 0..SAVED_GPR_PAIRS {
             let off = 16 + (i as i32) * 16;
             self.code.stp(19 + i as u8 * 2, 19 + i as u8 * 2 + 1, 29, off);
@@ -589,8 +590,8 @@ impl<'a> Asm<'a> {
             let off = 16 + SAVED_GPR_PAIRS as i32 * 16 + (i as i32) * 16;
             self.code.stp_d(8 + i as u8 * 2, 8 + i as u8 * 2 + 1, 29, off);
         }
-        self.code.add_rr(RBASE, 0, 0);             // mov x19, x0 (base)
-        self.code.add_rr(RENV,  1, 0);              // mov x20, x1 (env)
+        self.code.add_rr(RBASE, 0, 31);                 // mov x19, x0  (add x19, x0, xzr)
+        self.code.add_rr(RENV,  1, 31);                 // mov x20, x1
         let inner = self.code.len() as u32;
 
         // ── handover (side traces) ──
@@ -696,7 +697,8 @@ impl<'a> Asm<'a> {
             let off = 16 + SAVED_GPR_PAIRS as i32*16 + (i as i32)*16;
             self.code.ldp_d(8+i as u8*2, 8+i as u8*2+1, 29, off);
         }
-        self.code.ldp(29, 30, 31, FRAME as i32); // ldp fp,lr,[sp],#FRAME
+        self.code.ldp(29, 30, 31, 0);  // ldp fp, lr, [sp]
+        self.code.add_imm(31, 31, FRAME); // add sp, sp, #FRAME
         self.code.ret();
 
         // ── exit stubs ──
