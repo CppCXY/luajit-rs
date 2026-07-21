@@ -171,7 +171,7 @@ enum Owner { None, Ins(IRRef), Konst(IRRef) }
 struct PhiInfo { phi: IRRef, lref: IRRef, rref: IRRef, num: bool }
 struct Stub { snapidx: usize, flush: Vec<(u8, IRRef)>, gc: bool }
 
-#[inline] fn pin(rg: u8) -> u16 { 1u16 << rg }
+#[inline] fn pin(rg: u8) -> u32 { 1u32 << rg }
 
 // ── Asm ────────────────────────────────────────────────────────────────────
 
@@ -256,7 +256,7 @@ impl<'a> Asm<'a> {
         if r>=REF_BIAS { self.loc[Self::iidx(r)] } else { (0..NREG as u8).find(|&i| self.owner[i as usize]==Owner::Konst(r)) }
     }
     fn steal_quiet(&mut self, rg: u8) { if let Owner::Ins(o)=self.owner[rg as usize] { self.loc[Self::iidx(o)]=None; } self.owner[rg as usize]=Owner::None; }
-    fn alloc(&mut self, pinned: u16) -> Result<u8, TraceError> {
+    fn alloc(&mut self, pinned: u32) -> Result<u8, TraceError> {
         for &rg in ALLOC_REGS.iter() { if pinned&pin(rg)==0 && self.owner[rg as usize]==Owner::None { return Ok(rg); } }
         for &rg in ALLOC_REGS.iter() { if pinned&pin(rg)!=0 { continue; } let dead=match self.owner[rg as usize] { Owner::Ins(o)=>self.last_use[Self::iidx(o)]<self.cur, Owner::Konst(o)=>self.klast_use[Self::kidx(o)]<self.cur, _=>unreachable!() }; if dead { self.steal_quiet(rg); return Ok(rg); } }
         let mut best:Option<(u8,IRRef)>=None;
@@ -265,7 +265,7 @@ impl<'a> Asm<'a> {
         if let Owner::Ins(o)=self.owner[rg as usize] { let i=Self::iidx(o); if !self.env_valid[i] { self.code.str_d(rg,RENV,Self::env_ofs(o)); self.env_valid[i]=true; } }
         self.steal_quiet(rg); Ok(rg)
     }
-    fn fetch_fp(&mut self, r: IRRef, pinned: u16) -> Result<u8, TraceError> {
+    fn fetch_fp(&mut self, r: IRRef, pinned: u32) -> Result<u8, TraceError> {
         if let Some(rg)=self.reg_of(r) { return Ok(rg); }
         let rg=self.alloc(pinned)?;
         if r>=REF_BIAS { self.code.ldr_d(rg,RENV,Self::env_ofs(r)); self.owner[rg as usize]=Owner::Ins(r); self.loc[Self::iidx(r)]=Some(rg); }
@@ -603,7 +603,7 @@ impl<'a> Asm<'a> {
         // ── prologue: allocate frame, save callee-saved regs ──
         self.code.sub_imm(31, 31, FRAME);               // sub sp, sp, #FRAME
         self.code.stp(29, 30, 31, 0);                   // stp fp, lr, [sp]
-        self.code.add_rr(29, 31, 31);                   // mov fp, sp  (add fp, sp, xzr)
+        self.code.add_imm(29, 31, 0);                 // mov fp, sp  (add fp, sp, #0)
         for i in 0..SAVED_GPR_PAIRS {
             let off = 16 + (i as i32) * 16;
             self.code.stp(19 + i as u8 * 2, 19 + i as u8 * 2 + 1, 29, off);
@@ -680,12 +680,31 @@ impl<'a> Asm<'a> {
         let lastsnap = self.tr.snap.len()-1;
         let looping = self.tr.linktype==TraceLink::Loop && self.tr.link==self.tr.traceno;
         if looping {
-            // Always use legacy path: write snapshot to stack, jump to head.
-            // The optimized path (loop_pos + phi_move) NYI.
             self.snapidx = lastsnap;
             self.tail_restore(lastsnap);
-            let off = (head as i64 - self.code.len() as i64) as i32 / 4;
-            self.code.b(off);
+            if let Some(lp) = self.loop_pos {
+                // PHI-aware back edge: copy rref values to lref homes,
+                // then jump to the variant part (just after LOOP).
+                for p in self.phis.clone() {
+                    if !p.num { continue; }
+                    let lhome = self.reg_of(p.lref);
+                    let pinned = if let Some(rg) = lhome { pin(rg) } else { 0 };
+                    if let Ok(rval) = self.fetch_fp(p.rref, pinned) {
+                        if let Some(lh) = lhome {
+                            if lh != rval { self.code.fmov_dd(lh, rval); }
+                        } else {
+                            self.code.str_d(rval, RENV, Self::env_ofs(p.lref));
+                            self.env_valid[Self::iidx(p.lref)] = true;
+                        }
+                    }
+                }
+                let off = (lp as i64 - self.code.len() as i64) as i32 / 4;
+                self.code.b(off);
+            } else {
+                // Legacy trace (no IR_LOOP): jump back to head.
+                let off = (head as i64 - self.code.len() as i64) as i32 / 4;
+                self.code.b(off);
+            }
         } else if matches!(self.tr.linktype, TraceLink::Uprec|TraceLink::Tailrec) && self.tr.link==self.tr.traceno {
             return Err(TraceError::NYIIR); // recursive tail NYI
         } else if self.tr.linktype==TraceLink::Root && let Some(target)=self.link {
