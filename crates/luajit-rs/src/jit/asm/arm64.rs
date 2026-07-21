@@ -850,18 +850,57 @@ impl<'a> Asm<'a> {
             self.snapidx = lastsnap;
             self.tail_restore(lastsnap);
             if let Some(lp) = self.loop_pos {
-                // PHI-aware back edge: copy rref values to lref homes,
-                // then jump to the variant part (just after LOOP).
-                for p in self.phis.clone() {
-                    if !p.num { continue; }
+                // PHI-aware back edge: parallel-assign rref values to lref
+                // homes, then jump to the variant part (just after LOOP).
+                // Handles cycles (a,b = b,a) by staging through a temp.
+                let phis: Vec<_> = self.phis.iter().filter(|p| p.num).cloned().collect();
+                // Detect conflicts: a PHI reads from a register that
+                // another PHI writes to (cyclic dependency).
+                let mut needs_temp = vec![false; phis.len()];
+                for i in 0..phis.len() {
+                    if let Some(ri) = self.reg_of(phis[i].rref) {
+                        for j in 0..phis.len() {
+                            if i == j { continue; }
+                            if self.reg_of(phis[j].lref) == Some(ri) {
+                                needs_temp[i] = true;
+                            }
+                        }
+                    }
+                }
+                // Phase 1: stage rrefs that conflict into temp registers.
+                let mut temp_used = 0u8;
+                for (i, p) in phis.iter().enumerate() {
+                    if needs_temp[i] {
+                        let temp_rg = FP_SCRATCH + temp_used;
+                        temp_used += 1;
+                        if let Ok(rval) = self.fetch_fp(p.rref, 0) {
+                            self.code.fmov_dd(temp_rg, rval);
+                        }
+                    }
+                }
+                // Phase 2: write to lref homes (from staged temps or
+                // directly from rrefs).
+                let mut temp_idx = 0u8;
+                for (i, p) in phis.iter().enumerate() {
                     let lhome = self.reg_of(p.lref);
-                    let pinned = if let Some(rg) = lhome { pin(rg) } else { 0 };
-                    if let Ok(rval) = self.fetch_fp(p.rref, pinned) {
+                    if needs_temp[i] {
+                        let temp_rg = FP_SCRATCH + temp_idx;
+                        temp_idx += 1;
                         if let Some(lh) = lhome {
-                            if lh != rval { self.code.fmov_dd(lh, rval); }
+                            if lh != temp_rg { self.code.fmov_dd(lh, temp_rg); }
                         } else {
-                            self.code.str_d(rval, RENV, Self::env_ofs(p.lref));
+                            self.code.str_d(temp_rg, RENV, Self::env_ofs(p.lref));
                             self.env_valid[Self::iidx(p.lref)] = true;
+                        }
+                    } else {
+                        let pinned = if let Some(rg) = lhome { pin(rg) } else { 0 };
+                        if let Ok(rval) = self.fetch_fp(p.rref, pinned) {
+                            if let Some(lh) = lhome {
+                                if lh != rval { self.code.fmov_dd(lh, rval); }
+                            } else {
+                                self.code.str_d(rval, RENV, Self::env_ofs(p.lref));
+                                self.env_valid[Self::iidx(p.lref)] = true;
+                            }
                         }
                     }
                 }
