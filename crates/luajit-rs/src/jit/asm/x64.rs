@@ -1136,7 +1136,7 @@ impl<'a> Asm<'a> {
     /// jcc are chosen so a NaN always takes the correct side (see
     /// fold_numcmp: U* variants succeed on unordered).
     fn asm_comp(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        debug_assert!(irt_isnum(ins.t()) && ins.is_guard());
+        debug_assert!((irt_isnum(ins.t()) || irt_isint(ins.t())) && ins.is_guard());
         let (x, y) = (ins.op1 as IRRef, ins.op2 as IRRef);
         let (fst, snd, cc) = match ins.op() {
             IROp::LT => (y, x, CC_BE),
