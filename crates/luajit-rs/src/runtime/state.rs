@@ -292,6 +292,10 @@ pub struct LuaState {
     /// `c_depth` recorded when this coroutine was (re)entered; yielding is
     /// legal only while `c_depth == c_base` (no intervening C frames).
     pub c_base: u32,
+    /// Current bytecode PC, updated by the VM for error location reporting.
+    pub debug_pc: usize,
+    /// Current chunk name for error location reporting.
+    pub debug_chunkname: Vec<u8>,
 }
 
 impl LuaState {
@@ -326,6 +330,8 @@ impl LuaState {
             suspend: Suspend::Start,
             c_depth: 0,
             c_base: 0,
+            debug_pc: 0,
+            debug_chunkname: Vec::new(),
         }
     }
 
@@ -413,10 +419,28 @@ impl LuaState {
         self.stack[self.top]
     }
 
-    /// Raise a runtime error carrying a string message. Interns the message
-    /// and stores it as the error object.
+    /// Raise a runtime error carrying a string message. Includes line/chunk
+    /// location when debug_pc is set.
     pub fn runtime_error(&mut self, msg: impl AsRef<[u8]>) -> crate::err::LuaError {
-        let sid = self.heap().intern(msg.as_ref());
+        let mut full = msg.as_ref().to_vec();
+        if self.debug_pc != 0 {
+            let func_slot = self.base.saturating_sub(2);
+            if let Some(fv) = self.stack[func_slot].as_func() {
+                if let crate::func::GcFunc::Lua(cl) = fv.as_ref() {
+                    let pt = cl.proto.as_ref();
+                    if self.debug_pc < pt.lines.len() {
+                        let line = pt.lines[self.debug_pc] as usize + pt.firstline as usize;
+                        if !self.debug_chunkname.is_empty() {
+                            let cn = String::from_utf8_lossy(&self.debug_chunkname);
+                            full.extend(format!("\n  at {}:{}", cn, line).bytes());
+                        } else {
+                            full.extend(format!("\n  at line {}", line).bytes());
+                        }
+                    }
+                }
+            }
+        }
+        let sid = self.heap().intern(&full);
         self.errval = self.heap().str_value(sid);
         crate::err::LuaError::Runtime
     }

@@ -596,6 +596,7 @@ impl Interp {
             () => {{
                 self.base = cur_base!();
                 self.pc = unsafe { ip.offset_from(self.bcp) as usize };
+                self.l().debug_pc = self.pc;
             }};
         }
         macro_rules! resync {

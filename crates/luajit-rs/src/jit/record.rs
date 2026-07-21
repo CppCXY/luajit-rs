@@ -7,8 +7,9 @@
 //! arithmetic, moves, constants and comparisons. Everything else aborts
 //! with NYIBC and feeds the penalty/blacklist engine, exactly like LuaJIT
 //! handles unrecordable bytecode. Calls, table access and returns arrive
-//! with later phases, as does number->integer narrowing (all numeric
-//! slots stay IRT_NUM for now, hence KSHORT interns a KNUM).
+//! with later phases, as does number->integer narrowing (integer-valued
+//! constants and FORL induction variables use IRT_INT; general narrowing
+//! will arrive with a dedicated backward narrowing pass).
 
 use crate::bc::*;
 use crate::gc::GcPtr;
@@ -582,12 +583,21 @@ impl Record {
     /// `rec_for_check` (numeric mode): guard a non-constant step's sign.
     fn for_check(&mut self, dir: bool, step: TRef) -> Result<(), TraceError> {
         if !tref_isk(step) {
-            let zero = self.cur.ir.knum(0.0);
-            self.cur.ir.emitir(
-                irtg(if dir { IROp::GE } else { IROp::LT }, IRT_NUM),
-                tref_ref(step),
-                tref_ref(zero),
-            )?;
+            if tref_isint(step) {
+                let zero = self.cur.ir.kint(0);
+                self.cur.ir.emitir(
+                    irtg(if dir { IROp::GE } else { IROp::LT }, IRT_INT),
+                    tref_ref(step),
+                    tref_ref(zero),
+                )?;
+            } else {
+                let zero = self.cur.ir.knum(0.0);
+                self.cur.ir.emitir(
+                    irtg(if dir { IROp::GE } else { IROp::LT }, IRT_NUM),
+                    tref_ref(step),
+                    tref_ref(zero),
+                )?;
+            }
         }
         Ok(())
     }
@@ -614,11 +624,26 @@ impl Record {
         let stop = self.fori_arg(fori, ra + FORL_STOP);
         let step = self.fori_arg(fori, ra + FORL_STEP);
         let dir = Self::for_direction(self.slot_val(l, base, ra + FORL_STEP));
-        self.scev.t = IRT_NUM;
-        self.scev.dir = dir;
-        self.scev.stop = tref_ref(stop);
-        self.scev.step = tref_ref(step);
-        self.for_check(dir, step)?;
+        let stop_val = self.slot_val(l, base, ra + FORL_STOP).num();
+        let step_val = self.slot_val(l, base, ra + FORL_STEP).num();
+        let int_step = num_isint(step_val);
+        let int_stop = num_isint(stop_val);
+        let narrow = int_step && int_stop;
+        if narrow {
+            let step_int = self.cur.ir.kint(step_val as i32);
+            let stop_int = self.cur.ir.kint(stop_val as i32);
+            self.scev.t = IRT_NUM;
+            self.scev.dir = dir;
+            self.scev.stop = tref_ref(stop_int);
+            self.scev.step = tref_ref(step_int);
+            self.for_check(dir, step_int)?;
+        } else {
+            self.scev.t = IRT_NUM;
+            self.scev.dir = dir;
+            self.scev.stop = tref_ref(stop);
+            self.scev.step = tref_ref(step);
+            self.for_check(dir, step)?;
+        }
         if idx == 0 {
             idx = self.sloadt(ra + FORL_IDX, IRT_NUM, IRSLOAD_INHERIT);
         }
@@ -626,7 +651,7 @@ impl Record {
             idx = self
                 .cur
                 .ir
-                .emitir(irtn(IROp::ADD), tref_ref(idx), tref_ref(step))?;
+                .emitir(irtn(IROp::ADD), tref_ref(idx), self.scev.step)?;
             self.set_base(ra + FORL_IDX, idx);
         }
         self.set_base(ra + FORL_EXT, idx);
@@ -847,13 +872,29 @@ impl Record {
 
     // -- Arithmetic ------------------------------------------------------------------
 
-    /// Numeric arithmetic (no narrowing yet): both operands must be nums.
+    /// Numeric arithmetic with integer narrowing: if both operands are
+    /// integers, emit an integer op; otherwise fall back to FP.
     fn arith(&mut self, rb: TRef, rc: TRef, op: IROp) -> Result<TRef, TraceError> {
-        if !tref_isnum(rb) || !tref_isnum(rc) {
-            return Err(TraceError::NYIBC); // Strings/metamethod arith NYI.
+        if !tref_isnum_or_int(rb) || !tref_isnum_or_int(rc) {
+            return Err(TraceError::NYIBC);
+        }
+        let int_rb = tref_isint(rb);
+        let int_rc = tref_isint(rc);
+        let use_int =
+            (int_rb && int_rc) && matches!(op, IROp::ADD | IROp::SUB | IROp::MUL | IROp::MOD);
+        if use_int {
+            if op == IROp::MOD {
+                return self
+                    .cur
+                    .ir
+                    .emitir(irti(IROp::MOD), tref_ref(rb), tref_ref(rc));
+            }
+            return self
+                .cur
+                .ir
+                .emitir(irti(op), tref_ref(rb), tref_ref(rc));
         }
         if op == IROp::MOD {
-            // x % y ==> x - floor(x/y)*y (IR_MOD is integer-only).
             let tmp = self
                 .cur
                 .ir

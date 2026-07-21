@@ -435,6 +435,18 @@ pub fn tref_isnil(tr: TRef) -> bool {
 pub fn tref_isint(tr: TRef) -> bool {
     tref_type(tr) == IRT_INT
 }
+
+#[inline]
+pub fn tref_isnum_or_int(tr: TRef) -> bool {
+    let t = tref_type(tr);
+    t == IRT_NUM || t == IRT_INT
+}
+
+#[inline]
+pub fn num_isint(n: f64) -> bool {
+    let i = n as i32;
+    i as f64 == n
+}
 #[inline]
 pub fn tref_istab(tr: TRef) -> bool {
     tref_type(tr) == IRT_TAB
@@ -638,6 +650,11 @@ impl IrBuf {
     #[inline]
     pub fn knum_val(&self, r: IRRef) -> f64 {
         f64::from_bits(self.k64_val(r))
+    }
+
+    /// Iterate over all constant IR instructions (in reverse-ref order).
+    pub fn const_iter(&self) -> impl Iterator<Item = &IRIns> {
+        self.k.iter()
     }
 
     /// All KGC constants as NaN-boxed values, for GC root marking.

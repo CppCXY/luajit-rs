@@ -475,11 +475,19 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 | IROp::DIV
                 | IROp::POW
                 | IROp::MIN
-                | IROp::MAX => {
-                    let x = f64::from_bits(val(env, ins.op1 as IRRef));
-                    let y = f64::from_bits(val(env, ins.op2 as IRRef));
-                    let z = super::opt_fold::fold_numarith(x, y, op);
-                    env[(r - REF_BIAS) as usize] = z.to_bits();
+                | IROp::MAX
+                | IROp::MOD => {
+                    if irt_isint(ins.t()) {
+                        let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
+                        let y = f64::from_bits(val(env, ins.op2 as IRRef)) as i32;
+                        let z = super::opt_fold::kfold_intop(x, y, op);
+                        env[(r - REF_BIAS) as usize] = (z as f64).to_bits();
+                    } else {
+                        let x = f64::from_bits(val(env, ins.op1 as IRRef));
+                        let y = f64::from_bits(val(env, ins.op2 as IRRef));
+                        let z = super::opt_fold::fold_numarith(x, y, op);
+                        env[(r - REF_BIAS) as usize] = z.to_bits();
+                    }
                 }
                 IROp::NEG => {
                     let x = f64::from_bits(val(env, ins.op1 as IRRef));
@@ -512,8 +520,21 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         let x = f64::from_bits(val(env, ins.op1 as IRRef));
                         let y = f64::from_bits(val(env, ins.op2 as IRRef));
                         super::opt_fold::fold_numcmp(x, y, op)
+                    } else if irt_isint(ins.t()) {
+                        let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
+                        let y = f64::from_bits(val(env, ins.op2 as IRRef)) as i32;
+                        match op {
+                            IROp::LT => x < y,
+                            IROp::GE => x >= y,
+                            IROp::LE => x <= y,
+                            IROp::GT => x > y,
+                            IROp::ULT => (x as u32) < (y as u32),
+                            IROp::UGE => (x as u32) >= (y as u32),
+                            IROp::ULE => (x as u32) <= (y as u32),
+                            _ => (x as u32) > (y as u32),
+                        }
                     } else {
-                        unreachable!("non-num ordered comparison in trace")
+                        unreachable!("non-num/int ordered comparison in trace")
                     };
                     debug_assert!(ins.is_guard());
                     if !cond {
@@ -535,6 +556,28 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     if !cond {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
+                }
+                IROp::CONV => {
+                    // op2 encodes target type; for now only NUM↔INT.
+                    let src = val(env, ins.op1 as IRRef);
+                    let tgt = ins.op2 as u8;
+                    let z = if irt_isnum(tgt) {
+                        // INT → NUM: value already stored as f64 bits.
+                        src
+                    } else if irt_isint(tgt) && ins.is_guard() {
+                        // NUM → INT (guarded): verify exact int32.
+                        let x = f64::from_bits(src);
+                        if super::ir::num_isint(x) {
+                            (x as i32 as f64).to_bits()
+                        } else {
+                            return exit_snapshot(l, base, cbase, tr, env, snapidx);
+                        }
+                    } else {
+                        // NUM → INT (unguarded).
+                        let x = f64::from_bits(src);
+                        (x as i32 as f64).to_bits()
+                    };
+                    env[(r - REF_BIAS) as usize] = z;
                 }
                 _ => unreachable!("unexpected IR op {:?} in phase-3 trace", op),
             }
@@ -684,6 +727,7 @@ fn exit_snapshot(
 fn typecheck(v: LuaValue, t: u8) -> bool {
     match irt_type(t) {
         IRT_NUM => v.is_number(),
+        IRT_INT => v.is_number(),
         IRT_NIL => v.is_nil(),
         IRT_FALSE => v.to_bits() == LuaValue::FALSE.to_bits(),
         IRT_TRUE => v.to_bits() == LuaValue::TRUE.to_bits(),

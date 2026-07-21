@@ -258,6 +258,9 @@ pub struct CTState {
     pub hash: [u16; CTHASH_SIZE],
     /// Typedef name → type ID index (for ffi.typeof/ffi.new name lookup).
     pub names: std::collections::HashMap<String, u32>,
+    /// Struct field lookup: (struct_id, field_name) → (field_id, offset_info).
+    /// offset_info stores the field's type_id (hi 16 bits) and byte offset (lo 16 bits).
+    pub field_names: std::collections::HashMap<(u32, String), (u32, u32)>,
 }
 
 impl Default for CTState {
@@ -274,6 +277,7 @@ impl CTState {
             miscmap: 0,
             hash: [u16::MAX; CTHASH_SIZE],
             names: std::collections::HashMap::new(),
+            field_names: std::collections::HashMap::new(),
         };
         cts.init_predefined();
         cts
@@ -391,6 +395,18 @@ impl CTState {
             let child = self.get(id);
             if !ctype_isattrib(child.info) { return child; }
             id = ctype_cid(child.info);
+        }
+    }
+
+    /// Resolve typedef chain to the underlying raw struct/enum ID.
+    pub fn resolve_raw_id(&self, mut id: u32) -> u32 {
+        loop {
+            let ct = self.get(id);
+            if ctype_isattrib(ct.info) || ctype_istypedef(ct.info) {
+                id = ctype_cid(ct.info);
+            } else {
+                return id;
+            }
         }
     }
 }

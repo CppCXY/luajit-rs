@@ -132,7 +132,7 @@ pub fn fold_numcmp(a: f64, b: f64, op: IROp) -> bool {
 }
 
 /// `kfold_intop` (32 bit wrapping semantics, MOD is Lua floor-mod).
-fn kfold_intop(k1: i32, k2: i32, op: IROp) -> i32 {
+pub fn kfold_intop(k1: i32, k2: i32, op: IROp) -> i32 {
     match op {
         IROp::ADD => k1.wrapping_add(k2),
         IROp::SUB => k1.wrapping_sub(k2),
@@ -240,7 +240,7 @@ fn fold_step(buf: &mut IrBuf, fins: &mut IRIns) -> Result<Step, TraceError> {
                 return Ok(Step::Retry);
             }
             // Note: x + 0 ==> x is INVALID for x = -0 (FP), int only.
-            if rop == Some(IROp::KINT) && fright.unwrap().i() == 0 {
+            if irt_isint(fins.t()) && rop == Some(IROp::KINT) && fright.unwrap().i() == 0 {
                 return Ok(Step::Ref(fins.op1 as IRRef)); // simplify_intadd_k
             }
             comm_swap(fins)

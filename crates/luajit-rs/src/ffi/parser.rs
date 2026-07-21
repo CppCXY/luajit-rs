@@ -17,7 +17,7 @@ enum Token {
     Eof, Ident, Integer,
     // Operators & punctuation
     Star, Amp, LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    Comma, Semicolon, Colon, Ellipsis, Eql,
+    Comma, Semicolon, Colon, Ellipsis, Eql, Question,
     // Keywords
     KwVoid, KwChar, KwShort, KwInt, KwLong, KwFloat, KwDouble,
     KwSigned, KwUnsigned, KwBool, KwComplex,
@@ -123,6 +123,7 @@ impl<'a> Lexer<'a> {
             b',' => Token::Comma, b';' => Token::Semicolon,
             b':' => Token::Colon,
             b'=' => Token::Eql,
+            b'?' => Token::Question,
             b'.' => {
                 if self.peek() == b'.' { self.advance(); if self.peek()==b'.' { self.advance(); Token::Ellipsis } else { Token::Ellipsis } }
                 else { Token::Eof }
@@ -256,23 +257,29 @@ impl<'a> Parser<'a> {
         let first_field_id = self.cts.top;
         let mut total_size: u32 = 0;
         let mut max_align: u32 = 1;
+        let mut field_infos: Vec<(String, u32, u32)> = Vec::new(); // (name, type_id, offset)
 
         while self.tok != Token::RBrace && self.tok != Token::Eof {
             let fdecl = self.parse_decl_spec()?;
 
-            // Read field name(s), bitfields
-            loop {
-                if self.tok == Token::Ident { self.next(); }
-                if self.tok == Token::Colon {
-                    self.next(); // eat :
-                    while self.tok != Token::Comma && self.tok != Token::Semicolon
-                        && self.tok != Token::RBrace && self.tok != Token::Eof {
-                        self.next();
-                    }
+            // Read field name(s)
+            let field_name = if self.tok == Token::Ident {
+                let name = String::from_utf8_lossy(&self.lex.buf).to_string();
+                self.next();
+                name
+            } else {
+                String::new()
+            };
+
+            // Bitfield
+            if self.tok == Token::Colon {
+                self.next(); // eat :
+                while self.tok != Token::Comma && self.tok != Token::Semicolon
+                    && self.tok != Token::RBrace && self.tok != Token::Eof {
+                    self.next();
                 }
-                if self.tok == Token::Comma { self.next(); continue; }
-                break;
             }
+            if self.tok == Token::Comma { self.next(); }
             if self.tok == Token::Semicolon { self.next(); }
 
             // Extract field info before any mutable ops on cts
@@ -287,6 +294,9 @@ impl<'a> Parser<'a> {
             self.cts.tab.push(CType {
                 info: finfo, size: total_size, sib: 0, next: 0, name: 0,
             });
+            if !field_name.is_empty() {
+                field_infos.push((field_name, fdecl.type_id, total_size));
+            }
             self.cts.top += 1;
             total_size += field_size.0;
         }
@@ -308,7 +318,12 @@ impl<'a> Parser<'a> {
             | (max_align.trailing_zeros() << ctinfo::SHIFT_ALIGN);
         self.cts.tab.push(CType { info: sinfo, size: total_size, sib: 0, next: 0, name: 0 });
         self.cts.top += 1;
-        Ok(self.cts.top - 1)
+        let struct_id = self.cts.top - 1;
+        // Register field names
+        for (name, type_id, offset) in field_infos {
+            self.cts.field_names.insert((struct_id, name), (type_id, offset));
+        }
+        Ok(struct_id)
     }
 
     // -- Enum --

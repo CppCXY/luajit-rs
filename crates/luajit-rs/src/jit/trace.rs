@@ -675,8 +675,8 @@ fn blacklist_pc(pt: GcPtr<Proto>, pc: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bc::BCIns;
-    use crate::jit::ir::{IROp, IRT_NUM, irt_type};
+    use crate::bc::{bc_d, bc_op, BCIns, BCOp};
+    use crate::jit::ir::IROp;
     use crate::state::Lua;
     use crate::value::LuaValue;
 
@@ -782,7 +782,7 @@ mod tests {
         let mut loops = 0;
         for r in crate::jit::ir::REF_FIRST..tr.ir.nins() {
             let ir = tr.ir.ir(r);
-            if ir.op() == IROp::ADD && irt_type(ir.t()) == IRT_NUM {
+            if ir.op() == IROp::ADD {
                 adds += 1;
             }
             if ir.is_guard() && ir.op() != IROp::LOOP {
@@ -1607,6 +1607,78 @@ mod tests {
     }
 
     // -- JIT correctness suite: run programs through JIT, verify results ---
+
+    #[test]
+    fn integer_narrowing_uses_kint_in_forl() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local s = 0 for i = 1, 200 do s = s + i end return s",
+        );
+        let forl_pc = find_op(pt, BCOp::FORL).unwrap();
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(20100.0));
+
+        let g = lua.global();
+        let jforl = pt.as_ref().bc[forl_pc];
+        assert!(
+            matches!(bc_op(jforl), BCOp::JFORL),
+            "FORL should be patched to JFORL, got {:?}",
+            bc_op(jforl)
+        );
+        let tno = bc_d(jforl);
+        let tr = g.jit.trace[tno as usize]
+            .as_deref()
+            .expect("trace registered");
+
+        let mut kint_count = 0;
+        let mut knum_count = 0;
+        for ins in tr.ir.const_iter() {
+            if ins.op() == IROp::KINT {
+                kint_count += 1;
+            }
+            if ins.op() == IROp::KNUM {
+                knum_count += 1;
+            }
+        }
+        assert!(
+            kint_count >= 2,
+            "expected at least 2 KINT constants (step + stop), got {}",
+            kint_count
+        );
+        // KNUM may still exist from initializers and other constants.
+        // After full narrowing lands, they will all become KINT.
+        assert!(
+            kint_count > 0 && knum_count <= 3,
+            "KINT={} KNUM={} — narrowing should reduce KNUM count",
+            kint_count,
+            knum_count
+        );
+    }
+
+    #[test]
+    fn integer_narrowing_correctness_basic() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_num(
+            jit_run(&mut lua, "local s=0 for i=1,10000 do s=s+i end return s"),
+            50005000.0,
+        );
+    }
+
+    #[test]
+    fn integer_narrowing_correctness_nested() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 for i=1,100 do for j=1,100 do s=s+1 end end return s",
+            ),
+            10000.0,
+        );
+    }
 
     fn jit_run(lua: &mut Lua, src: &str) -> LuaValue {
         let (f, _pt) = load_proto(lua, src);
