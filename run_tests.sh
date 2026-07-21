@@ -45,12 +45,12 @@ for f in "$TEST_DIR"/*.lua; do
 
     if [ $ec -eq 0 ]; then
         echo "  PASS  $name"
-        ((passed++))
+        (( ++passed ))
     else
         msg="${output:0:120}"
         [ ${#output} -gt 120 ] && msg="${msg}..."
         echo "  FAIL  $name  -- $msg"
-        ((failed++))
+        (( ++failed ))
     fi
 done
 
