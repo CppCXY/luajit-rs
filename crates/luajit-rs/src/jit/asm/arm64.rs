@@ -16,7 +16,7 @@ use super::super::record::{
     IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC, IRSLOAD_PARENT,
 };
 use super::super::{
-    GCtrace, TraceError, TraceLink, snap_ref,
+    GCtrace, SNAP_NORESTORE, TraceError, TraceLink, snap_ref, snap_slot,
 };
 
 // ── ARM64 encoding helpers ─────────────────────────────────────────────────
@@ -576,6 +576,28 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
+    // ═══ tail_restore: write snapshot values back to Lua stack ═══════════════
+    fn tail_restore(&mut self, snapidx: usize) {
+        let snap = &self.tr.snap[snapidx];
+        let ofs = snap.mapofs as usize;
+        for &sn in &self.tr.snapmap[ofs..ofs + snap.nent as usize] {
+            if sn & SNAP_NORESTORE != 0 { continue; }
+            let disp = (snap_slot(sn) as i32 - 2) * 8;
+            let rref = snap_ref(sn);
+            if rref >= REF_BIAS {
+                if let Some(rg) = self.loc[Self::iidx(rref)] {
+                    self.code.str_d(rg, RBASE, disp);
+                } else {
+                    self.code.ldr(RSCRATCH, RENV, Self::env_ofs(rref));
+                    self.code.str(RSCRATCH, RBASE, disp);
+                }
+            } else {
+                self.code.mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, rref));
+                self.code.str(RSCRATCH, RBASE, disp);
+            }
+        }
+    }
+
     // ═══ emit: main loop ════════════════════════════════════════════════════
     fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
         // ── prologue: allocate frame, save callee-saved regs ──
@@ -662,12 +684,13 @@ impl<'a> Asm<'a> {
                 // Loop back: flush snapshot, jump to loop head
                 self.snapidx = lastsnap;
                 for (rg, fr) in self.exit_flush_set(lastsnap) { self.code.str_d(rg,RENV,Self::env_ofs(fr)); }
-                let off = (lp as i64 - self.code.len() as i64) as i32 / 4 - 1;
+                let off = (lp as i64 - self.code.len() as i64) as i32 / 4;
                 self.code.b(off);
             } else {
-                // Legacy loop: restore snapshot and jump to head
-                for (rg, fr) in self.exit_flush_set(lastsnap) { self.code.str_d(rg,RENV,Self::env_ofs(fr)); }
-                let off = (head as i64 - self.code.len() as i64) as i32 / 4 - 1;
+                // Legacy loop: write snapshot to stack, jump to head
+                self.snapidx = lastsnap;
+                self.tail_restore(lastsnap);
+                let off = (head as i64 - self.code.len() as i64) as i32 / 4;
                 self.code.b(off);
             }
         } else if matches!(self.tr.linktype, TraceLink::Uprec|TraceLink::Tailrec) && self.tr.link==self.tr.traceno {
@@ -729,6 +752,11 @@ impl<'a> Asm<'a> {
         }
 
         // Allocate mcode
+        let dump_mcode = std::env::var("LUAJIT_RS_MCDUMP").is_ok();
+        if dump_mcode {
+            eprintln!("=== ARM64 MCODE tr={} PROLOGUE inner={} ===", self.tr.traceno, inner);
+            eprintln!("{}", hex_dump(&self.code.0));
+        }
         let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
         area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code.0);
         if !area.protect_exec() { return Err(TraceError::MCODEAL); }
@@ -759,4 +787,18 @@ pub fn patch_exit(area: &mut McodeArea, stub_tails: &[(u32, u32)], exitno: u32, 
         }
     }
     area.protect_exec();
+}
+
+fn hex_dump(buf: &[u8]) -> String {
+    let mut s = String::with_capacity(buf.len() * 4);
+    for (off, chunk) in buf.chunks(16).enumerate() {
+        use std::fmt::Write;
+        let _ = write!(s, "{:04x}: ", off * 16);
+        for (i, &b) in chunk.iter().enumerate() {
+            if i == 8 { s.push(' '); }
+            let _ = write!(s, "{:02x} ", b);
+        }
+        s.push('\n');
+    }
+    s
 }

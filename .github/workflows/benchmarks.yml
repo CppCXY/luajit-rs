@@ -136,6 +136,9 @@ jobs:
         run: cargo build --release
 
       - name: Run Benchmarks
+        env:
+          LUAJIT_RS_MCDUMP: 1
+          LUAJIT_RS_TRDUMP: 1
         run: |
           echo "## Benchmark Results - macOS (macos-latest)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
