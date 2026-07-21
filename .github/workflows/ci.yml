@@ -21,6 +21,8 @@ jobs:
             os: ubuntu-latest
           - name: windows-x64
             os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
 
