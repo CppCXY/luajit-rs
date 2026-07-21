@@ -1,8 +1,10 @@
+use crate::bc;
 use crate::err::LuaResult;
 use crate::func::GcFunc;
 use crate::state::LuaState;
 use crate::stdlib::{arg, nargs, push};
 use crate::value::LuaValue;
+use crate::vm::FRAME_TYPE_MASK;
 
 fn set_basemt_for(
     l: &mut LuaState,
@@ -57,80 +59,76 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
         format!("{}\nstack traceback:\n", msg)
     };
 
-    // Walk frames from the current base upward.
     let mut slot = l.base;
-    let stack = &l.stack;
-
-    loop {
+    let mut first = true;
+    for _ in 0..64 {
         if slot < 2 {
             break;
         }
-
-        let func = stack[slot - 2];
-        let link_bits = stack[slot - 1].to_bits();
+        // Skip FRAME_VARG wrappers.
+        let mut cur_slot = slot;
+        let mut cur_link = l.stack[cur_slot - 1].to_bits();
+        while (cur_link & FRAME_TYPE_MASK) as u64 == 3 /* FRAME_VARG */ {
+            cur_slot = cur_slot.saturating_sub((cur_link >> 3) as usize);
+            if cur_slot < 2 { break; }
+            cur_link = l.stack[cur_slot - 1].to_bits();
+        }
+        let func = l.stack[cur_slot - 2];
+        let frame_type = cur_link & FRAME_TYPE_MASK;
 
         if let Some(fv) = func.as_func() {
             match fv.as_ref() {
-                GcFunc::Lua(cl) => {
+                crate::func::GcFunc::Lua(cl) => {
                     let pt = cl.proto.as_ref();
-                    let src = pt.source.map(|sid| {
-                        String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned()
-                    }).unwrap_or_else(|| "?".to_string());
+                    let src = pt.source.and_then(|sid| {
+                        l.heap().strings.try_lookup(sid).map(|_| {
+                            String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned()
+                        })
+                    }).unwrap_or_else(|| "(unknown)".to_string());
 
-                    // For the current frame, get line from debug_pc.
-                    // For previous frames, get line from frame link (return PC).
-                    let pc = if slot == l.base {
-                        l.debug_pc
-                    } else if (link_bits & 0x3) == 0 {
-                        let ret_pc = link_bits as usize;
-                        if ret_pc >= 4 && ret_pc <= pt.bc.len() * 4 {
-                            (ret_pc / 4).saturating_sub(1)
+                    let pc = if first {
+                        l.debug_pc.saturating_sub(1)
+                    } else {
+                        let ret_ip = cur_link as *const crate::bc::BCIns;
+                        let call_ptr = unsafe { ret_ip.sub(1) };
+                        let bcp = pt.bc.as_ptr();
+                        if call_ptr >= bcp && call_ptr < unsafe { bcp.add(pt.bc.len()) } {
+                            (call_ptr as usize - bcp as usize) / 4
                         } else {
                             0
                         }
-                    } else {
-                        0
                     };
-
-                    let line = if pc > 0 && pc < pt.lines.len() {
+                    let line = if pc < pt.lines.len() {
                         pt.lines[pc] as usize + pt.firstline as usize
                     } else {
                         pt.firstline as usize
                     };
+                    trace.push_str(&format!("\t{}:{}: in {}\n", src, line,
+                        if first { "main chunk" } else { "function" }));
+                    first = false;
 
-                    trace.push_str(&format!(
-                        "\t{}:{}: in main chunk\n",
-                        src, line,
-                    ));
+                    // Walk to caller via frame link.
+                    if (frame_type as u64) == 0 && cur_link != 0 {
+                        let ret_ip = cur_link as *const crate::bc::BCIns;
+                        let call_ins = unsafe { *ret_ip.sub(1) };
+                        let a = crate::bc::bc_a(call_ins) as usize;
+                        slot = slot.saturating_sub(2 + a);
+                        continue;
+                    }
+                    break;
                 }
-                GcFunc::C(_) => {
+                crate::func::GcFunc::C(_) => {
                     trace.push_str("\t[C]: in function\n");
+                    first = false;
+                    if (frame_type as u64) == 0 && cur_link != 0 {
+                        slot = (cur_link >> 3) as usize;
+                        continue;
+                    }
+                    break;
                 }
             }
-        } else {
-            trace.push_str("\t?: in ?\n");
         }
-
-        // Follow frame link upward
-        let frame_type = link_bits as u8 & 0x3;
-        match frame_type {
-            0 => {
-                // FRAME_LUA: link is return PC. The previous frame's base
-                // is at the call site. We can't directly get it from the link.
-                break;
-            }
-            1 => {
-                // FRAME_C: host entry - stop
-                break;
-            }
-            3 => {
-                // FRAME_VARG: skip vararg wrappers
-                let delta = (link_bits >> 3) as usize;
-                if delta == 0 || delta > slot { break; }
-                slot -= delta;
-            }
-            _ => break,
-        }
+        break;
     }
 
     let sid = l.heap().intern(trace.as_bytes());
