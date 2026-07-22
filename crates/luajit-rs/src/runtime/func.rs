@@ -34,6 +34,11 @@ impl Upval {
         }
     }
 
+    /// Repoint the value pointer (used after stack reallocation).
+    pub fn repoint(&mut self, new_ptr: NonNull<LuaValue>) {
+        self.v = new_ptr;
+    }
+
     /// `func_emptyuv`: an empty, already-closed upvalue holding nil.
     /// The `v` pointer is patched to `&tv` after pool insertion.
     pub fn new_closed(immutable: bool) -> Upval {

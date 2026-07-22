@@ -102,6 +102,14 @@ impl GcHeap {
         self.total + self.strings.bytes() + crate::table::TABLE_EXTRA.with(|c| c.get())
             >= self.threshold
     }
+
+    /// Run a full GC cycle if the threshold has been exceeded.
+    /// Call at allocation points to prevent unbounded growth.
+    pub fn maybe_collect(g: &mut GlobalState) {
+        if g.heap.should_collect() {
+            crate::gc::full_gc(g);
+        }
+    }
 }
 
 /// Number of internal itype tags, used to size the base-metatable array.
@@ -275,8 +283,9 @@ pub enum Suspend {
 pub struct LuaState {
     g: GlobalRef,
     is_main: bool,
-    /// The value stack / register file. Fixed capacity; see `STACK_MAX`.
+    /// The value stack / register file. Grows dynamically up to `_max_stack`.
     pub stack: Vec<LuaValue>,
+    _max_stack: usize,
     pub base: usize,
     pub top: usize,
     /// Open upvalues pointing into this thread's stack, kept sorted by slot
@@ -309,18 +318,21 @@ impl LuaState {
     /// The stack starts tiny (8 slots) and grows lazily via `stack_ensure`;
     /// `is_main` pre-allocates the full 512 KiB so the main thread never
     /// pays for `Vec::resize` during execution. Coroutines cost ~64 bytes
-    /// at creation (zero-fill deferred until the stack is actually used).
+    /// at creation. The stack starts tiny and grows dynamically when the
+    /// depth requires it. Open upvalue pointers are re-anchored after every
+    /// resize so closures stay correct.
     pub fn new(g: GlobalRef, is_main: bool) -> LuaState {
         let max_stack = if is_main { STACK_MAX } else { CO_STACK_MAX };
-        let initial_len = if is_main { STACK_MAX } else { 8 };
+        let initial_len = 1024;
         LuaState {
             g,
             is_main,
             stack: {
-                let mut v = Vec::with_capacity(max_stack);
+                let mut v = Vec::with_capacity(initial_len);
                 v.resize(initial_len, LuaValue::NIL);
                 v
             },
+            _max_stack: max_stack,
             base: 0,
             top: 0,
             openuv: Vec::new(),
@@ -340,19 +352,32 @@ impl LuaState {
     }
 
     /// Ensure the stack can hold at least `need` slots (absolute index).
-    /// Called before any operation that might push `top` beyond the current
-    /// length. The stack grows by doubling, capped at `STACK_MAX`.
+    /// Grows dynamically by doubling, capped at `STACK_MAX`.  Open upvalue
+    /// pointers that reference the old stack are patched after a reallocation.
+    /// Also serves as a GC check point so loops that push values (e.g. table
+    /// stores, string concatenation) eventually trigger collection.
     #[inline]
     pub fn stack_ensure(&mut self, need: usize) {
         if need > self.stack.len() {
-            let new_len = (self.stack.len() * 2).max(need + 16).min(STACK_MAX);
-            debug_assert!(
-                new_len <= self.stack.capacity(),
-                "stack overflow: {} > {}",
-                new_len,
-                self.stack.capacity()
-            );
+            let new_len = (self.stack.len() * 2).max(need + 16).min(self._max_stack);
+            assert!(new_len <= self._max_stack, "stack overflow");
+            let old_ptr = self.stack.as_mut_ptr();
+            let old_len = self.stack.len();
             self.stack.resize(new_len, LuaValue::NIL);
+            let new_ptr = self.stack.as_mut_ptr();
+            if old_ptr != new_ptr {
+                let delta_bytes = new_ptr as isize - old_ptr as isize;
+                if delta_bytes != 0 {
+                    for &uv in &self.openuv {
+                        let uv_mut = uv.as_mut();
+                        let p = uv_mut.value_ptr() as *mut LuaValue;
+                        if p >= old_ptr && p < unsafe { old_ptr.add(old_len) } {
+                            let new_p = unsafe { (p as *mut u8).offset(delta_bytes) as *mut LuaValue };
+                            uv_mut.repoint(unsafe { NonNull::new_unchecked(new_p) });
+                        }
+                    }
+                }
+            }
         }
     }
 
