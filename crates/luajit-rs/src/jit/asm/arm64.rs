@@ -117,12 +117,12 @@ impl Emit {
     fn frintp(&mut self, dd: u8, dn: u8) { self.u32(0x1E64_C000|((dn as u32)<<5)|(dd as u32)); }
     fn frintz(&mut self, dd: u8, dn: u8) { self.u32(0x1E65_C000|((dn as u32)<<5)|(dd as u32)); }
     fn fcmp(&mut self, dn: u8, dm: u8) { self.u32(0x1E60_2000|((dm as u32)<<16)|((dn as u32)<<5)); }
-    fn scvtf_w(&mut self, dd: u8, wn: u8) { self.u32(0x1E22_0000|((wn as u32)<<5)|(dd as u32)); }
-    fn scvtf_x(&mut self, dd: u8, xn: u8) { self.u32(0x9E22_0000|((xn as u32)<<5)|(dd as u32)); }
-    fn ucvtf_w(&mut self, dd: u8, wn: u8) { self.u32(0x1E23_0000|((wn as u32)<<5)|(dd as u32)); }
-    fn ucvtf_x(&mut self, dd: u8, xn: u8) { self.u32(0x9E23_0000|((xn as u32)<<5)|(dd as u32)); }
-    fn fcvtzs_w(&mut self, wd: u8, dn: u8) { self.u32(0x1E38_0000|((dn as u32)<<5)|(wd as u32)); }
-    fn fcvtzs_x(&mut self, xd: u8, dn: u8) { self.u32(0x9E38_0000|((dn as u32)<<5)|(xd as u32)); }
+    fn scvtf_w(&mut self, dd: u8, wn: u8) { self.u32(0x1E62_0000|((wn as u32)<<5)|(dd as u32)); }
+    fn scvtf_x(&mut self, dd: u8, xn: u8) { self.u32(0x9E62_0000|((xn as u32)<<5)|(dd as u32)); }
+    fn ucvtf_w(&mut self, dd: u8, wn: u8) { self.u32(0x1E63_0000|((wn as u32)<<5)|(dd as u32)); }
+    fn ucvtf_x(&mut self, dd: u8, xn: u8) { self.u32(0x9E63_0000|((xn as u32)<<5)|(dd as u32)); }
+    fn fcvtzs_w(&mut self, wd: u8, dn: u8) { self.u32(0x1E78_0000|((dn as u32)<<5)|(wd as u32)); }
+    fn fcvtzs_x(&mut self, xd: u8, dn: u8) { self.u32(0x9E78_0000|((dn as u32)<<5)|(xd as u32)); }
 
     // fcsel Dd, Dn, Dm, cond
     fn fcsel(&mut self, dd: u8, dn: u8, dm: u8, cc: u32) { self.u32(0x1E20_0C00|((dm as u32)<<16)|(cc<<12)|((dn as u32)<<5)|(dd as u32)); }
@@ -405,9 +405,13 @@ impl<'a> Asm<'a> {
 
     // FLOAD: meta guard (table.metatable == nil)
     fn asm_meta_guard(&mut self, ins: &IRIns) {
-        // FIXME: meta guard fires spuriously, skip for now.
-        // Load table to validate env slot is accessible (side effects only).
-        let _ = ins;
+        const META_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
+        self.gpr_load_ref(RSCRATCH, ins.op1 as IRRef);
+        self.code.mov64(RSCRATCH2, crate::value::LJ_GCVMASK);
+        self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
+        self.code.ldr(RSCRATCH2, RSCRATCH, META_OFF);
+        self.code.cmp_imm(RSCRATCH2, 0);
+        self.guard(cond::NE);
     }
 
     // ── helper_call: emit a call to an extern "C" helper ──────────────────
