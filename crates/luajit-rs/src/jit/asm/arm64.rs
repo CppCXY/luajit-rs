@@ -240,7 +240,7 @@ impl<'a> Asm<'a> {
             let ofs = snap.mapofs as usize;
             for sn in &tr.snapmap[ofs..ofs+snap.nent as usize] {
                 let rr = snap_ref(*sn);
-                if rr>=REF_BIAS { a.mark_use(rr,lu); if !irt_isnum(tr.ir.ir(rr).t()) { a.needs_env[Self::iidx(rr)]=true; } }
+                if rr>=REF_BIAS { a.mark_use(rr,lu); a.needs_env[Self::iidx(rr)]=true; }
             }
         }
         for &(own,_) in &tr.parentmap { a.env_valid[Self::iidx(own as IRRef)]=true; }
@@ -657,10 +657,11 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
-    // ABS: clear sign bit
+    // ABS: clear sign bit.  Same pattern as asm_neg: fetch source first,
+    // then allocate dest separately to avoid the into_dst/fetch_fp ENV relaod trap.
     fn asm_abs(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let d = self.into_dst(ins.op1 as IRRef)?;
-        let m = self.fetch_fp(ins.op1 as IRRef, pin(d))?;
+        let m = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        let d = self.alloc(pin(m))?;
         self.code.fabs_d(d, m);
         self.def(d);
         Ok(())
@@ -1006,8 +1007,8 @@ impl<'a> Asm<'a> {
             let mut ec = self.exit_code(st.snapidx);
             if st.gc { ec |= 0x8000; } else { self.stub_tails.push((st.snapidx as u32, tail as u32)); }
             self.code.mov64(0, ec as u64); // x0 = exit code
-            // patchable tail: mov(4) + mov64(16) + br(4) = 24 bytes reserved
-            while self.code.len() < tail + 24 { self.code.nop(); }
+            // patchable tail: mov(4)+mov(4)+mov64(16)+br(4) = 28 bytes reserved
+            while self.code.len() < tail + 28 { self.code.nop(); }
             // b epilogue
             let off = (epilogue as i64 - self.code.len() as i64) as i32 / 4;
             self.code.b(off);
@@ -1050,6 +1051,7 @@ pub fn patch_exit(area: &mut McodeArea, stub_tails: &[(u32, u32)], exitno: u32, 
             let t = target as u64;
             let mut e = Emit(Vec::new());
             e.add_rr(0, 19, 31);  // mov x0, x19 — restore base for side trace
+            e.add_rr(1, 20, 31);  // mov x1, x20 — restore env for side trace
             e.mov64(16, t);         // mov x16, target
             e.br(16);               // br x16
             code[p..p+e.0.len()].copy_from_slice(&e.0);
