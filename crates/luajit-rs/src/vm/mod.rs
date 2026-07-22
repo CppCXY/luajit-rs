@@ -196,8 +196,10 @@ fn call_c(
     l.stack[args_base - 1] = LuaValue::from_bits(((saved_base as u64) << 3) | FRAME_LUA);
     l.base = args_base;
     l.top = args_base + nargs;
-    if l.global().heap.should_collect() {
-        crate::gc::full_gc(l.global());
+    let g = l.global();
+    if g.heap.should_collect() || g.heap.debt > 4096 {
+        crate::gc::full_gc(g);
+        g.heap.debt = 0;
     }
     let r = f(l);
     let n = match r {
@@ -2270,8 +2272,10 @@ impl Interp {
         l.base = args_base;
         l.top = args_base + nargs;
         // C-call boundary is a GC safe point (args anchored, frames below).
-        if l.global().heap.should_collect() {
-            crate::gc::full_gc(l.global());
+        let g = l.global();
+        if g.heap.should_collect() || g.heap.debt > 0 {
+            crate::gc::full_gc(g);
+            g.heap.debt = 0;
         }
         let r = f(l);
         let n = match r {

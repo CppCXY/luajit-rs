@@ -677,7 +677,7 @@ pub fn open(l: &mut LuaState) {
     let heap = unsafe { &mut (*g).heap };
 
     // -- ffi table ------------------------------------------------------------
-    let ffi_tab = heap.alloc_table(LuaTable::new(0, 16));
+    let ffi_tab = heap.alloc_table(LuaTable::new(0, 5)); // 20 entries → 32 nodes
     let builtins: [(&[u8], CFunction); 19] = [
         (b"cdef", ffi_cdef),
         (b"new", ffi_new),

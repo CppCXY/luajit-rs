@@ -31,6 +31,8 @@ pub struct GcHeap {
     pub total: usize,
     /// Next collection when `total + strings.bytes()` crosses this.
     pub threshold: usize,
+    /// Accumulated GC debt — paid down at safe points (C call boundaries).
+    pub debt: usize,
 }
 
 impl Default for GcHeap {
@@ -45,37 +47,55 @@ impl Default for GcHeap {
             threads: Pool::with_page_size(4),
             total: 0,
             threshold: crate::gc::GC_THRESHOLD_MIN,
+            debt: 0,
         }
     }
 }
 
 impl GcHeap {
+    /// Track an allocation and advance the GC threshold if necessary.
+    /// Mirrors LuaJIT's `lj_gc_step` debt tracking: when the total crosses
+    /// the threshold, we bump it forward instead of collecting immediately.
+    fn account_alloc(&mut self, size: usize) {
+        let live = self.total + self.strings.bytes() + crate::table::TABLE_EXTRA.with(|c| c.get());
+        if live >= self.threshold {
+            self.debt += size;
+            self.threshold = live + 16384; // Bump forward to avoid constant checks
+        }
+    }
+
     pub fn alloc_table(&mut self, t: LuaTable) -> GcPtr<LuaTable> {
         self.total += t.gc_size();
+        self.account_alloc(t.gc_size());
         self.tables.alloc(t)
     }
 
     pub fn alloc_proto(&mut self, p: Proto) -> GcPtr<Proto> {
         self.total += p.gc_size();
+        self.account_alloc(p.gc_size());
         self.protos.alloc(p)
     }
 
     pub fn alloc_func(&mut self, f: GcFunc) -> GcPtr<GcFunc> {
-        self.total += crate::gc::account_func(&f);
+        let size = crate::gc::account_func(&f);
+        self.total += size;
+        self.account_alloc(size);
         self.funcs.alloc(f)
     }
 
     pub fn alloc_upval(&mut self, uv: crate::func::Upval) -> GcPtr<crate::func::Upval> {
-        self.total += crate::gc::account_upval();
+        let size = crate::gc::account_upval();
+        self.total += size;
+        self.account_alloc(size);
         let p = self.upvals.alloc(uv);
-        // Closed upvalues point at their own inline slot; the address is
-        // only stable after pool insertion, so patch it up here.
         p.as_mut().init_closed();
         p
     }
 
     pub fn alloc_thread(&mut self, th: LuaState) -> GcPtr<LuaState> {
-        self.total += crate::gc::account_thread(&th);
+        let size = crate::gc::account_thread(&th);
+        self.total += size;
+        self.account_alloc(size);
         self.threads.alloc(th)
     }
 
@@ -88,7 +108,13 @@ impl GcHeap {
     }
 
     pub fn intern(&mut self, s: &[u8]) -> StrId {
-        self.strings.intern(s)
+        let prev_bytes = self.strings.bytes();
+        let sid = self.strings.intern(s);
+        let new_bytes = self.strings.bytes();
+        if new_bytes > prev_bytes {
+            self.account_alloc(new_bytes - prev_bytes);
+        }
+        sid
     }
 
     /// A `LuaValue` for an interned string id.
@@ -101,14 +127,6 @@ impl GcHeap {
     pub fn should_collect(&self) -> bool {
         self.total + self.strings.bytes() + crate::table::TABLE_EXTRA.with(|c| c.get())
             >= self.threshold
-    }
-
-    /// Run a full GC cycle if the threshold has been exceeded.
-    /// Call at allocation points to prevent unbounded growth.
-    pub fn maybe_collect(g: &mut GlobalState) {
-        if g.heap.should_collect() {
-            crate::gc::full_gc(g);
-        }
     }
 }
 
