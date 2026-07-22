@@ -545,20 +545,54 @@ impl<'a> Asm<'a> {
         self.ff_result(ins)
     }
 
-    // ALOAD: array load via helper
+    /// Guard key is exact int in [0, asize). Leaves table GcPtr in x9, int key in w11.
+    fn asm_array_head(&mut self, tab: IRRef, key: IRRef) -> Result<(), TraceError> {
+        const ASIZE_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, asize) as i32;
+        let sk = self.fetch_fp(key, 0)?;
+        self.gpr_load_ref(RSCRATCH, tab);
+        self.code.mov64(RSCRATCH2, crate::value::LJ_GCVMASK);
+        self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
+        self.code.fcvtzs_w(RSCRATCH3, sk);
+        self.code.scvtf_w(FP_SCRATCH, RSCRATCH3);
+        self.code.fcmp(sk, FP_SCRATCH);
+        self.guard(cond::NE);
+        self.guard(cond::VS);
+        self.code.ldr_w(RSCRATCH2, RSCRATCH, ASIZE_OFF);
+        self.code.cmp_rr_w(RSCRATCH3, RSCRATCH2);
+        self.guard(cond::CS);
+        Ok(())
+    }
+
+    // ALOAD: inlined array-part load (like x64 asm_aload)
     fn asm_aload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        // Fallback: use the shared helper jit_tget for now.
-        // TODO: inline fast path when array bounds are guarded.
-        let addr = super::super::exec::jit_tget as *const () as usize as u64;
-        self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
+        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
+        self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
+        self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
+        // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
+        self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
+        self.code.ldr(0, RSCRATCH2, 0); // x0 = [x10]
         self.ff_result(ins)
     }
-    // ASTORE: array store via helper
+
+    // ASTORE: inlined array-part store (set_int fast path)
     fn asm_astore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
         let carg = *self.tr.ir.ir(ins.op2 as IRRef);
         debug_assert_eq!(carg.op(), IROp::CARG);
-        let addr = super::super::exec::jit_tset as *const () as usize as u64;
-        self.helper_call(addr, &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef]);
+        self.asm_array_head(ins.op1 as IRRef, carg.op1 as IRRef)?;
+        self.code.cmp_imm(RSCRATCH3, 0);
+        self.guard(cond::EQ);
+        self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
+        // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
+        self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
+        let val = carg.op2 as IRRef;
+        if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
+            self.code.fmov_gpr(RSCRATCH3, sv);
+            self.code.str(RSCRATCH3, RSCRATCH2, 0);
+        } else {
+            self.gpr_load_ref(RSCRATCH3, val);
+            self.code.str(RSCRATCH3, RSCRATCH2, 0);
+        }
         Ok(())
     }
 
