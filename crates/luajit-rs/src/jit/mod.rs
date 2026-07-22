@@ -414,7 +414,7 @@ impl JitState {
                     self::asm::HOST_ARCH
                 }
             },
-            no_asm: std::env::var("LUAJIT_RS_NOASM").is_ok(),
+            no_asm: std::env::var("LUAJIT_RS_NOASM").is_ok() || self::asm::HOST_ARCH == self::asm::Arch::Arm64,
             trace_dump: std::env::var("LUAJIT_RS_TRDUMP").is_ok(),
             trace_dump2: std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2"),
         };
