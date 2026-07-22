@@ -363,9 +363,14 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         } else {
-            // FIXME: GC type guard fires spuriously — needs investigation
-            // of the asr+cmp encoding or RBASE slot offset for func types.
             self.code.ldr(RSCRATCH, RBASE, disp);
+            // Mirrors lj_asm_arm64.h: ASR tmp_reg, val_reg, #47; CMN tmp_reg, #(-itype)
+            let tmp = 30; // LR = x30, used as temp by LuaJIT
+            self.code.u32(0x936F_FC00 | ((RSCRATCH as u32) << 5) | (tmp as u32)); // asr x30, x9, #47
+            let ity = !(ty as u32);
+            let cmn = ((-(ity as i32)) as u32) & 0xFFF;
+            self.code.u32(0xB12003FF | (cmn << 10) | ((tmp as u32) << 5)); // cmn x30, #imm12
+            self.guard(cond::NE);
         }
         Ok(())
     }
@@ -420,24 +425,28 @@ impl<'a> Asm<'a> {
     // with the helper's result in x0. RBASE/RENV are callee-saved (x19/x20)
     // and survive the call automatically.
     fn helper_call(&mut self, addr: u64, args: &[IRRef]) {
-        // Park allocatable volatile FP registers that are still live.
+        // Collect phi lrefs — these are loop-carried and must survive calls.
+        let phi_lrefs: Vec<IRRef> = self.phis.iter().map(|p| p.lref).collect();
         for &rg in ALLOC_REGS.iter() {
-            if rg > 7 && rg < 16 { continue; } // callee-saved
+            if rg > 7 && rg < 16 { continue; }
             if let Owner::Ins(o) = self.owner[rg as usize] {
                 let i = Self::iidx(o);
                 if self.last_use[i] > self.cur && !self.env_valid[i] {
                     self.code.str_d(rg, RENV, Self::env_ofs(o));
                     self.env_valid[i] = true;
                 }
+                // Don't steal phi lrefs — they're loop-carried
+                if !phi_lrefs.contains(&o) {
+                    self.steal_quiet(rg);
+                }
+            } else {
+                self.steal_quiet(rg);
             }
-            self.steal_quiet(rg);
         }
-        // Load arguments into x0-x2 (ARM64 calling convention).
         debug_assert!(args.len() <= 3);
         for (n, &r) in args.iter().enumerate() {
             self.gpr_load_ref(n as u8, r);
         }
-        // Call the helper: blr RSCRATCH.
         self.code.mov64(RSCRATCH, addr);
         self.code.blr(RSCRATCH);
     }
@@ -558,8 +567,21 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
-    // GCSTEP: FIXME - GC exit doesn't properly trigger GC in caller
-    fn asm_gcstep(&mut self, _ins: &IRIns) {}
+    // GCSTEP: GC debt check — exit to interpreter when collection is due.
+    fn asm_gcstep(&mut self, ins: &IRIns) {
+        let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
+        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
+        self.code.mov64(RSCRATCH, total_addr);
+        self.code.ldr(RSCRATCH2, RSCRATCH, 0);
+        self.code.mov64(RSCRATCH3, extra_addr);
+        self.code.ldr(RSCRATCH, RSCRATCH3, 0);
+        self.code.add_rr(RSCRATCH2, RSCRATCH2, RSCRATCH);
+        self.code.mov64(RSCRATCH, thres_addr);
+        self.code.ldr(RSCRATCH, RSCRATCH, 0);
+        self.code.cmp_rr(RSCRATCH2, RSCRATCH);
+        self.guard_gc(cond::CS);
+    }
 
     // TOBIT: wrapping num→int32→num
     fn asm_tobit(&mut self, ins: &IRIns) -> Result<(), TraceError> {
@@ -721,7 +743,10 @@ impl<'a> Asm<'a> {
                 self.fixups.push((eq_pos, eq_guard_idx));
             }
         } else {
-            // HACK: skip non-numeric EQ/NE guard to test trace stability
+            self.gpr_load_ref(RSCRATCH, ins.op1 as IRRef);
+            self.gpr_load_ref(RSCRATCH2, ins.op2 as IRRef);
+            self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+            self.guard(if eq { cond::NE } else { cond::EQ });
         }
         Ok(())
     }
