@@ -321,6 +321,35 @@ fn lib_getmetatable(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
+fn call_reader(l: &mut LuaState, reader: LuaValue) -> Result<Vec<u8>, Vec<u8>> {
+    let saved_top = l.top;
+    let saved_base = l.base;
+    let fs = l.top + 16;
+    l.stack_ensure(fs + 4);
+    l.stack[fs] = reader;
+    // No args to reader
+    match crate::vm::execute(l, fs, 0, 1) {
+        Ok(_) => {
+            let r = l.stack[fs];
+            l.top = saved_top;
+            l.base = saved_base;
+            if r.is_nil() {
+                Ok(Vec::new())
+            } else if let Some(sid) = r.as_string_id() {
+                Ok(l.str_static(sid).to_vec())
+            } else {
+                let s = crate::stdlib::tostring_bytes(l, r);
+                Ok(s)
+            }
+        }
+        Err(e) => {
+            l.top = saved_top;
+            l.base = saved_base;
+            Err(b"reader function error".to_vec())
+        }
+    }
+}
+
 fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
     let src = arg(l, 0);
     if let Some(s) = src.as_string() {
@@ -351,13 +380,52 @@ fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
             }
         }
     } else if src.is_func() {
-        l.stack[l.base] = LuaValue::NIL;
-        l.stack[l.base + 1] = l
-            .global()
-            .heap
-            .str_value(l.global().heap.intern(b"reader function not supported"));
-        l.top = l.base + 2;
-        Ok(2)
+        let chunkname = if nargs(l) >= 2 {
+            let v = arg(l, 1);
+            if let Some(s2) = v.as_string() {
+                String::from_utf8_lossy(s2.as_ref().as_bytes()).into_owned()
+            } else {
+                "=(load)".to_string()
+            }
+        } else {
+            "=(load)".to_string()
+        };
+        // Collect chunks from reader function
+        let mut code: Vec<u8> = Vec::new();
+        loop {
+            let r = match call_reader(l, src) {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    l.stack[l.base] = LuaValue::NIL;
+                    l.stack[l.base + 1] = l.global().heap.str_value(
+                        l.global().heap.intern(
+                            format!("error calling reader: {}", String::from_utf8_lossy(e.as_ref())).as_bytes()
+                        )
+                    );
+                    l.top = l.base + 2;
+                    return Ok(2);
+                }
+            };
+            if r.is_empty() {
+                break;
+            }
+            code.extend_from_slice(&r);
+        }
+        match crate::state::load(l, code, &chunkname) {
+            Ok(v) => {
+                push(l, v);
+                Ok(1)
+            }
+            Err(msg) => {
+                l.stack[l.base] = LuaValue::NIL;
+                l.stack[l.base + 1] = l
+                    .global()
+                    .heap
+                    .str_value(l.global().heap.intern(msg.as_bytes()));
+                l.top = l.base + 2;
+                Ok(2)
+            }
+        }
     } else {
         Err(err_bad_arg(l, 1, "load", "string or function", ""))
     }

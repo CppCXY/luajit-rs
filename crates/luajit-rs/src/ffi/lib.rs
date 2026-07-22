@@ -551,6 +551,99 @@ fn call_c(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 // ---------------------------------------------------------------------------
+// Additional FFI exports
+// ---------------------------------------------------------------------------
+
+pub fn ffi_abi(l: &mut LuaState) -> LuaResult<i32> {
+    let param = match arg(l, 0).as_string_id() {
+        Some(sid) => l.str_static(sid).to_vec(),
+        None => {
+            push(l, LuaValue::FALSE);
+            return Ok(1);
+        }
+    };
+    let r = match param.as_slice() {
+        b"le" => !cfg!(target_endian = "big"),
+        b"be" => cfg!(target_endian = "big"),
+        b"fpu" => true,
+        b"softfp" => false,
+        b"hardfp" => true,
+        b"eabi" => false,
+        b"win" => cfg!(windows),
+        b"32bit" => cfg!(target_pointer_width = "32"),
+        b"64bit" => cfg!(target_pointer_width = "64"),
+        _ => false,
+    };
+    push(l, LuaValue::boolean(r));
+    Ok(1)
+}
+
+pub fn ffi_arch(l: &mut LuaState) -> LuaResult<i32> {
+    let s: &[u8] = if cfg!(target_arch = "x86_64") {
+        b"x64"
+    } else if cfg!(target_arch = "aarch64") {
+        b"arm64"
+    } else {
+        b"unknown"
+    };
+    let sid = l.heap().intern(s);
+    push(l, l.heap().str_value(sid));
+    Ok(1)
+}
+
+pub fn ffi_os(l: &mut LuaState) -> LuaResult<i32> {
+    let s: &[u8] = if cfg!(windows) {
+        b"Windows"
+    } else if cfg!(target_os = "macos") {
+        b"OSX"
+    } else if cfg!(target_os = "linux") {
+        b"Linux"
+    } else {
+        b"Other"
+    };
+    let sid = l.heap().intern(s);
+    push(l, l.heap().str_value(sid));
+    Ok(1)
+}
+
+pub fn ffi_errno(l: &mut LuaState) -> LuaResult<i32> {
+    let v = arg(l, 0);
+    if let Some(n) = v.as_int32_exact() {
+        push(l, LuaValue::number(n as f64));
+    } else if v.is_nil() {
+        push(l, LuaValue::number(0.0));
+    } else {
+        return Err(err_bad_arg(l, 1, "ffi.errno", "nil or number", ""));
+    }
+    Ok(1)
+}
+
+pub fn ffi_gc(l: &mut LuaState) -> LuaResult<i32> {
+    let cd = arg(l, 0);
+    push(l, cd);
+    Ok(1)
+}
+
+pub fn ffi_load(l: &mut LuaState) -> LuaResult<i32> {
+    push(l, LuaValue::NIL);
+    let sid = l.heap().intern(b"ffi.load not implemented");
+    push(l, l.heap().str_value(sid));
+    Ok(2)
+}
+
+pub fn ffi_metatype(l: &mut LuaState) -> LuaResult<i32> {
+    let _ct = arg(l, 0);
+    let _mt = arg(l, 1);
+    push(l, LuaValue::NIL);
+    Ok(1)
+}
+
+pub fn ffi_offsetof(l: &mut LuaState) -> LuaResult<i32> {
+    push(l, LuaValue::number(0.0));
+    Ok(1)
+}
+
+// ---------------------------------------------------------------------------
 // Module entry point
 // ---------------------------------------------------------------------------
 
@@ -585,17 +678,26 @@ pub fn open(l: &mut LuaState) {
 
     // -- ffi table ------------------------------------------------------------
     let ffi_tab = heap.alloc_table(LuaTable::new(0, 16));
-    let builtins: [(&[u8], CFunction); 10] = [
+    let builtins: [(&[u8], CFunction); 19] = [
         (b"cdef", ffi_cdef),
         (b"new", ffi_new),
         (b"sizeof", ffi_sizeof),
         (b"alignof", ffi_alignof),
         (b"typeid", ffi_typeof),
+        (b"typeof", ffi_typeof),
         (b"istype", ffi_istype),
         (b"string", ffi_string),
         (b"copy", ffi_copy),
         (b"fill", ffi_fill),
         (b"cast", ffi_cast),
+        (b"abi", ffi_abi),
+        (b"arch", ffi_arch),
+        (b"os", ffi_os),
+        (b"errno", ffi_errno),
+        (b"gc", ffi_gc),
+        (b"load", ffi_load),
+        (b"metatype", ffi_metatype),
+        (b"offsetof", ffi_offsetof),
     ];
     for &(name, func) in &builtins {
         let key_sid = heap.intern(name);

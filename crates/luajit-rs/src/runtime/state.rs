@@ -546,7 +546,11 @@ impl Default for Box<Lua> {
 pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue, String> {
     let g = l.global();
     let mut parser = crate::parse::Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
+    // Suppress panic output for compile errors (caught by catch_unwind).
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));
+    std::panic::set_hook(prev_hook);
     let mut proto = match result {
         Ok(p) => p,
         Err(e) => {

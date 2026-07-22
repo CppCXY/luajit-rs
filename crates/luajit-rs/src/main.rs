@@ -230,10 +230,10 @@ fn dofile(lua: &mut luajit_rs::state::Lua, name: &str) -> i32 {
     };
     let chunkname = format!(
         "@{}",
-        Path::new(name)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(name)
+        std::path::absolute(Path::new(name))
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| name.to_string())
     );
     let f = match luajit_rs::state::load(ll, src, &chunkname) {
         Ok(v) => v,
