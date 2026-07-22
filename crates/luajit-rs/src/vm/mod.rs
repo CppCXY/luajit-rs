@@ -192,10 +192,14 @@ fn call_c(
     let args_base = func_slot + 2;
     let saved_base = l.base;
     let saved_top = l.top;
+    // Set a frame link so error walkers can find the caller.
+    l.stack[args_base - 1] = LuaValue::from_bits(((saved_base as u64) << 3) | FRAME_LUA);
     l.base = args_base;
     l.top = args_base + nargs;
-    if l.global().heap.should_collect() {
-        crate::gc::full_gc(l.global());
+    let g = l.global();
+    if g.heap.should_collect() || g.heap.debt > 4096 {
+        crate::gc::full_gc(g);
+        g.heap.debt = 0;
     }
     let r = f(l);
     let n = match r {
@@ -2268,8 +2272,10 @@ impl Interp {
         l.base = args_base;
         l.top = args_base + nargs;
         // C-call boundary is a GC safe point (args anchored, frames below).
-        if l.global().heap.should_collect() {
-            crate::gc::full_gc(l.global());
+        let g = l.global();
+        if g.heap.should_collect() || g.heap.debt > 0 {
+            crate::gc::full_gc(g);
+            g.heap.debt = 0;
         }
         let r = f(l);
         let n = match r {

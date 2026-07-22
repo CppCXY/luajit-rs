@@ -31,6 +31,8 @@ pub struct GcHeap {
     pub total: usize,
     /// Next collection when `total + strings.bytes()` crosses this.
     pub threshold: usize,
+    /// Accumulated GC debt — paid down at safe points (C call boundaries).
+    pub debt: usize,
 }
 
 impl Default for GcHeap {
@@ -45,37 +47,55 @@ impl Default for GcHeap {
             threads: Pool::with_page_size(4),
             total: 0,
             threshold: crate::gc::GC_THRESHOLD_MIN,
+            debt: 0,
         }
     }
 }
 
 impl GcHeap {
+    /// Track an allocation and advance the GC threshold if necessary.
+    /// Mirrors LuaJIT's `lj_gc_step` debt tracking: when the total crosses
+    /// the threshold, we bump it forward instead of collecting immediately.
+    fn account_alloc(&mut self, size: usize) {
+        let live = self.total + self.strings.bytes() + crate::table::TABLE_EXTRA.with(|c| c.get());
+        if live >= self.threshold {
+            self.debt += size;
+            self.threshold = live + 16384; // Bump forward to avoid constant checks
+        }
+    }
+
     pub fn alloc_table(&mut self, t: LuaTable) -> GcPtr<LuaTable> {
         self.total += t.gc_size();
+        self.account_alloc(t.gc_size());
         self.tables.alloc(t)
     }
 
     pub fn alloc_proto(&mut self, p: Proto) -> GcPtr<Proto> {
         self.total += p.gc_size();
+        self.account_alloc(p.gc_size());
         self.protos.alloc(p)
     }
 
     pub fn alloc_func(&mut self, f: GcFunc) -> GcPtr<GcFunc> {
-        self.total += crate::gc::account_func(&f);
+        let size = crate::gc::account_func(&f);
+        self.total += size;
+        self.account_alloc(size);
         self.funcs.alloc(f)
     }
 
     pub fn alloc_upval(&mut self, uv: crate::func::Upval) -> GcPtr<crate::func::Upval> {
-        self.total += crate::gc::account_upval();
+        let size = crate::gc::account_upval();
+        self.total += size;
+        self.account_alloc(size);
         let p = self.upvals.alloc(uv);
-        // Closed upvalues point at their own inline slot; the address is
-        // only stable after pool insertion, so patch it up here.
         p.as_mut().init_closed();
         p
     }
 
     pub fn alloc_thread(&mut self, th: LuaState) -> GcPtr<LuaState> {
-        self.total += crate::gc::account_thread(&th);
+        let size = crate::gc::account_thread(&th);
+        self.total += size;
+        self.account_alloc(size);
         self.threads.alloc(th)
     }
 
@@ -88,7 +108,13 @@ impl GcHeap {
     }
 
     pub fn intern(&mut self, s: &[u8]) -> StrId {
-        self.strings.intern(s)
+        let prev_bytes = self.strings.bytes();
+        let sid = self.strings.intern(s);
+        let new_bytes = self.strings.bytes();
+        if new_bytes > prev_bytes {
+            self.account_alloc(new_bytes - prev_bytes);
+        }
+        sid
     }
 
     /// A `LuaValue` for an interned string id.
@@ -275,8 +301,9 @@ pub enum Suspend {
 pub struct LuaState {
     g: GlobalRef,
     is_main: bool,
-    /// The value stack / register file. Fixed capacity; see `STACK_MAX`.
+    /// The value stack / register file. Grows dynamically up to `_max_stack`.
     pub stack: Vec<LuaValue>,
+    _max_stack: usize,
     pub base: usize,
     pub top: usize,
     /// Open upvalues pointing into this thread's stack, kept sorted by slot
@@ -309,18 +336,21 @@ impl LuaState {
     /// The stack starts tiny (8 slots) and grows lazily via `stack_ensure`;
     /// `is_main` pre-allocates the full 512 KiB so the main thread never
     /// pays for `Vec::resize` during execution. Coroutines cost ~64 bytes
-    /// at creation (zero-fill deferred until the stack is actually used).
+    /// at creation. The stack starts tiny and grows dynamically when the
+    /// depth requires it. Open upvalue pointers are re-anchored after every
+    /// resize so closures stay correct.
     pub fn new(g: GlobalRef, is_main: bool) -> LuaState {
         let max_stack = if is_main { STACK_MAX } else { CO_STACK_MAX };
-        let initial_len = if is_main { STACK_MAX } else { 8 };
+        let initial_len = 1024;
         LuaState {
             g,
             is_main,
             stack: {
-                let mut v = Vec::with_capacity(max_stack);
+                let mut v = Vec::with_capacity(initial_len);
                 v.resize(initial_len, LuaValue::NIL);
                 v
             },
+            _max_stack: max_stack,
             base: 0,
             top: 0,
             openuv: Vec::new(),
@@ -340,19 +370,32 @@ impl LuaState {
     }
 
     /// Ensure the stack can hold at least `need` slots (absolute index).
-    /// Called before any operation that might push `top` beyond the current
-    /// length. The stack grows by doubling, capped at `STACK_MAX`.
+    /// Grows dynamically by doubling, capped at `STACK_MAX`.  Open upvalue
+    /// pointers that reference the old stack are patched after a reallocation.
+    /// Also serves as a GC check point so loops that push values (e.g. table
+    /// stores, string concatenation) eventually trigger collection.
     #[inline]
     pub fn stack_ensure(&mut self, need: usize) {
         if need > self.stack.len() {
-            let new_len = (self.stack.len() * 2).max(need + 16).min(STACK_MAX);
-            debug_assert!(
-                new_len <= self.stack.capacity(),
-                "stack overflow: {} > {}",
-                new_len,
-                self.stack.capacity()
-            );
+            let new_len = (self.stack.len() * 2).max(need + 16).min(self._max_stack);
+            assert!(new_len <= self._max_stack, "stack overflow");
+            let old_ptr = self.stack.as_mut_ptr();
+            let old_len = self.stack.len();
             self.stack.resize(new_len, LuaValue::NIL);
+            let new_ptr = self.stack.as_mut_ptr();
+            if old_ptr != new_ptr {
+                let delta_bytes = new_ptr as isize - old_ptr as isize;
+                if delta_bytes != 0 {
+                    for &uv in &self.openuv {
+                        let uv_mut = uv.as_mut();
+                        let p = uv_mut.value_ptr() as *mut LuaValue;
+                        if p >= old_ptr && p < unsafe { old_ptr.add(old_len) } {
+                            let new_p = unsafe { (p as *mut u8).offset(delta_bytes) as *mut LuaValue };
+                            uv_mut.repoint(unsafe { NonNull::new_unchecked(new_p) });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -439,22 +482,32 @@ impl LuaState {
                     crate::func::GcFunc::Lua(cl) => {
                         let pt = cl.proto.as_ref();
                         let pc = self.debug_pc.saturating_sub(1).min(pt.lines.len().saturating_sub(1));
-                        if pc < pt.lines.len() {
-                            let line = pt.lines[pc] as usize + pt.firstline as usize;
-                            let src = pt.source.and_then(|sid| {
-                                self.heap().strings.try_lookup(sid).map(|_ptr| {
-                                    let bytes = self.heap().strings.get(sid);
-                                    String::from_utf8_lossy(bytes).into_owned()
-                                })
-                            }).unwrap_or_else(|| "=?".to_string());
-                            let msg_str = String::from_utf8_lossy(&full);
-                            full = format!("@{}:{}: {}", src, line, msg_str).into_bytes();
-                        }
+                        let line = if pc < pt.lines.len() {
+                            pt.lines[pc] as usize
+                        } else {
+                            pt.firstline as usize
+                        };
+                        let src = pt.source.and_then(|sid| {
+                            self.heap().strings.try_lookup(sid).map(|_ptr| {
+                                let bytes = self.heap().strings.get(sid);
+                                // Strip leading '@' or '=' for display.
+                                let s = if bytes.starts_with(&[b'@']) || bytes.starts_with(&[b'=']) {
+                                    &bytes[1..]
+                                } else {
+                                    bytes
+                                };
+                                String::from_utf8_lossy(s).into_owned()
+                            })
+                        }).unwrap_or_else(|| "=?".to_string());
+                        let msg_str = String::from_utf8_lossy(&full);
+                        full = format!("{}:{}: {}", src, line, msg_str).into_bytes();
                         break;
                     }
                     crate::func::GcFunc::C(_) => {
-                        // C function: walk to caller via frame link.
-                        if (link_bits & FRAME_TYPE_MASK) == 0 {
+                        // Walk to caller via frame link.
+                        // FRAME_LUA=0 means the link encodes the caller's base.
+                        let ft = link_bits & FRAME_TYPE_MASK;
+                        if ft == 0 /* FRAME_LUA */ {
                             slot = (link_bits >> 3) as usize;
                             continue;
                         }
@@ -536,7 +589,11 @@ impl Default for Box<Lua> {
 pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue, String> {
     let g = l.global();
     let mut parser = crate::parse::Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
+    // Suppress panic output for compile errors (caught by catch_unwind).
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));
+    std::panic::set_hook(prev_hook);
     let mut proto = match result {
         Ok(p) => p,
         Err(e) => {
@@ -577,6 +634,10 @@ pub fn register_proto(heap: &mut GcHeap, mut proto: Proto) -> GcPtr<Proto> {
             let taken = std::mem::replace(&mut proto.kgc[i], crate::proto::KGc::Str(0));
             if let crate::proto::KGc::Proto(child) = taken {
                 let r = register_proto(heap, *child);
+                // Propagate parent source to child protos that don't have one.
+                if r.as_ref().source.is_none() {
+                    r.as_mut().source = proto.source;
+                }
                 proto.kgc[i] = crate::proto::KGc::ProtoRef(r);
             }
         }
@@ -620,6 +681,45 @@ mod tests {
                 let pt = c.proto.as_ref();
                 assert_eq!(pt.numparams, 0);
                 assert!(!pt.bc.is_empty());
+            }
+            _ => panic!("expected Lua closure"),
+        }
+    }
+
+    #[test]
+    fn load_stores_source_on_proto() {
+        let mut lua = Lua::new();
+        let f = load(lua.main(), b"error('test')".to_vec(), "@test.lua").unwrap();
+        match f.as_func().unwrap().as_ref() {
+            GcFunc::Lua(c) => {
+                let pt = c.proto.as_ref();
+                assert!(pt.source.is_some(), "source should be set");
+                let sid = pt.source.unwrap();
+                let bytes = lua.global().heap.strings.get(sid);
+                assert_eq!(bytes, b"@test.lua");
+            }
+            _ => panic!("expected Lua closure"),
+        }
+    }
+
+    #[test]
+    fn nested_proto_inherits_source() {
+        let mut lua = Lua::new();
+        let f = load(lua.main(), b"local function f() end".to_vec(), "@test.lua").unwrap();
+        match f.as_func().unwrap().as_ref() {
+            GcFunc::Lua(c) => {
+                assert!(c.proto.as_ref().source.is_some(), "main chunk should have source");
+                let pt = c.proto.as_ref();
+                for k in &pt.kgc {
+                    if let crate::proto::KGc::ProtoRef(child) = k {
+                        assert!(child.as_ref().source.is_some(), "child proto should inherit source");
+                        let sid = child.as_ref().source.unwrap();
+                        let bytes = lua.global().heap.strings.get(sid);
+                        assert_eq!(bytes, b"@test.lua");
+                        return;
+                    }
+                }
+                panic!("no child proto found");
             }
             _ => panic!("expected Lua closure"),
         }

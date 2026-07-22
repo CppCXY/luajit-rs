@@ -2698,8 +2698,12 @@ impl<'a> Parser<'a> {
             }
         }
         if parse_isend(self.ls.tok) && self.ls.tok != Tok::Until {
-            let nactvar = self.cur().scopes.last().unwrap().nactvar;
-            self.vstack[idx].slot = nactvar;
+            let scope = self.cur().scopes.last().unwrap();
+            let nactvar = scope.nactvar;
+            let vstart = scope.vstart as usize;
+            // Set label slot to the slot of the first goto/label entry in
+            // this scope, matching LJ's `bl->vstart[bl->nactvar].slot`.
+            self.vstack[idx].slot = self.vstack[vstart + nactvar as usize].slot;
         }
         let vstart = self.cur().scopes.last().unwrap().vstart;
         self.gola_resolve(vstart, idx);
@@ -2998,6 +3002,9 @@ impl<'a> Parser<'a> {
             Tok::Label => {
                 self.parse_label();
             }
+            Tok::Char(b';') => {
+                self.ls.next();
+            }
             // Not expressible as a match guard: `peek` needs `&mut self`.
             #[allow(clippy::collapsible_match)]
             Tok::Goto => {
@@ -3020,7 +3027,9 @@ impl<'a> Parser<'a> {
         self.synlevel_begin();
         while !islast && !parse_isend(self.ls.tok) {
             islast = self.parse_stmt();
-            self.lex_opt(Tok::Char(b';'));
+            while self.ls.tok == Tok::Char(b';') {
+                self.ls.next();
+            }
             debug_assert!(
                 self.cur().framesize as u32 >= self.cur().freereg
                     && self.cur().freereg >= self.cur().nactvar

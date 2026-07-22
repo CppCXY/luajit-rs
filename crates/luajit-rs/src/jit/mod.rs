@@ -303,7 +303,7 @@ impl Default for HotPenalty {
 
 pub const PENALTY_SLOTS: usize = 64; // Penalty cache slots. Power of two.
 pub const PENALTY_MIN: u32 = 36 * 2; // Minimum penalty value.
-pub const PENALTY_MAX: u32 = 60000; // Maximum penalty value.
+pub const PENALTY_MAX: u32 = 6000; // Maximum penalty value.
 pub const PENALTY_RNDBITS: u32 = 4; // # of random bits added to the penalty.
 
 /// Small PRNG for penalty randomization (stands in for lj_prng's TW223;

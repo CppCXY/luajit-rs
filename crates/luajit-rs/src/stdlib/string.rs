@@ -184,22 +184,108 @@ fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
         Some(sid) => l.str_static(sid).to_vec(),
         None => return Err(err_bad_arg(l, 2, "string.gsub", "string", "")),
     };
-    let repl = match arg(l, 2).as_string_id() {
-        Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg(l, 3, "string.gsub", "string", "")),
-    };
+    let repl_arg = arg(l, 2);
     let max = arg(l, 3).as_number().map(|n| n as usize);
 
-    match gsub(&s, &pat, &repl, max) {
-        Ok((result, count)) => {
-            let sid = l.heap().intern(&result);
-            l.stack[l.base] = l.heap().str_value(sid);
-            l.stack[l.base + 1] = LuaValue::number(count as f64);
-            l.top = l.base + 2;
-            Ok(2)
+    if repl_arg.is_func() {
+        let (result, count) = gsub_fn(l, &s, &pat, repl_arg, max)?;
+        let sid = l.heap().intern(&result);
+        l.stack[l.base] = l.heap().str_value(sid);
+        l.stack[l.base + 1] = LuaValue::number(count as f64);
+        l.top = l.base + 2;
+        Ok(2)
+    } else {
+        let repl = match repl_arg.as_string_id() {
+            Some(sid) => l.str_static(sid).to_vec(),
+            None => return Err(err_bad_arg(l, 3, "string.gsub", "string or function", "")),
+        };
+        match gsub(&s, &pat, &repl, max) {
+            Ok((result, count)) => {
+                let sid = l.heap().intern(&result);
+                l.stack[l.base] = l.heap().str_value(sid);
+                l.stack[l.base + 1] = LuaValue::number(count as f64);
+                l.top = l.base + 2;
+                Ok(2)
+            }
+            Err(e) => Err(l.runtime_error(e.as_bytes())),
         }
-        Err(e) => Err(l.runtime_error(e.as_bytes())),
     }
+}
+
+fn gsub_fn(
+    l: &mut LuaState,
+    s: &[u8],
+    pat: &[u8],
+    func: LuaValue,
+    max: Option<usize>,
+) -> Result<(Vec<u8>, usize), crate::err::LuaError> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut count = 0;
+    loop {
+        if let Some(limit) = max {
+            if count >= limit { break; }
+        }
+        match crate::stdlib::pattern::find(s, pat, pos) {
+            Ok(Some((m_start, m_end, caps))) => {
+                out.extend_from_slice(&s[pos..m_start]);
+                let mut args: Vec<LuaValue> = Vec::new();
+                for i in 0..caps.len() {
+                    match caps.get(i) {
+                        Some(crate::stdlib::pattern::CaptureValue::Substring(cs, ce)) => {
+                            let sid = l.heap().intern(&s[*cs..*ce]);
+                            args.push(l.heap().str_value(sid));
+                        }
+                        Some(crate::stdlib::pattern::CaptureValue::Position(_)) => {
+                            args.push(LuaValue::number(m_start as f64 + 1.0));
+                        }
+                        None => args.push(LuaValue::NIL),
+                    }
+                }
+                let r = call_lua_fn(l, func, &args)?;
+                if let Some(sid) = r.as_string_id() {
+                    out.extend_from_slice(l.str_static(sid));
+                } else if r.is_false() || r.is_nil() {
+                    // Use empty string for false/nil
+                } else {
+                    let ts = crate::stdlib::tostring_bytes(l, r);
+                    out.extend_from_slice(&ts);
+                }
+                count += 1;
+                if m_end == m_start {
+                    if m_end == s.len() { break; }
+                    out.push(s[m_end]);
+                    pos = m_end + 1;
+                } else {
+                    pos = m_end;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(l.runtime_error(e.as_bytes())),
+        }
+    }
+    out.extend_from_slice(&s[pos..]);
+    Ok((out, count))
+}
+
+fn call_lua_fn(
+    l: &mut LuaState,
+    func: LuaValue,
+    args: &[LuaValue],
+) -> Result<LuaValue, crate::err::LuaError> {
+    let saved_top = l.top;
+    let saved_base = l.base;
+    let fs = l.top + 16;
+    l.stack_ensure(fs + 4 + args.len());
+    l.stack[fs] = func;
+    for (i, a) in args.iter().enumerate() {
+        l.stack[fs + 2 + i] = *a;
+    }
+    let _ = crate::vm::execute(l, fs, args.len(), 1)?;
+    let r = l.stack[fs];
+    l.top = saved_top;
+    l.base = saved_base;
+    Ok(r)
 }
 
 pub fn str_byte(l: &mut LuaState) -> LuaResult<i32> {

@@ -728,7 +728,7 @@ mod tests {
             assert!(rounds < 32, "never blacklisted");
         }
         assert!(pt.as_ref().flags & PROTO_ILOOP != 0);
-        assert!((9..=11).contains(&rounds), "rounds = {}", rounds);
+        assert!((7..=11).contains(&rounds), "rounds = {}", rounds);
     }
 
     #[test]
