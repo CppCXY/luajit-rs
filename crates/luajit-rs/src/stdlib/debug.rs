@@ -1,6 +1,4 @@
-use crate::bc;
 use crate::err::LuaResult;
-use crate::func::GcFunc;
 use crate::state::LuaState;
 use crate::stdlib::{arg, nargs, push};
 use crate::value::LuaValue;

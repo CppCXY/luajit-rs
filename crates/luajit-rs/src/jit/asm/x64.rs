@@ -214,7 +214,10 @@ impl<'a> Asm<'a> {
             link,
             stub_tails: Vec::new(),
         };
+        #[cfg(target_arch = "x86_64")]
         let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
+        #[cfg(not(target_arch = "x86_64"))]
+        let sse41 = false;
         for r in REF_FIRST..tr.ir.nins() {
             let ins = tr.ir.ir(r);
             match ins.op() {
@@ -433,18 +436,6 @@ impl<'a> Asm<'a> {
             }
             self.cur = r;
             let ins = *self.tr.ir.ir(r);
-            if std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2") {
-                eprintln!(
-                    "  tr{} {:#05x} {:04} {:?} {} {} t={}",
-                    self.tr.traceno,
-                    self.code.len(),
-                    r - REF_BIAS,
-                    ins.op(),
-                    ins.op1 as i32 - REF_BIAS as i32,
-                    ins.op2 as i32 - REF_BIAS as i32,
-                    ins.t(),
-                );
-            }
             match ins.op() {
                 IROp::NOP | IROp::BASE => {}
                 IROp::LOOP => self.asm_loop_head(),

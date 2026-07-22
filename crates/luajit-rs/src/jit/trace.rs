@@ -10,8 +10,10 @@
 //! code backend. Until then the start instruction's hot counter is parked
 //! at 0xffff so a finished loop only re-checks its registry entry rarely.
 
-use crate::bc::{BCOp, bc_isret, bc_j, bc_op, setbc_d, setbc_op};
+use crate::bc::{self, BCOp, bc_isret, bc_j, bc_op, setbc_d, setbc_op};
 use crate::gc::GcPtr;
+use crate::jit::ir::IrBuf;
+use crate::jit::{GCtrace, record};
 use crate::proto::{PROTO_ILOOP, PROTO_NOJIT, Proto};
 use crate::state::{GlobalState, LuaState};
 
@@ -29,14 +31,6 @@ const HOTCOUNT_PARKED: HotCount = 0xffff;
 /// ITERL / LOOP or a FUNCF header). Reset the counter and start a root
 /// trace unless the compiler is busy.
 pub fn trace_hot(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        // ARM64 JIT is disabled: loop back-edge and side-trace linking
-        // are not yet stable on this architecture.
-        let _ = (l, base, pt, pc);
-        return;
-    }
-    #[cfg(not(target_arch = "aarch64"))]
     {
         let g = l.global();
         let js = &mut g.jit;
@@ -59,12 +53,6 @@ pub fn trace_hot(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
 /// resume point. The caller (the trace executor) has already restored
 /// the snapshot to the Lua stack.
 pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = (l, base, parent, exitno);
-        return;
-    }
-    #[cfg(not(target_arch = "aarch64"))]
     {
         let g = l.global();
         let js = &mut g.jit;
@@ -92,7 +80,7 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
     // Side traces start as a pseudo-JMP: `pc` may lie inside an inlined
     // callee, so the root proto's bytecode must not be indexed with it.
     let startins = if js.parent != 0 {
-        crate::bc::bcins_ad(BCOp::JMP, 0, 0)
+        bc::bcins_ad(BCOp::JMP, 0, 0)
     } else {
         pt.as_ref().bc[pc]
     };
@@ -191,7 +179,7 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
         }
         // The registry owns the parent; the borrow is split like in the
         // executor (traces are never freed while the compiler runs).
-        let t: *const super::GCtrace = &**js.trace[parent as usize]
+        let t: *const GCtrace = &**js.trace[parent as usize]
             .as_ref()
             .expect("freed parent trace");
         if let Err(e) = rec.snap_replay(unsafe { &*t }, exitno) {
@@ -262,7 +250,7 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
             }
         }
     }
-    if 1 + pt.as_ref().framesize as usize >= super::record::MAX_JSLOTS {
+    if 1 + pt.as_ref().framesize as usize >= record::MAX_JSLOTS {
         let g = l.global();
         g.jit.err = TraceError::STACKOV;
         g.jit.state = TraceState::Err;
@@ -400,9 +388,9 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
     let trace = std::mem::replace(
         &mut rec.cur,
         // Placeholder; `rec` is dropped right after.
-        super::GCtrace {
+        GCtrace {
             traceno: 0,
-            ir: super::ir::IrBuf::new(0, 0),
+            ir: IrBuf::new(0, 0),
             snap: Vec::new(),
             snapmap: Vec::new(),
             mcode: None,
@@ -418,7 +406,6 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             stub_tails: Vec::new(),
         },
     );
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let trace = {
         // `lj_asm_trace`: assemble the IR to machine code. On NYI/OOM the
         // trace stays on the portable IR executor (mcode = None). Root
@@ -434,9 +421,9 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         } else {
             None
         };
-        let no_asm = std::env::var("LUAJIT_RS_NOASM").is_ok();
-        if !no_asm && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target) {
-            if std::env::var("LUAJIT_RS_TRDUMP").is_ok() {
+        let arch = js.arch;
+        if !js.no_asm && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target, arch) {
+            if js.trace_dump {
                 eprintln!(
                     "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",
                     trace.traceno,
@@ -461,7 +448,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         }
         trace
     };
-    if std::env::var("LUAJIT_RS_TRDUMP").is_ok() {
+    if js.trace_dump {
         eprintln!(
             "STOP {} {:?} link={} start={:?} line={} native={} snaps={:?}",
             trace.traceno,
@@ -482,7 +469,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                 .map(|s| (s.iref - super::ir::REF_BIAS, s.pc, s.baseslot, s.nslots))
                 .collect::<Vec<_>>(),
         );
-        if std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2") {
+        if js.trace_dump2 {
             use super::ir::{IR_NAMES, REF_BIAS, REF_FIRST};
             for r in REF_FIRST..trace.ir.nins() {
                 let i = trace.ir.ir(r);
@@ -554,7 +541,6 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             // entry (lj_asm_patchexit) — the whole tree then runs in
             // machine code without Rust round trips.
             debug_assert!(parent != 0 && root != 0, "not a side trace");
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             {
                 let target = js.trace[traceno as usize].as_ref().and_then(|t| {
                     t.mcode
@@ -565,7 +551,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                     let pt_ = js.trace[parent as usize].as_mut().unwrap();
                     let tails = std::mem::take(&mut pt_.stub_tails);
                     if let Some(area) = &mut pt_.mcode {
-                        super::asm::patch_exit(area, &tails, exitno as u32, target);
+                        super::asm::patch_exit(area, &tails, exitno as u32, target, js.arch);
                     }
                     pt_.stub_tails = tails;
                 }

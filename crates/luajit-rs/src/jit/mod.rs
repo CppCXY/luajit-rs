@@ -373,17 +373,19 @@ pub struct JitState {
     pub penaltyslot: u32,
     /// PRNG state for penalty randomization.
     pub prng: Prng,
+    /// Target architecture for native code generation (cached from env/default).
+    pub arch: self::asm::Arch,
+    /// Skip native code generation (LUAJIT_RS_NOASM), cached at startup.
+    pub no_asm: bool,
+    /// Trace dump enabled (LUAJIT_RS_TRDUMP), cached at startup.
+    pub trace_dump: bool,
+    /// Trace dump level 2 (LUAJIT_RS_TRDUMP=2), cached at startup.
+    pub trace_dump2: bool,
 }
 
 impl JitState {
     pub fn new() -> JitState {
-        // On platforms without a native codegen backend, JIT is off by
-        // default — the portable IR executor is slower than pure
-        // interpretation.  Users can still enable it with `jit.on()`.
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let flags = JIT_F_ON;
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let flags = 0;
         let mut js = JitState {
             flags,
             state: TraceState::Idle,
@@ -402,6 +404,19 @@ impl JitState {
             penalty: [HotPenalty::default(); PENALTY_SLOTS],
             penaltyslot: 0,
             prng: Prng::new(),
+            arch: {
+                let over = std::env::var("LUAJIT_RS_JIT_ARCH").unwrap_or_default();
+                if over.eq_ignore_ascii_case("arm64") || over.eq_ignore_ascii_case("aarch64") {
+                    self::asm::Arch::Arm64
+                } else if over.eq_ignore_ascii_case("x64") || over.eq_ignore_ascii_case("x86_64") {
+                    self::asm::Arch::X64
+                } else {
+                    self::asm::HOST_ARCH
+                }
+            },
+            no_asm: std::env::var("LUAJIT_RS_NOASM").is_ok() || self::asm::HOST_ARCH == self::asm::Arch::Arm64,
+            trace_dump: std::env::var("LUAJIT_RS_TRDUMP").is_ok(),
+            trace_dump2: std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2"),
         };
         js.init_hotcount();
         js

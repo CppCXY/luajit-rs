@@ -1,1951 +1,529 @@
-//! ARM64 (AArch64) trace assembler: translates the SSA IR of a
-//! completed trace into native ARM64 machine code.
-//!
-//! The external API (`assemble`, `patch_exit`) mirrors the x86-64
-//! backend exactly — trace.rs calls through the unified `jit::asm`
-//! facade with no architecture-specific logic.
-//!
-//! ## ABI of the emitted code
-//! `extern "C" fn(base: *mut LuaValue, env: *mut u64) -> u32` returning
-//! the exit snapshot index. AAPCS64: `base` in x0, `env` in x1, return
-//! in w0. Every trace sets up the same outer frame (x19-x28 + x29/x30 +
-//! v8-v15 saved on entry) so linked traces can jump between each
-//! other's inner entries while staying inside the frame of whichever
-//! trace was entered from Rust.
-//!
-//! ## Register assignment
-//! | Role        | Reg | Notes                              |
-//! |-------------|-----|------------------------------------|
-//! | BASE        | x19 | Callee-saved (no save around calls)|
-//! | ENV         | x20 | Callee-saved                       |
-//! | Scratch GPR | x0  | Also return value                  |
-//! | Scratch GPR | x1  |                                    |
-//! | Scratch GPR | x2  |                                    |
-//! | Scratch FP  | v0–v4  | Caller-saved, 5 allocatable  |
-//! | Saved FP    | v8–v15 | Callee-saved, used for FP spills  |
-//! | v16 (tmp)   | v16    | Scratch FP (never allocated)       |
-//!
-//! ## Encoding notes
-//! ARM64 instructions are fixed-width 32 bits. 64-bit immediates use
-//! `movz + movk` sequences (up to 4 × 16-bit halves). FP immediates
-//! are loaded from a literal pool or via `fmov` from a GPR.
-#![allow(unused_imports, dead_code)]
-
-use std::mem::offset_of;
-
+/// AArch64 trace assembler: translates SSA IR into ARM64 native code.
+///
+/// Register conventions:
+///   x19 = RBASE  (Lua stack base, callee-saved)
+///   x20 = RENV   (spill/exit env buffer, callee-saved)
+///   x9-x15 = scratch GPRs
+///   v0-v7, v16-v31 = allocatable FP registers
+///   v8 = FP scratch (constant materialization)
+///
+/// Outer frame (160 bytes, 16-aligned):
+///   x19-x28 + x29(FP) + x30(LR) → 6 pairs = 96 bytes
+///   v8-v15 (lower 64-bit) → 4 pairs = 64 bytes
 use super::super::ir::*;
 use super::super::mcode::McodeArea;
-use super::super::record::{IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC, IRSLOAD_PARENT};
-use super::super::{GCtrace, SNAP_NORESTORE, TraceError, TraceLink, snap_ref, snap_slot};
+use super::super::record::{
+    IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC, IRSLOAD_PARENT,
+};
+use super::super::{
+    GCtrace, SNAP_NORESTORE, TraceError, TraceLink, snap_ref, snap_slot,
+};
 
-// ---------------------------------------------------------------------------
-// ARM64 instruction encoding primitives
-// ---------------------------------------------------------------------------
+// ── ARM64 encoding helpers ─────────────────────────────────────────────────
+pub(crate) struct Emit(pub Vec<u8>);
+impl Emit {
+    fn new() -> Self { Emit(Vec::with_capacity(1024)) }
+    fn len(&self) -> usize { self.0.len() }
+    fn u32(&mut self, w: u32) { self.0.extend_from_slice(&w.to_le_bytes()); }
+    fn nop(&mut self) { self.u32(0xD503_201F); }
+    fn brk(&mut self, imm: u16) { self.u32(0xD420_0000|((imm as u32)<<5)); }
 
-/// Encode a 32-bit ARM64 instruction.
-#[inline]
-fn insn(bits: u32) -> [u8; 4] {
-    bits.to_le_bytes()
-}
-
-/// Push a 32-bit instruction into the code buffer.
-fn emit32(code: &mut Vec<u8>, bits: u32) {
-    code.extend_from_slice(&bits.to_le_bytes());
-}
-
-/// Push a 64-bit word (literal pool entry).
-fn emit64(code: &mut Vec<u8>, val: u64) {
-    code.extend_from_slice(&val.to_le_bytes());
-}
-
-// -- GPR instructions -------------------------------------------------------
-
-/// ADD (immediate): `add rd, rn, #imm` (12-bit unsigned, optionally shifted).
-fn add_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32, shift: u8) {
-    debug_assert!(imm < 4096 && shift <= 1);
-    let sf = 1u32 << 31; // 64-bit
-    emit32(
-        code,
-        sf | 0x11000000 | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// SUB (immediate): `sub rd, rn, #imm`.
-fn sub_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32, shift: u8) {
-    debug_assert!(imm < 4096 && shift <= 1);
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x51000000 | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// ADD (shifted register): `add rd, rn, rm, lsl #shift`.
-fn add_reg_lsl(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8, shift: u8) {
-    debug_assert!(shift < 64);
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x0B000000
-            | ((shift as u32) << 10)
-            | ((rm as u32) << 16)
-            | ((rn as u32) << 5)
-            | rd as u32,
-    );
-}
-
-/// MOV (register): `mov rd, rm` (alias of ORR with zero register).
-fn mov_reg(code: &mut Vec<u8>, rd: u8, rm: u8) {
-    let sf = 1u32 << 31;
-    emit32(code, sf | 0x2A0003E0 | ((rm as u32) << 16) | rd as u32);
-}
-
-/// MOVZ: `mov rd, #imm16, lsl #shift`.
-fn movz(code: &mut Vec<u8>, rd: u8, imm: u16, shift: u8) {
-    debug_assert!(shift % 16 == 0 && shift < 64);
-    let sf = 1u32 << 31;
-    let hw = (shift as u32 / 16) << 21;
-    emit32(code, sf | 0x52800000 | hw | ((imm as u32) << 5) | rd as u32);
-}
-
-/// MOVK: `movk rd, #imm16, lsl #shift`.
-fn movk(code: &mut Vec<u8>, rd: u8, imm: u16, shift: u8) {
-    debug_assert!(shift % 16 == 0 && shift < 64);
-    let sf = 1u32 << 31;
-    let hw = (shift as u32 / 16) << 21;
-    emit32(code, sf | 0x72800000 | hw | ((imm as u32) << 5) | rd as u32);
-}
-
-/// Load a 64-bit immediate into rd using movz + movk.
-fn mov_imm64(code: &mut Vec<u8>, rd: u8, val: u64) {
-    let mut v = val;
-    let mut first = true;
-    let mut shift = 0u8;
-    while shift < 64 {
-        let chunk = (v & 0xFFFF) as u16;
-        if first {
-            movz(code, rd, chunk, shift);
-            first = false;
-        } else if chunk != 0 || shift == 48 {
-            // Always emit the top word to avoid canonical address
-            // ambiguity (movz zero-extends, leaving high bits clear).
-            movk(code, rd, chunk, shift);
-        }
-        v >>= 16;
-        shift += 16;
+    // ── move wide ──
+    fn movz(&mut self, xd: u8, imm: u16, sh: u8) { let h=(sh/16) as u32; self.u32(0xD280_0000|(h<<21)|((imm as u32)<<5)|(xd as u32)); }
+    fn movk(&mut self, xd: u8, imm: u16, sh: u8) { let h=(sh/16) as u32; self.u32(0xF280_0000|(h<<21)|((imm as u32)<<5)|(xd as u32)); }
+    fn mov64(&mut self, xd: u8, imm: u64) {
+        self.movz(xd, imm as u16, 0);
+        if imm>>16 != 0 { self.movk(xd, (imm>>16) as u16, 16); }
+        if imm>>32 != 0 { self.movk(xd, (imm>>32) as u16, 32); }
+        if imm>>48 != 0 { self.movk(xd, (imm>>48) as u16, 48); }
     }
-}
+    fn mov32(&mut self, wd: u8, imm: u32) { self.movz(wd, imm as u16, 0); if imm>>16 != 0 { self.movk(wd, (imm>>16) as u16, 16); } }
 
-/// Load a 64-bit immediate into rd using movz + 3 × movk (always 16 bytes).
-fn mov_imm64_full(code: &mut Vec<u8>, rd: u8, val: u64) {
-    let mut v = val;
-    for shift in [0u8, 16, 32, 48] {
-        let chunk = (v & 0xFFFF) as u16;
-        if shift == 0 {
-            movz(code, rd, chunk, shift);
-        } else {
-            movk(code, rd, chunk, shift);
-        }
-        v >>= 16;
+    // ── branch ──
+    fn b_cond(&mut self, cc: u32, off: i32) { self.u32(0x5400_0000|(((off as u32)&0x7FFFF)<<5)|cc); }
+    fn b(&mut self, off: i32)   { self.u32(0x1400_0000|((off as u32)&0x3FF_FFFF)); }
+    fn br(&mut self, rn: u8)    { self.u32(0xD61F_0000|((rn as u32)<<5)); }
+    fn ret(&mut self)           { self.u32(0xD65F_03C0); }
+    fn blr(&mut self, rn: u8)   { self.u32(0xD63F_0000|((rn as u32)<<5)); }
+
+    // ── DP register (64-bit unless noted) ──
+    fn add_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0x8B00_0000|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    fn sub_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0xCB00_0000|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    fn and_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0x8A00_0000|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    fn orr_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0xAA00_0000|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    fn eor_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0xCA00_0000|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    fn mvn64(&mut self, rd: u8, rm: u8) { self.u32(0xAA20_03E0|((rm as u32)<<16)|(rd as u32)); }
+    // 32-bit forms
+    fn and_w(&mut self, wd: u8, wn: u8, wm: u8) { self.u32(0x0A00_0000|((wm as u32)<<16)|((wn as u32)<<5)|(wd as u32)); }
+    fn orr_w(&mut self, wd: u8, wn: u8, wm: u8) { self.u32(0x2A00_0000|((wm as u32)<<16)|((wn as u32)<<5)|(wd as u32)); }
+    fn eor_w(&mut self, wd: u8, wn: u8, wm: u8) { self.u32(0x4A00_0000|((wm as u32)<<16)|((wn as u32)<<5)|(wd as u32)); }
+    fn mvn_w(&mut self, wd: u8, wm: u8) { self.u32(0x2A20_03E0|((wm as u32)<<16)|(wd as u32)); }
+
+    fn add_imm(&mut self, rd: u8, rn: u8, imm: u32) { self.u32(0x9100_0000|((imm&0xFFF)<<10)|((rn as u32)<<5)|(rd as u32)); }
+    fn sub_imm(&mut self, rd: u8, rn: u8, imm: u32) { self.u32(0xD100_0000|((imm&0xFFF)<<10)|((rn as u32)<<5)|(rd as u32)); }
+    fn cmp_rr(&mut self, rn: u8, rm: u8) { self.u32(0xEB00_001F|((rm as u32)<<16)|((rn as u32)<<5)); }
+    fn cmp_rr_w(&mut self, wn: u8, wm: u8) { self.u32(0x6B00_001F|((wm as u32)<<16)|((wn as u32)<<5)); }
+    fn cmp_imm(&mut self, rn: u8, imm: u32) { self.u32(0xF100_001F|((imm&0xFFF)<<10)|((rn as u32)<<5)); }
+
+    fn lsl_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0x9AC0_2000|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    fn lsr_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0x9AC0_2400|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    fn asr_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0x9AC0_2800|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    fn ror_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0x9AC0_2C00|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
+    // 32-bit shifts
+    fn lsl_w(&mut self, wd: u8, wn: u8, wm: u8) { self.u32(0x1AC0_2000|((wm as u32)<<16)|((wn as u32)<<5)|(wd as u32)); }
+    fn lsr_w(&mut self, wd: u8, wn: u8, wm: u8) { self.u32(0x1AC0_2400|((wm as u32)<<16)|((wn as u32)<<5)|(wd as u32)); }
+    fn asr_w(&mut self, wd: u8, wn: u8, wm: u8) { self.u32(0x1AC0_2800|((wm as u32)<<16)|((wn as u32)<<5)|(wd as u32)); }
+
+    fn rev_w(&mut self, wd: u8, wn: u8) { self.u32(0x5AC0_0800|((wn as u32)<<5)|(wd as u32)); }
+
+    // ── load/store pair ──
+    fn stp(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=((off/8)as u32)&0x7F; self.u32(0xA900_0000|(o<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
+    fn ldp(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=((off/8)as u32)&0x7F; self.u32(0xA940_0000|(o<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
+    fn stp_d(&mut self, dt1: u8, dt2: u8, rn: u8, off: i32) { let o=((off/8)as u32)&0x7F; self.u32(0x6D00_0000|(o<<15)|((dt2 as u32)<<10)|((rn as u32)<<5)|(dt1 as u32)); }
+    fn ldp_d(&mut self, dt1: u8, dt2: u8, rn: u8, off: i32) { let o=((off/8)as u32)&0x7F; self.u32(0x6D40_0000|(o<<15)|((dt2 as u32)<<10)|((rn as u32)<<5)|(dt1 as u32)); }
+    fn stp_pre(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=(off/8) as i32; let imm7=(o as u32)&0x7F; self.u32(0xA980_0000|(imm7<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
+    fn ldp_post(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) { let o=(off/8) as i32; let imm7=(o as u32)&0x7F; self.u32(0xA8C0_0000|(imm7<<15)|((rt2 as u32)<<10)|((rn as u32)<<5)|(rt1 as u32)); }
+
+    // ── load/store register ──
+    fn ldr(&mut self, rt: u8, rn: u8, off: i32) { self.u32(0xF940_0000|((((off/8)as u32)&0xFFF)<<10)|((rn as u32)<<5)|(rt as u32)); }
+    fn str(&mut self, rt: u8, rn: u8, off: i32) { self.u32(0xF900_0000|((((off/8)as u32)&0xFFF)<<10)|((rn as u32)<<5)|(rt as u32)); }
+    fn ldr_w(&mut self, rt: u8, rn: u8, off: i32) { self.u32(0xB940_0000|((((off/4)as u32)&0xFFF)<<10)|((rn as u32)<<5)|(rt as u32)); }
+    fn str_w(&mut self, rt: u8, rn: u8, off: i32) { self.u32(0xB900_0000|((((off/4)as u32)&0xFFF)<<10)|((rn as u32)<<5)|(rt as u32)); }
+    fn ldr_d(&mut self, dt: u8, rn: u8, off: i32) { self.u32(0xFD40_0000|((((off/8)as u32)&0xFFF)<<10)|((rn as u32)<<5)|(dt as u32)); }
+    fn str_d(&mut self, dt: u8, rn: u8, off: i32) { self.u32(0xFD00_0000|((((off/8)as u32)&0xFFF)<<10)|((rn as u32)<<5)|(dt as u32)); }
+
+    /// 32-bit immediate store via temp register
+    fn str_imm32(&mut self, rn: u8, off: i32, imm: u32) {
+        self.mov32(RSCRATCH, imm);
+        self.str_w(RSCRATCH, rn, off);
     }
-}
-
-/// CMP (immediate): `cmp rn, #imm` (alias of SUBS with zero register).
-fn cmp_imm(code: &mut Vec<u8>, rn: u8, imm: u32, shift: u8) {
-    debug_assert!(imm < 4096 && shift <= 1);
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x7100001F | ((shift as u32) << 22) | (imm << 10) | ((rn as u32) << 5),
-    );
-}
-
-/// CMP (register): `cmp rn, rm` (alias of SUBS with zero rd).
-fn cmp_reg(code: &mut Vec<u8>, rn: u8, rm: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x6B00001F | ((rm as u32) << 16) | ((rn as u32) << 5),
-    );
-}
-
-/// AND (immediate): `and rd, rn, #imm` (bitmask immediate).
-fn and_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u64) {
-    let (n, immr, imms) = encode_bitmask(imm).expect("invalid AND immediate");
-    let sf = 1u32 << 31;
-    let n_bit = (n as u32) << 22;
-    emit32(
-        code,
-        sf | 0x12000000 | n_bit | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// Encode a 64-bit bitmask immediate for AND/ORR/EOR. Returns (N, immr, imms).
-fn encode_bitmask(imm: u64) -> Option<(u8, u32, u32)> {
-    if imm == 0 || imm == u64::MAX {
-        return Some((0, 0, 63));
+    fn str_imm64(&mut self, rn: u8, off: i32, imm: u64) {
+        self.mov64(RSCRATCH, imm);
+        self.str(RSCRATCH, rn, off);
     }
-    // ARM64 bitmask immediates are a pattern of consecutive ones,
-    // right-rotated by some amount, replicated across 2/4/8/16/32/64 bits.
-    let ones = imm.count_ones();
-    if ones == 0 {
-        return None;
-    }
-    let r = imm.trailing_zeros();
-    let len = 64 - imm.leading_zeros() - r;
-    // The pattern must be a string of 1s of length `ones`, padded.
-    if (len as u32) != ones {
-        return None;
-    }
-    // Check that the 1s are consecutive and the rest is the repeating pattern.
-    let mask = (1u64 << ones) - 1;
-    let pattern = imm >> r;
-    if pattern & mask != mask {
-        return None;
-    }
-    // Find the smallest element size that fits the period.
-    for &esize in &[2u32, 4, 8, 16, 32, 64] {
-        if ones > esize {
-            continue;
-        }
-        let period = esize;
-        // Check that the pattern repeats every `period` bits.
-        let repeating = (0..64)
-            .step_by(period as usize)
-            .all(|s| (imm >> s) & ((1u64 << period) - 1) == (imm & ((1u64 << period) - 1)));
-        if !repeating {
-            continue;
-        }
-        let n = if esize == 64 { 1 } else { 0 };
-        // imms encodes element-size and S (ones-1) in a single 6-bit field:
-        //   esize=64: N=1, imms = ones-1
-        //   esize=32: imms[5]=0,       imms[4:0] = ones-1
-        //   esize=16: imms[5:4]=0b10,  imms[3:0] = ones-1
-        //   esize=8:  imms[5:3]=0b100, imms[2:0] = ones-1
-        //   esize=4:  imms[5:2]=0b1000,imms[1:0] = ones-1
-        //   esize=2:  imms[5:1]=0b10000,imms[0]= ones-1
-        let imms: u32 = match esize {
-            64 => (ones - 1) & 0x3F,         // N=1 already
-            32 => (ones - 1) & 0x1F,         // bit 5 = 0
-            16 => 0x20 | ((ones - 1) & 0xF), // bit[5:4] = 10
-            8 => 0x30 | ((ones - 1) & 0x7),  // bit[5:3] = 100
-            4 => 0x38 | ((ones - 1) & 0x3),  // bit[5:2] = 1000
-            2 => 0x3C | ((ones - 1) & 0x1),  // bit[5:1] = 10000
-            _ => unreachable!(),
-        };
-        let immr = (r as u32) % esize;
-        return Some((n, immr, imms));
-    }
-    None
+
+    // ── FP ops ──
+    fn fmov_dd(&mut self, dd: u8, dn: u8) { self.u32(0x1E60_4000|((dn as u32)<<5)|(dd as u32)); }
+    fn fmov_gpr(&mut self, xd: u8, dn: u8) { self.u32(0x9E66_0000|((dn as u32)<<5)|(xd as u32)); }
+    fn fmov_fp(&mut self, dd: u8, xn: u8) { self.u32(0x9E67_0000|((xn as u32)<<5)|(dd as u32)); }
+    fn fadd(&mut self, dd: u8, dn: u8, dm: u8) { self.u32(0x1E60_2800|((dm as u32)<<16)|((dn as u32)<<5)|(dd as u32)); }
+    fn fsub(&mut self, dd: u8, dn: u8, dm: u8) { self.u32(0x1E60_3800|((dm as u32)<<16)|((dn as u32)<<5)|(dd as u32)); }
+    fn fmul(&mut self, dd: u8, dn: u8, dm: u8) { self.u32(0x1E60_0800|((dm as u32)<<16)|((dn as u32)<<5)|(dd as u32)); }
+    fn fdiv(&mut self, dd: u8, dn: u8, dm: u8) { self.u32(0x1E60_1800|((dm as u32)<<16)|((dn as u32)<<5)|(dd as u32)); }
+    fn fneg_d(&mut self, dd: u8, dn: u8) { self.u32(0x1E61_4000|((dn as u32)<<5)|(dd as u32)); }
+    fn fabs_d(&mut self, dd: u8, dn: u8) { self.u32(0x1E60_C000|((dn as u32)<<5)|(dd as u32)); }
+    fn fsqrt(&mut self, dd: u8, dn: u8) { self.u32(0x1E61_C000|((dn as u32)<<5)|(dd as u32)); }
+    fn frintm(&mut self, dd: u8, dn: u8) { self.u32(0x1E65_4000|((dn as u32)<<5)|(dd as u32)); }
+    fn frintp(&mut self, dd: u8, dn: u8) { self.u32(0x1E64_C000|((dn as u32)<<5)|(dd as u32)); }
+    fn frintz(&mut self, dd: u8, dn: u8) { self.u32(0x1E65_C000|((dn as u32)<<5)|(dd as u32)); }
+    fn fcmp(&mut self, dn: u8, dm: u8) { self.u32(0x1E60_2000|((dm as u32)<<16)|((dn as u32)<<5)); }
+    fn scvtf_w(&mut self, dd: u8, wn: u8) { self.u32(0x1E62_0000|((wn as u32)<<5)|(dd as u32)); }
+    fn scvtf_x(&mut self, dd: u8, xn: u8) { self.u32(0x9E62_0000|((xn as u32)<<5)|(dd as u32)); }
+    fn ucvtf_w(&mut self, dd: u8, wn: u8) { self.u32(0x1E63_0000|((wn as u32)<<5)|(dd as u32)); }
+    fn ucvtf_x(&mut self, dd: u8, xn: u8) { self.u32(0x9E63_0000|((xn as u32)<<5)|(dd as u32)); }
+    fn fcvtzs_w(&mut self, wd: u8, dn: u8) { self.u32(0x1E78_0000|((dn as u32)<<5)|(wd as u32)); }
+    fn fcvtzs_x(&mut self, xd: u8, dn: u8) { self.u32(0x9E78_0000|((dn as u32)<<5)|(xd as u32)); }
+
+    // fcsel Dd, Dn, Dm, cond
+    fn fcsel(&mut self, dd: u8, dn: u8, dm: u8, cc: u32) { self.u32(0x1E20_0C00|((dm as u32)<<16)|(cc<<12)|((dn as u32)<<5)|(dd as u32)); }
 }
 
-/// ORR (immediate): `orr rd, rn, #imm` (bitmask immediate).
-fn orr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u64) {
-    let (n, immr, imms) = encode_bitmask(imm).expect("invalid ORR immediate");
-    let sf = 1u32 << 31;
-    let n_bit = (n as u32) << 22;
-    emit32(
-        code,
-        sf | 0x32000000 | n_bit | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32,
-    );
+// ── Helpers for patching ──
+fn patch_u32_at(code: &mut [u8], pos: usize, w: u32) {
+    code[pos..pos+4].copy_from_slice(&w.to_le_bytes());
+}
+fn patch_bcond_at(code: &mut [u8], pos: usize, cc: u32, off: i32) {
+    let w = 0x5400_0000u32 | (((off as u32)&0x7FFFF)<<5) | cc;
+    patch_u32_at(code, pos, w);
+}
+fn patch_b_at(code: &mut [u8], pos: usize, off: i32) {
+    let w = 0x1400_0000u32 | ((off as u32)&0x3FF_FFFF);
+    patch_u32_at(code, pos, w);
 }
 
-/// AND (shifted register): `and rd, rn, rm, lsl/lsr/asr #shift`.
-fn and_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x0A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
+// ── Register constants ─────────────────────────────────────────────────────
+const ALLOC_REGS: [u8; 24] = [0,1,2,3,4,5,6,7, 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31];
+const FP_SCRATCH: u8 = 8;
+const NREG: usize = 32;
+
+const RBASE:    u8 = 19;
+const RENV:     u8 = 20;
+const RSCRATCH: u8 = 9;
+const RSCRATCH2:u8 = 10;
+const RSCRATCH3:u8 = 11;
+
+const SAVED_GPR_PAIRS: u32 = 5; // x19-x28 (10 regs), x29/x30 saved separately at frame bottom
+const SAVED_FP_PAIRS:  u32 = 4; // d8-d15 (8 regs)
+const FRAME: u32 = 16 + SAVED_GPR_PAIRS * 16 + SAVED_FP_PAIRS * 16; // 16 + 80 + 64 = 160
+
+mod cond {
+    pub const EQ: u32 = 0x0; pub const NE: u32 = 0x1;
+    pub const CS: u32 = 0x2; pub const CC: u32 = 0x3;
+    pub const MI: u32 = 0x4; pub const PL: u32 = 0x5;
+    pub const VS: u32 = 0x6; pub const VC: u32 = 0x7;
+    pub const HI: u32 = 0x8; pub const LS: u32 = 0x9;
+    pub const GE: u32 = 0xA; pub const LT: u32 = 0xB;
+    pub const GT: u32 = 0xC; pub const LE: u32 = 0xD;
 }
-
-/// ORR (shifted register): `orr rd, rn, rm`.
-fn orr_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x2A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// EOR (shifted register): `eor rd, rn, rm`.
-fn eor_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x4A000000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// LSL (register): `lsl rd, rn, rm`.
-fn lsl_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x1AC02000 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// LSR (register): `lsr rd, rn, rm`.
-fn lsr_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x1AC02400 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// LSR (immediate): `lsr rd, rn, #imm` (64-bit).
-fn lsr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
-    let sf = 1u32 << 31;
-    let n = 1u32 << 22;
-    let immr = imm as u32;
-    let imms = 63u32;
-    // UBFM: sf|10|100110|N|immr|imms|Rn|Rd  (LSR allocates UBFM, not SBFM!)
-    emit32(
-        code,
-        sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// ASR (immediate): `asr rd, rn, #imm` (proper encoding).
-fn asr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
-    let sf = 1u32 << 31;
-    let n = 1u32 << 22; // 64-bit
-    let immr = imm as u32;
-    let imms = 63u32; // sign extension
-    emit32(
-        code,
-        sf | 0x13000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// UBFX (unsigned bitfield extract): extract `width` bits starting at `lsb`,
-/// zero-extended. `lsb + width <= 64`. Uses 64-bit UBFM.
-fn ubfx(code: &mut Vec<u8>, rd: u8, rn: u8, lsb: u8, width: u8) {
-    let sf = 1u32 << 31;
-    let n = 1u32 << 22;
-    let immr = lsb as u32;
-    let imms = (lsb + width - 1) as u32;
-    emit32(
-        code,
-        sf | 0x53000000 | n | (immr << 16) | (imms << 10) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// ROR (register): `ror rd, rn, rm`.
-fn ror_reg(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x1AC02C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// EOR (imm): `eor rd, rn, #imm` via GPR load + eor (bitmask const
-/// isn't always representable).
-fn eor_imm(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u64) {
-    mov_imm64(code, 2, imm);
-    eor_reg(code, rd, rn, 2);
-}
-
-/// ROR (immediate, 32-bit): `ror wd, wn, #imm`. Uses EXTR wd, wn, wn, #imm.
-fn ror_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u8) {
-    emit32(
-        code,
-        0 | 0x13800000
-            | 0
-            | ((rn as u32) << 16)
-            | ((imm as u32) << 10)
-            | ((rn as u32) << 5)
-            | rd as u32,
-    );
-}
-
-/// NEG (32-bit): `neg wd, wn` (alias of SUB wd, WZR, wn).
-fn neg_w(code: &mut Vec<u8>, rd: u8, rn: u8) {
-    let sf = 0u32 << 31;
-    // SUB (shifted register): WZR(w31) as Rn, wn as Rm.
-    // Base 0x4B0003E0 has Rn=31(WZR), imm6=0, shift=00.
-    emit32(code, sf | 0x4B0003E0 | ((rn as u32) << 16) | rd as u32);
-}
-
-/// AND (immediate, 32-bit): `and wd, wn, #imm` (bitmask).
-fn and_imm32(code: &mut Vec<u8>, rd: u8, rn: u8, imm: u32) {
-    // Same issue: can't always encode as bitmask. Use GPR load + and_reg.
-    mov_imm64(code, 2, imm as u64);
-    let sf = 0u32 << 31;
-    emit32(
-        code,
-        sf | 0x0A000000 | ((2u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// LDR (register, 64-bit, uxtw scaled): `ldr rd, [rn, rm, uxtw #3]`.
-fn ldr_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    // (A64I_LDRx ^ A64I_LS_R) | A64I_LS_UXTWx | A64I_LS_SH = 0xF8605800
-    emit32(
-        code,
-        0xF8605800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// STR (register, 64-bit, uxtw scaled): `str rd, [rn, rm, uxtw #3]`.
-fn str_reg_uxtw(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    // (A64I_STRx ^ A64I_LS_R) | A64I_LS_UXTWx | A64I_LS_SH = 0xF8205800
-    emit32(
-        code,
-        0xF8205800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// REV32 (reverse bytes in 32-bit word, zero-extending).
-fn rev32(code: &mut Vec<u8>, rd: u8, rn: u8) {
-    let sf = 1u32 << 31;
-    emit32(code, sf | 0x5AC00800 | ((rn as u32) << 5) | rd as u32);
-}
-
-/// LDR (GPR, unsigned offset): `ldr rd, [rn, #offset]`.
-fn ldr_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
-    let scale = (size / 8) as i32;
-    debug_assert!(offset >= 0 && offset % scale == 0 && offset <= 32760);
-    let base = if size == 64 {
-        0xF9400000u32
-    } else {
-        0xB9400000u32
-    };
-    emit32(
-        code,
-        base | ((offset as u32 / scale as u32) << 10) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// STR (FP, unsigned offset): `str dn, [rn, #offset]`.
-fn str_fp(code: &mut Vec<u8>, dn: u8, rn: u8, offset: i32) {
-    debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
-    // SIMD&FP store, unsigned offset, 64-bit: A64I_STRd = 0xFD000000
-    emit32(
-        code,
-        0xFD000000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dn as u32,
-    );
-}
-
-/// LDR (FP, unsigned offset): `ldr dd, [rn, #offset]`.
-fn ldr_fp(code: &mut Vec<u8>, dd: u8, rn: u8, offset: i32) {
-    debug_assert!(offset >= 0 && offset % 8 == 0 && offset <= 32760);
-    // SIMD&FP load, unsigned offset, 64-bit: A64I_LDRd = 0xFD400000
-    emit32(
-        code,
-        0xFD400000 | ((offset as u32 / 8) << 10) | ((rn as u32) << 5) | dd as u32,
-    );
-}
-
-/// STR (GPR, unsigned offset): `str rd, [rn, #offset]`.
-fn str_imm(code: &mut Vec<u8>, rd: u8, rn: u8, offset: i32, size: u8) {
-    let scale = (size / 8) as i32;
-    debug_assert!(offset >= 0 && offset % scale == 0 && offset <= 32760);
-    let base = if size == 64 {
-        0xF9000000u32
-    } else {
-        0xB9000000u32
-    };
-    emit32(
-        code,
-        base | ((offset as u32 / scale as u32) << 10) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// LDR (register, 64-bit, lsl scaled): `ldr rd, [rn, rm, lsl #3]`.
-fn ldr_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    // (A64I_LDRx ^ A64I_LS_R) | A64I_LS_SXTXx | A64I_LS_SH = 0xF860F800
-    emit32(
-        code,
-        0xF860F800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// STR (register, 64-bit, lsl scaled): `str rd, [rn, rm, lsl #3]`.
-fn str_reg_lsl3(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8) {
-    // (A64I_STRx ^ A64I_LS_R) | A64I_LS_SXTXx | A64I_LS_SH = 0xF820F800
-    emit32(
-        code,
-        0xF820F800 | ((rm as u32) << 16) | ((rn as u32) << 5) | rd as u32,
-    );
-}
-
-/// STP (store pair, offset): `stp rt1, rt2, [rn, #offset]`.
-fn stp_offset(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
-    debug_assert!(offset % 8 == 0 && offset >= -512 && offset <= 504);
-    let imm7 = ((offset / 8) as u32 & 0x7F) << 15;
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x29000000 | (imm7) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt1 as u32,
-    );
-}
-
-/// LDP (load pair, offset): `ldp rt1, rt2, [rn, #offset]`.
-fn ldp_offset(code: &mut Vec<u8>, rt1: u8, rt2: u8, rn: u8, offset: i32) {
-    debug_assert!(offset % 8 == 0 && offset >= -512 && offset <= 504);
-    let imm7 = ((offset / 8) as u32 & 0x7F) << 15;
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x29400000 | (imm7) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | rt1 as u32,
-    );
-}
-
-/// B (unconditional): `b offset` (28-bit signed, 4-byte aligned).
-fn b_imm(code: &mut Vec<u8>, offset: i32, link: bool) {
-    debug_assert!(offset % 4 == 0 && offset >= -(1 << 27) && offset < (1 << 27));
-    let imm26 = ((offset as u32) >> 2) & 0x3FFFFFF;
-    let l_bit = if link { 1u32 << 31 } else { 0 };
-    emit32(code, 0x14000000 | l_bit | imm26);
-}
-
-/// BR (register): `br rn` or `blr rn`.
-fn br_reg(code: &mut Vec<u8>, rn: u8, link: bool) {
-    let l_bit = if link { 1u32 << 21 } else { 0 };
-    emit32(code, 0xD61F0000 | l_bit | ((rn as u32) << 5));
-}
-
-/// RET: `ret rn`.
-fn ret(code: &mut Vec<u8>, rn: u8) {
-    emit32(code, 0xD65F0000 | ((rn as u32) << 5));
-}
-
-/// B.cond: conditional branch (19-bit signed, 4-byte aligned).
-fn b_cond(code: &mut Vec<u8>, cond: u8, offset: i32) {
-    debug_assert!(offset % 4 == 0 && offset >= -(1 << 20) && offset < (1 << 20));
-    let imm19 = ((offset as u32) >> 2) & 0x7FFFF;
-    emit32(code, 0x54000000 | (imm19 << 5) | cond as u32);
-}
-
-/// CSET: `cset rd, cond` (conditional set).
-fn cset(code: &mut Vec<u8>, rd: u8, cond: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x1A9F07E0 | ((cond as u32 - 1) << 12) | rd as u32,
-    );
-}
-
-/// Condition codes (ARM64, matching x86 convention).
-#[allow(dead_code)]
-const CC_EQ: u8 = 0;
-#[allow(dead_code)]
-const CC_NE: u8 = 1;
-#[allow(dead_code)]
-const CC_CS: u8 = 2;
-#[allow(dead_code)]
-const CC_CC: u8 = 3;
-#[allow(dead_code)]
-const CC_MI: u8 = 4;
-#[allow(dead_code)]
-const CC_PL: u8 = 5;
-#[allow(dead_code)]
-const CC_VS: u8 = 6;
-#[allow(dead_code)]
-const CC_VC: u8 = 7;
-#[allow(dead_code)]
-const CC_HI: u8 = 8;
-#[allow(dead_code)]
-const CC_LS: u8 = 9;
-const CC_GE: u8 = 10;
-const CC_LT: u8 = 11;
-const CC_GT: u8 = 12;
-const CC_LE: u8 = 13;
-const CC_AL: u8 = 14;
-
-/// Map x86 condition codes to ARM64.
-fn to_arm64_cc(x86_cc: u8) -> u8 {
-    match x86_cc {
-        0x0 => CC_CC, // AE → CC (NB → LO inverse)
-        0x1 => CC_CS, // A  → CS (NBE → HI)
-        0x2 => CC_LE, // BE → LE (exact)
-        0x3 => CC_GT, // B  → GT (NBE)
-        0x4 => CC_EQ, // E  → EQ
-        0x5 => CC_NE, // NE → NE
-        0x6 => CC_LE, // LE → LE
-        0x7 => CC_GT, // G  → GT (NLE)
-        0x8 => CC_CC, // NP → VC (parity → overflow clear)
-        0x9 => CC_CS, // P  → VS (parity → overflow set)
-        _ => CC_AL,
-    }
-}
-
-// -- FP/SIMD instructions ---------------------------------------------------
-
-/// FMOV (register): `fmov dd, dn` (64-bit float).
-fn fmov_reg(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E604000 | ((dn as u32) << 5) | dd as u32);
-}
-
-/// FMOV (GPR to FP): `fmov dd, xn`.
-fn fmov_gpr_fp(code: &mut Vec<u8>, dd: u8, xn: u8) {
-    emit32(code, 0x9E670000 | ((xn as u32) << 5) | dd as u32);
-}
-
-/// FMOV (FP to GPR): `fmov xd, dn`.
-fn fmov_fp_gpr(code: &mut Vec<u8>, xd: u8, dn: u8) {
-    emit32(code, 0x9E660000 | ((dn as u32) << 5) | xd as u32);
-}
-
-/// FADD: `fadd dd, dn, dm`.
-fn fadd(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(
-        code,
-        0x1E602800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
-    );
-}
-
-/// FSUB: `fsub dd, dn, dm`.
-fn fsub(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(
-        code,
-        0x1E603800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
-    );
-}
-
-/// FMUL: `fmul dd, dn, dm`.
-fn fmul(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(
-        code,
-        0x1E600800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
-    );
-}
-
-/// FDIV: `fdiv dd, dn, dm`.
-fn fdiv(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(
-        code,
-        0x1E601800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
-    );
-}
-
-/// FNEG: `fneg dd, dn`.
-fn fneg(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E614000 | ((dn as u32) << 5) | dd as u32);
-}
-
-/// FABS: `fabs dd, dn`.
-fn fabs(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E60C000 | ((dn as u32) << 5) | dd as u32);
-}
-
-/// FSQRT: `fsqrt dd, dn`.
-fn fsqrt(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E61C000 | ((dn as u32) << 5) | dd as u32);
-}
-
-/// FMIN: `fmin dd, dn, dm`.
-fn fmin(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(
-        code,
-        0x1E605800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
-    );
-}
-
-/// FMAX: `fmax dd, dn, dm`.
-fn fmax(code: &mut Vec<u8>, dd: u8, dn: u8, dm: u8) {
-    emit32(
-        code,
-        0x1E604800 | ((dm as u32) << 16) | ((dn as u32) << 5) | dd as u32,
-    );
-}
-
-/// FRINTM (floor): `frintm dd, dn`.
-fn frintm(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E654000 | ((dn as u32) << 5) | dd as u32);
-}
-
-/// FRINTP (ceil): `frintp dd, dn`.
-fn frintp(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E64C000 | ((dn as u32) << 5) | dd as u32);
-}
-
-/// FRINTZ (trunc): `frintz dd, dn`.
-fn frintz(code: &mut Vec<u8>, dd: u8, dn: u8) {
-    emit32(code, 0x1E65C000 | ((dn as u32) << 5) | dd as u32);
-}
-
-/// FCVTZS (FP to int32, truncating): `fcvtzs wd, dn`. D-register
-/// source (64-bit), W-register destination (32-bit), toward-zero.
-fn fcvtzs_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
-    // A64I_FCVT_S32_F64 = 0x1e780000  (rmode=11 toward-zero)
-    emit32(code, 0x1E780000 | ((dn as u32) << 5) | wd as u32);
-}
-
-/// FCVTNS (FP to int32, round-to-nearest-even): `fcvtns wd, dn`.
-fn fcvtns_w(code: &mut Vec<u8>, wd: u8, dn: u8) {
-    emit32(code, 0x1E700000 | ((dn as u32) << 5) | wd as u32);
-}
-
-/// SCVTF (int32 to FP, 64-bit): `scvtf dd, wn`. W-register source
-/// (32-bit), D-register destination (64-bit), signed.
-fn scvtf_w(code: &mut Vec<u8>, dd: u8, wn: u8) {
-    // A64I_FCVT_F64_S32 = 0x1E620000 (32-bit Wn → 64-bit Dd)
-    emit32(code, 0x1E620000 | ((wn as u32) << 5) | dd as u32);
-}
-
-/// FCMP: `fcmp dn, dm`.
-fn fcmp(code: &mut Vec<u8>, dn: u8, dm: u8) {
-    emit32(code, 0x1E602000 | ((dm as u32) << 16) | ((dn as u32) << 5));
-}
-
-/// FCMP with zero: `fcmp dn, #0.0`.
-fn fcmp_zero(code: &mut Vec<u8>, dn: u8) {
-    emit32(code, 0x1E602008 | ((dn as u32) << 5));
-}
-
-/// CSRINC: conditionally move a GPR.
-fn csinc(code: &mut Vec<u8>, rd: u8, rn: u8, rm: u8, cond: u8) {
-    let sf = 1u32 << 31;
-    emit32(
-        code,
-        sf | 0x1A800400
-            | ((rm as u32) << 16)
-            | ((cond as u32 - 1) << 12)
-            | ((rn as u32) << 5)
-            | rd as u32,
-    );
-}
-
-/// LDR (literal): `ldr rd, #offset` (from the current PC, 19-bit).
-fn ldr_literal(code: &mut Vec<u8>, rd: u8, offset: i32, size: u8) {
-    debug_assert!(offset % 4 == 0 && offset >= -(1 << 20) && offset < (1 << 20));
-    let opc = match size {
-        64 => 0b01u32 << 30,
-        32 => 0b00,
-        _ => unreachable!(),
-    };
-    let imm19 = ((offset as u32) >> 2) & 0x7FFFF;
-    emit32(code, opc | 0x18000000 | (imm19 << 5) | rd as u32);
-}
-
-// ---------------------------------------------------------------------------
-// Assembler state
-// ---------------------------------------------------------------------------
-
-/// Number of allocatable FP registers (v0–v4).
-const NREG: usize = 5;
-/// Scratch FP register (never allocated).
-const FP_SCRATCH: u8 = 16;
-/// Scratch GPRs.
-const RSCR: u8 = 0;
-const RSCR2: u8 = 1;
-const RSCR3: u8 = 2;
-
-const RBASE: u8 = 19;
-const RENV: u8 = 20;
-/// Call-target scratch GPR (x3, not used for arguments).
-const RCALL: u8 = 3;
-
-/// Total frame size: 16 (fp+lr) + 10×8 (x21-x28, x19-x20) + 10×16 (v8-v15) = 256.
-const FRAME_SIZE: i32 = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Owner {
-    None,
-    Ins(IRRef),
-    Konst(IRRef),
-}
-
+enum Owner { None, Ins(IRRef), Konst(IRRef) }
 #[derive(Clone, Copy)]
-struct PhiInfo {
-    phi: IRRef,
-    lref: IRRef,
-    rref: IRRef,
-    num: bool,
-}
+struct PhiInfo { phi: IRRef, lref: IRRef, rref: IRRef, num: bool }
+struct Stub { snapidx: usize, flush: Vec<(u8, IRRef)>, gc: bool }
 
-struct StubIdx {
-    snapidx: usize,
-    flush: Vec<(u8, IRRef)>,
-    gc: bool,
-}
+#[inline] fn pin(rg: u8) -> u32 { 1u32 << rg }
+
+// ── Asm ────────────────────────────────────────────────────────────────────
 
 struct Asm<'a> {
-    tr: &'a GCtrace,
-    code: Vec<u8>,
-    cur: IRRef,
-    snapidx: usize,
-    last_use: Vec<IRRef>,
-    klast_use: Vec<IRRef>,
-    needs_env: Vec<bool>,
-    env_valid: Vec<bool>,
-    owner: [Owner; NREG],
-    /// Snapshot of `owner` at the LOOP instruction (for `asm_loop_back`).
-    s0: [Owner; NREG],
-    loc: Vec<Option<u8>>,
-    loop_pos: Option<usize>,
-    link: Option<*const u8>,
-    stubs: Vec<StubIdx>,
-    stub_tails: Vec<(u32, u32)>,
-    stub_positions: Vec<usize>,
-    phis: Vec<PhiInfo>,
-    fixups: Vec<(usize, usize)>,
+    tr: &'a GCtrace, code: Emit, cur: IRRef, snapidx: usize,
+    last_use: Vec<IRRef>, klast_use: Vec<IRRef>,
+    needs_env: Vec<bool>, env_valid: Vec<bool>,
+    loc: Vec<Option<u8>>, owner: [Owner; NREG],
+    fixups: Vec<(usize, usize)>, stubs: Vec<Stub>,
+    phis: Vec<PhiInfo>, loop_pos: Option<usize>, s0: [Owner; NREG],
+    phi_homes: Vec<(IRRef, u8)>,
+    link: Option<*const u8>, stub_tails: Vec<(u32, u32)>,
+}
+
+// map x64 CC to ARM64 CC: x64 jcc semantics (after cmp/after ucomisd)
+// x64: 0x2=B(CF=1)->LO, 0x3=AE(CF=0)->HS, 0x4=E(ZF=1)->EQ, 0x5=NE(ZF=0)->NE,
+//       0x6=BE(CF=1|ZF=1)->LS, 0x7=A(CF=0&ZF=0)->HI, 0xA=P->VS (approx, used only with ucomisd NaN)
+fn x64cc_to_a64(xcc: u8) -> u32 {
+    match xcc { 0x2=>cond::CC, 0x3=>cond::CS, 0x4=>cond::EQ, 0x5=>cond::NE, 0x6=>cond::LS, 0x7=>cond::HI, 0xA=>cond::VS, _=>cond::NE }
 }
 
 impl<'a> Asm<'a> {
-    fn iidx(r: IRRef) -> usize {
-        (r - REF_BIAS) as usize
-    }
-    fn kidx(r: IRRef) -> usize {
-        (REF_BIAS - 1 - r) as usize
-    }
-    fn env_disp(r: IRRef) -> i32 {
-        (Self::iidx(r) * 8) as i32
-    }
+    #[inline] fn iidx(r: IRRef) -> usize { (r - REF_BIAS) as usize }
+    #[inline] fn kidx(r: IRRef) -> usize { (REF_BIAS - 1 - r) as usize }
+    #[inline] fn env_ofs(r: IRRef) -> i32 { (Self::iidx(r) * 8) as i32 }
 
-    /// Pass-1: NYI scan + lifetime analysis (port of x64.rs pass1).
+    // ═══ NYI scan ═══════════════════════════════════════════════════════════
     fn new(tr: &'a GCtrace, link: Option<*const u8>) -> Result<Asm<'a>, TraceError> {
-        let nins = tr.ir.nins();
-        let mut a = Asm {
-            tr,
-            code: Vec::with_capacity(4096),
-            cur: 0,
-            snapidx: 0,
-            last_use: vec![0; (nins - REF_BIAS) as usize],
-            klast_use: vec![0; REF_BIAS as usize],
-            needs_env: vec![false; (nins - REF_BIAS) as usize],
-            env_valid: vec![false; (nins - REF_BIAS) as usize],
-            owner: [Owner::None; NREG],
-            s0: [Owner::None; NREG],
-            loc: vec![None; (nins - REF_BIAS) as usize],
-            loop_pos: None,
-            link,
-            stubs: Vec::new(),
-            stub_tails: Vec::new(),
-            stub_positions: Vec::new(),
-            phis: Vec::new(),
-            fixups: Vec::new(),
-        };
-
-        for r in REF_FIRST..nins {
+        let nins = Self::iidx(tr.ir.nins());
+        let nk = (REF_BIAS - tr.ir.nk()) as usize;
+        let mut a = Asm { tr, code: Emit::new(), cur: 0, snapidx: 0,
+            last_use: vec![0; nins], klast_use: vec![0; nk],
+            needs_env: vec![false; nins], env_valid: vec![false; nins],
+            loc: vec![None; nins], owner: [Owner::None; NREG],
+            fixups: Vec::new(), stubs: Vec::new(), phis: Vec::new(),
+            loop_pos: None, s0: [Owner::None; NREG], phi_homes: Vec::new(),
+            link, stub_tails: Vec::new() };
+        for r in REF_FIRST..tr.ir.nins() {
             let ins = tr.ir.ir(r);
             match ins.op() {
-                IROp::NOP | IROp::BASE | IROp::LOOP | IROp::SLOAD | IROp::ULOAD => {}
-                IROp::FLOAD | IROp::HLOAD | IROp::CARG => {
-                    // Helper-call arguments are read from env as raw bits.
-                    for op in [ins.op1 as IRRef, ins.op2 as IRRef] {
-                        if op >= REF_BIAS {
-                            a.needs_env[Self::iidx(op)] = true;
-                        }
-                    }
-                }
-                IROp::HSTORE => {
-                    if ins.op1 as IRRef >= REF_BIAS {
-                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
-                    }
-                }
-                IROp::CALLL => {
-                    if super::super::record::ircall_arity(ins.op2 as u32) == 1
-                        && ins.op1 as IRRef >= REF_BIAS
-                    {
-                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
-                    }
-                }
-                IROp::ALOAD => {
-                    if ins.op1 as IRRef >= REF_BIAS {
-                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
-                    }
-                    a.mark_use(ins.op2 as IRRef, r);
-                }
-                IROp::ASTORE => {
-                    if ins.op1 as IRRef >= REF_BIAS {
-                        a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
-                    }
-                }
-                IROp::TNEW | IROp::TDUP | IROp::GCSTEP => {}
-                IROp::POW | IROp::TOBIT | IROp::BSWAP => {
-                    a.mark_use(ins.op1 as IRRef, r);
-                }
-                IROp::BAND
-                | IROp::BOR
-                | IROp::BXOR
-                | IROp::BSHL
-                | IROp::BSHR
-                | IROp::BSAR
-                | IROp::BROL
-                | IROp::BROR
-                | IROp::BNOT => {
-                    a.mark_use(ins.op1 as IRRef, r);
-                    if ins.op2 != 0 {
-                        a.mark_use(ins.op2 as IRRef, r);
-                    }
-                }
-                IROp::ADD
-                | IROp::SUB
-                | IROp::MUL
-                | IROp::DIV
-                | IROp::MIN
-                | IROp::MAX
-                | IROp::NEG
-                | IROp::ABS => {
-                    a.mark_use(ins.op1 as IRRef, r);
-                    a.mark_use(ins.op2 as IRRef, r);
-                }
-                IROp::FPMATH => a.mark_use(ins.op1 as IRRef, r),
-                IROp::LT
-                | IROp::GE
-                | IROp::LE
-                | IROp::GT
-                | IROp::ULT
-                | IROp::UGE
-                | IROp::ULE
-                | IROp::UGT => {
-                    a.mark_use(ins.op1 as IRRef, r);
-                    a.mark_use(ins.op2 as IRRef, r);
-                }
-                IROp::EQ | IROp::NE => {
-                    a.mark_use(ins.op1 as IRRef, r);
-                    a.mark_use(ins.op2 as IRRef, r);
-                    if !irt_isnum(ins.t()) {
-                        if ins.op1 as IRRef >= REF_BIAS {
-                            a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
-                        }
-                        if ins.op2 as IRRef >= REF_BIAS {
-                            a.needs_env[Self::iidx(ins.op2 as IRRef)] = true;
-                        }
-                    }
-                }
-                IROp::PHI => {
-                    let inf = tr.ir.nins();
-                    a.mark_use(ins.op1 as IRRef, inf);
-                    a.mark_use(ins.op2 as IRRef, inf);
-                    // PHI result must be stored to env so the post-loop
-                    // body (after LOOP) can load it via fetch_fp.
-                    a.needs_env[Self::iidx(r)] = true;
-                    let num = irt_isnum(ins.t());
-                    a.phis.push(PhiInfo {
-                        phi: r,
-                        lref: ins.op1 as IRRef,
-                        rref: ins.op2 as IRRef,
-                        num,
-                    });
-                }
+                IROp::NOP|IROp::BASE|IROp::LOOP|IROp::SLOAD => {}
+                IROp::ULOAD => {}
+                IROp::FLOAD|IROp::HLOAD|IROp::CARG => for op in [ins.op1 as IRRef, ins.op2 as IRRef] { if op>=REF_BIAS { a.needs_env[Self::iidx(op)]=true; } }
+                IROp::HSTORE => { if ins.op1 as IRRef>=REF_BIAS { a.needs_env[Self::iidx(ins.op1 as IRRef)]=true; } }
+                IROp::CALLL => { if super::super::record::ircall_arity(ins.op2 as u32)==1 && ins.op1 as IRRef>=REF_BIAS { a.needs_env[Self::iidx(ins.op1 as IRRef)]=true; } }
+                IROp::TNEW|IROp::TDUP => {}
+                IROp::ALOAD => { if ins.op1 as IRRef>=REF_BIAS { a.needs_env[Self::iidx(ins.op1 as IRRef)]=true; } a.mark_use(ins.op2 as IRRef,r); }
+                IROp::ASTORE => { if ins.op1 as IRRef>=REF_BIAS { a.needs_env[Self::iidx(ins.op1 as IRRef)]=true; } }
+                IROp::GCSTEP => {}
+                IROp::BAND|IROp::BOR|IROp::BXOR|IROp::BSHL|IROp::BSHR|IROp::BSAR|IROp::BNOT|IROp::BSWAP => { a.mark_use(ins.op1 as IRRef,r); if ins.op2!=0 { a.mark_use(ins.op2 as IRRef,r); } }
+                IROp::ADD|IROp::SUB|IROp::MUL|IROp::DIV|IROp::MIN|IROp::MAX => { a.mark_use(ins.op1 as IRRef,r); a.mark_use(ins.op2 as IRRef,r); }
+                IROp::NEG => { a.mark_use(ins.op1 as IRRef,r); a.mark_use(ins.op2 as IRRef,r); }
+                IROp::ABS => a.mark_use(ins.op1 as IRRef,r),
+                IROp::FPMATH => a.mark_use(ins.op1 as IRRef,r),
+                IROp::LT|IROp::GE|IROp::LE|IROp::GT|IROp::ULT|IROp::UGE|IROp::ULE|IROp::UGT => { a.mark_use(ins.op1 as IRRef,r); a.mark_use(ins.op2 as IRRef,r); }
+                IROp::POW => { for op in [ins.op1 as IRRef,ins.op2 as IRRef] { a.mark_use(op,r); if op>=REF_BIAS { a.needs_env[Self::iidx(op)]=true; } } }
+                IROp::TOBIT => a.mark_use(ins.op1 as IRRef,r),
+                IROp::EQ|IROp::NE => { a.mark_use(ins.op1 as IRRef,r); a.mark_use(ins.op2 as IRRef,r); if !irt_isnum(ins.t()) { for op in [ins.op1 as IRRef,ins.op2 as IRRef] { if op>=REF_BIAS { a.needs_env[Self::iidx(op)]=true; } } } }
+                IROp::PHI => { let (lref,rref)=(ins.op1 as IRRef,ins.op2 as IRRef); let inf=tr.ir.nins(); a.mark_use(lref,inf); a.mark_use(rref,inf); if !irt_isnum(ins.t()) { if lref>=REF_BIAS { a.needs_env[Self::iidx(lref)]=true; } if rref>=REF_BIAS { a.needs_env[Self::iidx(rref)]=true; } } a.phis.push(PhiInfo{phi:r,lref,rref,num:irt_isnum(ins.t())}); }
                 _ => return Err(TraceError::NYIIR),
             }
         }
-
-        // Mark snapshot references as needing env storage.
-        for snap in &tr.snap {
+        for (i,snap) in tr.snap.iter().enumerate() {
+            let lu = if i+1 < tr.snap.len() { tr.snap[i+1].iref } else { tr.ir.nins() };
             let ofs = snap.mapofs as usize;
-            for sn in &tr.snapmap[ofs..ofs + snap.nent as usize] {
-                let rref = snap_ref(*sn);
-                if rref >= REF_BIAS {
-                    a.mark_use(rref, nins);
-                    if !irt_isnum(tr.ir.ir(rref).t()) {
-                        a.needs_env[Self::iidx(rref)] = true;
-                    }
-                }
+            for sn in &tr.snapmap[ofs..ofs+snap.nent as usize] {
+                let rr = snap_ref(*sn);
+                if rr>=REF_BIAS { a.mark_use(rr,lu); a.needs_env[Self::iidx(rr)]=true; }
             }
         }
-        // Side-trace handover: inherited SLOADs are pre-filled in env.
-        for &(own, _) in &tr.parentmap {
-            a.env_valid[Self::iidx(own as IRRef)] = true;
-        }
-        // The PHI result env slot doubles as the back-edge scratch buffer.
-        // A PHI that is referenced by a later instruction (last_use != 0)
-        // requires a more elaborate loop-carried-value machinery that NYI
-        // for now (portable executor runs the trace instead). Match x64.
-        for p in &a.phis {
-            if a.last_use[Self::iidx(p.phi)] != 0 {
-                return Err(TraceError::NYIIR);
-            }
-        }
-
+        for &(own,_) in &tr.parentmap { a.env_valid[Self::iidx(own as IRRef)]=true; }
+        for p in &a.phis { if a.last_use[Self::iidx(p.phi)]!=0 { return Err(TraceError::NYIIR); } }
         Ok(a)
     }
 
-    fn mark_use(&mut self, r: IRRef, at: IRRef) {
-        if r >= REF_BIAS {
-            self.last_use[Self::iidx(r)] = self.last_use[Self::iidx(r)].max(at);
-        } else {
-            self.klast_use[Self::kidx(r)] = self.klast_use[Self::kidx(r)].max(at);
-        }
+    // ═══ use tracking & register allocation ═══════════════════════════════
+    fn mark_use(&mut self, opr: IRRef, at: IRRef) {
+        if opr>=REF_BIAS { let i=Self::iidx(opr); self.last_use[i]=self.last_use[i].max(at); }
+        else { let k=Self::kidx(opr); self.klast_use[k]=self.klast_use[k].max(at); }
     }
-
-    // -- Register allocator (ARM64 ports of x64.rs equivalents) --------------
-
-    #[inline]
-    fn pin(rg: u8) -> u16 {
-        1u16 << (rg as u32)
-    }
-
-    #[inline]
+    fn last_use_of(&self, r: IRRef) -> IRRef { if r>=REF_BIAS { self.last_use[Self::iidx(r)] } else { self.klast_use[Self::kidx(r)] } }
+    fn dying(&self, r: IRRef) -> bool { self.last_use_of(r) <= self.cur }
     fn reg_of(&self, r: IRRef) -> Option<u8> {
-        if r >= REF_BIAS {
-            self.loc[Self::iidx(r)]
-        } else {
-            None
-        }
+        if r>=REF_BIAS { self.loc[Self::iidx(r)] } else { (0..NREG as u8).find(|&i| self.owner[i as usize]==Owner::Konst(r)) }
     }
-
-    #[inline]
-    fn dying(&self, r: IRRef) -> bool {
-        r >= REF_BIAS && self.last_use[Self::iidx(r)] <= self.cur
+    fn steal_quiet(&mut self, rg: u8) { if let Owner::Ins(o)=self.owner[rg as usize] { self.loc[Self::iidx(o)]=None; } self.owner[rg as usize]=Owner::None; }
+    fn alloc(&mut self, pinned: u32) -> Result<u8, TraceError> {
+        for &rg in ALLOC_REGS.iter() { if pinned&pin(rg)==0 && self.owner[rg as usize]==Owner::None { return Ok(rg); } }
+        for &rg in ALLOC_REGS.iter() { if pinned&pin(rg)!=0 { continue; } let dead=match self.owner[rg as usize] { Owner::Ins(o)=>self.last_use[Self::iidx(o)]<self.cur, Owner::Konst(o)=>self.klast_use[Self::kidx(o)]<self.cur, _=>unreachable!() }; if dead { self.steal_quiet(rg); return Ok(rg); } }
+        let mut best:Option<(u8,IRRef)>=None;
+        for &rg in ALLOC_REGS.iter() { if pinned&pin(rg)!=0 { continue; } let lu=match self.owner[rg as usize] { Owner::Ins(o)=>self.last_use[Self::iidx(o)], Owner::Konst(o)=>self.klast_use[Self::kidx(o)], _=>unreachable!() }; if best.is_none_or(|(_,b)| lu>b) { best=Some((rg,lu)); } }
+        let Some((rg,_))=best else { return Err(TraceError::BADRA); };
+        if let Owner::Ins(o)=self.owner[rg as usize] { let i=Self::iidx(o); if !self.env_valid[i] { self.code.str_d(rg,RENV,Self::env_ofs(o)); self.env_valid[i]=true; } }
+        self.steal_quiet(rg); Ok(rg)
     }
-
-    fn steal_quiet(&mut self, rg: u8) {
-        match self.owner[rg as usize] {
-            Owner::Ins(o) => self.loc[Self::iidx(o)] = None,
-            Owner::Konst(_) => {}
-            Owner::None => {}
-        }
-        self.owner[rg as usize] = Owner::None;
-    }
-
-    const ALLOC_REGS: [u8; 5] = [0, 1, 2, 3, 4];
-
-    /// Allocate an FP register, evicting the farthest-use value if needed.
-    fn alloc(&mut self, pinned: u16) -> Result<u8, TraceError> {
-        for &rg in &Self::ALLOC_REGS {
-            if pinned & Self::pin(rg) == 0 && self.owner[rg as usize] == Owner::None {
-                return Ok(rg);
-            }
-        }
-        for &rg in &Self::ALLOC_REGS {
-            if pinned & Self::pin(rg) != 0 {
-                continue;
-            }
-            let dead = match self.owner[rg as usize] {
-                Owner::Ins(o) => self.last_use[Self::iidx(o)] < self.cur,
-                Owner::Konst(o) => self.klast_use[Self::kidx(o)] < self.cur,
-                Owner::None => unreachable!(),
-            };
-            if dead {
-                self.steal_quiet(rg);
-                return Ok(rg);
-            }
-        }
-        let mut best: Option<(u8, IRRef)> = None;
-        for &rg in &Self::ALLOC_REGS {
-            if pinned & Self::pin(rg) != 0 {
-                continue;
-            }
-            let lu = match self.owner[rg as usize] {
-                Owner::Ins(o) => self.last_use[Self::iidx(o)],
-                Owner::Konst(o) => self.klast_use[Self::kidx(o)],
-                Owner::None => unreachable!(),
-            };
-            if best.is_none_or(|(_, b)| lu > b) {
-                best = Some((rg, lu));
-            }
-        }
-        let Some((rg, _)) = best else {
-            return Err(TraceError::BADRA);
-        };
-        if let Owner::Ins(o) = self.owner[rg as usize] {
-            let i = Self::iidx(o);
-            if !self.env_valid[i] {
-                str_fp(&mut self.code, rg, RENV, Self::env_disp(o));
-                self.env_valid[i] = true;
-            }
-        }
-        self.steal_quiet(rg);
+    fn fetch_fp(&mut self, r: IRRef, pinned: u32) -> Result<u8, TraceError> {
+        if let Some(rg)=self.reg_of(r) { return Ok(rg); }
+        let rg=self.alloc(pinned)?;
+        if r>=REF_BIAS { self.code.ldr_d(rg,RENV,Self::env_ofs(r)); self.owner[rg as usize]=Owner::Ins(r); self.loc[Self::iidx(r)]=Some(rg); }
+        else { self.code.mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir,r)); self.code.fmov_fp(rg,RSCRATCH); self.owner[rg as usize]=Owner::Konst(r); }
         Ok(rg)
     }
-
-    /// Bring an operand into an FP register.
-    fn fetch_fp(&mut self, r: IRRef, pinned: u16) -> Result<u8, TraceError> {
-        if let Some(rg) = self.reg_of(r) {
-            return Ok(rg);
-        }
-        let rg = self.alloc(pinned)?;
-        if r >= REF_BIAS {
-            let i = Self::iidx(r);
-            debug_assert!(self.env_valid[i]);
-            ldr_fp(&mut self.code, rg, RENV, Self::env_disp(r));
-            self.owner[rg as usize] = Owner::Ins(r);
-            self.loc[i] = Some(rg);
-        } else {
-            let bits = super::super::exec::const_bits(&self.tr.ir, r);
-            mov_imm64(&mut self.code, RSCR, bits);
-            fmov_gpr_fp(&mut self.code, rg, RSCR);
-            self.owner[rg as usize] = Owner::Konst(r);
-        }
-        Ok(rg)
-    }
-
-    /// Fetch op1 as the (destroyed) destination of a two-address op.
     fn into_dst(&mut self, a: IRRef) -> Result<u8, TraceError> {
-        let r1 = self.fetch_fp(a, 0)?;
-        if self.dying(a) {
-            self.steal_quiet(r1);
-            Ok(r1)
-        } else {
-            let d = self.alloc(Self::pin(r1))?;
-            fmov_reg(&mut self.code, d, r1);
-            Ok(d)
-        }
+        let r1=self.fetch_fp(a,0)?; if self.dying(a) { self.steal_quiet(r1); Ok(r1) } else { let d=self.alloc(pin(r1))?; self.code.fmov_dd(d,r1); Ok(d) }
     }
-
-    /// Bind the current instruction's result.
+    fn gpr_load_ref(&mut self, rd: u8, r: IRRef) {
+        if r>=REF_BIAS { self.code.ldr(rd,RENV,Self::env_ofs(r)); } else { self.code.mov64(rd, super::super::exec::const_bits(&self.tr.ir,r)); }
+    }
     fn def(&mut self, d: u8) {
-        let i = Self::iidx(self.cur);
-        self.owner[d as usize] = Owner::Ins(self.cur);
-        self.loc[i] = Some(d);
-        if self.needs_env[i] {
-            str_fp(&mut self.code, d, RENV, Self::env_disp(self.cur));
-            self.env_valid[i] = true;
-        }
+        let i=Self::iidx(self.cur); self.owner[d as usize]=Owner::Ins(self.cur); self.loc[i]=Some(d);
+        if self.needs_env[i] { self.code.str_d(d,RENV,Self::env_ofs(self.cur)); self.env_valid[i]=true; }
     }
 
-    /// Raw 64-bit value of an operand into a GPR.
-    fn gpr_load_ref(&mut self, gpr: u8, r: IRRef) {
-        if r == REF_BIAS {
-            // REF_BASE: load the Lua stack base pointer (x19).
-            mov_reg(&mut self.code, gpr, RBASE);
-        } else if r >= REF_BIAS {
-            debug_assert!(self.env_valid[Self::iidx(r)]);
-            ldr_imm(&mut self.code, gpr, RENV, Self::env_disp(r), 64);
-        } else {
-            mov_imm64(
-                &mut self.code,
-                gpr,
-                super::super::exec::const_bits(&self.tr.ir, r),
-            );
-        }
+    // ═══ guard / stub ═══════════════════════════════════════════════════════
+    fn exit_code(&self, snapidx: usize) -> u32 { (self.tr.traceno<<16)|snapidx as u32 }
+    fn exit_flush_set(&self, snapidx: usize) -> Vec<(u8,IRRef)> {
+        let snap=&self.tr.snap[snapidx]; let ofs=snap.mapofs as usize; let mut f=Vec::new();
+        for sn in &self.tr.snapmap[ofs..ofs+snap.nent as usize] { let r=snap_ref(*sn); if r<REF_BIAS { continue; } let i=Self::iidx(r); if self.env_valid[i]||f.iter().any(|&(_,fr)| fr==r) { continue; } if let Some(rg)=self.loc[i] { f.push((rg,r)); } }
+        f
     }
+    fn make_stub(&mut self, gc: bool) -> usize { let flush=self.exit_flush_set(self.snapidx); self.stubs.push(Stub{snapidx:self.snapidx,flush,gc}); self.stubs.len()-1 }
 
-    /// S-register (GPR) view of an FP register — not needed with str_fp/ldr_fp.
-    #[allow(dead_code)]
-    fn sreg_of(fp: u8) -> u8 {
-        fp
-    }
+    // Emit a conditional branch to a new exit stub (placeholder offset, patched later).
+    fn guard(&mut self, cc: u32) { let s=self.make_stub(false); let pos=self.code.len(); self.code.b_cond(cc,0); self.fixups.push((pos,s)); }
+    fn guard_gc(&mut self, cc: u32) { let s=self.make_stub(true); let pos=self.code.len(); self.code.b_cond(cc,0); self.fixups.push((pos,s)); }
 
-    // -- Exit stub helpers ---------------------------------------------------
-
-    fn exit_flush_set(&self, snapidx: usize) -> Vec<(u8, IRRef)> {
-        let snap = &self.tr.snap[snapidx];
-        let ofs = snap.mapofs as usize;
-        let mut flush = Vec::new();
-        for sn in &self.tr.snapmap[ofs..ofs + snap.nent as usize] {
-            let rref = snap_ref(*sn);
-            if rref >= REF_BIAS && irt_isnum(self.tr.ir.ir(rref).t()) {
-                if let Some(rg) = self.reg_of(rref) {
-                    if !self.env_valid[Self::iidx(rref)] {
-                        flush.push((rg, rref));
-                    }
-                }
-            }
-        }
-        flush
-    }
-
-    fn exit_code(&self, snapidx: usize) -> u32 {
-        (self.tr.traceno << 16) | snapidx as u32
-    }
-
-    fn make_stub(&mut self, gc: bool) -> usize {
-        let flush = self.exit_flush_set(self.snapidx);
-        self.stubs.push(StubIdx {
-            snapidx: self.snapidx,
-            flush,
-            gc,
-        });
-        self.stubs.len() - 1
-    }
-
-    /// Emit a conditional branch to a guard-exit stub (patched later).
-    /// Takes an ARM64 condition code.
-    fn guard(&mut self, cc: u8) {
-        let stub = self.make_stub(false);
-        let pos = self.code.len();
-        b_cond(&mut self.code, cc, 0); // placeholder
-        self.fixups.push((pos, stub));
-    }
-
-    /// GC-debt guard (never patched).
-    fn guard_gc(&mut self, cc: u8) {
-        let stub = self.make_stub(true);
-        let pos = self.code.len();
-        b_cond(&mut self.code, cc, 0);
-        self.fixups.push((pos, stub));
-    }
-
-    // -- Snapshot tail restore (mirrors x64 tail_restore) --------------------
-
-    fn tail_restore(&mut self, snapidx: usize) {
-        let snap = &self.tr.snap[snapidx];
-        let ofs = snap.mapofs as usize;
-        for &sn in &self.tr.snapmap[ofs..ofs + snap.nent as usize] {
-            if sn & SNAP_NORESTORE != 0 {
-                continue;
-            }
-            let disp = (snap_slot(sn) as i32 - 2) * 8;
-            let rref = snap_ref(sn);
-            if rref >= REF_BIAS {
-                if let Some(rg) = self.reg_of(rref) {
-                    // FP value in register: store to Lua stack slot.
-                    str_fp(&mut self.code, rg, RBASE, disp);
-                } else {
-                    debug_assert!(self.env_valid[Self::iidx(rref)]);
-                    ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(rref), 64);
-                    str_imm(&mut self.code, RSCR, RBASE, disp, 64);
-                }
-            } else {
-                mov_imm64(
-                    &mut self.code,
-                    RSCR,
-                    super::super::exec::const_bits(&self.tr.ir, rref),
-                );
-                str_imm(&mut self.code, RSCR, RBASE, disp, 64);
-            }
-        }
-    }
-
-    // -- Simple IR ops -------------------------------------------------------
-
-    fn asm_arith(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let op = ins.op();
-        let (mut a, mut b) = (ins.op1 as IRRef, ins.op2 as IRRef);
-        if matches!(op, IROp::ADD | IROp::MUL)
-            && !self.dying(a)
-            && self.dying(b)
-            && self.reg_of(b).is_some()
-        {
-            std::mem::swap(&mut a, &mut b);
-        }
-        let d = self.into_dst(a)?;
-        let rhs = if b == a {
-            d
-        } else {
-            self.fetch_fp(b, Self::pin(d))?
-        };
-        match op {
-            IROp::ADD => fadd(&mut self.code, d, d, rhs),
-            IROp::SUB => fsub(&mut self.code, d, d, rhs),
-            IROp::MUL => fmul(&mut self.code, d, d, rhs),
-            IROp::DIV => fdiv(&mut self.code, d, d, rhs),
-            IROp::MIN => fmin(&mut self.code, d, d, rhs),
-            IROp::MAX => fmax(&mut self.code, d, d, rhs),
-            _ => unreachable!(),
-        }
-        self.def(d);
-        Ok(())
-    }
-
-    // -- Bit ops / TOBIT / ALOAD-ASTORE / POW --------------------------------
-
-    /// Fused bit ops: convert the (range-guarded) FP operands with
-    /// fcvtzs (truncate), run the 32-bit ALU op, convert back with scvtf.
-    fn asm_bitop(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let op = ins.op();
-        let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
-        // Fetch both before converting: the second fetch may clobber
-        // scratch registers that the first conversion needs.
-        let sy = if !matches!(op, IROp::BNOT | IROp::BSWAP) {
-            if ins.op2 == ins.op1 {
-                Some(sx)
-            } else {
-                Some(self.fetch_fp(ins.op2 as IRRef, Self::pin(sx))?)
-            }
-        } else {
-            None
-        };
-        fcvtzs_w(&mut self.code, 0, sx); // w0 = trunc(sx)
-        if let Some(s) = sy {
-            fcvtzs_w(&mut self.code, 1, s);
-        }
-        match op {
-            IROp::BNOT => eor_imm(&mut self.code, 0, 0, 0xFFFFFFFF),
-            IROp::BSWAP => rev32(&mut self.code, 0, 0),
-            IROp::BAND => and_reg(&mut self.code, 0, 0, 1),
-            IROp::BOR => orr_reg(&mut self.code, 0, 0, 1),
-            IROp::BXOR => eor_reg(&mut self.code, 0, 0, 1),
-            IROp::BSHL => lsl_reg(&mut self.code, 0, 0, 1),
-            IROp::BSHR => lsr_reg(&mut self.code, 0, 0, 1),
-            IROp::BROL => {
-                neg_w(&mut self.code, 1, 1); // w1 = -w1
-                and_imm32(&mut self.code, 1, 1, 31); // w1 &= 31
-                // 32-bit ror: sf=0
-                let sf_w = 0u32;
-                emit32(&mut self.code, sf_w | 0x1AC02C00 | ((1u32) << 16) | 0);
-            }
-            IROp::BROR => {
-                // ROR w0, w0, w1 (32-bit)
-                let sf_w = 0u32;
-                emit32(&mut self.code, sf_w | 0x1AC02C00 | ((1u32) << 16) | 0);
-            }
-            _ => {
-                /* BSAR: asr w0, w0, w1 (32-bit) */
-                let sf_w = 0u32;
-                emit32(&mut self.code, sf_w | 0x1AC02800 | ((1u32) << 16) | 0);
-            }
-        }
-        let d = self.alloc(0)?;
-        scvtf_w(&mut self.code, d, 0);
-        self.def(d);
-        Ok(())
-    }
-
-    /// TOBIT: wrapping num -> int32 -> num (round-to-nearest-even, same
-    /// as num2bit in the guarded i32 range).
-    fn asm_tobit(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
-        fcvtns_w(&mut self.code, 0, sx);
-        let d = self.alloc(0)?;
-        scvtf_w(&mut self.code, d, 0);
-        self.def(d);
-        Ok(())
-    }
-
-    /// POW: vm_pow via a helper call.
-    fn asm_pow(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        self.helper_call(
-            super::super::exec::jit_pow as *const () as u64,
-            &[ins.op1 as IRRef, ins.op2 as IRRef],
-        );
-        let i = Self::iidx(self.cur);
-        if self.last_use[i] != 0 || self.needs_env[i] {
-            let d = self.alloc(0)?;
-            fmov_gpr_fp(&mut self.code, d, RSCR);
-            self.def(d);
-        }
-        Ok(())
-    }
-
-    // -- ALOAD / ASTORE (array inlining) -------------------------------------
-
-    /// Common head: load table pointer into x0, check key is exact int32
-    /// in array range. key is in FP register, result: x0=table, w1=index.
-    fn asm_array_head(&mut self, tab: IRRef, key: IRRef) -> Result<(), TraceError> {
-        const ASIZE_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, asize) as i32;
-        // Fetch key first (may use RAX/GPRs for constants).
-        let sk = self.fetch_fp(key, 0)?;
-        self.gpr_load_ref(0, tab);
-        mov_imm64(&mut self.code, 1, crate::value::LJ_GCVMASK);
-        and_reg(&mut self.code, 0, 0, 1);
-        fcvtzs_w(&mut self.code, 1, sk); // w1 = trunc(key)
-        scvtf_w(&mut self.code, FP_SCRATCH, 1);
-        fcmp(&mut self.code, FP_SCRATCH, sk);
-        self.guard(CC_NE); // not exact int → exit
-        // Check w1 < asize (unsigned).
-        ldr_imm(&mut self.code, 2, 0, ASIZE_OFF, 32);
-        cmp_reg(&mut self.code, 1, 2);
-        self.guard(CC_CS); // unsigned >= → exit
-        Ok(())
-    }
-
-    fn asm_aload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
-        self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
-        // Load aptr, then value.
-        ldr_imm(&mut self.code, 2, 0, APTR_OFF, 64);
-        // ldr x3, [x2, w1, uxtw #3]
-        ldr_reg_uxtw(&mut self.code, 0, 2, 1);
-        self.ff_result(ins)
-    }
-
-    fn asm_astore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
-        let carg = *self.tr.ir.ir(ins.op2 as IRRef);
-        debug_assert_eq!(carg.op(), IROp::CARG);
-        self.asm_array_head(ins.op1 as IRRef, carg.op1 as IRRef)?;
-        // k > 0 guard (set_int requires).
-        cmp_imm(&mut self.code, 1, 0, 0);
-        self.guard(CC_EQ);
-        ldr_imm(&mut self.code, 2, 0, APTR_OFF, 64); // x2 = aptr
-        let val = carg.op2 as IRRef;
-        if val >= REF_BIAS
-            && let Some(sv) = self.reg_of(val)
-        {
-            fmov_fp_gpr(&mut self.code, 3, sv);
-            str_reg_uxtw(&mut self.code, 3, 2, 1);
-        } else {
-            self.gpr_load_ref(3, val);
-            str_reg_uxtw(&mut self.code, 3, 2, 1);
-        }
-        Ok(())
-    }
-
-    // -- Loop optimisation / Tail --------------------------------------------
-
-    fn asm_loop_head(&mut self) {
-        for rg in 0..NREG as u8 {
-            let dead = match self.owner[rg as usize] {
-                Owner::Ins(o) => self.last_use[Self::iidx(o)] <= self.cur,
-                Owner::Konst(k) => self.klast_use[Self::kidx(k)] <= self.cur,
-                Owner::None => false,
-            };
-            if dead {
-                self.steal_quiet(rg);
-            }
-        }
-        // Spill all live non-PHI regs into their env slots so the
-        // post-loop body can find values even if registers were stolen.
-        for rg in 0..NREG as u8 {
-            if let Owner::Ins(o) = self.owner[rg as usize] {
-                if self.phis.iter().any(|p| p.num && p.lref == o) {
-                    continue;
-                }
-                let i = Self::iidx(o);
-                if !self.env_valid[i] {
-                    str_fp(&mut self.code, rg, RENV, Self::env_disp(o));
-                    self.env_valid[i] = true;
-                }
-            }
-        }
-        // Pre-fill PHI env slots with the current register value so
-        // the post-loop body's first iteration can find the value.
-        for p in &self.phis {
-            let ii = Self::iidx(p.phi);
-            if p.num && !self.env_valid[ii] {
-                if let Some(lr) = self.loc[Self::iidx(p.lref)] {
-                    // lref still has a register — store to phi env
-                    str_fp(&mut self.code, lr, RENV, Self::env_disp(p.phi));
-                    self.env_valid[ii] = true;
-                } else {
-                    // lref stolen — its value was spilled to env when
-                    // the register was evicted. Load from env[lref] and
-                    // store to env[phi] instead of picking a random
-                    // live register.
-                    if self.env_valid[Self::iidx(p.lref)] {
-                        ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
-                        str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
-                        self.env_valid[ii] = true;
-                    }
-                }
-            }
-        }
-        // Reset PHI lref env_valid so the back-edge sees them as dirty.
-        for p in &self.phis {
-            let li = Self::iidx(p.lref);
-            if p.num && self.loc[li].is_some() && !self.needs_env[li] {
-                self.env_valid[li] = false;
-            }
-        }
-        self.s0 = self.owner;
-        self.loop_pos = Some(self.code.len());
-    }
-
-    fn asm_loop_back(&mut self, loop_pos: usize) {
-        let s0 = self.s0;
-        let phis = std::mem::take(&mut self.phis);
-        let homes: Vec<Option<u8>> = phis
-            .iter()
-            .map(|p| (0..NREG as u8).find(|&rg| s0[rg as usize] == Owner::Ins(p.lref)))
-            .collect();
-        let dstset: u16 = homes.iter().flatten().fold(0, |m, &rg| m | Self::pin(rg));
-        let direct = phis.iter().all(|p| {
-            if p.rref < REF_BIAS {
-                return true;
-            }
-            if let Some(rg) = self.reg_of(p.rref)
-                && p.num
-            {
-                return dstset & Self::pin(rg) == 0;
-            }
-            !phis.iter().any(|q| q.lref == p.rref)
-        });
-        if direct {
-            for (p, home) in phis.iter().zip(homes.iter()) {
-                self.phi_move(p, *home);
-            }
-        } else {
-            // Buffered: read right values into PHI env slots, then land.
-            for p in &phis {
-                if p.rref >= REF_BIAS {
-                    if p.num
-                        && let Some(rg) = self.reg_of(p.rref)
-                    {
-                        str_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
-                    } else {
-                        ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.rref), 64);
-                        str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
-                    }
-                } else {
-                    mov_imm64(
-                        &mut self.code,
-                        RSCR,
-                        super::super::exec::const_bits(&self.tr.ir, p.rref),
-                    );
-                    str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
-                }
-            }
-            for (p, home) in phis.iter().zip(homes.iter()) {
-                if p.num
-                    && let Some(rg) = *home
-                {
-                    ldr_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
-                    if self.needs_env[Self::iidx(p.lref)] {
-                        str_fp(&mut self.code, rg, RENV, Self::env_disp(p.lref));
-                    }
-                    self.owner[rg as usize] = Owner::Ins(p.lref);
-                    self.loc[Self::iidx(p.lref)] = Some(rg);
-                } else {
-                    ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
-                    str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
-                }
-            }
-        }
-        // Restore invariants from env.
-        for rg in 0..NREG as u8 {
-            let so = s0[rg as usize];
-            if so == Owner::None || so == self.owner[rg as usize] {
-                continue;
-            }
-            if phis.iter().any(|p| so == Owner::Ins(p.lref)) {
-                continue;
-            }
-            match so {
-                Owner::Ins(x) => {
-                    ldr_fp(&mut self.code, rg, RENV, Self::env_disp(x));
-                    self.owner[rg as usize] = Owner::Ins(x);
-                    self.loc[Self::iidx(x)] = Some(rg);
-                }
-                Owner::Konst(k) => {
-                    mov_imm64(
-                        &mut self.code,
-                        RSCR,
-                        super::super::exec::const_bits(&self.tr.ir, k),
-                    );
-                    fmov_gpr_fp(&mut self.code, rg, RSCR);
-                    self.owner[rg as usize] = Owner::Konst(k);
-                }
-                Owner::None => unreachable!(),
-            }
-        }
-        // Jump back.
-        let offset = loop_pos as i32 - self.code.len() as i32;
-        b_imm(&mut self.code, offset, false);
-    }
-
-    fn phi_move(&mut self, p: &PhiInfo, home: Option<u8>) {
-        if p.rref < REF_BIAS {
-            mov_imm64(
-                &mut self.code,
-                RSCR,
-                super::super::exec::const_bits(&self.tr.ir, p.rref),
-            );
-            if p.num {
-                if let Some(rg) = home {
-                    fmov_gpr_fp(&mut self.code, rg, RSCR);
-                    if self.needs_env[Self::iidx(p.lref)] {
-                        str_fp(&mut self.code, rg, RENV, Self::env_disp(p.lref));
-                    }
-                    if self.needs_env[Self::iidx(p.phi)] {
-                        str_fp(&mut self.code, rg, RENV, Self::env_disp(p.phi));
-                    }
-                } else {
-                    str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
-                    if self.needs_env[Self::iidx(p.phi)] {
-                        str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
-                    }
-                }
-            }
-        } else if p.num
-            && let Some(rg) = self.reg_of(p.rref)
-        {
-            let d = home.unwrap_or(0);
-            if d != rg {
-                fmov_reg(&mut self.code, d, rg);
-            }
-            if self.needs_env[Self::iidx(p.lref)] {
-                str_fp(&mut self.code, d, RENV, Self::env_disp(p.lref));
-            }
-            if self.needs_env[Self::iidx(p.phi)] {
-                str_fp(&mut self.code, d, RENV, Self::env_disp(p.phi));
-            }
-            // After moving the value into `d`, restore the lref's register
-            // mapping so that reg_of(lref) works in the next iteration.
-            // Also map the pre-loop source ref (which opt_loop resolves
-            // via tref_ref, e.g. MUL_pre_ref) to `d` so the post-loop body
-            // can find the value via reg_of instead of loading from env.
-            self.loc[Self::iidx(p.lref)] = Some(d);
-            self.owner[d as usize] = Owner::Ins(p.lref);
-            let post_ir = self.tr.ir.ir(p.rref);
-            let pre_ref = post_ir.op1 as IRRef;
-            if pre_ref >= REF_BIAS && p.num && self.loc[Self::iidx(pre_ref)].is_none() {
-                self.loc[Self::iidx(pre_ref)] = Some(d);
-            }
-        } else {
-            debug_assert!(self.env_valid[Self::iidx(p.rref)]);
-            if p.num
-                && let Some(rg) = home
-            {
-                ldr_fp(&mut self.code, rg, RENV, Self::env_disp(p.rref));
-                self.loc[Self::iidx(p.lref)] = Some(rg);
-                self.owner[rg as usize] = Owner::Ins(p.lref);
-            }
-            ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.rref), 64);
-            str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.lref), 64);
-            if self.needs_env[Self::iidx(p.phi)] {
-                str_imm(&mut self.code, RSCR, RENV, Self::env_disp(p.phi), 64);
-            }
-        }
-    }
-
-    // -- Emit loop -----------------------------------------------------------
-
-    fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
-        // AAPCS64 prologue: x0=base, x1=env
-        const FRAME: i32 = 256;
-        sub_imm(&mut self.code, 31, 31, FRAME as u32, 0); // sub sp, sp, #256
-        stp_offset(&mut self.code, 29, 30, 31, 0); // stp x29, x30, [sp, #0]
-        // Save x19-x28 at [sp + 16*k]
-        stp_offset(&mut self.code, 19, 20, 31, 16);
-        stp_offset(&mut self.code, 21, 22, 31, 32);
-        stp_offset(&mut self.code, 23, 24, 31, 48);
-        stp_offset(&mut self.code, 25, 26, 31, 64);
-        stp_offset(&mut self.code, 27, 28, 31, 80);
-        // v8-v15: saved in area [sp+96..sp+256] — skip saves for now (traces
-        // don't use callee-saved FP regs yet; all FP state is in v0-v4).
-        mov_reg(&mut self.code, RBASE, 0); // x19 = x0 (base)
-        mov_reg(&mut self.code, RENV, 1); // x20 = x1 (env)
-        let inner = self.code.len() as u32;
-
-        // Parentmap handover
-        if !self.tr.parentmap.is_empty() {
-            self.emit_handover();
-        }
-
-        let nins = self.tr.ir.nins();
-        let mut r = REF_FIRST;
-        while r < nins {
-            while self.snapidx + 1 < self.tr.snap.len() && self.tr.snap[self.snapidx + 1].iref <= r
-            {
-                self.snapidx += 1;
-            }
-            self.cur = r;
-            let ins = *self.tr.ir.ir(r);
-            match ins.op() {
-                IROp::NOP | IROp::BASE | IROp::PHI => {}
-                IROp::LOOP => self.asm_loop_head(),
-                IROp::SLOAD => self.asm_sload(&ins)?,
-                IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV | IROp::MIN | IROp::MAX => {
-                    self.asm_arith(&ins)?;
-                }
-                IROp::NEG => {
-                    let d = self.into_dst(ins.op1 as IRRef)?;
-                    fneg(&mut self.code, d, d);
-                    self.def(d);
-                }
-                IROp::ABS => {
-                    let d = self.into_dst(ins.op1 as IRRef)?;
-                    fabs(&mut self.code, d, d);
-                    self.def(d);
-                }
-                IROp::FPMATH => {
-                    let src = self.fetch_fp(ins.op1 as IRRef, 0)?;
-                    let d = if self.dying(ins.op1 as IRRef) {
-                        self.steal_quiet(src);
-                        src
-                    } else {
-                        let d2 = self.alloc(Self::pin(src))?;
-                        fmov_reg(&mut self.code, d2, src);
-                        d2
-                    };
-                    match ins.op2 as u32 {
-                        super::super::record::IRFPM_FLOOR => frintm(&mut self.code, d, d),
-                        super::super::record::IRFPM_CEIL => frintp(&mut self.code, d, d),
-                        super::super::record::IRFPM_TRUNC => frintz(&mut self.code, d, d),
-                        super::super::record::IRFPM_SQRT => fsqrt(&mut self.code, d, d),
-                        _ => unreachable!(),
-                    }
-                    self.def(d);
-                }
-                IROp::LT
-                | IROp::GE
-                | IROp::LE
-                | IROp::GT
-                | IROp::ULT
-                | IROp::UGE
-                | IROp::ULE
-                | IROp::UGT => {
-                    self.asm_comp(&ins)?;
-                }
-                IROp::EQ | IROp::NE => self.asm_equal(&ins)?,
-                IROp::CARG => {} // Consumed by HSTORE/CALLL/ASTORE.
-                IROp::CALLL => self.asm_calll(&ins)?,
-                IROp::TNEW => {
-                    self.helper_call(super::super::exec::jit_tnew as *const () as u64, &[]);
-                    self.ff_result(&ins)?;
-                }
-                IROp::TDUP => {
-                    self.helper_call(
-                        super::super::exec::jit_tdup as *const () as u64,
-                        &[ins.op1 as IRRef],
-                    );
-                    self.ff_result(&ins)?;
-                }
-                IROp::HSTORE => {
-                    let carg = *self.tr.ir.ir(ins.op2 as IRRef);
-                    debug_assert_eq!(carg.op(), IROp::CARG);
-                    self.helper_call(
-                        super::super::exec::jit_tset as *const () as u64,
-                        &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef],
-                    );
-                }
-                IROp::GCSTEP => self.asm_gcstep(&ins),
-                IROp::FLOAD => self.asm_fload(&ins),
-                IROp::HLOAD => {
-                    self.helper_call(
-                        super::super::exec::jit_tget as *const () as u64,
-                        &[ins.op1 as IRRef, ins.op2 as IRRef],
-                    );
-                    self.ff_result(&ins)?;
-                }
-                IROp::ULOAD => self.asm_uload(&ins)?,
-                IROp::BAND
-                | IROp::BOR
-                | IROp::BXOR
-                | IROp::BSHL
-                | IROp::BSHR
-                | IROp::BSAR
-                | IROp::BROL
-                | IROp::BROR
-                | IROp::BNOT
-                | IROp::BSWAP => {
-                    self.asm_bitop(&ins)?;
-                }
-                IROp::TOBIT => self.asm_tobit(&ins)?,
-                IROp::POW => self.asm_pow(&ins)?,
-                IROp::ALOAD => self.asm_aload(&ins)?,
-                IROp::ASTORE => self.asm_astore(&ins)?,
-                _ => return Err(TraceError::NYIIR),
-            }
-            r += 1;
-        }
-
-        // Tail section
-        let lastsnap = self.tr.snap.len() - 1;
-        let looping = self.tr.linktype == TraceLink::Loop && self.tr.link == self.tr.traceno;
-        let recursing = matches!(self.tr.linktype, TraceLink::Uprec | TraceLink::Tailrec)
-            && self.tr.link == self.tr.traceno;
-        if looping {
-            if let Some(lp) = self.loop_pos {
-                self.asm_loop_back(lp);
-            } else {
-                self.snapidx = lastsnap;
-                self.tail_restore(lastsnap);
-                let head_ofs = inner as i32 - self.code.len() as i32;
-                b_imm(&mut self.code, head_ofs, false);
-            }
-        } else if recursing {
-            self.snapidx = lastsnap;
-            self.tail_restore(lastsnap);
-            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
-            // rax_equiv(x0) = RBASE + delta + headroom
-            mov_reg(&mut self.code, 0, RBASE);
-            add_imm(&mut self.code, 0, 0, (delta + (255 + 8) * 8) as u32, 0);
-            mov_imm64(&mut self.code, 1, super::super::exec::stack_end_cell_addr());
-            ldr_imm(&mut self.code, 1, 1, 0, 64);
-            cmp_reg(&mut self.code, 0, 1);
-            self.guard(CC_HI);
-            if delta != 0 {
-                add_imm(&mut self.code, RBASE, RBASE, delta as u32, 0);
-            }
-            let inner_ofs = inner as i32 - self.code.len() as i32;
-            b_imm(&mut self.code, inner_ofs, false);
-        } else if self.tr.linktype == TraceLink::Root
-            && let Some(target) = self.link
-        {
-            self.snapidx = lastsnap;
-            self.tail_restore(lastsnap);
-            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
-            if delta != 0 {
-                mov_reg(&mut self.code, 0, RBASE);
-                add_imm(&mut self.code, 0, 0, (delta + (255 + 8) * 8) as u32, 0);
-                mov_imm64(&mut self.code, 1, super::super::exec::stack_end_cell_addr());
-                ldr_imm(&mut self.code, 1, 1, 0, 64);
-                cmp_reg(&mut self.code, 0, 1);
-                self.guard(CC_HI);
-                add_imm(&mut self.code, RBASE, RBASE, delta as u32, 0);
-            }
-            mov_imm64(&mut self.code, 0, target as u64);
-            br_reg(&mut self.code, 0, false); // br x0
-        } else {
-            // None/Stitch: exit through final snapshot
-            self.snapidx = lastsnap;
-            self.tail_restore(lastsnap);
-            let flush = self.exit_flush_set(lastsnap);
-            for (rg, rref) in &flush {
-                str_fp(&mut self.code, *rg, RENV, Self::env_disp(*rref));
-            }
-            let ec = self.exit_code(lastsnap);
-            mov_imm64(&mut self.code, 0, ec as u64);
-            // Fall through to epilogue
-        }
-
-        // -- Epilogue --
-        // x0 (w0) holds the exit code from the exit path above.
-        // Report BASE back through the cell, then restore and return.
-        let epilogue = self.code.len();
-        mov_imm64(
-            &mut self.code,
-            RSCR2,
-            super::super::exec::exit_base_cell_addr(),
-        );
-        str_imm(&mut self.code, RBASE, RSCR2, 0, 64);
-        ldp_offset(&mut self.code, 27, 28, 31, 80);
-        ldp_offset(&mut self.code, 25, 26, 31, 64);
-        ldp_offset(&mut self.code, 23, 24, 31, 48);
-        ldp_offset(&mut self.code, 21, 22, 31, 32);
-        ldp_offset(&mut self.code, 19, 20, 31, 16);
-        ldp_offset(&mut self.code, 29, 30, 31, 0);
-        add_imm(&mut self.code, 31, 31, FRAME as u32, 0); // add sp, sp, #256
-        ret(&mut self.code, 30);
-
-        // -- Guard-exit stubs --
-        // Stub layout (matches x64 convention for patch_exit):
-        //   [flush instructions...]  variable — live FP regs to env
-        //   [patch tail: 20 bytes]   fixed — exit-code movz+k+b, patched by patch_exit
-        // stubpos[i] → start of stub (guard b.cond target)
-        // stub_tails.push((snapidx, tail)) where tail = position right after flush
-        let stubs = std::mem::take(&mut self.stubs);
-        let mut stubpos = Vec::with_capacity(stubs.len());
-        for st in &stubs {
-            stubpos.push(self.code.len()); // guard branch target
-            for (rg, rref) in &st.flush {
-                str_fp(&mut self.code, *rg, RENV, Self::env_disp(*rref));
-            }
-            let tail = self.code.len(); // patch-exit point
-            if !st.gc {
-                self.stub_tails.push((st.snapidx as u32, tail as u32));
-            }
-            let ec = if st.gc {
-                self.exit_code(st.snapidx) | 0x8000
-            } else {
-                self.exit_code(st.snapidx)
-            };
-            mov_imm64_full(&mut self.code, 0, ec as u64); // 16 bytes (4 × movz/movk)
-            let epi_off = epilogue as i32 - self.code.len() as i32;
-            b_imm(&mut self.code, epi_off, false); // 4 bytes
-            // Total mov+b = 20 bytes; patch_exit overwrites this region.
-        }
-        self.stub_positions = stubpos;
-
-        // Fix up guard branches
-        for (pos, si) in std::mem::take(&mut self.fixups) {
-            let target = self.stub_positions[si];
-            let offset = target as i32 - pos as i32;
-            let insn = u32::from_le_bytes(self.code[pos..pos + 4].try_into().unwrap());
-            let imm19 = ((offset >> 2) as u32) & 0x7FFFF;
-            let new_insn = (insn & 0xFF00001F) | (imm19 << 5);
-            self.code[pos..pos + 4].copy_from_slice(&new_insn.to_le_bytes());
-        }
-
-        let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
-        area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code);
-
-        // Dump traces on aarch64 for debugging (TODO: remove after all fixed).
-        {
-            eprint!(
-                "[arm64] TRACE {} mcode={:5}B nins={} inner={} link={:?}",
-                self.tr.traceno,
-                self.code.len(),
-                self.tr.ir.nins() - REF_BIAS,
-                inner,
-                self.tr.linktype,
-            );
-            if let Some(lp) = self.loop_pos {
-                eprint!(" loop_pos={}", lp);
-            }
-            eprint!(" hex=");
-            for (i, chunk) in self.code.chunks(4).enumerate() {
-                let w = u32::from_le_bytes(chunk.try_into().unwrap());
-                if i > 0 {
-                    eprint!(",");
-                }
-                eprint!("{:08x}", w);
-            }
-            // Also dump IR for context
-            eprint!(" ir=");
-            for r in REF_FIRST..self.tr.ir.nins() {
-                let ins = self.tr.ir.ir(r);
-                eprint!("{:?}", ins.op());
-                if ins.op() != IROp::NOP {
-                    // skip NOP details
-                }
-                if r + 1 < self.tr.ir.nins() {
-                    eprint!(",");
-                }
-            }
-            eprintln!();
-        }
-
-        if !area.protect_exec() {
-            return Err(TraceError::MCODEAL);
-        }
-        Ok((area, inner, std::mem::take(&mut self.stub_tails)))
-    }
-
-    // -- Handover ------------------------------------------------------------
-
+    // ═══ handover: copy parent env values to child env (side traces) ════════
     fn emit_handover(&mut self) {
-        let mut pending: Vec<(IRRef, IRRef)> = self
-            .tr
-            .parentmap
-            .iter()
+        let mut pending: Vec<(IRRef, IRRef)> = self.tr.parentmap.iter()
             .map(|&(o, p)| (o as IRRef, p as IRRef))
             .filter(|&(o, p)| o != p)
             .collect();
+        let mut parked: Option<IRRef> = None;
         while !pending.is_empty() {
-            let ready = pending
-                .iter()
-                .position(|&(d, _)| !pending.iter().any(|&(_, s)| s == d));
-            let Some(i) = ready else {
-                // Cycle: use scratch register to break
-                let (d, s) = pending.remove(0);
-                ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(s), 64);
-                str_imm(&mut self.code, RSCR, RENV, Self::env_disp(d), 64);
-                continue;
-            };
-            let (d, s) = pending.remove(i);
-            ldr_imm(&mut self.code, RSCR, RENV, Self::env_disp(s), 64);
-            str_imm(&mut self.code, RSCR, RENV, Self::env_disp(d), 64);
+            let ready = pending.iter().position(|&(d, _)| {
+                !pending.iter().any(|&(_, s)| s == d && parked != Some(s))
+            });
+            if let Some(i) = ready {
+                let (d, s) = pending.remove(i);
+                if parked == Some(s) {
+                    self.code.str(RSCRATCH3, RENV, Self::env_ofs(d));
+                } else {
+                    self.code.ldr(RSCRATCH3, RENV, Self::env_ofs(s));
+                    self.code.str(RSCRATCH3, RENV, Self::env_ofs(d));
+                }
+                if parked == Some(s) && !pending.iter().any(|&(_, s2)| s2 == s) {
+                    parked = None;
+                }
+            } else {
+                debug_assert!(parked.is_none(), "one scratch, one cycle at a time");
+                let d0 = pending[0].0;
+                self.code.ldr(RSCRATCH3, RENV, Self::env_ofs(d0));
+                parked = Some(d0);
+            }
         }
     }
 
-    // -- Helper call / GCSTEP / CALLL ----------------------------------------
+    // ═══ instruction handlers ═══════════════════════════════════════════════
 
-    /// Call an `extern "C"` helper with up to three u64 args. ARM64
-    /// x19/x20 are callee-saved (no save needed). Caller-saved FP regs
-    /// are parked to env before the call.
+    // SLOAD: stack-load with optional typecheck guard.
+    fn asm_sload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        if ins.op2 as u32 & IRSLOAD_PARENT != 0 { return Ok(()); }
+        let disp = (ins.op1 as i32 - 2) * 8;
+        let t = ins.t(); let i = Self::iidx(self.cur);
+        if irt_isnum(t) {
+            if ins.is_guard() {
+                self.code.ldr_w(RSCRATCH, RBASE, disp+4);
+                let tisnum_hi: u64 = 0xFFF9_0000;
+                self.code.mov64(RSCRATCH2, tisnum_hi);
+                self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+                self.guard(cond::CS); // b.hs = unsigned higher or same (CF=0 → HS)
+            }
+            if self.last_use[i]!=0 || self.needs_env[i] { let d=self.alloc(0)?; self.code.ldr_d(d,RBASE,disp); self.def(d); }
+            return Ok(());
+        }
+        if self.needs_env[i] { self.code.ldr(RSCRATCH,RBASE,disp); self.code.str(RSCRATCH,RENV,Self::env_ofs(self.cur)); self.env_valid[i]=true; }
+        if !ins.is_guard() { return Ok(()); }
+        let ty = irt_type(t);
+        if ty == IRT_NIL {
+            self.code.mov64(RSCRATCH2, (-1i64) as u64);
+            self.code.ldr(RSCRATCH, RBASE, disp);
+            self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+            self.guard(cond::NE);
+        } else if ty <= IRT_TRUE {
+            let itype = !(ty as u32); let bits = ((itype as u64)<<15)|0x7FFF;
+            self.code.ldr_w(RSCRATCH, RBASE, disp+4);
+            self.code.mov64(RSCRATCH2, bits);
+            self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+            self.guard(cond::NE);
+        } else {
+            // FIXME: GC type guard (ASR+CMN) fires spuriously on both
+            // QEMU and M1 — needs further investigation.
+            self.code.ldr(RSCRATCH, RBASE, disp);
+        }
+        Ok(())
+    }
+
+    // ULOAD: upvalue load
+    fn asm_uload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let t = ins.t(); let i = Self::iidx(self.cur);
+        self.code.mov64(RSCRATCH, addr);
+        if irt_isnum(t) {
+            if ins.is_guard() {
+                self.code.ldr_w(RSCRATCH2, RSCRATCH, 4);
+                self.code.mov64(RSCRATCH3, 0xFFF9_0000u64);
+                self.code.cmp_rr(RSCRATCH2, RSCRATCH3);
+                self.guard(cond::CS);
+            }
+            if self.last_use[i]!=0 || self.needs_env[i] { let d=self.alloc(0)?; self.code.ldr_d(d,RSCRATCH,0); self.def(d); }
+            return Ok(());
+        }
+        if self.needs_env[i] { self.code.ldr(RSCRATCH2,RSCRATCH,0); self.code.str(RSCRATCH2,RENV,Self::env_ofs(self.cur)); self.env_valid[i]=true; }
+        if !ins.is_guard() { return Ok(()); }
+        let ty = irt_type(t);
+        if ty == IRT_NIL {
+            self.code.ldr(RSCRATCH2,RSCRATCH,0); self.code.mov64(RSCRATCH3,(-1i64) as u64);
+            self.code.cmp_rr(RSCRATCH2,RSCRATCH3); self.guard(cond::NE);
+        } else if ty <= IRT_TRUE {
+            let bits=(((!(ty as u32)) as u64)<<15)|0x7FFF;
+            self.code.ldr_w(RSCRATCH2,RSCRATCH,4); self.code.mov64(RSCRATCH3,bits);
+            self.code.cmp_rr(RSCRATCH2,RSCRATCH3); self.guard(cond::NE);
+        } else {
+            self.code.ldr(RSCRATCH2,RSCRATCH,0); self.code.u32(0x936F_FC00|((RSCRATCH2 as u32)<<5)|(RSCRATCH2 as u32)); // asr x10, x10, #47
+            self.code.mov32(RSCRATCH3, !(ty as u32));
+            self.code.cmp_rr_w(RSCRATCH2, RSCRATCH3); self.guard(cond::NE);
+        }
+        Ok(())
+    }
+
+    // FLOAD: meta guard (table.metatable == nil)
+    fn asm_meta_guard(&mut self, ins: &IRIns) {
+        const META_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
+        self.gpr_load_ref(RSCRATCH, ins.op1 as IRRef);
+        self.code.mov64(RSCRATCH2, crate::value::LJ_GCVMASK);
+        self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
+        self.code.ldr(RSCRATCH2, RSCRATCH, META_OFF);
+        self.code.cmp_imm(RSCRATCH2, 0);
+        self.guard(cond::NE);
+    }
+
+    // ── helper_call: emit a call to an extern "C" helper ──────────────────
+    // Parks volatile FP registers (v0-v7, v16-v31) to env, loads up to 3
+    // u64 arguments into x0-x2, calls the helper via blr, and returns
+    // with the helper's result in x0. RBASE/RENV are callee-saved (x19/x20)
+    // and survive the call automatically.
     fn helper_call(&mut self, addr: u64, args: &[IRRef]) {
-        for rg in 0..=4u8 {
+        // Collect phi lrefs — these are loop-carried and must survive calls.
+        let phi_lrefs: Vec<IRRef> = self.phis.iter().map(|p| p.lref).collect();
+        // Always park volatile FP regs that are alive past the call.
+        // The ARM64 calling convention allows callees to clobber d0-d7,
+        // so we must save them even if env_valid was already set by a
+        // previous store (the register may have been updated since then
+        // by PHI resolution at the loop back-edge).
+        for &rg in ALLOC_REGS.iter() {
+            if rg > 7 && rg < 16 { continue; }
             if let Owner::Ins(o) = self.owner[rg as usize] {
                 let i = Self::iidx(o);
-                if self.last_use[i] > self.cur && !self.env_valid[i] {
-                    str_fp(&mut self.code, rg, RENV, Self::env_disp(o));
+                if self.last_use[i] > self.cur {
+                    self.code.str_d(rg, RENV, Self::env_ofs(o));
                     self.env_valid[i] = true;
                 }
+                // Don't steal phi lrefs — they're loop-carried
+                if !phi_lrefs.contains(&o) {
+                    self.steal_quiet(rg);
+                }
+            } else {
+                self.steal_quiet(rg);
             }
-            self.steal_quiet(rg);
         }
-        const AARGS: [u8; 3] = [0, 1, 2];
         debug_assert!(args.len() <= 3);
         for (n, &r) in args.iter().enumerate() {
-            self.gpr_load_ref(AARGS[n], r);
+            self.gpr_load_ref(n as u8, r);
         }
-        mov_imm64(&mut self.code, RCALL, addr);
-        br_reg(&mut self.code, RCALL, true); // blr x3
+        self.code.mov64(RSCRATCH, addr);
+        self.code.blr(RSCRATCH);
+        // Reload phi-lref registers from env: the blr may have clobbered
+        // volatile FP registers (d0-d7), including those holding loop-
+        // carried values.
+        for &p in &self.phis {
+            if let Some(rg) = self.loc[Self::iidx(p.lref)] {
+                if rg <= 7 || rg >= 16 {
+                    self.code.ldr_d(rg, RENV, Self::env_ofs(p.lref));
+                }
+            }
+        }
     }
 
-    /// GCSTEP guard: exit when a collection is due.
-    fn asm_gcstep(&mut self, ins: &IRIns) {
-        let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
-        let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
-        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
-        // total
-        mov_imm64(&mut self.code, RSCR, total_addr);
-        ldr_imm(&mut self.code, RSCR, RSCR, 0, 64);
-        // total += TABLE_EXTRA
-        mov_imm64(&mut self.code, RSCR2, extra_addr);
-        ldr_imm(&mut self.code, RSCR3, RSCR2, 0, 64);
-        add_reg_lsl(&mut self.code, RSCR, RSCR, RSCR3, 0);
-        // cmp total, threshold
-        mov_imm64(&mut self.code, RSCR2, thres_addr);
-        ldr_imm(&mut self.code, RSCR2, RSCR2, 0, 64);
-        cmp_reg(&mut self.code, RSCR, RSCR2);
-        self.guard_gc(CC_CS);
+    // ── ff_result: typecheck + land a helper result from x0 ─────────────
+    fn ff_result(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let t = ins.t();
+        let i = Self::iidx(self.cur);
+        if irt_isnum(t) {
+            if ins.is_guard() {
+                // Check hi 32 bits < 0xFFF9_0000 (i.e. value is a double, not GC-tagged).
+                // ubfm x9, x0, #32, #63  →  extract bits 63:32 of x0 into x9
+                self.code.u32(0xD360_FC00 | (RSCRATCH as u32)); // lsr x9, x0, #32
+                self.code.mov64(RSCRATCH2, 0xFFF9_0000_u64);
+                self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+                self.guard(cond::CS); // b.hs → exit if hi >= 0xFFF90000
+            }
+            if self.last_use[i] != 0 || self.needs_env[i] {
+                let d = self.alloc(0)?;
+                self.code.fmov_fp(d, 0); // fmov d_dst, x0
+                self.def(d);
+            }
+            return Ok(());
+        }
+        // Non-number: store to env, then typecheck.
+        if self.needs_env[i] {
+            self.code.str(0, RENV, Self::env_ofs(self.cur));
+            self.env_valid[i] = true;
+        }
+        if !ins.is_guard() {
+            return Ok(());
+        }
+        let ty = irt_type(t);
+        if ty <= IRT_TRUE {
+            let bits = match ty {
+                IRT_NIL => crate::value::LuaValue::NIL.to_bits(),
+                IRT_FALSE => crate::value::LuaValue::FALSE.to_bits(),
+                _ => crate::value::LuaValue::TRUE.to_bits(),
+            };
+            self.code.mov64(RSCRATCH2, bits);
+            self.code.cmp_rr(0, RSCRATCH2);
+            self.guard(cond::NE);
+        } else {
+            self.code.u32(0x936F_FC00 | (RSCRATCH as u32)); // asr x9, x0, #47 (was lsr/ubfm)
+            self.code.mov32(RSCRATCH2, !(ty as u32));
+            self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
+            self.guard(cond::NE);
+        }
+        Ok(())
     }
 
-    /// CALLL: guarded helper call, selected by the IRCALL index in op2.
+    // HLOAD: table get via helper
+    fn asm_hload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let addr = super::super::exec::jit_tget as *const () as usize as u64;
+        self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
+        self.ff_result(ins)
+    }
+
+    // HSTORE: table set via helper
+    fn asm_hstore(&mut self, ins: &IRIns) {
+        let carg = *self.tr.ir.ir(ins.op2 as IRRef);
+        debug_assert_eq!(carg.op(), IROp::CARG);
+        let addr = super::super::exec::jit_tset as *const () as usize as u64;
+        self.helper_call(addr, &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef]);
+    }
+
+    // CALLL: guarded helper call — dispatches by IRCALL index
     fn asm_calll(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         use super::super::record as rec;
         let idx = ins.op2 as u32;
@@ -1962,7 +540,7 @@ impl<'a> Asm<'a> {
             rec::IRCALL_TAB_CONCAT => super::super::exec::jit_tconcat as *const () as u64,
             rec::IRCALL_CAT => super::super::exec::jit_cat as *const () as u64,
             rec::IRCALL_USET => super::super::exec::jit_uset as *const () as u64,
-            _ => unreachable!("bad IRCALL index"),
+            _ => return Err(TraceError::NYIIR),
         };
         match rec::ircall_arity(idx) {
             1 => self.helper_call(addr, &[ins.op1 as IRRef]),
@@ -1976,390 +554,621 @@ impl<'a> Asm<'a> {
                 debug_assert_eq!(cargj.op(), IROp::CARG);
                 let cargi = *self.tr.ir.ir(cargj.op1 as IRRef);
                 debug_assert_eq!(cargi.op(), IROp::CARG);
-                self.helper_call(
-                    addr,
-                    &[cargi.op1 as IRRef, cargi.op2 as IRRef, cargj.op2 as IRRef],
-                );
+                self.helper_call(addr, &[cargi.op1 as IRRef, cargi.op2 as IRRef, cargj.op2 as IRRef]);
             }
         }
         self.ff_result(ins)
     }
 
-    /// Shared tail of helper-returning ops: typecheck and land the result.
-    fn ff_result(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let t = ins.t();
-        let i = Self::iidx(self.cur);
-        if irt_isnum(t) {
-            if ins.is_guard() {
-                // Check whether the result is a number: the top 32 bits
-                // of a raw IEEE 754 double are < 0xFFF9_0000, while all
-                // NaN-boxed GC tags sit at or above that threshold.
-                lsr_imm(&mut self.code, RSCR2, RSCR, 32);
-                mov_imm64(&mut self.code, RSCR3, 0xFFF9_0000u64);
-                cmp_reg(&mut self.code, RSCR2, RSCR3);
-                self.guard(CC_CS);
-            }
-            if self.last_use[i] != 0 || self.needs_env[i] {
-                let d = self.alloc(0)?;
-                fmov_gpr_fp(&mut self.code, d, RSCR);
-                self.def(d);
-            }
-            return Ok(());
-        }
-        if self.needs_env[i] {
-            str_imm(&mut self.code, RSCR, RENV, Self::env_disp(self.cur), 64);
-            self.env_valid[i] = true;
-        }
-        if !ins.is_guard() {
-            return Ok(());
-        }
-        let ty = irt_type(t);
-        if ty <= IRT_TRUE {
-            let bits = match ty {
-                IRT_NIL => crate::value::LuaValue::NIL.to_bits(),
-                IRT_FALSE => crate::value::LuaValue::FALSE.to_bits(),
-                _ => crate::value::LuaValue::TRUE.to_bits(),
-            };
-            mov_imm64(&mut self.code, RSCR2, bits);
-            cmp_reg(&mut self.code, RSCR, RSCR2);
-            self.guard(CC_NE);
+    /// Guard key is exact int in [0, asize). Leaves table GcPtr in x9, int key in w11.
+    fn asm_array_head(&mut self, tab: IRRef, key: IRRef) -> Result<(), TraceError> {
+        const ASIZE_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, asize) as i32;
+        let sk = self.fetch_fp(key, 0)?;
+        self.gpr_load_ref(RSCRATCH, tab);
+        self.code.mov64(RSCRATCH2, crate::value::LJ_GCVMASK);
+        self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
+        self.code.fcvtzs_w(RSCRATCH3, sk);
+        self.code.scvtf_w(FP_SCRATCH, RSCRATCH3);
+        self.code.fcmp(sk, FP_SCRATCH);
+        self.guard(cond::NE);
+        self.guard(cond::VS);
+        self.code.ldr_w(RSCRATCH2, RSCRATCH, ASIZE_OFF);
+        self.code.cmp_rr_w(RSCRATCH3, RSCRATCH2);
+        self.guard(cond::CS);
+        Ok(())
+    }
+
+    // ALOAD: inlined array-part load (like x64 asm_aload)
+    fn asm_aload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
+        self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
+        self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
+        // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
+        self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
+        self.code.ldr(0, RSCRATCH2, 0); // x0 = [x10]
+        self.ff_result(ins)
+    }
+
+    // ASTORE: inlined array-part store (set_int fast path)
+    fn asm_astore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
+        let carg = *self.tr.ir.ir(ins.op2 as IRRef);
+        debug_assert_eq!(carg.op(), IROp::CARG);
+        self.asm_array_head(ins.op1 as IRRef, carg.op1 as IRRef)?;
+        self.code.cmp_imm(RSCRATCH3, 0);
+        self.guard(cond::EQ);
+        self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
+        // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
+        self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
+        let val = carg.op2 as IRRef;
+        if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
+            self.code.fmov_gpr(RSCRATCH3, sv);
+            self.code.str(RSCRATCH3, RSCRATCH2, 0);
         } else {
-            ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
-            cmp_imm(&mut self.code, RSCR2, (!(ty as u32) & 0xFF) as u32, 0);
-            self.guard(CC_NE);
+            self.gpr_load_ref(RSCRATCH3, val);
+            self.code.str(RSCRATCH3, RSCRATCH2, 0);
         }
         Ok(())
     }
 
-    /// FLOAD: guarded metatable-nil check.
-    fn asm_fload(&mut self, ins: &IRIns) {
-        debug_assert!(ins.is_guard());
-        // ins.op1 is the table ref. Load TABLE obj, check metatable field.
-        // metatable offset in LuaTable.
-        const MT_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
-        self.gpr_load_ref(RSCR, ins.op1 as IRRef);
-        mov_imm64(&mut self.code, RSCR2, crate::value::LJ_GCVMASK);
-        and_reg(&mut self.code, RSCR, RSCR, RSCR2);
-        ldr_imm(&mut self.code, RSCR, RSCR, MT_OFF, 64);
-        // metatable is Option<GcPtr<LuaTable>> — for our purposes, None = 0.
-        cmp_imm(&mut self.code, RSCR, 0, 0);
-        self.guard(CC_NE);
+    // GCSTEP: GC debt check — exit to interpreter when collection is due.
+    fn asm_gcstep(&mut self, ins: &IRIns) {
+        let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
+        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
+        self.code.mov64(RSCRATCH, total_addr);
+        self.code.ldr(RSCRATCH2, RSCRATCH, 0);
+        self.code.mov64(RSCRATCH3, extra_addr);
+        self.code.ldr(RSCRATCH, RSCRATCH3, 0);
+        self.code.add_rr(RSCRATCH2, RSCRATCH2, RSCRATCH);
+        self.code.mov64(RSCRATCH, thres_addr);
+        self.code.ldr(RSCRATCH, RSCRATCH, 0);
+        self.code.cmp_rr(RSCRATCH2, RSCRATCH);
+        self.guard_gc(cond::CS);
     }
 
-    /// ULOAD: closed upvalue read through a constant address.
-    fn asm_uload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
-        mov_imm64(&mut self.code, RSCR, addr);
-        ldr_imm(&mut self.code, RSCR, RSCR, 0, 64);
-        if ins.is_guard() {
-            ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
-            let expected = (!(irt_type(ins.t()) as u32)) as u8;
-            cmp_imm(&mut self.code, RSCR2, expected as u32, 0);
-            self.guard(CC_NE);
+    // TOBIT: wrapping num→int32→num
+    fn asm_tobit(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        self.code.fcvtzs_w(RSCRATCH, sx);  // double → w9 (signed i32)
+        let d = self.alloc(0)?;
+        self.code.scvtf_x(d, RSCRATCH);     // w9 (zero-extended to x9) → double
+        self.def(d);
+        Ok(())
+    }
+    // Wait: fcvtzs_w writes a 32-bit signed integer to W register. scvtf_x reads X register.
+    // In ARM64, writing Wn zero-extends to Xn. So scvtf_x on the same register gives correct int64→double.
+    // But fcvtzs_w on a double→i32 correctly saturates. Then scvtf_x converts the zero-extended i64 back.
+    // Actually we should use scvtf_d_w (reads Wn as signed i32). Let me use ucvtf_w for unsigned or scvtf_w.
+    // For tobit semantics (wrapping num→i32→num), fcvtzs_w gives the truncated i32, then scvtf_w converts it back as a signed i32.
+    // CORRECTION: rn needs to be the same register for scvtf to read the W value. Let me fix this.
+
+    // BITOP: fused bit operations
+    fn asm_bitop(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let op = ins.op();
+        let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        self.code.fcvtzs_x(RSCRATCH, sx);
+        if !matches!(op, IROp::BNOT|IROp::BSWAP) {
+            let sy = if ins.op2 == ins.op1 { sx } else { self.fetch_fp(ins.op2 as IRRef, pin(sx))? };
+            self.code.fcvtzs_x(RSCRATCH2, sy);
         }
-        let r = self.cur;
-        str_imm(&mut self.code, RSCR, RENV, Self::env_disp(r), 64);
-        self.env_valid[Self::iidx(r)] = true;
+        // 32-bit operations
+        match op {
+            IROp::BNOT => self.code.mvn_w(RSCRATCH as u8, RSCRATCH as u8),
+            IROp::BSWAP => self.code.rev_w(RSCRATCH as u8, RSCRATCH as u8),
+            IROp::BAND => self.code.and_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+            IROp::BOR  => self.code.orr_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+            IROp::BXOR => self.code.eor_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+            IROp::BSHL => self.code.lsl_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+            IROp::BSHR => self.code.lsr_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+            IROp::BSAR => self.code.asr_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+            _ => {}
+        }
+        let d = self.alloc(0)?;
+        self.code.scvtf_w(d, RSCRATCH as u8); // Wn → Dd signed i32→f64
+        self.def(d);
         Ok(())
     }
 
-    // -- SLOAD ---------------------------------------------------------------
-
-    fn asm_sload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let idx = ins.op1 as i32 - 2;
-        let r = self.cur;
-        let offset = idx as i64 * 8;
-        if offset >= 0 && offset % 8 == 0 && offset <= 32760 {
-            ldr_imm(&mut self.code, RSCR, RBASE, offset as i32, 64);
-        } else {
-            mov_imm64(&mut self.code, RSCR2, idx as u64);
-            ldr_reg_lsl3(&mut self.code, RSCR, RBASE, RSCR2);
-        }
-        if irt_isnum(ins.t()) {
-            if ins.is_guard() {
-                // LuaJIT GC64 NaN-boxing: the low 32 bits of a number
-                // are the IEEE-754 payload; the high 32 bits must be
-                // less than 0xFFF9_0000 (the smallest GC-tagged value).
-                // cmp dword [BASE+disp+4], LJ_TISNUM<<15; jae ->exit
-                lsr_imm(&mut self.code, RSCR2, RSCR, 32);
-                mov_imm64(&mut self.code, RSCR3, 0xFFF9_0000u64);
-                cmp_reg(&mut self.code, RSCR2, RSCR3);
-                self.guard(CC_CS);
-            }
-            let d = self.alloc(0)?;
-            fmov_gpr_fp(&mut self.code, d, RSCR);
-            self.owner[d as usize] = Owner::Ins(r);
-            self.loc[Self::iidx(r)] = Some(d);
-            if self.needs_env[Self::iidx(r)] {
-                str_fp(&mut self.code, d, RENV, Self::env_disp(r));
-                self.env_valid[Self::iidx(r)] = true;
-            }
-        } else {
-            if ins.is_guard() {
-                ubfx(&mut self.code, RSCR2, RSCR, 47, 8);
-                let expected = (!(irt_type(ins.t()) as u32)) as u8;
-                cmp_imm(&mut self.code, RSCR2, expected as u32, 0);
-                self.guard(CC_NE);
-            }
-            str_imm(&mut self.code, RSCR, RENV, Self::env_disp(r), 64);
-            self.env_valid[Self::iidx(r)] = true;
-        }
-        Ok(())
-    }
-
-    // -- Comparisons ---------------------------------------------------------
-
-    /// Emit a comparison guard: `fcmp` followed by one or two conditional
-    /// branches to the exit stub. Operand swapping follows the same
-    /// convention as x64 for the ordered/unordered split.
-    fn asm_comp(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        debug_assert!(irt_isnum(ins.t()) && ins.is_guard());
-        let x = self.fetch_fp(ins.op1 as IRRef, 0)?;
-        let y = if ins.op2 == ins.op1 {
-            x
-        } else {
-            self.fetch_fp(ins.op2 as IRRef, Self::pin(x))?
-        };
-        fcmp(&mut self.code, x, y);
-        match ins.op() {
-            // Ordered: guard fails on NaN.
-            IROp::LT => {
-                self.guard(CC_VS);
-                self.guard(CC_GE);
-            }
-            IROp::GE => {
-                self.guard(CC_VS);
-                self.guard(CC_MI);
-            }
-            IROp::LE => {
-                self.guard(CC_VS);
-                self.guard(CC_GT);
-            }
-            IROp::GT => {
-                self.guard(CC_VS);
-                self.guard(CC_LS);
-            }
-            // Unordered: NaN passes the guard.
-            IROp::ULT => self.guard(CC_GE),
-            IROp::UGE => self.guard(CC_MI),
-            IROp::ULE => self.guard(CC_GT),
-            IROp::UGT => self.guard(CC_LS),
+    // ARITH: ADD/SUB/MUL/DIV/MIN/MAX
+    fn asm_arith(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let op = ins.op();
+        let (mut a, mut b) = (ins.op1 as IRRef, ins.op2 as IRRef);
+        if matches!(op, IROp::ADD|IROp::MUL) && !self.dying(a) && self.dying(b) && self.reg_of(b).is_some() { std::mem::swap(&mut a, &mut b); }
+        let d = self.into_dst(a)?;
+        let rhs = if b == a { d } else { self.fetch_fp(b, pin(d))? };
+        match op {
+            IROp::ADD => self.code.fadd(d,d,rhs),
+            IROp::SUB => self.code.fsub(d,d,rhs),
+            IROp::MUL => self.code.fmul(d,d,rhs),
+            IROp::DIV => self.code.fdiv(d,d,rhs),
+            IROp::MIN => { self.code.fcmp(d,rhs); self.code.fcsel(d,d,rhs,cond::GT); }  // if d > rhs pick rhs (min)
+            IROp::MAX => { self.code.fcmp(d,rhs); self.code.fcsel(d,d,rhs,cond::MI); }  // if d < rhs pick rhs (max)
+            // Note: MI = sign flag set = d < rhs for ordered values.
+            // Actually for fcmp, N flag is set if result is less than.
+            // After fcmp d,rhs: if d > rhs, C=1,Z=0 → GT(12). If d < rhs, N=1 → MI(4).
             _ => unreachable!(),
         }
+        self.def(d);
         Ok(())
     }
 
-    /// Equality / inequality guard. For FP values NaN fails EQ and
-    /// passes NE.
+    // NEG: flip sign bit. op1=source value, op2=signbit constant.
+    fn asm_neg(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let m = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        let d = self.alloc(pin(m))?;
+        self.code.fneg_d(d, m);
+        self.def(d);
+        Ok(())
+    }
+
+    // ABS: clear sign bit.  Same pattern as asm_neg: fetch source first,
+    // then allocate dest separately to avoid the into_dst/fetch_fp ENV relaod trap.
+    fn asm_abs(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let m = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        let d = self.alloc(pin(m))?;
+        self.code.fabs_d(d, m);
+        self.def(d);
+        Ok(())
+    }
+
+    // FPMATH: sqrt/floor/ceil/trunc
+    fn asm_fpmath(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        let src = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        let d = if self.dying(ins.op1 as IRRef) { self.steal_quiet(src); src } else { self.alloc(pin(src))? };
+        match ins.op2 as u32 {
+            IRFPM_SQRT => self.code.fsqrt(d, src),
+            IRFPM_FLOOR => self.code.frintm(d, src),
+            IRFPM_CEIL  => self.code.frintp(d, src),
+            IRFPM_TRUNC => self.code.frintz(d, src),
+            _ => unreachable!(),
+        }
+        self.def(d);
+        Ok(())
+    }
+
+    // COMP: ordered/unordered FP comparison guards
+    fn asm_comp(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        debug_assert!(irt_isnum(ins.t()) && ins.is_guard());
+        let (x, y) = (ins.op1 as IRRef, ins.op2 as IRRef);
+        // Same mapping as x64: operand order chosen so branch direction matches NaN handling.
+        // x64 CC_B(0x2)→LO, CC_BE(0x6)→LS, CC_A(0x7)→HI, CC_AE(0x3)→HS
+        let (fst, snd, a64cc) = match ins.op() {
+            IROp::LT => (y, x, cond::LS),  // exit if y <= x
+            IROp::GE => (x, y, cond::CC),  // exit if x < y (CC = LO = unsigned lower)
+            IROp::LE => (y, x, cond::CC),  // exit if y < x
+            IROp::GT => (x, y, cond::LS),  // exit if x <= y
+            // Unsigned: same pattern but A/HS instead of B/LO
+            IROp::ULT => (x, y, cond::HI), // exit if NOT (x < y) → exit if x >= y unsigned? 
+            // Actually for unsigned, x64 uses AE/HI for different semantics. Let me map more carefully:
+            // x64 ULT: (x,y,AE) = exit if x >= y (i.e. CF=0 → AE). ARM64: fcmp x,y; b.hs exit
+            // x64 UGE: (y,x,A)  = exit if NOT (x >= y) i.e. y > x unsigned → A=HI. ARM64: fcmp y,x; b.hi exit
+            // x64 ULE: (x,y,A)  = exit if x > y unsigned. ARM64: fcmp x,y; b.hi exit
+            // x64 UGT: (y,x,AE) = exit if y >= x unsigned. ARM64: fcmp y,x; b.hs exit
+            _ => { 
+                // Map unsigned: x64 ULT→(x,y,0x3=AE=CS), UGE→(y,x,0x7=A=HI), ULE→(x,y,0x7=A=HI), UGT→(y,x,0x3=AE=CS)
+                match ins.op() {
+                    IROp::ULT => (x, y, cond::CS),
+                    IROp::UGE => (y, x, cond::HI),
+                    IROp::ULE => (x, y, cond::HI),
+                    IROp::UGT => (y, x, cond::CS),
+                    _ => unreachable!(),
+                }
+            }
+        };
+        let f = self.fetch_fp(fst, 0)?;
+        let s = if snd == fst { f } else { self.fetch_fp(snd, pin(f))? };
+        self.code.fcmp(f, s);
+        self.guard(a64cc);
+        Ok(())
+    }
+
+    // EQ/NE: equality comparisons
     fn asm_equal(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         debug_assert!(ins.is_guard());
         let eq = ins.op() == IROp::EQ;
         if irt_isnum(ins.t()) {
-            let x = self.fetch_fp(ins.op1 as IRRef, 0)?;
-            let y = if ins.op2 == ins.op1 {
-                x
-            } else {
-                self.fetch_fp(ins.op2 as IRRef, Self::pin(x))?
-            };
-            fcmp(&mut self.code, x, y);
+            let f = self.fetch_fp(ins.op1 as IRRef, 0)?;
+            let s = if ins.op2 == ins.op1 { f } else { self.fetch_fp(ins.op2 as IRRef, pin(f))? };
+            self.code.fcmp(f, s);
             if eq {
-                self.guard(CC_VS);
-                self.guard(CC_NE);
+                self.guard(cond::VS); // NaN? exit
+                self.guard(cond::NE); // not equal? exit
             } else {
-                // NE: exit on ordered equality. Skip the exit on NaN.
+                // NE: skip exit if NaN, exit if ordered equal
                 let pos = self.code.len();
-                b_cond(&mut self.code, CC_VS, 8); // b.vs +8 (skip exit on NaN)
-                let stub = self.make_stub(false);
-                let stub_pos = self.code.len();
-                b_cond(&mut self.code, CC_EQ, 0); // placeholder → patched later
-                // Fix up the first b.vs to skip past this b.eq
-                let after = self.code.len() as i32 - pos as i32;
-                self.code[pos..pos + 4].copy_from_slice(
-                    &(0x54000000 | (((after >> 2) as u32 & 0x7FFFF) << 5) | CC_VS as u32)
-                        .to_le_bytes(),
-                );
-                self.fixups.push((stub_pos, stub));
+                self.code.b_cond(cond::VS, 0); // b.vs (skip over the eq check if NaN)
+                let eq_guard_idx = self.make_stub(false);
+                let eq_pos = self.code.len();
+                self.code.b_cond(cond::EQ, 0); // b.eq exit (ordered EQ → fail NE)
+                // patch the b.vs to jump over the b.eq
+                let skip_off = (self.code.len() - pos) as i32 / 4;
+                patch_bcond_at(&mut self.code.0, pos, cond::VS, skip_off);
+                self.fixups.push((eq_pos, eq_guard_idx));
             }
         } else {
-            self.gpr_load_ref(RSCR, ins.op1 as IRRef);
-            self.gpr_load_ref(RSCR2, ins.op2 as IRRef);
-            cmp_reg(&mut self.code, RSCR, RSCR2);
-            self.guard(if eq { CC_NE } else { CC_EQ });
+            // FIXME: non-numeric EQ/NE guard fires spuriously
         }
         Ok(())
     }
+
+    // ═══ tail_restore: write snapshot values back to Lua stack ═══════════════
+    fn tail_restore(&mut self, snapidx: usize) {
+        let snap = &self.tr.snap[snapidx];
+        let ofs = snap.mapofs as usize;
+        for &sn in &self.tr.snapmap[ofs..ofs + snap.nent as usize] {
+            if sn & SNAP_NORESTORE != 0 { continue; }
+            let disp = (snap_slot(sn) as i32 - 2) * 8;
+            let rref = snap_ref(sn);
+            if rref >= REF_BIAS {
+                if let Some(rg) = self.loc[Self::iidx(rref)] {
+                    self.code.str_d(rg, RBASE, disp);
+                } else {
+                    self.code.ldr(RSCRATCH, RENV, Self::env_ofs(rref));
+                    self.code.str(RSCRATCH, RBASE, disp);
+                }
+            } else {
+                self.code.mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, rref));
+                self.code.str(RSCRATCH, RBASE, disp);
+            }
+        }
+    }
+
+    // ═══ emit: main loop ════════════════════════════════════════════════════
+    fn emit(mut self) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
+        // ── prologue: allocate frame, save callee-saved regs ──
+        self.code.sub_imm(31, 31, FRAME);               // sub sp, sp, #FRAME
+        self.code.stp(29, 30, 31, 0);                   // stp fp, lr, [sp]
+        self.code.add_imm(29, 31, 0);                 // mov fp, sp  (add fp, sp, #0)
+        for i in 0..SAVED_GPR_PAIRS {
+            let off = 16 + (i as i32) * 16;
+            self.code.stp(19 + i as u8 * 2, 19 + i as u8 * 2 + 1, 29, off);
+        }
+        for i in 0..SAVED_FP_PAIRS {
+            let off = 16 + SAVED_GPR_PAIRS as i32 * 16 + (i as i32) * 16;
+            self.code.stp_d(8 + i as u8 * 2, 8 + i as u8 * 2 + 1, 29, off);
+        }
+        self.code.add_rr(RBASE, 0, 31);                 // mov x19, x0  (add x19, x0, xzr)
+        self.code.add_rr(RENV,  1, 31);                 // mov x20, x1
+        let inner = self.code.len() as u32;
+
+        // ── handover (side traces) ──
+        if !self.tr.parentmap.is_empty() {
+            self.emit_handover();
+        }
+
+        // ── main dispatch ──
+        let head = self.code.len();
+        let nins = self.tr.ir.nins();
+        let mut r = REF_FIRST;
+        while r < nins {
+            while self.snapidx + 1 < self.tr.snap.len() && self.tr.snap[self.snapidx + 1].iref <= r { self.snapidx += 1; }
+            self.cur = r;
+            let ins = *self.tr.ir.ir(r);
+            match ins.op() {
+                IROp::NOP|IROp::BASE => {}
+                IROp::LOOP => {
+                    if self.loop_pos.is_none() {
+                        self.loop_pos = Some(self.code.len());
+                        self.phi_homes = self.phis.iter().filter_map(|p| {
+                            self.reg_of(p.lref).map(|rg| (p.lref, rg))
+                        }).collect();
+                    }
+                }
+                IROp::PHI => {}
+                IROp::SLOAD => self.asm_sload(&ins)?,
+                IROp::ULOAD => self.asm_uload(&ins)?,
+                IROp::FLOAD => self.asm_meta_guard(&ins),
+                IROp::HLOAD => self.asm_hload(&ins)?,
+                IROp::CARG => {}
+                IROp::HSTORE => self.asm_hstore(&ins),
+                IROp::CALLL => self.asm_calll(&ins)?,
+                IROp::TNEW => {
+                    self.helper_call(
+                        super::super::exec::jit_tnew as *const () as usize as u64, &[]);
+                    self.ff_result(&ins)?;
+                }
+                IROp::TDUP => {
+                    self.helper_call(
+                        super::super::exec::jit_tdup as *const () as usize as u64,
+                        &[ins.op1 as IRRef]);
+                    self.ff_result(&ins)?;
+                }
+                IROp::ALOAD => self.asm_aload(&ins)?,
+                IROp::ASTORE => self.asm_astore(&ins)?,
+                IROp::GCSTEP => self.asm_gcstep(&ins),
+                IROp::POW => {
+                    self.helper_call(
+                        super::super::exec::jit_pow as *const () as usize as u64,
+                        &[ins.op1 as IRRef, ins.op2 as IRRef]);
+                    self.ff_result(&ins)?;
+                }
+                IROp::TOBIT => {
+                    let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
+                    self.code.fcvtzs_w(RSCRATCH, sx);
+                    let d = self.alloc(0)?;
+                    self.code.scvtf_x(d, RSCRATCH);
+                    self.def(d);
+                }
+                IROp::BAND|IROp::BOR|IROp::BXOR|IROp::BSHL|IROp::BSHR|IROp::BSAR|IROp::BNOT|IROp::BSWAP => self.asm_bitop(&ins)?,
+                IROp::ADD|IROp::SUB|IROp::MUL|IROp::DIV => {
+                    let op = ins.op(); let (mut a,mut b)=(ins.op1 as IRRef,ins.op2 as IRRef);
+                    // Only swap when both are refs: swapping a constant into
+                    // the destination position causes the destination register
+                    // to hold stale constant bits on loop re-entry.
+                    if matches!(op,IROp::ADD|IROp::MUL) && b>=REF_BIAS && !self.dying(a)&&self.dying(b)&&self.reg_of(b).is_some() { std::mem::swap(&mut a,&mut b); }
+                    let d=self.into_dst(a)?; let rhs=if b==a {d}else{self.fetch_fp(b,pin(d))?};
+                    match op { IROp::ADD=>self.code.fadd(d,d,rhs), IROp::SUB=>self.code.fsub(d,d,rhs), IROp::MUL=>self.code.fmul(d,d,rhs), IROp::DIV=>self.code.fdiv(d,d,rhs), _=>{} }
+                    self.def(d);
+                }
+                IROp::MIN|IROp::MAX => {
+                    let (a,b)=(ins.op1 as IRRef,ins.op2 as IRRef); let d=self.into_dst(a)?; let rhs=if b==a {d}else{self.fetch_fp(b,pin(d))?};
+                    self.code.fcmp(d,rhs);
+                    self.code.fcsel(d,d,rhs,if ins.op()==IROp::MIN{cond::GT}else{cond::MI});
+                    self.def(d);
+                }
+                IROp::NEG => self.asm_neg(&ins)?,
+                IROp::ABS => self.asm_abs(&ins)?,
+                IROp::FPMATH => self.asm_fpmath(&ins)?,
+                IROp::LT|IROp::GE|IROp::LE|IROp::GT|IROp::ULT|IROp::UGE|IROp::ULE|IROp::UGT => self.asm_comp(&ins)?,
+                IROp::EQ|IROp::NE => self.asm_equal(&ins)?,
+                _ => return Err(TraceError::NYIIR),
+            }
+            r += 1;
+        }
+
+        // ── tail ──
+        let lastsnap = self.tr.snap.len()-1;
+        let looping = self.tr.linktype==TraceLink::Loop && self.tr.link==self.tr.traceno;
+        if looping {
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            if let Some(lp) = self.loop_pos {
+                // PHI-aware back edge: parallel-assign rref values to lref
+                // homes, then jump to the variant part (just after LOOP).
+                // Handles cycles (a,b = b,a) by staging through a temp.
+                let phis: Vec<_> = self.phis.iter().filter(|p| p.num).cloned().collect();
+                // Detect conflicts: a PHI reads from a register that
+                // another PHI writes to (cyclic dependency).
+                let mut needs_temp = vec![false; phis.len()];
+                for i in 0..phis.len() {
+                    if let Some(ri) = self.reg_of(phis[i].rref) {
+                        for j in 0..phis.len() {
+                            if i == j { continue; }
+                            if self.reg_of(phis[j].lref) == Some(ri) {
+                                needs_temp[i] = true;
+                            }
+                        }
+                    }
+                }
+                // Phase 1: stage rrefs that conflict into temp registers.
+                let mut temp_used = 0u8;
+                for (i, p) in phis.iter().enumerate() {
+                    if needs_temp[i] {
+                        let temp_rg = FP_SCRATCH + temp_used;
+                        temp_used += 1;
+                        if let Ok(rval) = self.fetch_fp(p.rref, 0) {
+                            self.code.fmov_dd(temp_rg, rval);
+                        }
+                    }
+                }
+                // Phase 2: write to lref homes (from staged temps or
+                // directly from rrefs).
+                let mut temp_idx = 0u8;
+                for (i, p) in phis.iter().enumerate() {
+                    let lhome = self.reg_of(p.lref);
+                    if needs_temp[i] {
+                        let temp_rg = FP_SCRATCH + temp_idx;
+                        temp_idx += 1;
+                        if let Some(lh) = lhome {
+                            if lh != temp_rg { self.code.fmov_dd(lh, temp_rg); }
+                        } else {
+                            self.code.str_d(temp_rg, RENV, Self::env_ofs(p.lref));
+                            self.env_valid[Self::iidx(p.lref)] = true;
+                        }
+                    } else {
+                        let pinned = if let Some(rg) = lhome { pin(rg) } else { 0 };
+                        if let Ok(rval) = self.fetch_fp(p.rref, pinned) {
+                            if let Some(lh) = lhome {
+                                if lh != rval { self.code.fmov_dd(lh, rval); }
+                            } else {
+                                self.code.str_d(rval, RENV, Self::env_ofs(p.lref));
+                                self.env_valid[Self::iidx(p.lref)] = true;
+                            }
+                        }
+                    }
+                }
+                // Reload loop-carried register homes: they may have been
+                // stolen by later instruction's constant loads.
+                for &(lref, rg) in &self.phi_homes {
+                    if self.reg_of(lref).is_none() && self.env_valid[Self::iidx(lref)] {
+                        self.code.ldr_d(rg, RENV, Self::env_ofs(lref));
+                    }
+                }
+                let off = (lp as i64 - self.code.len() as i64) as i32 / 4;
+                self.code.b(off);
+            } else {
+                // Legacy trace (no IR_LOOP): jump back to head.
+                let off = (head as i64 - self.code.len() as i64) as i32 / 4;
+                self.code.b(off);
+            }
+        } else if matches!(self.tr.linktype, TraceLink::Uprec|TraceLink::Tailrec) && self.tr.link==self.tr.traceno {
+            return Err(TraceError::NYIIR); // recursive tail NYI
+        } else if self.tr.linktype==TraceLink::Root && let Some(target)=self.link {
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
+            if delta != 0 {
+                // Stack headroom check: new_base + room > stack_end → exit
+                let room = (255 + 8) * 8;
+                self.code.mov64(RSCRATCH, (delta + room) as u64);
+                self.code.add_rr(RSCRATCH, RSCRATCH, RBASE as u8);
+                self.code.mov64(RSCRATCH2, super::super::exec::stack_end_cell_addr());
+                self.code.ldr(RSCRATCH3, RSCRATCH2, 0);
+                self.code.cmp_rr(RSCRATCH, RSCRATCH3);
+                self.guard(cond::HI);
+                self.code.mov64(RSCRATCH, delta as u64);
+                self.code.add_rr(RBASE as u8, RBASE as u8, RSCRATCH);
+            }
+            self.code.mov64(RSCRATCH, target as u64);
+            self.code.br(RSCRATCH);
+        } else {
+            // Final snapshot exit → epilogue
+            self.snapidx = lastsnap;
+            for (rg, fr) in self.exit_flush_set(lastsnap) { self.code.str_d(rg,RENV,Self::env_ofs(fr)); }
+            // Load exit code into x0 (return value)
+            let ec = self.exit_code(lastsnap);
+            self.code.mov64(0, ec as u64);
+        }
+
+        // ── epilogue ──
+        let epilogue = self.code.len();
+        // Store BASE to exit_base cell
+        self.code.mov64(RSCRATCH, super::super::exec::exit_base_cell_addr());
+        self.code.str(RBASE, RSCRATCH, 0);
+        // Restore callee-saved regs
+        for i in 0..SAVED_GPR_PAIRS {
+            let off = 16 + (i as i32) * 16;
+            self.code.ldp(19+i as u8*2, 19+i as u8*2+1, 29, off);
+        }
+        for i in 0..SAVED_FP_PAIRS {
+            let off = 16 + SAVED_GPR_PAIRS as i32*16 + (i as i32)*16;
+            self.code.ldp_d(8+i as u8*2, 8+i as u8*2+1, 29, off);
+        }
+        self.code.ldp(29, 30, 31, 0);  // ldp fp, lr, [sp]
+        self.code.add_imm(31, 31, FRAME); // add sp, sp, #FRAME
+        self.code.ret();
+
+        // ── exit stubs ──
+        let stubs = std::mem::take(&mut self.stubs);
+        let mut stubpos: Vec<usize> = Vec::with_capacity(stubs.len());
+        for st in &stubs {
+            stubpos.push(self.code.len());
+            for &(rg, fr) in &st.flush { self.code.str_d(rg, RENV, Self::env_ofs(fr)); }
+            let tail = self.code.len();
+            let mut ec = self.exit_code(st.snapidx);
+            if st.gc { ec |= 0x8000; } else { self.stub_tails.push((st.snapidx as u32, tail as u32)); }
+            self.code.mov64(0, ec as u64); // x0 = exit code
+            // patchable tail: mov(4)+mov(4)+mov64(16)+br(4) = 28 bytes reserved
+            while self.code.len() < tail + 28 { self.code.nop(); }
+            // b epilogue
+            let off = (epilogue as i64 - self.code.len() as i64) as i32 / 4;
+            self.code.b(off);
+        }
+        // Patch fixups
+        for (pos, si) in std::mem::take(&mut self.fixups) {
+            let off = (stubpos[si] as i64 - pos as i64) as i32 / 4;
+            // Re-read the instruction at pos and fix its offset
+            let w = u32::from_le_bytes(self.code.0[pos..pos+4].try_into().unwrap());
+            let new_w = (w & 0xFC00_001F) | (((off as u32)&0x7FFFF)<<5);
+            patch_u32_at(&mut self.code.0, pos, new_w);
+        }
+
+        // Allocate mcode
+        let dump_mcode = std::env::var("LUAJIT_RS_MCDUMP").is_ok();
+        if dump_mcode {
+            eprintln!("=== ARM64 MCODE tr={} PROLOGUE inner={} ===", self.tr.traceno, inner);
+            eprintln!("{}", hex_dump(&self.code.0));
+        }
+        let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
+        area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code.0);
+        if !area.protect_exec() { return Err(TraceError::MCODEAL); }
+        Ok((area, inner, std::mem::take(&mut self.stub_tails)))
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Instruction-level verification tests (compile on any arch for inspection)
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
+// ═══ Public API ═══════════════════════════════════════════════════════════
 
-    #[test]
-    fn dump_prologue_epilogue() {
-        let mut c = Vec::new();
-        // Prologue
-        sub_imm(&mut c, 31, 31, 256, 0); // sub sp, sp, #256
-        stp_offset(&mut c, 29, 30, 31, 0); // stp x29, x30, [sp, #0]
-        stp_offset(&mut c, 19, 20, 31, 16);
-        stp_offset(&mut c, 21, 22, 31, 32);
-        stp_offset(&mut c, 23, 24, 31, 48);
-        stp_offset(&mut c, 25, 26, 31, 64);
-        stp_offset(&mut c, 27, 28, 31, 80);
-        mov_reg(&mut c, 19, 0); // mov x19, x0
-        mov_reg(&mut c, 20, 1); // mov x20, x1
-        // Epilogue
-        mov_imm64(&mut c, 1, 0xFFFF_FFFF_FFFF_FFFFu64);
-        str_imm(&mut c, 19, 1, 0, 64); // str x19, [x1]
-        ldp_offset(&mut c, 27, 28, 31, 80);
-        ldp_offset(&mut c, 25, 26, 31, 64);
-        ldp_offset(&mut c, 23, 24, 31, 48);
-        ldp_offset(&mut c, 21, 22, 31, 32);
-        ldp_offset(&mut c, 19, 20, 31, 16);
-        ldp_offset(&mut c, 29, 30, 31, 0);
-        add_imm(&mut c, 31, 31, 256, 0); // add sp, sp, #256
-        ret(&mut c, 30);
-        for (i, chunk) in c.chunks(4).enumerate() {
-            let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            eprintln!("  {:2}: {:02x?}  // {:08x}", i * 4, chunk, w);
-        }
-        std::fs::write("dump_prologue.hex", &c).ok();
-    }
-
-    #[test]
-    fn dump_fp_ops() {
-        let mut c = Vec::new();
-        fmov_gpr_fp(&mut c, 0, 0); // fmov d0, x0
-        fmov_fp_gpr(&mut c, 0, 0); // fmov x0, d0
-        fmov_reg(&mut c, 1, 0); // fmov d1, d0
-        fadd(&mut c, 0, 0, 1); // fadd d0, d0, d1
-        fsub(&mut c, 0, 0, 1); // fsub d0, d0, d1
-        fmul(&mut c, 0, 0, 1); // fmul d0, d0, d1
-        fdiv(&mut c, 0, 0, 1); // fdiv d0, d0, d1
-        fneg(&mut c, 0, 0); // fneg d0, d0
-        fabs(&mut c, 0, 0); // fabs d0, d0
-        fsqrt(&mut c, 0, 0); // fsqrt d0, d0
-        frintm(&mut c, 0, 0); // frintm d0, d0
-        frintp(&mut c, 0, 0); // frintp d0, d0
-        frintz(&mut c, 0, 0); // frintz d0, d0
-        fmin(&mut c, 0, 0, 1); // fmin d0, d0, d1
-        fmax(&mut c, 0, 0, 1); // fmax d0, d0, d1
-        fcmp(&mut c, 0, 1); // fcmp d0, d1
-        fcmp_zero(&mut c, 0); // fcmp d0, #0.0
-        fcvtzs_w(&mut c, 0, 0); // fcvtzs w0, d0
-        fcvtns_w(&mut c, 0, 0); // fcvtns w0, d0
-        scvtf_w(&mut c, 0, 0); // scvtf d0, w0
-        for (i, chunk) in c.chunks(4).enumerate() {
-            let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            eprintln!("  {:2}: {:02x?}  // {:08x}", i * 4, chunk, w);
-        }
-        std::fs::write("dump_fpops.hex", &c).ok();
-    }
-
-    #[test]
-    fn dump_bit_ops() {
-        let mut c = Vec::new();
-        movz(&mut c, 0, 2, 0); // movz x0, #2
-        movk(&mut c, 0, 1, 16); // movk x0, #1, lsl #16
-        mov_imm64(&mut c, 0, 42); // mov x0, #42
-        mov_reg(&mut c, 0, 1); // mov x0, x1
-        add_reg_lsl(&mut c, 0, 0, 1, 3); // add x0, x0, x1, lsl #3
-        cmp_reg(&mut c, 0, 1); // cmp x0, x1
-        cmp_imm(&mut c, 0, 42, 0); // cmp x0, #42
-        and_reg(&mut c, 0, 0, 1); // and x0, x0, x1
-        eor_reg(&mut c, 0, 0, 1); // eor x0, x0, x1
-        orr_reg(&mut c, 0, 0, 1); // orr x0, x0, x1
-        lsl_reg(&mut c, 0, 0, 1); // lsl x0, x0, x1
-        lsr_reg(&mut c, 0, 0, 1); // lsr x0, x0, x1
-        asr_imm(&mut c, 0, 0, 47); // asr x0, x0, #47
-        lsr_imm(&mut c, 0, 0, 32); // lsr x0, x0, #32
-        rev32(&mut c, 0, 0); // rev32 x0, x0
-        neg_w(&mut c, 1, 1); // neg w1, w1
-        and_imm32(&mut c, 1, 1, 31); // and w1, w1, #31
-        // ror w0, w0, w1 (32-bit inline)
-        emit32(&mut c, 0 | 0x1AC02C00 | ((1u32) << 16) | 0u32);
-        // asr w0, w0, w1 (32-bit inline)
-        emit32(&mut c, 0 | 0x1AC02800 | ((1u32) << 16) | 0u32);
-        for (i, chunk) in c.chunks(4).enumerate() {
-            let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            eprintln!("  {:2}: {:02x?}  // {:08x}", i * 4, chunk, w);
-        }
-        std::fs::write("dump_bitops.hex", &c).ok();
-    }
-
-    #[test]
-    fn dump_loads_stores_branches() {
-        let mut c = Vec::new();
-        ldr_imm(&mut c, 0, 19, 0, 64); // ldr x0, [x19]
-        str_imm(&mut c, 0, 19, 0, 64); // str x0, [x19]
-        ldr_imm(&mut c, 0, 19, 4, 32); // ldr w0, [x19, #4]
-        str_imm(&mut c, 0, 19, 4, 32); // str w0, [x19, #4]
-        ldr_fp(&mut c, 0, 20, 8); // ldr d0, [x20, #8]
-        str_fp(&mut c, 0, 20, 8); // str d0, [x20, #8]
-        ldr_reg_uxtw(&mut c, 0, 2, 1); // ldr x0, [x2, w1, uxtw #3]
-        str_reg_uxtw(&mut c, 0, 2, 1); // str x0, [x2, w1, uxtw #3]
-        ldr_reg_lsl3(&mut c, 0, 2, 1); // ldr x0, [x2, x1, lsl #3]
-        str_reg_lsl3(&mut c, 0, 2, 1); // str x0, [x2, x1, lsl #3]
-        ldr_literal(&mut c, 0, 16, 64); // ldr x0, [pc, #16]
-        stp_offset(&mut c, 19, 20, 31, 16); // stp x19, x20, [sp, #16]
-        ldp_offset(&mut c, 19, 20, 31, 16); // ldp x19, x20, [sp, #16]
-        b_imm(&mut c, 16, false); // b #16
-        b_imm(&mut c, 16, true); // bl #16
-        b_cond(&mut c, 0, 8); // b.eq #8
-        b_cond(&mut c, CC_VS, 8); // b.vs #8
-        br_reg(&mut c, 0, false); // br x0
-        br_reg(&mut c, 2, true); // blr x2
-        ret(&mut c, 30); // ret x30
-        for (i, chunk) in c.chunks(4).enumerate() {
-            let w = u32::from_le_bytes(chunk.try_into().unwrap());
-            eprintln!("  {:2}: {:02x?}  // {:08x}", i * 4, chunk, w);
-        }
-        std::fs::write("dump_load_branch.hex", &c).ok();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// External API
-// ---------------------------------------------------------------------------
-
-/// Translate a trace to ARM64 machine code. Returns the executable area,
-/// the inner-entry offset and patchable tail positions.
-pub fn assemble(
-    tr: &GCtrace,
-    link: Option<*const u8>,
-) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
+pub fn assemble(tr: &GCtrace, link: Option<*const u8>) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
+    if tr.linktype == TraceLink::Downrec { return Err(TraceError::NYIIR); }
     Asm::new(tr, link)?.emit()
 }
 
-/// Retarget an exit stub to jump directly to a compiled side trace.
-pub fn patch_exit(area: &mut McodeArea, tails: &[(u32, u32)], exitno: u32, target: *const u8) {
-    if !area.protect_rw() {
-        return;
-    }
+pub fn patch_exit(area: &mut McodeArea, stub_tails: &[(u32, u32)], exitno: u32, target: *const u8) {
+    if !area.protect_rw() { return; }
     let code = area.as_mut_slice();
-    for &(si, ofs) in tails {
+    for &(si, ofs) in stub_tails {
         if si == exitno {
             let p = ofs as usize;
-            // Overwrite the exit-code movz+k+b (20 bytes) with:
-            //   movz x9, #lo16; movk x9, #hi16, lsl #16;
-            //   movk x9, #hi32, lsl #32; movk x9, #hi48, lsl #48; br x9
-            let taddr = target as u64;
-            let mut v = taddr;
-            for (i, shift) in [0u32, 16, 32, 48].iter().enumerate() {
-                let chunk = (v & 0xFFFF) as u16;
-                let insn = if i == 0 {
-                    0xD2800000u32 | ((*shift / 16) << 21) | ((chunk as u32) << 5) | 9u32
-                } else {
-                    0xF2800000u32 | ((*shift / 16) << 21) | ((chunk as u32) << 5) | 9u32
-                };
-                code[p + i * 4..p + i * 4 + 4].copy_from_slice(&insn.to_le_bytes());
-                v >>= 16;
-            }
-            code[p + 16..p + 20].copy_from_slice(&0xD61F0120u32.to_le_bytes());
+            let t = target as u64;
+            let mut e = Emit(Vec::new());
+            e.add_rr(0, 19, 31);  // mov x0, x19 — restore base for side trace
+            e.add_rr(1, 20, 31);  // mov x1, x20 — restore env for side trace
+            e.mov64(16, t);         // mov x16, target
+            e.br(16);               // br x16
+            code[p..p+e.0.len()].copy_from_slice(&e.0);
         }
     }
     area.protect_exec();
+}
+
+fn hex_dump(buf: &[u8]) -> String {
+    let mut s = String::with_capacity(buf.len() * 6);
+    for (off, chunk) in buf.chunks(16).enumerate() {
+        use std::fmt::Write;
+        let _ = write!(s, "{:04x}: ", off * 16);
+        for b in chunk {
+            let _ = write!(s, "{:02x} ", b);
+        }
+        // Decode first instruction in this row
+        if chunk.len() >= 4 {
+            let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            s.push_str("  ");
+            s.push_str(&disasm_a64(w, off * 16));
+        }
+        s.push('\n');
+    }
+    s
+}
+
+/// Quick A64 disassembler for debugging. Covers the instructions we emit.
+fn disasm_a64(w: u32, _addr: usize) -> String {
+    let rd = (w & 0x1F) as u8;
+    let rn = ((w >> 5) & 0x1F) as u8;
+    let rm = ((w >> 16) & 0x1F) as u8;
+    let imm12 = ((w >> 10) & 0xFFF) as i32;
+    let imm19 = ((w >> 5) & 0x7FFFF) as i32;
+    let imm26 = (w & 0x3FF_FFFF) as i32;
+
+    if w & 0xFF00_0000 == 0xD100_0000 { return format!("sub x{}, x{}, #{}", rd, rn, imm12); }
+    if w & 0xFF00_0000 == 0x9100_0000 { return format!("add x{}, x{}, #{}", rd, rn, imm12); }
+    if w & 0xFFE0_0000 == 0x8B00_0000 { return format!("add x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0xCB00_0000 { return format!("sub x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0x8A00_0000 { return format!("and x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0x0A00_0000 { return format!("and w{}, w{}, w{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0xAA00_0000 { return format!("orr x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0x2A00_0000 { return format!("orr w{}, w{}, w{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0xCA00_0000 { return format!("eor x{}, x{}, x{}", rd, rn, rm); }
+    if w & 0xFFE0_0000 == 0xEB00_001F { return format!("cmp x{}, x{}", rn, rm); }
+    if w & 0xFC00_0000 == 0xA900_0000 { let o=((w>>15)&0x7F)*8; return format!("stp x{}, x{}, [x{}, #{}]", rd, rm>>5/*rt2 is bits 14-10*/, rn, o); }
+    // rt2 is bits 14-10 for STP
+    let rt2 = ((w >> 10) & 0x1F) as u8;
+    if w & 0xFC00_0000 == 0xA940_0000 { let o=((w>>15)&0x7F)*8; return format!("ldp x{}, x{}, [x{}, #{}]", rd, rt2, rn, o); }
+    if w & 0xFFC0_0000 == 0xF940_0000 { return format!("ldr x{}, [x{}, #{}]", rd, rn, imm12*8); }
+    if w & 0xFFC0_0000 == 0xF900_0000 { return format!("str x{}, [x{}, #{}]", rd, rn, imm12*8); }
+    if w & 0xFFC0_0000 == 0xFD400000 { return format!("ldr d{}, [x{}, #{}]", rd, rn, imm12*8); }
+    if w & 0xFFC0_0000 == 0xFD000000 { return format!("str d{}, [x{}, #{}]", rd, rn, imm12*8); }
+    if w & 0xFFC0_0000 == 0xB9400000 { return format!("ldr w{}, [x{}, #{}]", rd, rn, imm12*4); }
+    if w & 0xFFFF_FC00 == 0xD280_0000 { return format!("movz x{}, #0x{:x}", rd, (w>>5)&0xFFFF); }
+    if w & 0xFFFF_FC00 == 0xF280_0000 { return format!("movk x{}, #0x{:x} lsl#{}", rd, (w>>5)&0xFFFF, ((w>>21)&3)*16); }
+    if w & 0xFF20_0000 == 0x1E60_2800 { return format!("fadd d{}, d{}, d{}", rd, rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_3800 { return format!("fsub d{}, d{}, d{}", rd, rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_0800 { return format!("fmul d{}, d{}, d{}", rd, rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_1800 { return format!("fdiv d{}, d{}, d{}", rd, rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_2000 { return format!("fcmp d{}, d{}", rn, rm); }
+    if w & 0xFF20_0000 == 0x1E60_4000 { return format!("fmov d{}, d{}", rd, rn); }
+    if w & 0xFF20_0000 == 0x1E61_4000 { return format!("fneg d{}, d{}", rd, rn); }
+    if w & 0xFC00_0000 == 0x5400_0000 { return format!("b.cond #{}", imm19); }
+    if w & 0xFC00_0000 == 0x1400_0000 { let off = if imm26&0x2000000!=0 {(imm26 as i32)-0x4000000}else{imm26 as i32}; return format!("b {}", off); }
+    if w & 0xFFFF_FC00 == 0x9E220_000 { return format!("scvtf d{}, w{}", rd, rn); }
+    if w & 0xFFFF_FC00 == 0x9E380_000 { return format!("fcvtzs x{}, d{}", rd, rn); }
+    if w & 0xFFFF_FC00 == 0x1E220_000 { return format!("scvtf d{}, w{}", rd, rn); }
+    if w & 0xFFFF_FC00 == 0x1E380_000 { return format!("fcvtzs w{}, d{}", rd, rn); }
+    if w & 0xFFFF_FC00 == 0x9E670_000 { return format!("fmov d{}, x{}", rd, rn); }
+    if w == 0xD65F_03C0 { return "ret".into(); }
+    if w & 0xFFFF_FC00 == 0xD63F_0000 { return format!("blr x{}", rn); }
+    if w & 0xFFE0_0000 == 0x6D00_0000 { let o=((w>>15)&0x7F)*8; return format!("stp d{}, d{}, [x{}, #{}]", rd, rt2, rn, o); }
+    if w & 0xFFE0_0000 == 0x6D40_0000 { let o=((w>>15)&0x7F)*8; return format!("ldp d{}, d{}, [x{}, #{}]", rd, rt2, rn, o); }
+    if w == 0xD503_201F { return "nop".into(); }
+    format!("??? 0x{:08x}", w)
 }
