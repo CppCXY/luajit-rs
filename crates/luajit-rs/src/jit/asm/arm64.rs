@@ -62,6 +62,7 @@ impl Emit {
     fn add_imm(&mut self, rd: u8, rn: u8, imm: u32) { self.u32(0x9100_0000|((imm&0xFFF)<<10)|((rn as u32)<<5)|(rd as u32)); }
     fn sub_imm(&mut self, rd: u8, rn: u8, imm: u32) { self.u32(0xD100_0000|((imm&0xFFF)<<10)|((rn as u32)<<5)|(rd as u32)); }
     fn cmp_rr(&mut self, rn: u8, rm: u8) { self.u32(0xEB00_001F|((rm as u32)<<16)|((rn as u32)<<5)); }
+    fn cmp_rr_w(&mut self, wn: u8, wm: u8) { self.u32(0x6B00_001F|((wm as u32)<<16)|((wn as u32)<<5)); }
     fn cmp_imm(&mut self, rn: u8, imm: u32) { self.u32(0xF100_001F|((imm&0xFFF)<<10)|((rn as u32)<<5)); }
 
     fn lsl_rr(&mut self, rd: u8, rn: u8, rm: u8) { self.u32(0x9AC0_2000|((rm as u32)<<16)|((rn as u32)<<5)|(rd as u32)); }
@@ -223,7 +224,7 @@ impl<'a> Asm<'a> {
                 IROp::GCSTEP => {}
                 IROp::BAND|IROp::BOR|IROp::BXOR|IROp::BSHL|IROp::BSHR|IROp::BSAR|IROp::BNOT|IROp::BSWAP => { a.mark_use(ins.op1 as IRRef,r); if ins.op2!=0 { a.mark_use(ins.op2 as IRRef,r); } }
                 IROp::ADD|IROp::SUB|IROp::MUL|IROp::DIV|IROp::MIN|IROp::MAX => { a.mark_use(ins.op1 as IRRef,r); a.mark_use(ins.op2 as IRRef,r); }
-                IROp::NEG => a.mark_use(ins.op2 as IRRef,r),
+                IROp::NEG => { a.mark_use(ins.op1 as IRRef,r); a.mark_use(ins.op2 as IRRef,r); }
                 IROp::ABS => a.mark_use(ins.op1 as IRRef,r),
                 IROp::FPMATH => a.mark_use(ins.op1 as IRRef,r),
                 IROp::LT|IROp::GE|IROp::LE|IROp::GT|IROp::ULT|IROp::UGE|IROp::ULE|IROp::UGT => { a.mark_use(ins.op1 as IRRef,r); a.mark_use(ins.op2 as IRRef,r); }
@@ -298,6 +299,37 @@ impl<'a> Asm<'a> {
     fn guard(&mut self, cc: u32) { let s=self.make_stub(false); let pos=self.code.len(); self.code.b_cond(cc,0); self.fixups.push((pos,s)); }
     fn guard_gc(&mut self, cc: u32) { let s=self.make_stub(true); let pos=self.code.len(); self.code.b_cond(cc,0); self.fixups.push((pos,s)); }
 
+    // ═══ handover: copy parent env values to child env (side traces) ════════
+    fn emit_handover(&mut self) {
+        let mut pending: Vec<(IRRef, IRRef)> = self.tr.parentmap.iter()
+            .map(|&(o, p)| (o as IRRef, p as IRRef))
+            .filter(|&(o, p)| o != p)
+            .collect();
+        let mut parked: Option<IRRef> = None;
+        while !pending.is_empty() {
+            let ready = pending.iter().position(|&(d, _)| {
+                !pending.iter().any(|&(_, s)| s == d && parked != Some(s))
+            });
+            if let Some(i) = ready {
+                let (d, s) = pending.remove(i);
+                if parked == Some(s) {
+                    self.code.str(RSCRATCH3, RENV, Self::env_ofs(d));
+                } else {
+                    self.code.ldr(RSCRATCH3, RENV, Self::env_ofs(s));
+                    self.code.str(RSCRATCH3, RENV, Self::env_ofs(d));
+                }
+                if parked == Some(s) && !pending.iter().any(|&(_, s2)| s2 == s) {
+                    parked = None;
+                }
+            } else {
+                debug_assert!(parked.is_none(), "one scratch, one cycle at a time");
+                let d0 = pending[0].0;
+                self.code.ldr(RSCRATCH3, RENV, Self::env_ofs(d0));
+                parked = Some(d0);
+            }
+        }
+    }
+
     // ═══ instruction handlers ═══════════════════════════════════════════════
 
     // SLOAD: stack-load with optional typecheck guard.
@@ -332,10 +364,9 @@ impl<'a> Asm<'a> {
             self.guard(cond::NE);
         } else {
             self.code.ldr(RSCRATCH, RBASE, disp);
-            // lsr x9, x9, #47  (UBFM x9, x9, #47, #63)
-            self.code.u32(0xD36F_FC00 | ((RSCRATCH as u32) << 5) | (RSCRATCH as u32));
-            self.code.mov64(RSCRATCH2, (!(ty as u32)) as u64);
-            self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+            self.code.u32(0x936F_FC00 | ((RSCRATCH as u32) << 5) | (RSCRATCH as u32)); // asr x9, x9, #47
+            self.code.mov32(RSCRATCH2, !(ty as u32));
+            self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         }
         Ok(())
@@ -367,8 +398,9 @@ impl<'a> Asm<'a> {
             self.code.ldr_w(RSCRATCH2,RSCRATCH,4); self.code.mov64(RSCRATCH3,bits);
             self.code.cmp_rr(RSCRATCH2,RSCRATCH3); self.guard(cond::NE);
         } else {
-            self.code.ldr(RSCRATCH2,RSCRATCH,0); self.code.u32(0xD36F_FC00|((RSCRATCH2 as u32)<<5)|(RSCRATCH2 as u32));
-            self.code.mov64(RSCRATCH3,(!(ty as u32)) as u64); self.code.cmp_rr(RSCRATCH2,RSCRATCH3); self.guard(cond::NE);
+            self.code.ldr(RSCRATCH2,RSCRATCH,0); self.code.u32(0x936F_FC00|((RSCRATCH2 as u32)<<5)|(RSCRATCH2 as u32)); // asr x10, x10, #47
+            self.code.mov32(RSCRATCH3, !(ty as u32));
+            self.code.cmp_rr_w(RSCRATCH2, RSCRATCH3); self.guard(cond::NE);
         }
         Ok(())
     }
@@ -451,10 +483,9 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(0, RSCRATCH2);
             self.guard(cond::NE);
         } else {
-            // Extract itype: ubfm x9, x0, #47, #63
-            self.code.u32(0xD36F_FC00 | (RSCRATCH as u32)); // lsr x9, x0, #47
-            self.code.mov64(RSCRATCH2, (!(ty as u32)) as u64);
-            self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+            self.code.u32(0x936F_FC00 | (RSCRATCH as u32)); // asr x9, x0, #47 (was lsr/ubfm)
+            self.code.mov32(RSCRATCH2, !(ty as u32));
+            self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         }
         Ok(())
@@ -617,10 +648,10 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
-    // NEG: flip sign bit
+    // NEG: flip sign bit. op1=source value, op2=signbit constant.
     fn asm_neg(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let d = self.into_dst(ins.op1 as IRRef)?;
-        let m = self.fetch_fp(ins.op2 as IRRef, pin(d))?;
+        let m = self.fetch_fp(ins.op1 as IRRef, 0)?;
+        let d = self.alloc(pin(m))?;
         self.code.fneg_d(d, m);
         self.def(d);
         Ok(())
@@ -760,7 +791,7 @@ impl<'a> Asm<'a> {
 
         // ── handover (side traces) ──
         if !self.tr.parentmap.is_empty() {
-            return Err(TraceError::NYIIR); // handover NYI for now
+            self.emit_handover();
         }
 
         // ── main dispatch ──
@@ -921,7 +952,23 @@ impl<'a> Asm<'a> {
         } else if matches!(self.tr.linktype, TraceLink::Uprec|TraceLink::Tailrec) && self.tr.link==self.tr.traceno {
             return Err(TraceError::NYIIR); // recursive tail NYI
         } else if self.tr.linktype==TraceLink::Root && let Some(target)=self.link {
-            return Err(TraceError::NYIIR); // root link NYI
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
+            if delta != 0 {
+                // Stack headroom check: new_base + room > stack_end → exit
+                let room = (255 + 8) * 8;
+                self.code.mov64(RSCRATCH, (delta + room) as u64);
+                self.code.add_rr(RSCRATCH, RSCRATCH, RBASE as u8);
+                self.code.mov64(RSCRATCH2, super::super::exec::stack_end_cell_addr());
+                self.code.ldr(RSCRATCH3, RSCRATCH2, 0);
+                self.code.cmp_rr(RSCRATCH, RSCRATCH3);
+                self.guard(cond::HI);
+                self.code.mov64(RSCRATCH, delta as u64);
+                self.code.add_rr(RBASE as u8, RBASE as u8, RSCRATCH);
+            }
+            self.code.mov64(RSCRATCH, target as u64);
+            self.code.br(RSCRATCH);
         } else {
             // Final snapshot exit → epilogue
             self.snapidx = lastsnap;
@@ -959,10 +1006,8 @@ impl<'a> Asm<'a> {
             let mut ec = self.exit_code(st.snapidx);
             if st.gc { ec |= 0x8000; } else { self.stub_tails.push((st.snapidx as u32, tail as u32)); }
             self.code.mov64(0, ec as u64); // x0 = exit code
-            // patchable tail: b epilogue (+ 3×movz/movk = 12 bytes reserved)
-            // ARM64: mov x0, #imm takes up to 4 instructions (16 bytes) for a full 64-bit value.
-            // But exit_code fits in 32 bits. We use 2×movz/movk (8 bytes) + nop (4 bytes) = 12 bytes.
-            while self.code.len() < tail + 12 { self.code.nop(); }
+            // patchable tail: mov(4) + mov64(16) + br(4) = 24 bytes reserved
+            while self.code.len() < tail + 24 { self.code.nop(); }
             // b epilogue
             let off = (epilogue as i64 - self.code.len() as i64) as i32 / 4;
             self.code.b(off);
@@ -1002,12 +1047,11 @@ pub fn patch_exit(area: &mut McodeArea, stub_tails: &[(u32, u32)], exitno: u32, 
     for &(si, ofs) in stub_tails {
         if si == exitno {
             let p = ofs as usize;
-            // Rewrite: mov x16, target (4×movz/movk) + br x16
-            // The stub tail has 12 bytes reserved: movz(4) + nop(4) + nop(4)
             let t = target as u64;
             let mut e = Emit(Vec::new());
-            e.mov64(16, t);  // x16 = target
-            e.br(16);         // br x16
+            e.add_rr(0, 19, 31);  // mov x0, x19 — restore base for side trace
+            e.mov64(16, t);         // mov x16, target
+            e.br(16);               // br x16
             code[p..p+e.0.len()].copy_from_slice(&e.0);
         }
     }

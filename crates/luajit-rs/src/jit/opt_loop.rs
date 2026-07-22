@@ -199,8 +199,7 @@ fn loop_unroll(rec: &mut Record) -> Result<(), TraceError> {
         let r = if ir.op() == IROp::SLOAD {
             debug_assert!(ir.op2 as u32 & IRSLOAD_FRAME == 0);
             let tr = rec.slot[ir.op1 as usize];
-            debug_assert!(tr != 0, "uninitialized slot accessed");
-            tref_ref(tr)
+            if tr != 0 { tref_ref(tr) } else { ins }
         } else {
             tref_ref(rec.cur.ir.emitir(ir.ot & !(IRT_ISPHI as u16), op1, op2)?)
         };
