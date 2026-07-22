@@ -439,22 +439,32 @@ impl LuaState {
                     crate::func::GcFunc::Lua(cl) => {
                         let pt = cl.proto.as_ref();
                         let pc = self.debug_pc.saturating_sub(1).min(pt.lines.len().saturating_sub(1));
-                        if pc < pt.lines.len() {
-                            let line = pt.lines[pc] as usize + pt.firstline as usize;
-                            let src = pt.source.and_then(|sid| {
-                                self.heap().strings.try_lookup(sid).map(|_ptr| {
-                                    let bytes = self.heap().strings.get(sid);
-                                    String::from_utf8_lossy(bytes).into_owned()
-                                })
-                            }).unwrap_or_else(|| "=?".to_string());
-                            let msg_str = String::from_utf8_lossy(&full);
-                            full = format!("@{}:{}: {}", src, line, msg_str).into_bytes();
-                        }
+                        let line = if pc < pt.lines.len() {
+                            pt.lines[pc] as usize
+                        } else {
+                            pt.firstline as usize
+                        };
+                        let src = pt.source.and_then(|sid| {
+                            self.heap().strings.try_lookup(sid).map(|_ptr| {
+                                let bytes = self.heap().strings.get(sid);
+                                // Strip leading '@' or '=' for display.
+                                let s = if bytes.starts_with(&[b'@']) || bytes.starts_with(&[b'=']) {
+                                    &bytes[1..]
+                                } else {
+                                    bytes
+                                };
+                                String::from_utf8_lossy(s).into_owned()
+                            })
+                        }).unwrap_or_else(|| "=?".to_string());
+                        let msg_str = String::from_utf8_lossy(&full);
+                        full = format!("{}:{}: {}", src, line, msg_str).into_bytes();
                         break;
                     }
                     crate::func::GcFunc::C(_) => {
-                        // C function: walk to caller via frame link.
-                        if (link_bits & FRAME_TYPE_MASK) == 0 {
+                        // Walk to caller via frame link.
+                        // FRAME_LUA=0 means the link encodes the caller's base.
+                        let ft = link_bits & FRAME_TYPE_MASK;
+                        if ft == 0 /* FRAME_LUA */ {
                             slot = (link_bits >> 3) as usize;
                             continue;
                         }
@@ -577,6 +587,10 @@ pub fn register_proto(heap: &mut GcHeap, mut proto: Proto) -> GcPtr<Proto> {
             let taken = std::mem::replace(&mut proto.kgc[i], crate::proto::KGc::Str(0));
             if let crate::proto::KGc::Proto(child) = taken {
                 let r = register_proto(heap, *child);
+                // Propagate parent source to child protos that don't have one.
+                if r.as_ref().source.is_none() {
+                    r.as_mut().source = proto.source;
+                }
                 proto.kgc[i] = crate::proto::KGc::ProtoRef(r);
             }
         }
@@ -620,6 +634,45 @@ mod tests {
                 let pt = c.proto.as_ref();
                 assert_eq!(pt.numparams, 0);
                 assert!(!pt.bc.is_empty());
+            }
+            _ => panic!("expected Lua closure"),
+        }
+    }
+
+    #[test]
+    fn load_stores_source_on_proto() {
+        let mut lua = Lua::new();
+        let f = load(lua.main(), b"error('test')".to_vec(), "@test.lua").unwrap();
+        match f.as_func().unwrap().as_ref() {
+            GcFunc::Lua(c) => {
+                let pt = c.proto.as_ref();
+                assert!(pt.source.is_some(), "source should be set");
+                let sid = pt.source.unwrap();
+                let bytes = lua.global().heap.strings.get(sid);
+                assert_eq!(bytes, b"@test.lua");
+            }
+            _ => panic!("expected Lua closure"),
+        }
+    }
+
+    #[test]
+    fn nested_proto_inherits_source() {
+        let mut lua = Lua::new();
+        let f = load(lua.main(), b"local function f() end".to_vec(), "@test.lua").unwrap();
+        match f.as_func().unwrap().as_ref() {
+            GcFunc::Lua(c) => {
+                assert!(c.proto.as_ref().source.is_some(), "main chunk should have source");
+                let pt = c.proto.as_ref();
+                for k in &pt.kgc {
+                    if let crate::proto::KGc::ProtoRef(child) = k {
+                        assert!(child.as_ref().source.is_some(), "child proto should inherit source");
+                        let sid = child.as_ref().source.unwrap();
+                        let bytes = lua.global().heap.strings.get(sid);
+                        assert_eq!(bytes, b"@test.lua");
+                        return;
+                    }
+                }
+                panic!("no child proto found");
             }
             _ => panic!("expected Lua closure"),
         }

@@ -192,6 +192,8 @@ fn call_c(
     let args_base = func_slot + 2;
     let saved_base = l.base;
     let saved_top = l.top;
+    // Set a frame link so error walkers can find the caller.
+    l.stack[args_base - 1] = LuaValue::from_bits(((saved_base as u64) << 3) | FRAME_LUA);
     l.base = args_base;
     l.top = args_base + nargs;
     if l.global().heap.should_collect() {

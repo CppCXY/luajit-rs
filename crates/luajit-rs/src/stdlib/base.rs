@@ -426,5 +426,10 @@ pub fn open(l: &mut LuaState) {
     let g = l.global().globals;
     g.as_mut().set(key, LuaValue::table(g));
 
+    let vsid = l.heap().intern(b"_VERSION");
+    let vkey = l.heap().str_value(vsid);
+    let vsid2 = l.heap().intern(b"Lua 5.1");
+    g.as_mut().set(vkey, l.heap().str_value(vsid2));
+
     let _ = LJ_TNIL;
 }
