@@ -422,11 +422,16 @@ impl<'a> Asm<'a> {
     fn helper_call(&mut self, addr: u64, args: &[IRRef]) {
         // Collect phi lrefs — these are loop-carried and must survive calls.
         let phi_lrefs: Vec<IRRef> = self.phis.iter().map(|p| p.lref).collect();
+        // Always park volatile FP regs that are alive past the call.
+        // The ARM64 calling convention allows callees to clobber d0-d7,
+        // so we must save them even if env_valid was already set by a
+        // previous store (the register may have been updated since then
+        // by PHI resolution at the loop back-edge).
         for &rg in ALLOC_REGS.iter() {
             if rg > 7 && rg < 16 { continue; }
             if let Owner::Ins(o) = self.owner[rg as usize] {
                 let i = Self::iidx(o);
-                if self.last_use[i] > self.cur && !self.env_valid[i] {
+                if self.last_use[i] > self.cur {
                     self.code.str_d(rg, RENV, Self::env_ofs(o));
                     self.env_valid[i] = true;
                 }
@@ -444,6 +449,16 @@ impl<'a> Asm<'a> {
         }
         self.code.mov64(RSCRATCH, addr);
         self.code.blr(RSCRATCH);
+        // Reload phi-lref registers from env: the blr may have clobbered
+        // volatile FP registers (d0-d7), including those holding loop-
+        // carried values.
+        for &p in &self.phis {
+            if let Some(rg) = self.loc[Self::iidx(p.lref)] {
+                if rg <= 7 || rg >= 16 {
+                    self.code.ldr_d(rg, RENV, Self::env_ofs(p.lref));
+                }
+            }
+        }
     }
 
     // ── ff_result: typecheck + land a helper result from x0 ─────────────
