@@ -152,7 +152,26 @@ mod sys {
     }
 
     pub fn page_size() -> usize {
-        16384
+        #[cfg(target_os = "linux")]
+        {
+            unsafe extern "C" {
+                fn sysconf(name: i32) -> i64;
+            }
+            const _SC_PAGESIZE: i32 = 30;
+            unsafe { sysconf(_SC_PAGESIZE) as usize }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn sysconf(name: i32) -> i64;
+            }
+            const _SC_PAGESIZE: i32 = 29;
+            unsafe { sysconf(_SC_PAGESIZE) as usize }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            16384
+        }
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

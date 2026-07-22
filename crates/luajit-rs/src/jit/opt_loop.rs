@@ -183,7 +183,16 @@ fn loop_unroll(rec: &mut Record) -> Result<(), TraceError> {
         if !irref_isk(op2) {
             op2 = subst[iidx(op2)] as IRRef;
         }
-        if irm_kind(IR_MODE[ir.op() as usize]) == IRM_N
+        // Treat certain side-effect-free loads as invariant when
+        // their operands haven't changed. FLOAD reads immutable
+        // object metadata (metatable) – its value is stable across
+        // loop iterations for the same object. Without this, the
+        // loop body duplicates the metatable-nil guard, bloating
+        // machine code and hurting QEMU throughput.
+        let mode = IR_MODE[ir.op() as usize];
+        let is_load = irm_kind(mode) == IRM_L
+            && ir.op() == IROp::FLOAD;
+        if (irm_kind(mode) == IRM_N || is_load)
             && op1 == ir.op1 as IRRef
             && op2 == ir.op2 as IRRef
         {

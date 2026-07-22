@@ -562,16 +562,23 @@ impl<'a> Asm<'a> {
 
     /// Guard key is exact int in [0, asize). Leaves table GcPtr in x9, int key in w11.
     fn asm_array_head(&mut self, tab: IRRef, key: IRRef) -> Result<(), TraceError> {
+        let _ = self.asm_array_head_ex(tab, key, false);
+        Ok(())
+    }
+
+    fn asm_array_head_ex(&mut self, tab: IRRef, key: IRRef, skip_exact: bool) -> Result<(), TraceError> {
         const ASIZE_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, asize) as i32;
         let sk = self.fetch_fp(key, 0)?;
         self.gpr_load_ref(RSCRATCH, tab);
         self.code.mov64(RSCRATCH2, crate::value::LJ_GCVMASK);
         self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
         self.code.fcvtzs_w(RSCRATCH3, sk);
-        self.code.scvtf_w(FP_SCRATCH, RSCRATCH3);
-        self.code.fcmp(sk, FP_SCRATCH);
-        self.guard(cond::NE);
-        self.guard(cond::VS);
+        if !skip_exact {
+            self.code.scvtf_w(FP_SCRATCH, RSCRATCH3);
+            self.code.fcmp(sk, FP_SCRATCH);
+            self.guard(cond::NE);
+            self.guard(cond::VS);
+        }
         self.code.ldr_w(RSCRATCH2, RSCRATCH, ASIZE_OFF);
         self.code.cmp_rr_w(RSCRATCH3, RSCRATCH2);
         self.guard(cond::CS);
@@ -589,14 +596,36 @@ impl<'a> Asm<'a> {
         self.ff_result(ins)
     }
 
+    fn key_provably_int(&self, keyref: IRRef) -> bool {
+        if keyref < REF_BIAS {
+            return false;
+        }
+        let ki = *self.tr.ir.ir(keyref);
+        match ki.op() {
+            IROp::ADD => {
+                (ki.op2 as u32) < REF_BIAS
+            }
+            IROp::PHI => {
+                let lref = ki.op1 as IRRef;
+                let rref = ki.op2 as IRRef;
+                self.key_provably_int(lref) || self.key_provably_int(rref)
+            }
+            _ => false,
+        }
+    }
+
     // ASTORE: inlined array-part store (set_int fast path)
     fn asm_astore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
         let carg = *self.tr.ir.ir(ins.op2 as IRRef);
         debug_assert_eq!(carg.op(), IROp::CARG);
-        self.asm_array_head(ins.op1 as IRRef, carg.op1 as IRRef)?;
-        self.code.cmp_imm(RSCRATCH3, 0);
-        self.guard(cond::EQ);
+        let keyref = carg.op1 as IRRef;
+        let int_key = self.key_provably_int(keyref);
+        self.asm_array_head_ex(ins.op1 as IRRef, keyref, int_key)?;
+        if !int_key {
+            self.code.cmp_imm(RSCRATCH3, 0);
+            self.guard(cond::EQ);
+        }
         self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
         // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
         self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
