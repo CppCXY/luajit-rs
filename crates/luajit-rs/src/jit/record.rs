@@ -1382,7 +1382,9 @@ impl Record {
         if !tref_istab(tab) {
             return Err(TraceError::NYIBC); // __index on non-tables NYI.
         }
-        let t = tabv.as_table().expect("guarded table tref");
+        let Some(t) = tabv.as_table() else {
+            return Err(TraceError::NYIBC);
+        };
         let v = LuaValue::from_bits(super::exec::jit_tget(tabv.to_bits(), keyv.to_bits()));
         if v.is_nil() {
             if t.as_ref().metatable.is_some() {
@@ -1429,7 +1431,9 @@ impl Record {
         if !tref_istab(tab) {
             return Err(TraceError::NYIBC);
         }
-        let t = tabv.as_table().expect("guarded table tref");
+        let Some(t) = tabv.as_table() else {
+            return Err(TraceError::NYIBC);
+        };
         if t.as_ref().metatable.is_some() {
             return Err(TraceError::NYIBC); // __newindex / protected path NYI.
         }
@@ -1856,7 +1860,9 @@ impl Record {
                 if !tref_istab(tab) {
                     return Err(TraceError::NYIBC);
                 }
-                let t = argv[0].as_table().expect("guarded table tref");
+                let Some(t) = argv[0].as_table() else {
+                    return Err(TraceError::NYIBC);
+                };
                 let lenv = t.as_ref().len();
                 // Record only the in-bounds fast path.
                 if lenv + 1 >= t.as_ref().asize {
@@ -1894,7 +1900,9 @@ impl Record {
                 if !tref_istab(tab) {
                     return Err(TraceError::NYIBC);
                 }
-                let t = argv[0].as_table().expect("guarded table tref");
+                let Some(t) = argv[0].as_table() else {
+                    return Err(TraceError::NYIBC);
+                };
                 let lenv = t.as_ref().len();
                 // Stay on the array fast path (the empty and hash-part
                 // boundaries exit to the interpreter).

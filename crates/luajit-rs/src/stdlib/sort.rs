@@ -168,21 +168,20 @@ fn compare_lua(
     a: LuaValue,
     b: LuaValue,
 ) -> LuaResult<bool> {
-    let func_slot = l.top;
+    let saved_top = l.top;
+    let saved_base = l.base;
+    let func_slot = l.top + 16;
+    l.stack_ensure(func_slot + 4);
     l.stack[func_slot] = LuaValue::func(comp);
-    l.stack[func_slot + 1] = LuaValue::NIL;
     l.stack[func_slot + 2] = a;
     l.stack[func_slot + 3] = b;
-    l.top = func_slot + 4;
-    let saved_base = l.base;
-    l.base = func_slot;
-    let nret = crate::vm::execute(l, l.base, 2, 1)?;
+    let nret = crate::vm::execute(l, func_slot, 2, 1)?;
     let r = if nret > 0 {
         l.stack[func_slot].is_truthy()
     } else {
         false
     };
-    l.top = l.base + nret;
+    l.top = saved_top;
     l.base = saved_base;
     Ok(r)
 }
