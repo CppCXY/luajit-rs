@@ -1,48 +1,30 @@
 # luajit-rs
 
-A LuaJIT-style Lua implementation written from scratch in Rust — bytecode
-compiler, NaN-boxed interpreter, and a tracing JIT compiler
+A LuaJIT-compatible Lua implementation written from scratch in Rust —
+bytecode compiler, NaN-boxed interpreter, and a tracing JIT compiler
+with an x86-64 machine-code backend.
 
 The entire codebase was written by **DeepSeek**, with a human providing
 direction and review.
 
-> **Status: experimental.** The core language, most of the standard
-> library, and the tracing JIT work well enough to run and win common
-> benchmarks, but this is not yet a drop-in LuaJIT replacement.
+> **Status: experimental.** The core language and standard library are
+> mostly functional. The tracing JIT works on x86-64. ARM64 JIT is
+> incomplete — traces run on the portable IR executor, which is slower
+> than the interpreter on this architecture.  Use `jit.off()` on ARM64.
 
 ## Highlights
 
-- **Lua 5.1 semantics** (the LuaJIT dialect), plus LuaJIT's `bit` library.
-- **Tracing JIT compiler**, closely modeled on LuaJIT's design:
-  - hot-path detection via hotcount tables, penalties and blacklisting,
-  - a recording interpreter emitting SSA IR with snapshots,
+- **Lua 5.1 / LuaJIT dialect** plus most of the LuaJIT standard library.
+- **Tracing JIT compiler** modeled on LuaJIT's design:
+  - hot-path detection (hotcounts → penalties → blacklisting),
+  - recording interpreter emitting SSA IR with snapshots,
   - FOLD / CSE / DCE and loop optimization (peeling + PHIs),
-  - side traces with trace linking and machine-code exit patching,
-  - an **x86-64 machine-code backend** (Windows & System V ABIs, W^X
-    code areas),
-  - a **portable IR executor** used on every other architecture
-    (including ARM64) and as a fallback for NYI traces.
-- **Precise garbage collector** with on-trace GC safe points.
-- Interpreter performance beats the PUC Lua 5.4 C interpreter on many
-  workloads even with the JIT disabled; with the JIT, compute-bound
-  benchmarks run 1.3–6x faster than PUC Lua (allocation-heavy ones are
-  still GC-bound, see below).
-
-## Benchmarks
-
-Measured on Windows x64 against PUC Lua (`lua`), lower is better:
-
-| Benchmark          | luajit-rs | PUC Lua | Ratio |
-|--------------------|----------:|--------:|------:|
-| fannkuch-redux (9) |    0.096s |  0.319s | 0.30x |
-| binary-trees (14)  |    1.658s |  1.260s | 1.23x |
-| nbody (500k)       |    0.941s |  1.201s | 0.78x |
-| spectral-norm (150)|    0.019s |  0.050s | 0.38x |
-| mandelbrot (600)   |    0.043s |  0.254s | 0.17x |
-| partial-sums (2M)  |    0.202s |  0.266s | 0.76x |
-
-Run them yourself: `./run_lua_benchmarks.ps1` (needs a native `lua` on
-`PATH`, or set `NATIVE_LUA`).
+  - **x86-64 machine-code backend** (Windows & System V ABIs),
+  - **portable IR executor** — interprets optimized SSA IR on any
+    platform.  Used as fallback for NYI traces and as the default on
+    ARM64 (where native code generation is not yet complete).
+- **Precise garbage collector** with trace GC safe points.
+- **Interactive REPL**, `-e`, stdin pipeline, script-file execution.
 
 ## Building
 
@@ -58,83 +40,74 @@ cargo test --workspace                       # test suite
 
 ## Platform support
 
-| Platform        | Interpreter | JIT (machine code) | JIT (IR executor) |
-|-----------------|:-----------:|:------------------:|:-----------------:|
-| Windows x64     | yes         | yes                | yes               |
-| Linux x64       | yes         | yes                | yes               |
-| macOS x64       | yes         | yes                | yes               |
-| Linux/macOS ARM64 | yes       | not yet            | yes               |
+| Platform        | Interpreter | JIT (native code) | JIT (IR executor) |
+|-----------------|:-----------:|:-----------------:|:-----------------:|
+| Windows x64     | ✓           | ✓                 | ✓                 |
+| Linux x64       | ✓           | ✓                 | ✓                 |
+| macOS x64       | ✓           | ✓                 | ✓                 |
+| ARM64 (macOS/Linux) | ✓       | —                 | ✓ (disabled by default) |
 
-On non-x86-64 targets, traces are still recorded and optimized but run
-on the portable IR executor instead of native code — faster than pure
-interpretation, slower than machine code. An ARM64 backend
-(`jit/asm_arm64`) is on the roadmap.
+On ARM64, native code generation defaults to **off**:
+traces are recorded and optimized but run on the portable IR executor.
+The IR executor overhead is significant — **`jit.off()` often performs
+better on ARM64** because the pure interpreter avoids IR dispatch
+overhead.  Set `LUAJIT_RS_NOASM=0` to re-enable the ARM64 backend
+(work in progress).
 
-## Debugging knobs
+## Standard library coverage
 
-Environment variables understood by the `luajit-rs` binary:
+Fully or mostly implemented: `base`, `string` (full Lua patterns + `gsub`
+with function replacement), `table` (incl. `sort` with custom comparator,
+`new`, `pack`/`unpack`), `math`, `bit`, `coroutine`, `os` (subset), `io`
+(subset), `package` (with `config`/`cpath`/`searchpath`/`loadlib`/
+`seeall`/`loaders`), `debug` (incl. `getinfo`/`traceback`/`getmetatable`/
+`getfenv`/`setfenv`), `jit` (on/off/flush/status/version/arch/os).
 
-| Variable            | Effect                                            |
-|---------------------|---------------------------------------------------|
-| `LUAJIT_RS_JIT=off` | Disable the JIT entirely (pure interpreter).      |
-| `LUAJIT_RS_NOASM=1` | Record/optimize traces but skip the x64 backend (forces the portable IR executor). |
-| `LUAJIT_RS_TRDUMP=1`| Dump compiled traces: mcode ranges plus a per-IR-instruction code-offset map. |
+Partially implemented: FFI (`cdef`/`new`/`sizeof`/`cast`/`abi`/`arch`/
+`os` etc. — no callbacks, no VLA, no `load`).
+
+Not yet: `io.lines` iterator from file handle, `os.execute` return value,
+`string.dump`, `debug.gethook`/`sethook` (stubs only), `dofile`/
+`loadfile`, `_VERSION`.
+
+## Debugging & tuning
+
+Environment variables:
+
+| Variable              | Effect |
+|-----------------------|--------|
+| `LUAJIT_RS_NOASM=1`   | Record & optimize traces but skip native codegen; forces the portable IR executor on all architectures. |
+| `LUAJIT_RS_TRDUMP=1`  | Print compiled trace summaries (IR + mcode offsets). |
+| `LUAJIT_RS_TRDUMP=2`  | Also dump hex + disassembly of generated machine code (ARM64). |
+| `LUAJIT_RS_JIT_ARCH`  | Override the auto-detected target architecture for assembly (`x64` / `arm64`). |
+| `LUA_PATH` / `LUA_CPATH` | Standard environment variables for `package.path` / `package.cpath`. |
+
+From Lua: `jit.off()` / `jit.on()`.
 
 ## Architecture
 
 ```
 crates/luajit-rs/src
-├── compiler/       lexer, parser, bytecode emitter (LuaJIT-format BC)
-├── runtime/        NaN-boxed values, strings, tables, GC, coroutines
+├── compiler/       lexer, parser, bytecode emitter (extended LuaJIT BC format)
+├── runtime/        NaN-boxed values, strings, tables, GC, coroutines, FuncState
 ├── vm/             direct bytecode interpreter + metamethod dispatch
 ├── jit/
 │   ├── trace.rs    hot counters, trace lifecycle, blacklisting, patching
-│   ├── record.rs   recording interpreter -> SSA IR (+ fast-function recorder)
+│   ├── record.rs   recording interpreter → SSA IR (+ fast-function recorder)
 │   ├── ir.rs       IR definitions and emission buffer
-│   ├── opt_fold.rs FOLD/CSE, opt_loop.rs loop peeling, opt_dce.rs DCE
-│   ├── asm_x64.rs  x86-64 backend (regalloc, guards, exit stubs)
+│   ├── opt_fold.rs FOLD/CSE/DCE, opt_loop.rs loop peeling + PHIs
+│   ├── asm/        x86-64 & ARM64 backends (regalloc, guards, exit stubs)
 │   ├── exec.rs     portable IR executor + snapshot restore + helpers
 │   └── mcode.rs    W^X executable memory management
-├── stdlib/         base, string (+ patterns), table, math, bit, os, coroutine
-└── util/           strtod/strfmt ports
+├── stdlib/         base, string (+ patterns), table, math, bit, os, coroutine,
+│                   io, package, debug, jit
+└── ffi/            C type parser, cdata, metatype, C namespace
 ```
 
 Key correspondences with LuaJIT sources: `trace.rs` ≈ `lj_trace.c`,
 `record.rs` ≈ `lj_record.c`/`lj_ffrecord.c`, `opt_fold.rs` ≈
-`lj_opt_fold.c`, `asm_x64.rs` ≈ `lj_asm_x86.h`, `exec.rs` has no LuaJIT
-equivalent (LuaJIT always JITs; we can fall back to interpreting IR).
-
-## Standard library coverage
-
-`base` (incl. `pcall`/`error`/metatable APIs), `string` with full Lua
-patterns, `table` (+ `sort`), `math`, `bit` (LuaJIT semantics:
-wrapping `tobit` conversion), `os` (subset), `coroutine`, `io`
-(subset: `open`/`read`/`write`/`lines`/`close` and file methods),
-`require` with `package.loaded`/`package.preload`/`package.path`.
-
-Not yet implemented: full `io` (seek, popen, stdout objects),
-`package.cpath`/C loaders, `debug`, FFI.
-
-## Roadmap
-
-- [x] String operations on trace (`string.len/sub/byte/char`, `#s`,
-      string comparisons — IRCALL helpers)
-- [x] Table allocation and library ops on trace (TNEW/TDUP, `#t`,
-      `table.insert`/`remove` array fast paths, `table.concat`)
-- [x] Recursive-call traces: up/tail recursion (self-linking function
-      traces), hot-call trace entry (JFUNCF), call-linked trace chains
-      with on-trace frame pushes and native base-shifting tails
-- [x] Trace stitching: partial traces across NYI bytecodes. When
-      recording hits an unsupported bytecode (CAT, string.format, …),
-      the prefix trace is kept as a Stitch link — the interpreter
-      handles the NYI off-trace and the prefix runs natively on every
-      subsequent iteration. (minstitch=10 IR ins threshold)
-- [ ] Down-recursion / return-following (the unwind side of recursion
-      still interprets; binary-trees needs it to pull ahead)
-- [ ] ARM64 machine-code backend
-- [x] `io` library subset and a `require` loader
-- [ ] Cheaper table allocation + incremental GC (allocation-bound
-      workloads are dominated by alloc/collect costs, not dispatch)
+`lj_opt_fold.c`, `exec.rs` has no direct LuaJIT equivalent (LuaJIT
+always runs native code; we fall back to IR interpretation).
 
 ## License
 
