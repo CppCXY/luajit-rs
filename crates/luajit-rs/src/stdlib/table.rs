@@ -3,6 +3,7 @@
 
 use crate::err::LuaResult;
 use crate::state::LuaState;
+use crate::table::LuaTable;
 use crate::value::LuaValue;
 
 use super::{LibTarget, arg, err_bad_arg, nargs, push};
@@ -186,11 +187,21 @@ fn tab_unpack(l: &mut LuaState) -> LuaResult<i32> {
     Ok(cnt as i32)
 }
 
+fn tab_new(l: &mut LuaState) -> LuaResult<i32> {
+    let narr = arg(l, 0).as_number().unwrap_or(0.0) as u32;
+    let nrec = arg(l, 1).as_number().unwrap_or(0.0) as u32;
+    let hbits = if nrec == 0 { 0 } else { (nrec as u32).next_power_of_two().trailing_zeros() };
+    let t = l.heap().alloc_table(LuaTable::new(narr, hbits));
+    push(l, LuaValue::table(t));
+    Ok(1)
+}
+
 pub fn open(l: &mut LuaState) {
     lual_reg!(l, b"table", LibTarget::Global)
         .func(b"concat", tab_concat)
         .func(b"insert", tab_insert)
         .func(b"move", tab_move)
+        .func(b"new", tab_new)
         .func(b"pack", tab_pack)
         .func(b"remove", tab_remove)
         .func(b"sort", tab_sort)

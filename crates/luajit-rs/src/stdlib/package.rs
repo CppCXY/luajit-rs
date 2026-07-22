@@ -550,6 +550,20 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
 
 // ── open ────────────────────────────────────────────────────────────────────
 
+fn tab_new_preload(l: &mut LuaState) -> LuaResult<i32> {
+    let k_table = str_key(l, b"table");
+    let table_tab = l.global().globals.as_ref().get_str(k_table).as_table().unwrap();
+    let k_new = str_key(l, b"new");
+    push(l, table_tab.as_ref().get_str(k_new));
+    Ok(1)
+}
+
+fn jit_profile_preload(l: &mut LuaState) -> LuaResult<i32> {
+    let t = l.heap().alloc_table(crate::table::LuaTable::new(0, 1));
+    push(l, LuaValue::table(t));
+    Ok(1)
+}
+
 pub fn open(l: &mut LuaState) {
     let pkg = package_table(l);
 
@@ -598,6 +612,22 @@ pub fn open(l: &mut LuaState) {
     }
     let gk = str_key(l, b"_G");
     loaded.as_mut().set(gk, LuaValue::table(g));
+
+    // Register table.new and jit.profile as preload entries
+    {
+        let preload = sub_table(l, pkg, b"preload");
+        let env = l.global().globals;
+        let tab_new_val = LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
+            f: tab_new_preload, env, upvals: Vec::new(),
+        })));
+        let jit_profile_val = LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
+            f: jit_profile_preload, env, upvals: Vec::new(),
+        })));
+        let tab_new_k = str_key(l, b"table.new");
+        preload.as_mut().set(tab_new_k, tab_new_val);
+        let jit_profile_k = str_key(l, b"jit.profile");
+        preload.as_mut().set(jit_profile_k, jit_profile_val);
+    }
 
     // loaders (preload, lua, c, croot) indexed 1..4
     {
