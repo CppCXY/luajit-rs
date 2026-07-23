@@ -71,17 +71,9 @@ pub struct LuaTable {
     /// "this table, used as a metatable, has no metamethod `mm`". `!0` for
     /// fresh tables; cleared by any string-key write.
     pub nomm: u8,
-}
-
-thread_local! {
-    /// Bytes of table array/hash growth since the last full GC. Growth
-    /// happens without heap access (plain `Vec` reallocation), so the
-    /// debt is tracked per VM thread and folded into `should_collect`;
-    /// `full_gc` resets it after re-estimating the live total (which
-    /// includes the grown capacities via `gc_size`). Thread-local: each
-    /// `Lua` instance is thread-bound, and compiled traces bake the
-    /// counter's address in.
-    pub static TABLE_EXTRA: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Pointer to `GcHeap.table_extra` for GC-debt accounting during
+    /// on-trace `Vec`-backed array resizes. Set by `alloc_table`.
+    pub(crate) table_extra: *mut usize,
 }
 
 impl Default for LuaTable {
@@ -106,6 +98,7 @@ impl LuaTable {
             freetop: 0,
             nomm: !0,
             metatable: None,
+            table_extra: std::ptr::null_mut(),
         };
         if hbits != 0 {
             t.new_hpart(hbits);
@@ -408,6 +401,7 @@ impl LuaTable {
             freetop: self.freetop,
             nomm: 0, // Keys with metamethod names may be present (lj_tab_dup).
             metatable: None,
+            table_extra: self.table_extra,
         };
         for v in t.array.iter_mut() {
             if v.is_table() {
@@ -571,7 +565,9 @@ impl LuaTable {
         let newcap = self.array.capacity() * std::mem::size_of::<LuaValue>()
             + self.node.capacity() * std::mem::size_of::<Node>();
         if newcap > oldcap {
-            TABLE_EXTRA.with(|c| c.set(c.get() + (newcap - oldcap)));
+            if !self.table_extra.is_null() {
+                unsafe { *self.table_extra += newcap - oldcap; }
+            }
         }
     }
 

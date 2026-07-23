@@ -15,6 +15,11 @@ use crate::vm::FRAME_TYPE_MASK;
 /// pointer in its 47-bit payload). The collector (`gc::full_gc`) marks from
 /// the roots and sweeps these pools. `total`/`threshold` drive the trigger,
 /// like LuaJIT's `gc.total`/`gc.threshold`.
+///
+/// `repr(C)` is required because the JIT backends emit loads at
+/// compile-time-computed offsets from the addresses of `total` / `threshold`
+/// (which are baked into trace IR as KINT64 constants).
+#[repr(C)]
 pub struct GcHeap {
     pub strings: Interner,
     pub protos: Pool<Proto>,
@@ -29,8 +34,10 @@ pub struct GcHeap {
     /// Allocation estimate for non-string objects (strings are tracked by
     /// the interner itself, which travels to the parser and back).
     pub total: usize,
-    /// Next collection when `total + strings.bytes()` crosses this.
+    /// Next collection when `total + strings.bytes() + table_extra` crosses this.
     pub threshold: usize,
+    /// Bytes of off-book table growth (Vec capacity) not tracked by `total`.
+    pub table_extra: usize,
     /// Accumulated GC debt — paid down at safe points (C call boundaries).
     pub debt: usize,
 }
@@ -47,6 +54,7 @@ impl Default for GcHeap {
             threads: Pool::with_page_size(4),
             total: 0,
             threshold: crate::gc::GC_THRESHOLD_MIN,
+            table_extra: 0,
             debt: 0,
         }
     }
@@ -57,14 +65,15 @@ impl GcHeap {
     /// Mirrors LuaJIT's `lj_gc_step` debt tracking: when the total crosses
     /// the threshold, we bump it forward instead of collecting immediately.
     fn account_alloc(&mut self, size: usize) {
-        let live = self.total + self.strings.bytes() + crate::table::TABLE_EXTRA.with(|c| c.get());
+        let live = self.total + self.strings.bytes() + self.table_extra;
         if live >= self.threshold {
             self.debt += size;
             self.threshold = live + 16384; // Bump forward to avoid constant checks
         }
     }
 
-    pub fn alloc_table(&mut self, t: LuaTable) -> GcPtr<LuaTable> {
+    pub fn alloc_table(&mut self, mut t: LuaTable) -> GcPtr<LuaTable> {
+        t.table_extra = &mut self.table_extra as *mut usize;
         self.total += t.gc_size();
         self.account_alloc(t.gc_size());
         self.tables.alloc(t)
@@ -125,8 +134,7 @@ impl GcHeap {
     /// `lj_gc_check`'s condition: is a collection due?
     #[inline]
     pub fn should_collect(&self) -> bool {
-        self.total + self.strings.bytes() + crate::table::TABLE_EXTRA.with(|c| c.get())
-            >= self.threshold
+        self.total + self.strings.bytes() + self.table_extra >= self.threshold
     }
 }
 

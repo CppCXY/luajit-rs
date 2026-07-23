@@ -659,7 +659,8 @@ impl<'a> Asm<'a> {
     fn asm_gcstep(&mut self, ins: &IRIns) {
         let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
         let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
-        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
+        // table_extra sits right after threshold in GcHeap (repr(C)).
+        let extra_addr = thres_addr + std::mem::size_of::<usize>() as u64;
         self.code.mov64(RSCRATCH, total_addr);
         self.code.ldr(RSCRATCH2, RSCRATCH, 0);
         self.code.mov64(RSCRATCH3, extra_addr);

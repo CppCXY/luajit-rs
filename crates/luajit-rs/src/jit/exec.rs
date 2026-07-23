@@ -869,7 +869,7 @@ fn jit_intern(bytes: &[u8]) -> u64 {
     let sid = heap.strings.intern(bytes);
     let grown = heap.strings.bytes() - before;
     if grown > 0 {
-        crate::table::TABLE_EXTRA.with(|c| c.set(c.get() + grown));
+        heap.table_extra += grown;
     }
     heap.str_value(sid).to_bits()
 }
