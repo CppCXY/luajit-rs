@@ -25,7 +25,7 @@ impl McodeArea {
         Some(McodeArea {
             ptr,
             len,
-            exec: true,  // Allocated as RWX — always executable.
+            exec: false,
         })
     }
 
@@ -43,19 +43,28 @@ impl McodeArea {
         self.ptr
     }
 
-    /// Writable view. The area is mapped RWX, so it is always writable.
+    /// Writable view. Only valid while the area is not executable.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        assert!(!self.exec, "mcode area is executable");
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
-    /// Pages are already RWX — just flush icache after code generation.
+    /// Flip the area to executable (W^X) and flush the icache.
     pub fn protect_exec(&mut self) -> bool {
+        if !self.exec && !sys::protect(self.ptr, self.len, true) {
+            return false;
+        }
         sys::flush_icache(self.ptr, self.len);
+        self.exec = true;
         true
     }
 
-    /// Pages are already RWX — no-op (always writable).
+    /// Flip the area back to writable (for exit-branch patching).
     pub fn protect_rw(&mut self) -> bool {
+        if self.exec && !sys::protect(self.ptr, self.len, false) {
+            return false;
+        }
+        self.exec = false;
         true
     }
 }
@@ -171,7 +180,7 @@ mod sys {
             mmap(
                 std::ptr::null_mut(),
                 len,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
+                PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANON,
                 -1,
                 0,
@@ -186,12 +195,15 @@ mod sys {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn alloc_rw(len: usize) -> Option<*mut u8> {
+        // macOS ARM64: MAP_JIT is required even when using plain
+        // mprotect — without it the kernel may refuse RW→RX
+        // transitions on Apple Silicon.
         const MAP_JIT: i32 = 0x800;
         let p = unsafe {
             mmap(
                 std::ptr::null_mut(),
                 len,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
+                PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANON | MAP_JIT,
                 -1,
                 0,

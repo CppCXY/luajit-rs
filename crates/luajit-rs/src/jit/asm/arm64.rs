@@ -632,7 +632,12 @@ impl<'a> Asm<'a> {
         if self.loop_pos.is_some() {
             let addr = super::super::exec::jit_tset as *const () as usize as u64;
             self.helper_call(addr, &[ins.op1 as IRRef, keyref, carg.op2 as IRRef]);
-            self.ff_result(ins)
+            // ASTORE has no return value; skip ff_result typecheck.
+            if self.needs_env[Self::iidx(self.cur)] {
+                self.code.str(0, RENV, Self::env_ofs(self.cur));
+                self.env_valid[Self::iidx(self.cur)] = true;
+            }
+            Ok(())
         } else {
             let int_key = self.key_provably_int(keyref);
             self.asm_array_head_ex(ins.op1 as IRRef, keyref, int_key)?;
