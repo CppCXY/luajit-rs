@@ -29,7 +29,7 @@ fn cts_of(l: &mut LuaState) -> &mut CTState {
 }
 
 /// Known C type names → predefined type IDs.
-fn quick_type_id(name: &str) -> Option<u32> {
+pub(crate) fn quick_type_id(name: &str) -> Option<u32> {
     Some(match name {
         "void" => CTypeID::Void as u32,
         "bool" | "_Bool" => CTypeID::Bool as u32,
@@ -46,6 +46,8 @@ fn quick_type_id(name: &str) -> Option<u32> {
         "unsigned long long" => CTypeID::UInt64 as u32,
         "float" => CTypeID::Float as u32,
         "double" => CTypeID::Double as u32,
+        "complex" => CTypeID::ComplexDouble as u32,
+        "complex float" => CTypeID::ComplexFloat as u32,
         "void *" | "void*" => CTypeID::PVoid as u32,
         _ => return None,
     })
@@ -81,7 +83,8 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
     };
 
     let raw = l.heap().strings.get(sid).to_vec();
-    let raw_str = std::str::from_utf8(&raw).map_err(|_| LuaError::Runtime)?;
+    let raw_str = std::str::from_utf8(&raw)
+        .map_err(|_| l.runtime_error(b"ffi: invalid UTF-8 in type name"))?;
     let name = raw_str.trim().to_string();
 
     // First try the full name including pointer/array suffixes.
@@ -92,11 +95,20 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
         return Ok(id);
     }
 
+    // If the string starts with a struct/union/enum keyword, don't strip anything
+    // — pass the full declaration to the parser.
+    let is_complex_decl = name.trim_start().starts_with("struct")
+        || name.trim_start().starts_with("union")
+        || name.trim_start().starts_with("enum");
+
     // Strip `[...]` suffix (VLA or fixed-size array).
-    let base = name
-        .find('[')
-        .map(|i| name[..i].trim().to_string())
-        .unwrap_or_else(|| name.clone());
+    let base = if is_complex_decl {
+        name.clone()
+    } else {
+        name.find('[')
+            .map(|i| name[..i].trim().to_string())
+            .unwrap_or_else(|| name.clone())
+    };
 
     // Strip `*` suffix for pointer to custom types.
     let (base, is_ptr) = if let Some(s) = base.strip_suffix('*') {
@@ -125,7 +137,9 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
 
     let cts = cts_of(l);
     let prev_top = cts.top;
-    parse(cts, &base).map_err(|_| LuaError::Runtime)?;
+    if let Err(e) = parse(cts, &base) {
+        return Err(l.runtime_error(format!("ffi: cannot parse '{}': {}", base, e).as_bytes()));
+    }
     if cts.top > prev_top {
         Ok(cts.top - 1)
     } else {
@@ -142,8 +156,9 @@ pub fn ffi_cdef(l: &mut LuaState) -> LuaResult<i32> {
         .as_string_id()
         .ok_or_else(|| err_bad_arg(l, 1, "ffi.cdef", "string", ""))?;
     let src = l.heap().strings.get(sid).to_vec();
-    let text = std::str::from_utf8(&src).map_err(|_| LuaError::Runtime)?;
-    parse(cts_of(l), text).map_err(|_| LuaError::Runtime)?;
+    let text = std::str::from_utf8(&src)
+        .map_err(|e| l.runtime_error(format!("ffi.cdef: invalid UTF-8: {}", e).as_bytes()))?;
+    parse(cts_of(l), text).map_err(|e| l.runtime_error(format!("ffi.cdef: {}", e).as_bytes()))?;
     Ok(0)
 }
 
@@ -378,9 +393,15 @@ fn read_field_from_slice(data: &[u8], offset: u32, sz: usize) -> f64 {
 }
 
 fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
-    let cd = arg(l, 0).as_cdata().ok_or(LuaError::Runtime)?;
+    let cd = match arg(l, 0).as_cdata() {
+        Some(c) => c,
+        None => return Err(l.runtime_error(b"ffi: expected cdata")),
+    };
     let key = arg(l, 1);
-    let cts = l.global().cts.as_ref().ok_or(LuaError::Runtime)?;
+    if l.global().cts.is_none() {
+        return Err(l.runtime_error(b"ffi: no type state"));
+    }
+    let cts = l.global().cts.as_ref().unwrap();
 
     let name = match key.as_string_id() {
         Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
@@ -430,14 +451,20 @@ fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
-    let cd = arg(l, 0).as_cdata().ok_or(LuaError::Runtime)?;
+    let cd = match arg(l, 0).as_cdata() {
+        Some(c) => c,
+        None => return Err(l.runtime_error(b"ffi: expected cdata")),
+    };
     let key = arg(l, 1);
     let val = arg(l, 2);
-    let cts = l.global().cts.as_ref().ok_or(LuaError::Runtime)?;
+    if l.global().cts.is_none() {
+        return Err(l.runtime_error(b"ffi: no type state"));
+    }
+    let cts = l.global().cts.as_ref().unwrap();
 
     let name = match key.as_string_id() {
         Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
-        _ => return Err(LuaError::Runtime),
+        _ => return Err(l.runtime_error(b"ffi: non-string key in cdata assignment")),
     };
 
     let raw_ct = cts.raw(cd.as_ref().ctypeid);
@@ -448,7 +475,9 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let Some((_field_type_id, offset)) = field_offset(cts, target_id, &name) else {
-        return Err(LuaError::Runtime);
+        return Err(l.runtime_error(
+            format!("ffi: no member '{}' in cdata", name).as_bytes(),
+        ));
     };
 
     let v = val.as_number().unwrap_or(0.0) as i32;
@@ -529,7 +558,8 @@ fn call_c(l: &mut LuaState) -> LuaResult<i32> {
         let a = arg(l, i);
         if let Some(sid) = a.as_string_id() {
             let bytes = l.heap().strings.get(sid).to_vec();
-            let cs = CString::new(bytes).map_err(|_| LuaError::Runtime)?;
+            let cs = CString::new(bytes)
+                .map_err(|_| l.runtime_error(b"ffi: string contains null byte"))?;
             cargs.push(cs.as_ptr() as i64);
             cstrs.push(cs);
         } else if let Some(cd) = a.as_cdata() {

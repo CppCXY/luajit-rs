@@ -372,13 +372,25 @@ impl<'a> Parser<'a> {
 
     fn const_cdata(&mut self, e: &ExpDesc) -> u32 {
         let fs = self.cur_mut();
-        let ctypeid = if e.aux == 1 {
-            crate::ffi::CTypeID::UInt64 as u32
+        let (ctypeid, size) = if e.aux == 2 {
+            // Imaginary literal: store as a complex double (2 x f64).
+            // We use a raw size-16 blob; the CT type is resolved at runtime.
+            (crate::ffi::CTypeID::Void as u32, 16u32)
+        } else if e.aux == 1 {
+            (crate::ffi::CTypeID::UInt64 as u32, 8u32)
         } else {
-            crate::ffi::CTypeID::Int64 as u32
+            (crate::ffi::CTypeID::Int64 as u32, 8u32)
         };
-        let mut cd = crate::runtime::cdata::CData::new(ctypeid, 8);
-        cd.data[..8].copy_from_slice(&e.nval.to_bits().to_le_bytes());
+        let mut cd = crate::runtime::cdata::CData::new(ctypeid, size as usize);
+        if e.aux == 2 {
+            // Complex: real part 0.0, imag part from nval
+            let zero: [u8; 8] = 0.0f64.to_le_bytes();
+            let imag: [u8; 8] = e.nval.to_le_bytes();
+            cd.data[..8].copy_from_slice(&zero);
+            cd.data[8..16].copy_from_slice(&imag);
+        } else {
+            cd.data[..8].copy_from_slice(&e.nval.to_bits().to_le_bytes());
+        }
         let idx = fs.kgc.len() as u32;
         fs.kgc.push(KGc::CData(Box::new(cd)));
         idx
@@ -2197,7 +2209,13 @@ impl<'a> Parser<'a> {
                 if self.ls.tokval.is_cdata {
                     *v = ExpDesc::init(VKCData, 0);
                     v.nval = f64::from_bits(self.ls.tokval.cdata_bits);
-                    v.aux = if self.ls.tokval.cdata_is_ull { 1 } else { 0 };
+                    v.aux = if self.ls.tokval.cdata_is_imag {
+                        2
+                    } else if self.ls.tokval.cdata_is_ull {
+                        1
+                    } else {
+                        0
+                    };
                 } else {
                     *v = ExpDesc::init(VKNum, 0);
                     v.nval = self.ls.tokval.num;

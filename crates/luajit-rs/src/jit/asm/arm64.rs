@@ -315,6 +315,7 @@ fn patch_bcond_at(code: &mut [u8], pos: usize, cc: u32, off: i32) {
     let w = 0x5400_0000u32 | (((off as u32) & 0x7FFFF) << 5) | cc;
     patch_u32_at(code, pos, w);
 }
+#[allow(unused)]
 fn patch_b_at(code: &mut [u8], pos: usize, off: i32) {
     let w = 0x1400_0000u32 | ((off as u32) & 0x3FF_FFFF);
     patch_u32_at(code, pos, w);
@@ -337,6 +338,7 @@ const SAVED_GPR_PAIRS: u32 = 5; // x19-x28 (10 regs), x29/x30 saved separately a
 const SAVED_FP_PAIRS: u32 = 4; // d8-d15 (8 regs)
 const FRAME: u32 = 16 + SAVED_GPR_PAIRS * 16 + SAVED_FP_PAIRS * 16; // 16 + 80 + 64 = 160
 
+#[allow(unused)]
 mod cond {
     pub const EQ: u32 = 0x0;
     pub const NE: u32 = 0x1;
@@ -1209,6 +1211,7 @@ impl<'a> Asm<'a> {
         self.guard_gc(cond::CS);
     }
 
+    #[allow(unused)]
     // TOBIT: wrapping num→int32→num
     fn asm_tobit(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
@@ -1268,6 +1271,7 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
+    #[allow(unused)]
     // ARITH: ADD/SUB/MUL/DIV/MIN/MAX
     fn asm_arith(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let op = ins.op();

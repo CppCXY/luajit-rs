@@ -89,7 +89,31 @@ fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
     let fd_sid = l.heap().intern(b"__fd");
     let fd_k = l.heap().str_value(fd_sid);
     t.as_mut().set(fd_k, LuaValue::number(id as f64));
+
+    // Set __tostring metatable so the handle can be printed.
+    let mt = l.heap().alloc_table(LuaTable::new(0, 2));
+    let ts_ref = l.heap().alloc_func(GcFunc::C(CClosure {
+        f: handle_tostring,
+        env,
+        upvals: Vec::new(),
+    }));
+    let ts_key = l.heap().str_value(l.heap().intern(b"__tostring"));
+    mt.as_mut().set(ts_key, LuaValue::func(ts_ref));
+    t.as_mut().metatable = Some(mt);
+
     LuaValue::table(t)
+}
+
+fn handle_tostring(l: &mut LuaState) -> LuaResult<i32> {
+    match handle_fd(l, 0) {
+        Some(fd) => {
+            let s = format!("file ({:#x})", fd);
+            let sid = l.heap().intern(s.as_bytes());
+            push(l, l.heap().str_value(sid));
+            Ok(1)
+        }
+        None => Err(l.runtime_error(b"attempt to use a closed file")),
+    }
 }
 
 // -- Reading -----------------------------------------------------------------

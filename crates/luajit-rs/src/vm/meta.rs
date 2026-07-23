@@ -348,22 +348,40 @@ impl Interp {
                 let mut mo = meta_lookup(g, o1, MM::Concat);
                 if mo.is_nil() {
                     mo = meta_lookup(g, o2, MM::Concat);
-                    if mo.is_nil() {
+                }
+                if !mo.is_nil() {
+                    let fs = self.mm_frame();
+                    let st = self.l().top;
+                    self.set_at(fs, mo);
+                    self.set_at(fs + 2, o1);
+                    self.set_at(fs + 3, o2);
+                    execute(self.l(), fs, 2, 1)?;
+                    let r = self.at(fs);
+                    self.l().top = st;
+                    top -= 1;
+                    self.set_at(top, r);
+                } else {
+                    // No __concat available. Try __tostring on non-string operands
+                    // and replace them, then continue the loop.
+                    let mut replaced = false;
+                    if !concat_ok(o1) {
+                        let s = crate::stdlib::tostring_meta(self.l(), o1)?;
+                        let sid = self.l().heap().intern(&s);
+                        self.set_at(top - 1, self.l().heap().str_value(sid));
+                        replaced = true;
+                    }
+                    if !concat_ok(o2) {
+                        let s = crate::stdlib::tostring_meta(self.l(), o2)?;
+                        let sid = self.l().heap().intern(&s);
+                        self.set_at(top, self.l().heap().str_value(sid));
+                        replaced = true;
+                    }
+                    if !replaced {
                         return Err(self
                             .l()
                             .runtime_error(b"attempt to concatenate a non-string value"));
                     }
                 }
-                let fs = self.mm_frame();
-                let st = self.l().top;
-                self.set_at(fs, mo);
-                self.set_at(fs + 2, o1);
-                self.set_at(fs + 3, o2);
-                execute(self.l(), fs, 2, 1)?;
-                let r = self.at(fs);
-                self.l().top = st;
-                top -= 1;
-                self.set_at(top, r);
             }
             if top <= bottom {
                 return Ok(self.at(bottom));

@@ -146,6 +146,7 @@ pub struct TokVal {
     pub is_cdata: bool,
     pub cdata_bits: u64,
     pub cdata_is_ull: bool,
+    pub cdata_is_imag: bool,
 }
 
 pub struct LexState<'a> {
@@ -356,6 +357,7 @@ impl<'a> LexState<'a> {
                     self.tokval.is_cdata = true;
                     self.tokval.cdata_bits = r.u;
                     self.tokval.cdata_is_ull = r.suffix == crate::strscan::NumSuffix::ULL;
+                    self.tokval.cdata_is_imag = r.suffix == crate::strscan::NumSuffix::Imag;
                 }
                 r.n
             }
@@ -597,9 +599,11 @@ impl<'a> LexState<'a> {
                 let cd = self.tokval.is_cdata;
                 let bits = self.tokval.cdata_bits;
                 let is_ull = self.tokval.cdata_is_ull;
+                let is_imag = self.tokval.cdata_is_imag;
                 self.tokval.is_cdata = false;
                 self.tokval.cdata_bits = 0;
                 self.tokval.cdata_is_ull = false;
+                self.tokval.cdata_is_imag = false;
                 return (
                     Tok::Number,
                     TokVal {
@@ -608,6 +612,7 @@ impl<'a> LexState<'a> {
                         is_cdata: cd,
                         cdata_bits: bits,
                         cdata_is_ull: is_ull,
+                        cdata_is_imag: is_imag,
                     },
                 );
             }
@@ -760,9 +765,11 @@ impl<'a> LexState<'a> {
                         let cd = self.tokval.is_cdata;
                         let bits = self.tokval.cdata_bits;
                         let is_ull = self.tokval.cdata_is_ull;
+                        let is_imag = self.tokval.cdata_is_imag;
                         self.tokval.is_cdata = false;
                         self.tokval.cdata_bits = 0;
                         self.tokval.cdata_is_ull = false;
+                        self.tokval.cdata_is_imag = false;
                         return (
                             Tok::Number,
                             TokVal {
@@ -771,6 +778,7 @@ impl<'a> LexState<'a> {
                                 is_cdata: cd,
                                 cdata_bits: bits,
                                 cdata_is_ull: is_ull,
+                                cdata_is_imag: is_imag,
                             },
                         );
                     } else {

@@ -1,4 +1,5 @@
 use crate::err::LuaResult;
+use crate::func::GcFunc;
 use crate::gc::GcPtr;
 use crate::state::LuaState;
 use crate::stdlib::{arg, err_bad_arg, nargs, push};
@@ -399,6 +400,53 @@ fn lib_sethook(_l: &mut LuaState) -> LuaResult<i32> {
     Ok(0)
 }
 
+fn lib_getupvalue(l: &mut LuaState) -> LuaResult<i32> {
+    let f = arg(l, 0);
+    let idx = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+    match f.as_func() {
+        Some(gf) => match gf.as_ref() {
+            GcFunc::Lua(cl) => {
+                if idx < 1 || idx > cl.upvals.len() {
+                    push(l, LuaValue::NIL);
+                    return Ok(1);
+                }
+                let uv_idx = idx - 1;
+                let proto = cl.proto.as_ref();
+                if uv_idx < proto.uvnames.len() && !proto.uvnames[uv_idx].is_empty() {
+                    let sid = l.heap().intern(proto.uvnames[uv_idx].as_bytes());
+                    push(l, l.heap().str_value(sid));
+                } else {
+                    push(l, l.heap().str_value(l.heap().intern(b"")));
+                }
+                let val = if uv_idx < cl.upvals.len() {
+                    cl.upvals[uv_idx].as_ref().get()
+                } else {
+                    LuaValue::NIL
+                };
+                push(l, val);
+                Ok(2)
+            }
+            GcFunc::C(_) => {
+                push(l, LuaValue::NIL);
+                Ok(1)
+            }
+        },
+        None => {
+            push(l, LuaValue::NIL);
+            Ok(1)
+        }
+    }
+}
+
+fn lib_upvaluejoin(l: &mut LuaState) -> LuaResult<i32> {
+    let _f1 = arg(l, 0);
+    let _n1 = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+    let _f2 = arg(l, 2);
+    let _n2 = arg(l, 3).as_number().unwrap_or(0.0) as usize;
+    // NYI: stub — just succeed silently
+    Ok(0)
+}
+
 // ── open ────────────────────────────────────────────────────────────────────
 
 pub fn open(l: &mut LuaState) {
@@ -412,5 +460,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"setfenv", lib_setfenv)
         .func(b"gethook", lib_gethook)
         .func(b"sethook", lib_sethook)
+        .func(b"getupvalue", lib_getupvalue)
+        .func(b"upvaluejoin", lib_upvaluejoin)
         .build();
 }

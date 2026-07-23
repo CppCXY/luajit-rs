@@ -32,6 +32,11 @@ enum Token {
     Ellipsis,
     Eql,
     Question,
+    Minus,
+    Plus,
+    LAngle,
+    RAngle,
+    Slash,
     // Keywords
     KwVoid,
     KwChar,
@@ -219,6 +224,11 @@ impl<'a> Lexer<'a> {
                 self.buf.push(c);
                 self.number_tail()
             }
+            b'-' => Token::Minus,
+            b'+' => Token::Plus,
+            b'<' => Token::LAngle,
+            b'>' => Token::RAngle,
+            b'/' => Token::Slash,
             _ => Token::Eof,
         }
     }
@@ -369,6 +379,38 @@ impl<'a> Parser<'a> {
                     decl.type_id = self.parse_enum()?;
                     seen_type = true;
                 }
+                Token::KwComplex => {
+                    if seen_type {
+                        break;
+                    }
+                    self.next(); // eat complex
+                    // Check for "complex float"
+                    if self.tok == Token::KwFloat {
+                        self.next();
+                        decl.type_id = CTypeID::ComplexFloat as u32;
+                    } else {
+                        decl.type_id = CTypeID::ComplexDouble as u32;
+                    }
+                    seen_type = true;
+                }
+                // Handle typedef'd type names (int8_t, uint32_t, etc.)
+                Token::Ident => {
+                    if seen_type {
+                        break;
+                    }
+                    let name = String::from_utf8_lossy(&self.lex.buf).to_string();
+                    if let Some(id) = crate::ffi::lib::quick_type_id(&name) {
+                        decl.type_id = id;
+                        self.next();
+                        seen_type = true;
+                    } else if let Some(&id) = self.cts.names.get(&name) {
+                        decl.type_id = id;
+                        self.next();
+                        seen_type = true;
+                    } else {
+                        break;
+                    }
+                }
                 _ => break,
             }
         }
@@ -404,11 +446,21 @@ impl<'a> Parser<'a> {
         let mut total_size: u32 = 0;
         let mut max_align: u32 = 1;
         let mut field_infos: Vec<(String, u32, u32)> = Vec::new(); // (name, type_id, offset)
+        let mut guard: usize = 0;
 
         while self.tok != Token::RBrace && self.tok != Token::Eof {
+            guard += 1;
+            if guard > 10000 {
+                return Err(format!("infinite loop in struct body, tok={:?}", self.tok));
+            }
             let fdecl = self.parse_decl_spec()?;
 
-            // Read field name(s)
+            // Skip pointer/declarator tokens (*, **, etc.) before the field name.
+            while self.tok == Token::Star || self.tok == Token::Slash {
+                self.next();
+            }
+
+            // Read field name(s) — comes before array brackets in C.
             let field_name = if self.tok == Token::Ident {
                 let name = String::from_utf8_lossy(&self.lex.buf).to_string();
                 self.next();
@@ -416,6 +468,17 @@ impl<'a> Parser<'a> {
             } else {
                 String::new()
             };
+
+            // Skip array declarator brackets (after field name)
+            while self.tok == Token::LBracket {
+                self.next(); // eat [
+                while self.tok != Token::RBracket && self.tok != Token::Eof {
+                    self.next();
+                }
+                if self.tok == Token::RBracket {
+                    self.next(); // eat ]
+                }
+            }
 
             // Bitfield
             if self.tok == Token::Colon {
@@ -553,7 +616,13 @@ impl<'a> Parser<'a> {
 
     fn skip_until_semicolon(&mut self) {
         let mut depth = 0u32;
+        let mut guard: usize = 0;
         loop {
+            guard += 1;
+            if guard > 10000 {
+                self.tok = Token::Eof;
+                return;
+            }
             match self.tok {
                 Token::Semicolon | Token::Eof => {
                     if depth == 0 {
@@ -606,7 +675,12 @@ impl<'a> Parser<'a> {
 /// Parse C declarations and register types in `CTState`.
 pub fn parse(cts: &mut CTState, src: &str) -> Result<(), String> {
     let mut p = Parser::new(src, cts);
+    let mut guard: usize = 0;
     while p.tok != Token::Eof {
+        guard += 1;
+        if guard > 10000 {
+            return Err(format!("infinite loop in parse, tok={:?}", p.tok));
+        }
         p.parse_declaration()?;
     }
     Ok(())

@@ -5,6 +5,7 @@ pub enum NumSuffix {
     None,
     LL,
     ULL,
+    Imag,
 }
 
 pub struct ScanNumberResult {
@@ -26,12 +27,18 @@ pub fn scan_number_full(s: &[u8]) -> Option<ScanNumberResult> {
         scan_dec_to_f64(body)?
     };
     // For float numbers with no suffix, n is the parsed f64 from body
+    // For imaginary suffix, also parse as f64 (n is the numeric value).
     // If suffix is LL/ULL, n is the u64 cast to f64 (for display/tostring)
-    let n = if is_float && suffix == NumSuffix::None {
-        // parse body as f64 for the `n` field
+    let n = if is_float && (suffix == NumSuffix::None || suffix == NumSuffix::Imag) {
         std::str::from_utf8(body).ok()?.parse::<f64>().ok()?
     } else {
         u as f64
+    };
+    // For imaginary suffix, store the f64 bits in u for the cdata representation.
+    let u = if suffix == NumSuffix::Imag {
+        n.to_bits()
+    } else {
+        u
     };
     Some(ScanNumberResult { n, u, suffix })
 }
@@ -154,6 +161,12 @@ pub fn scan_bin(s: &[u8]) -> Option<f64> {
 
 fn split_suffix(s: &[u8]) -> (&[u8], NumSuffix) {
     let len = s.len();
+    // Handle 'i' / 'I' suffix (imaginary / complex)
+    if let Some((last, rest)) = s.split_last() {
+        if *last == b'i' || *last == b'I' {
+            return (rest, NumSuffix::Imag);
+        }
+    }
     if len >= 3 {
         let last3 = &s[len - 3..];
         if (last3[0] == b'U' || last3[0] == b'u')
