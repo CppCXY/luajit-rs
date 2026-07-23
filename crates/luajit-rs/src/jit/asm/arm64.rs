@@ -783,22 +783,11 @@ impl<'a> Asm<'a> {
             IROp::LE => (y, x, cond::CC),  // exit if y < x
             IROp::GT => (x, y, cond::LS),  // exit if x <= y
             // Unsigned: same pattern but A/HS instead of B/LO
-            IROp::ULT => (x, y, cond::HI), // exit if NOT (x < y) → exit if x >= y unsigned? 
-            // Actually for unsigned, x64 uses AE/HI for different semantics. Let me map more carefully:
-            // x64 ULT: (x,y,AE) = exit if x >= y (i.e. CF=0 → AE). ARM64: fcmp x,y; b.hs exit
-            // x64 UGE: (y,x,A)  = exit if NOT (x >= y) i.e. y > x unsigned → A=HI. ARM64: fcmp y,x; b.hi exit
-            // x64 ULE: (x,y,A)  = exit if x > y unsigned. ARM64: fcmp x,y; b.hi exit
-            // x64 UGT: (y,x,AE) = exit if y >= x unsigned. ARM64: fcmp y,x; b.hs exit
-            _ => { 
-                // Map unsigned: x64 ULT→(x,y,0x3=AE=CS), UGE→(y,x,0x7=A=HI), ULE→(x,y,0x7=A=HI), UGT→(y,x,0x3=AE=CS)
-                match ins.op() {
-                    IROp::ULT => (x, y, cond::CS),
-                    IROp::UGE => (y, x, cond::HI),
-                    IROp::ULE => (x, y, cond::HI),
-                    IROp::UGT => (y, x, cond::CS),
-                    _ => unreachable!(),
-                }
-            }
+            IROp::ULT => (x, y, cond::CS), // exit if x >= y (x64 AE=CF=0 → ARM64 CS=unsigned higher-or-same)
+            IROp::UGE => (y, x, cond::HI), // exit if NOT (x >= y) i.e. y > x
+            IROp::ULE => (x, y, cond::HI), // exit if NOT (x <= y) i.e. x > y
+            IROp::UGT => (y, x, cond::CS), // exit if NOT (x > y) i.e. y >= x
+            _ => unreachable!(),
         };
         let f = self.fetch_fp(fst, 0)?;
         let s = if snd == fst { f } else { self.fetch_fp(snd, pin(f))? };
