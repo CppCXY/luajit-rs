@@ -626,24 +626,33 @@ impl<'a> Asm<'a> {
         let carg = *self.tr.ir.ir(ins.op2 as IRRef);
         debug_assert_eq!(carg.op(), IROp::CARG);
         let keyref = carg.op1 as IRRef;
-        let int_key = self.key_provably_int(keyref);
-        self.asm_array_head_ex(ins.op1 as IRRef, keyref, int_key)?;
-        if !int_key {
-            self.code.cmp_imm(RSCRATCH3, 0);
-            self.guard(cond::EQ);
-        }
-        self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
-        // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
-        self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
-        let val = carg.op2 as IRRef;
-        if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
-            self.code.fmov_gpr(RSCRATCH3, sv);
-            self.code.str(RSCRATCH3, RSCRATCH2, 0);
+        // In the loop body (after LOOP), the inline asize guard would exit to
+        // the interpreter every time the table needs to grow.  Call jit_tset
+        // directly instead, keeping the trace alive across resize boundaries.
+        if self.loop_pos.is_some() {
+            let addr = super::super::exec::jit_tset as *const () as usize as u64;
+            self.helper_call(addr, &[ins.op1 as IRRef, keyref, carg.op2 as IRRef]);
+            self.ff_result(ins)
         } else {
-            self.gpr_load_ref(RSCRATCH3, val);
-            self.code.str(RSCRATCH3, RSCRATCH2, 0);
+            let int_key = self.key_provably_int(keyref);
+            self.asm_array_head_ex(ins.op1 as IRRef, keyref, int_key)?;
+            if !int_key {
+                self.code.cmp_imm(RSCRATCH3, 0);
+                self.guard(cond::EQ);
+            }
+            self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
+            // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
+            self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
+            let val = carg.op2 as IRRef;
+            if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
+                self.code.fmov_gpr(RSCRATCH3, sv);
+                self.code.str(RSCRATCH3, RSCRATCH2, 0);
+            } else {
+                self.gpr_load_ref(RSCRATCH3, val);
+                self.code.str(RSCRATCH3, RSCRATCH2, 0);
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     // GCSTEP: GC debt check — exit to interpreter when collection is due.
