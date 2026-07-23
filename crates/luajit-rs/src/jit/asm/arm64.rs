@@ -1006,6 +1006,11 @@ impl<'a> Asm<'a> {
                         temp_idx += 1;
                         if let Some(lh) = lhome {
                             if lh != temp_rg { self.code.fmov_dd(lh, temp_rg); }
+                            // Keep env[lref] in sync.
+                            let li = Self::iidx(p.lref);
+                            if self.needs_env[li] {
+                                self.code.str_d(lh, RENV, Self::env_ofs(p.lref));
+                            }
                         } else {
                             self.code.str_d(temp_rg, RENV, Self::env_ofs(p.lref));
                             self.env_valid[Self::iidx(p.lref)] = true;
@@ -1015,6 +1020,11 @@ impl<'a> Asm<'a> {
                         if let Ok(rval) = self.fetch_fp(p.rref, pinned) {
                             if let Some(lh) = lhome {
                                 if lh != rval { self.code.fmov_dd(lh, rval); }
+                                // Keep env[lref] in sync so exit stubs read the freshest value.
+                                let li = Self::iidx(p.lref);
+                                if self.needs_env[li] {
+                                    self.code.str_d(lh, RENV, Self::env_ofs(p.lref));
+                                }
                             } else {
                                 self.code.str_d(rval, RENV, Self::env_ofs(p.lref));
                                 self.env_valid[Self::iidx(p.lref)] = true;
