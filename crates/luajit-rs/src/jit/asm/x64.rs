@@ -1050,12 +1050,12 @@ impl<'a> Asm<'a> {
 
     /// IR_GCSTEP: exit when a collection is due. Mirrors the trigger sum
     /// minus the string bytes (strings never grow on-trace):
-    /// `heap.total + TABLE_EXTRA >= heap.threshold`.
+    /// `heap.total + heap.table_extra >= heap.threshold`.
     fn asm_gcstep(&mut self, ins: &IRIns) {
         let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
         let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
-        // Thread-local cell: the trace is bound to this VM thread.
-        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
+        // table_extra is right after threshold in GcHeap (repr(C)).
+        let extra_addr = thres_addr + std::mem::size_of::<usize>() as u64;
         self.mov_r64_imm64(RAX, total_addr);
         self.mov_r64_mem(RAX, RAX, 0);
         self.mov_r64_imm64(RCX, extra_addr);

@@ -779,7 +779,7 @@ pub fn full_gc(g: &mut GlobalState) {
     heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
     // Table growth is now baked into the live estimate (gc_size counts
     // the grown capacities): reset the growth debt.
-    crate::table::TABLE_EXTRA.with(|c| c.set(0));
+    heap.table_extra = 0;
 }
 
 /// Allocation-time cost bookkeeping (the `lj_mem_newgco` side).

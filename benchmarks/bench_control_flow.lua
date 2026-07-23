@@ -1,6 +1,10 @@
 -- Benchmark: Control flow
 local iterations = 10000000
 
+local function check(name, cond, msg)
+    if not cond then print("FAIL: " .. name .. (msg and ": " .. msg or "")); os.exit(1) end
+end
+
 print("=== Control Flow Benchmark ===")
 print("Iterations:", iterations)
 
@@ -16,6 +20,7 @@ for i = 1, iterations do
 end
 local elapsed = os.clock() - start
 print(string.format("If-else: %.3f seconds (%.2f M ops/sec)", elapsed, iterations / elapsed / 1000000))
+check("if-else count", count == 0, string.format("got %d", count))
 
 -- While loop
 start = os.clock()
@@ -27,17 +32,19 @@ while i < iterations do
 end
 elapsed = os.clock() - start
 print(string.format("While loop: %.3f seconds (%.2f M ops/sec)", elapsed, iterations / elapsed / 1000000))
+local exp = (iterations * (iterations - 1)) / 2
+check("while sum", sum == exp, string.format("got %d want %d", sum, exp))
 
 -- Repeat-until loop
 start = os.clock()
-i = 0
-sum = 0
+i = 0; sum = 0
 repeat
     sum = sum + i
     i = i + 1
 until i >= iterations
 elapsed = os.clock() - start
 print(string.format("Repeat-until: %.3f seconds (%.2f M ops/sec)", elapsed, iterations / elapsed / 1000000))
+check("repeat sum", sum == exp, string.format("got %d want %d", sum, exp))
 
 -- Nested loops
 start = os.clock()
@@ -49,3 +56,6 @@ for i = 1, 1000 do
 end
 elapsed = os.clock() - start
 print(string.format("Nested loops (1000x1000): %.3f seconds (%.2f M ops/sec)", elapsed, 1000000 / elapsed / 1000000))
+check("nested sum", sum == 1000000, string.format("got %d", sum))
+
+print("ALL OK")

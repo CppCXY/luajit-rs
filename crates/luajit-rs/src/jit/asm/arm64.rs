@@ -420,13 +420,8 @@ impl<'a> Asm<'a> {
     // with the helper's result in x0. RBASE/RENV are callee-saved (x19/x20)
     // and survive the call automatically.
     fn helper_call(&mut self, addr: u64, args: &[IRRef]) {
-        // Collect phi lrefs — these are loop-carried and must survive calls.
         let phi_lrefs: Vec<IRRef> = self.phis.iter().map(|p| p.lref).collect();
-        // Always park volatile FP regs that are alive past the call.
-        // The ARM64 calling convention allows callees to clobber d0-d7,
-        // so we must save them even if env_valid was already set by a
-        // previous store (the register may have been updated since then
-        // by PHI resolution at the loop back-edge).
+        let mut saved: Vec<(u8, IRRef)> = Vec::new();
         for &rg in ALLOC_REGS.iter() {
             if rg > 7 && rg < 16 { continue; }
             if let Owner::Ins(o) = self.owner[rg as usize] {
@@ -434,8 +429,8 @@ impl<'a> Asm<'a> {
                 if self.last_use[i] > self.cur {
                     self.code.str_d(rg, RENV, Self::env_ofs(o));
                     self.env_valid[i] = true;
+                    saved.push((rg, o));
                 }
-                // Don't steal phi lrefs — they're loop-carried
                 if !phi_lrefs.contains(&o) {
                     self.steal_quiet(rg);
                 }
@@ -449,13 +444,20 @@ impl<'a> Asm<'a> {
         }
         self.code.mov64(RSCRATCH, addr);
         self.code.blr(RSCRATCH);
-        // Reload phi-lref registers from env: the blr may have clobbered
-        // volatile FP registers (d0-d7), including those holding loop-
-        // carried values.
         for &p in &self.phis {
             if let Some(rg) = self.loc[Self::iidx(p.lref)] {
                 if rg <= 7 || rg >= 16 {
                     self.code.ldr_d(rg, RENV, Self::env_ofs(p.lref));
+                }
+            }
+        }
+        for &(rg, o) in &saved {
+            if !phi_lrefs.contains(&o) {
+                let i = Self::iidx(o);
+                if self.loc[i].is_none() && self.env_valid[i] {
+                    self.code.ldr_d(rg, RENV, Self::env_ofs(o));
+                    self.owner[rg as usize] = Owner::Ins(o);
+                    self.loc[i] = Some(rg);
                 }
             }
         }
@@ -560,18 +562,24 @@ impl<'a> Asm<'a> {
         self.ff_result(ins)
     }
 
-    /// Guard key is exact int in [0, asize). Leaves table GcPtr in x9, int key in w11.
     fn asm_array_head(&mut self, tab: IRRef, key: IRRef) -> Result<(), TraceError> {
+        let _ = self.asm_array_head_ex(tab, key, false);
+        Ok(())
+    }
+
+    fn asm_array_head_ex(&mut self, tab: IRRef, key: IRRef, skip_exact: bool) -> Result<(), TraceError> {
         const ASIZE_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, asize) as i32;
         let sk = self.fetch_fp(key, 0)?;
         self.gpr_load_ref(RSCRATCH, tab);
         self.code.mov64(RSCRATCH2, crate::value::LJ_GCVMASK);
         self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
         self.code.fcvtzs_w(RSCRATCH3, sk);
-        self.code.scvtf_w(FP_SCRATCH, RSCRATCH3);
-        self.code.fcmp(sk, FP_SCRATCH);
-        self.guard(cond::NE);
-        self.guard(cond::VS);
+        if !skip_exact {
+            self.code.scvtf_w(FP_SCRATCH, RSCRATCH3);
+            self.code.fcmp(sk, FP_SCRATCH);
+            self.guard(cond::NE);
+            self.guard(cond::VS);
+        }
         self.code.ldr_w(RSCRATCH2, RSCRATCH, ASIZE_OFF);
         self.code.cmp_rr_w(RSCRATCH3, RSCRATCH2);
         self.guard(cond::CS);
@@ -581,12 +589,40 @@ impl<'a> Asm<'a> {
     // ALOAD: inlined array-part load (like x64 asm_aload)
     fn asm_aload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
-        self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
-        self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
-        // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
-        self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
-        self.code.ldr(0, RSCRATCH2, 0); // x0 = [x10]
-        self.ff_result(ins)
+        // In a loop body, use jit_tget to avoid the asize-guard → exit →
+        // side-trace → restore → re-entry infinite loop.
+        if self.loop_pos.is_some() {
+            self.helper_call(
+                super::super::exec::jit_tget as *const () as usize as u64,
+                &[ins.op1 as IRRef, ins.op2 as IRRef],
+            );
+            self.ff_result(ins)
+        } else {
+            self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
+            self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
+            // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
+            self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
+            self.code.ldr(0, RSCRATCH2, 0); // x0 = [x10]
+            self.ff_result(ins)
+        }
+    }
+
+    fn key_provably_int(&self, keyref: IRRef) -> bool {
+        if keyref < REF_BIAS {
+            return false;
+        }
+        let ki = *self.tr.ir.ir(keyref);
+        match ki.op() {
+            IROp::ADD => {
+                (ki.op2 as u32) < REF_BIAS
+            }
+            IROp::PHI => {
+                let lref = ki.op1 as IRRef;
+                let rref = ki.op2 as IRRef;
+                self.key_provably_int(lref) || self.key_provably_int(rref)
+            }
+            _ => false,
+        }
     }
 
     // ASTORE: inlined array-part store (set_int fast path)
@@ -594,28 +630,47 @@ impl<'a> Asm<'a> {
         const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
         let carg = *self.tr.ir.ir(ins.op2 as IRRef);
         debug_assert_eq!(carg.op(), IROp::CARG);
-        self.asm_array_head(ins.op1 as IRRef, carg.op1 as IRRef)?;
-        self.code.cmp_imm(RSCRATCH3, 0);
-        self.guard(cond::EQ);
-        self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
-        // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
-        self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
-        let val = carg.op2 as IRRef;
-        if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
-            self.code.fmov_gpr(RSCRATCH3, sv);
-            self.code.str(RSCRATCH3, RSCRATCH2, 0);
+        let keyref = carg.op1 as IRRef;
+        // In the loop body (after LOOP), the inline asize guard would exit to
+        // the interpreter every time the table needs to grow.  Call jit_tset
+        // directly instead, keeping the trace alive across resize boundaries.
+        if self.loop_pos.is_some() {
+            let addr = super::super::exec::jit_tset as *const () as usize as u64;
+            self.helper_call(addr, &[ins.op1 as IRRef, keyref, carg.op2 as IRRef]);
+            // ASTORE has no return value; skip ff_result typecheck.
+            if self.needs_env[Self::iidx(self.cur)] {
+                self.code.str(0, RENV, Self::env_ofs(self.cur));
+                self.env_valid[Self::iidx(self.cur)] = true;
+            }
+            Ok(())
         } else {
-            self.gpr_load_ref(RSCRATCH3, val);
-            self.code.str(RSCRATCH3, RSCRATCH2, 0);
+            let int_key = self.key_provably_int(keyref);
+            self.asm_array_head_ex(ins.op1 as IRRef, keyref, int_key)?;
+            if !int_key {
+                self.code.cmp_imm(RSCRATCH3, 0);
+                self.guard(cond::EQ);
+            }
+            self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
+            // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
+            self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
+            let val = carg.op2 as IRRef;
+            if val >= REF_BIAS && let Some(sv) = self.reg_of(val) {
+                self.code.fmov_gpr(RSCRATCH3, sv);
+                self.code.str(RSCRATCH3, RSCRATCH2, 0);
+            } else {
+                self.gpr_load_ref(RSCRATCH3, val);
+                self.code.str(RSCRATCH3, RSCRATCH2, 0);
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     // GCSTEP: GC debt check — exit to interpreter when collection is due.
     fn asm_gcstep(&mut self, ins: &IRIns) {
         let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
         let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
-        let extra_addr = crate::table::TABLE_EXTRA.with(|c| c.as_ptr() as u64);
+        // table_extra sits right after threshold in GcHeap (repr(C)).
+        let extra_addr = thres_addr + std::mem::size_of::<usize>() as u64;
         self.code.mov64(RSCRATCH, total_addr);
         self.code.ldr(RSCRATCH2, RSCRATCH, 0);
         self.code.mov64(RSCRATCH3, extra_addr);
@@ -739,22 +794,11 @@ impl<'a> Asm<'a> {
             IROp::LE => (y, x, cond::CC),  // exit if y < x
             IROp::GT => (x, y, cond::LS),  // exit if x <= y
             // Unsigned: same pattern but A/HS instead of B/LO
-            IROp::ULT => (x, y, cond::HI), // exit if NOT (x < y) → exit if x >= y unsigned? 
-            // Actually for unsigned, x64 uses AE/HI for different semantics. Let me map more carefully:
-            // x64 ULT: (x,y,AE) = exit if x >= y (i.e. CF=0 → AE). ARM64: fcmp x,y; b.hs exit
-            // x64 UGE: (y,x,A)  = exit if NOT (x >= y) i.e. y > x unsigned → A=HI. ARM64: fcmp y,x; b.hi exit
-            // x64 ULE: (x,y,A)  = exit if x > y unsigned. ARM64: fcmp x,y; b.hi exit
-            // x64 UGT: (y,x,AE) = exit if y >= x unsigned. ARM64: fcmp y,x; b.hs exit
-            _ => { 
-                // Map unsigned: x64 ULT→(x,y,0x3=AE=CS), UGE→(y,x,0x7=A=HI), ULE→(x,y,0x7=A=HI), UGT→(y,x,0x3=AE=CS)
-                match ins.op() {
-                    IROp::ULT => (x, y, cond::CS),
-                    IROp::UGE => (y, x, cond::HI),
-                    IROp::ULE => (x, y, cond::HI),
-                    IROp::UGT => (y, x, cond::CS),
-                    _ => unreachable!(),
-                }
-            }
+            IROp::ULT => (x, y, cond::CS), // exit if x >= y (x64 AE=CF=0 → ARM64 CS=unsigned higher-or-same)
+            IROp::UGE => (y, x, cond::HI), // exit if NOT (x >= y) i.e. y > x
+            IROp::ULE => (x, y, cond::HI), // exit if NOT (x <= y) i.e. x > y
+            IROp::UGT => (y, x, cond::CS), // exit if NOT (x > y) i.e. y >= x
+            _ => unreachable!(),
         };
         let f = self.fetch_fp(fst, 0)?;
         let s = if snd == fst { f } else { self.fetch_fp(snd, pin(f))? };
@@ -962,6 +1006,11 @@ impl<'a> Asm<'a> {
                         temp_idx += 1;
                         if let Some(lh) = lhome {
                             if lh != temp_rg { self.code.fmov_dd(lh, temp_rg); }
+                            // Keep env[lref] in sync.
+                            let li = Self::iidx(p.lref);
+                            if self.needs_env[li] {
+                                self.code.str_d(lh, RENV, Self::env_ofs(p.lref));
+                            }
                         } else {
                             self.code.str_d(temp_rg, RENV, Self::env_ofs(p.lref));
                             self.env_valid[Self::iidx(p.lref)] = true;
@@ -971,6 +1020,11 @@ impl<'a> Asm<'a> {
                         if let Ok(rval) = self.fetch_fp(p.rref, pinned) {
                             if let Some(lh) = lhome {
                                 if lh != rval { self.code.fmov_dd(lh, rval); }
+                                // Keep env[lref] in sync so exit stubs read the freshest value.
+                                let li = Self::iidx(p.lref);
+                                if self.needs_env[li] {
+                                    self.code.str_d(lh, RENV, Self::env_ofs(p.lref));
+                                }
                             } else {
                                 self.code.str_d(rval, RENV, Self::env_ofs(p.lref));
                                 self.env_valid[Self::iidx(p.lref)] = true;
