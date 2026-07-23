@@ -420,13 +420,8 @@ impl<'a> Asm<'a> {
     // with the helper's result in x0. RBASE/RENV are callee-saved (x19/x20)
     // and survive the call automatically.
     fn helper_call(&mut self, addr: u64, args: &[IRRef]) {
-        // Collect phi lrefs — these are loop-carried and must survive calls.
         let phi_lrefs: Vec<IRRef> = self.phis.iter().map(|p| p.lref).collect();
-        // Always park volatile FP regs that are alive past the call.
-        // The ARM64 calling convention allows callees to clobber d0-d7,
-        // so we must save them even if env_valid was already set by a
-        // previous store (the register may have been updated since then
-        // by PHI resolution at the loop back-edge).
+        let mut saved: Vec<(u8, IRRef)> = Vec::new();
         for &rg in ALLOC_REGS.iter() {
             if rg > 7 && rg < 16 { continue; }
             if let Owner::Ins(o) = self.owner[rg as usize] {
@@ -434,8 +429,8 @@ impl<'a> Asm<'a> {
                 if self.last_use[i] > self.cur {
                     self.code.str_d(rg, RENV, Self::env_ofs(o));
                     self.env_valid[i] = true;
+                    saved.push((rg, o));
                 }
-                // Don't steal phi lrefs — they're loop-carried
                 if !phi_lrefs.contains(&o) {
                     self.steal_quiet(rg);
                 }
@@ -449,13 +444,20 @@ impl<'a> Asm<'a> {
         }
         self.code.mov64(RSCRATCH, addr);
         self.code.blr(RSCRATCH);
-        // Reload phi-lref registers from env: the blr may have clobbered
-        // volatile FP registers (d0-d7), including those holding loop-
-        // carried values.
         for &p in &self.phis {
             if let Some(rg) = self.loc[Self::iidx(p.lref)] {
                 if rg <= 7 || rg >= 16 {
                     self.code.ldr_d(rg, RENV, Self::env_ofs(p.lref));
+                }
+            }
+        }
+        for &(rg, o) in &saved {
+            if !phi_lrefs.contains(&o) {
+                let i = Self::iidx(o);
+                if self.loc[i].is_none() && self.env_valid[i] {
+                    self.code.ldr_d(rg, RENV, Self::env_ofs(o));
+                    self.owner[rg as usize] = Owner::Ins(o);
+                    self.loc[i] = Some(rg);
                 }
             }
         }
@@ -560,7 +562,6 @@ impl<'a> Asm<'a> {
         self.ff_result(ins)
     }
 
-    /// Guard key is exact int in [0, asize). Leaves table GcPtr in x9, int key in w11.
     fn asm_array_head(&mut self, tab: IRRef, key: IRRef) -> Result<(), TraceError> {
         let _ = self.asm_array_head_ex(tab, key, false);
         Ok(())
