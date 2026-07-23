@@ -589,12 +589,22 @@ impl<'a> Asm<'a> {
     // ALOAD: inlined array-part load (like x64 asm_aload)
     fn asm_aload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         const APTR_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, aptr) as i32;
-        self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
-        self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
-        // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
-        self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
-        self.code.ldr(0, RSCRATCH2, 0); // x0 = [x10]
-        self.ff_result(ins)
+        // In a loop body, use jit_tget to avoid the asize-guard → exit →
+        // side-trace → restore → re-entry infinite loop.
+        if self.loop_pos.is_some() {
+            self.helper_call(
+                super::super::exec::jit_tget as *const () as usize as u64,
+                &[ins.op1 as IRRef, ins.op2 as IRRef],
+            );
+            self.ff_result(ins)
+        } else {
+            self.asm_array_head(ins.op1 as IRRef, ins.op2 as IRRef)?;
+            self.code.ldr(RSCRATCH, RSCRATCH, APTR_OFF);
+            // ADD RSCRATCH2, RSCRATCH, RSCRATCH3, LSL #3  (x10 = x9 + x11*8)
+            self.code.u32(0x8B000C00 | ((RSCRATCH3 as u32) << 16) | ((RSCRATCH as u32) << 5) | (RSCRATCH2 as u32));
+            self.code.ldr(0, RSCRATCH2, 0); // x0 = [x10]
+            self.ff_result(ins)
+        }
     }
 
     fn key_provably_int(&self, keyref: IRRef) -> bool {
