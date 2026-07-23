@@ -363,9 +363,15 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         } else {
-            // FIXME: GC type guard (ASR+CMN) fires spuriously on both
-            // QEMU and M1 — needs further investigation.
+            // GC type guard: extract the type tag and compare with expected itype.
+            // Uses the same pattern as asm_uload for GC types (ASR by 47).
             self.code.ldr(RSCRATCH, RBASE, disp);
+            if ins.is_guard() {
+                self.code.u32(0x936F_FC00 | ((RSCRATCH as u32) << 5) | (RSCRATCH as u32)); // asr x9, x9, #47
+                self.code.mov32(RSCRATCH2, !(ty as u32));
+                self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
+                self.guard(cond::NE);
+            }
         }
         Ok(())
     }
