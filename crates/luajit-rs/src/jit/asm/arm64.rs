@@ -820,8 +820,10 @@ impl<'a> Asm<'a> {
             if let Some(i) = ready {
                 let (d, s) = pending.remove(i);
                 if parked == Some(s) {
-                    self.code.str(RSCRATCH3, RENV, Self::env_ofs(d));
+                    // Parked value lives in RSCRATCH; copy it to the destination.
+                    self.code.str(RSCRATCH, RENV, Self::env_ofs(d));
                 } else {
+                    // Load from source via RSCRATCH3, keeping RSCRATCH for parking.
                     self.code.ldr(RSCRATCH3, RENV, Self::env_ofs(s));
                     self.code.str(RSCRATCH3, RENV, Self::env_ofs(d));
                 }
@@ -831,7 +833,7 @@ impl<'a> Asm<'a> {
             } else {
                 debug_assert!(parked.is_none(), "one scratch, one cycle at a time");
                 let d0 = pending[0].0;
-                self.code.ldr(RSCRATCH3, RENV, Self::env_ofs(d0));
+                self.code.ldr(RSCRATCH, RENV, Self::env_ofs(d0));
                 parked = Some(d0);
             }
         }
@@ -1528,6 +1530,42 @@ impl<'a> Asm<'a> {
                 IROp::NOP | IROp::BASE => {}
                 IROp::LOOP => {
                     if self.loop_pos.is_none() {
+                        // 1. Kill dead registers.
+                        for rg in 0..NREG as u8 {
+                            let dead = match self.owner[rg as usize] {
+                                Owner::Ins(o) => self.last_use[Self::iidx(o)] <= self.cur,
+                                Owner::Konst(k) => self.klast_use[Self::kidx(k)] <= self.cur,
+                                Owner::None => false,
+                            };
+                            if dead {
+                                self.steal_quiet(rg);
+                            }
+                        }
+                        // 2. Park invariant (non-PHI-lref) live values in env so that
+                        //    register-stealing later in the variant body does not lose
+                        //    loop-invariant data (analogous to x64's asm_loop_head).
+                        for rg in 0..NREG as u8 {
+                            if let Owner::Ins(o) = self.owner[rg as usize] {
+                                if self.phis.iter().any(|p| p.num && p.lref == o) {
+                                    continue; // Loop-carried PHI: back edge handles it.
+                                }
+                                let i = Self::iidx(o);
+                                if !self.env_valid[i] {
+                                    self.code.str_d(rg, RENV, Self::env_ofs(o));
+                                    self.env_valid[i] = true;
+                                }
+                            }
+                        }
+                        // 3. Invalidate stale pre-roll env copies for register-homed
+                        //    PHI lrefs: the back edge refreshes their env slot.
+                        for p in self.phis.iter() {
+                            let i = Self::iidx(p.lref);
+                            if p.num && self.loc[i].is_some() && !self.needs_env[i] {
+                                self.env_valid[i] = false;
+                            }
+                        }
+                        // 4. Snapshot register ownership for back-edge restoration.
+                        self.s0 = self.owner;
                         self.loop_pos = Some(self.code.len());
                         self.phi_homes = self
                             .phis
@@ -1724,6 +1762,37 @@ impl<'a> Asm<'a> {
                 for &(lref, rg) in &self.phi_homes {
                     if self.reg_of(lref).is_none() && self.env_valid[Self::iidx(lref)] {
                         self.code.ldr_d(rg, RENV, Self::env_ofs(lref));
+                    }
+                }
+                // Restore invariant (non-PHI-lref) register state that
+                // changed since the LOOP snapshot (analogous to x64's
+                // asm_loop_back step 4). Values parked at the LOOP head
+                // are reloaded from env; constants are re-materialized.
+                for rg in 0..NREG as u8 {
+                    let so = self.s0[rg as usize];
+                    if so == Owner::None || so == self.owner[rg as usize] {
+                        continue;
+                    }
+                    let is_phi = match so {
+                        Owner::Ins(o) => {
+                            self.phis.iter().any(|p| p.num && p.lref == o)
+                        }
+                        _ => false,
+                    };
+                    if is_phi {
+                        continue;
+                    }
+                    match so {
+                        Owner::Ins(x) => {
+                            debug_assert!(self.env_valid[Self::iidx(x)]);
+                            self.code.ldr_d(rg, RENV, Self::env_ofs(x));
+                        }
+                        Owner::Konst(k) => {
+                            self.code
+                                .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, k));
+                            self.code.fmov_fp(rg, RSCRATCH);
+                        }
+                        Owner::None => unreachable!(),
                     }
                 }
                 let off = (lp as i64 - self.code.len() as i64) as i32 / 4;
