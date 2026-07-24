@@ -262,6 +262,49 @@ impl Emit {
         );
     }
 
+    /// Load a 32-bit word from [rn + off], handling offsets that exceed the
+    /// 12-bit LDR immediate field (max 16380 bytes).  Uses RSCRATCH3 as
+    /// a temporary address register.
+    fn ldr_w_safe(&mut self, rt: u8, rn: u8, off: i32) {
+        if off >= 0 && (off as u32) <= 16380 && off & 3 == 0 {
+            self.ldr_w(rt, rn, off);
+        } else {
+            self.mov64(RSCRATCH3, off as u64);
+            self.add_rr(RSCRATCH3, RSCRATCH3, rn);
+            self.ldr_w(rt, RSCRATCH3, 0);
+        }
+    }
+    /// 64-bit load (ldr) with safe large-offset handling.
+    fn ldr_safe(&mut self, rt: u8, rn: u8, off: i32) {
+        if off >= 0 && (off as u32) <= 32760 && off & 7 == 0 {
+            self.ldr(rt, rn, off);
+        } else {
+            self.mov64(RSCRATCH3, off as u64);
+            self.add_rr(RSCRATCH3, RSCRATCH3, rn);
+            self.ldr(rt, RSCRATCH3, 0);
+        }
+    }
+    /// 64-bit store (str) with safe large-offset handling.
+    fn str_safe(&mut self, rt: u8, rn: u8, off: i32) {
+        if off >= 0 && (off as u32) <= 32760 && off & 7 == 0 {
+            self.str(rt, rn, off);
+        } else {
+            self.mov64(RSCRATCH3, off as u64);
+            self.add_rr(RSCRATCH3, RSCRATCH3, rn);
+            self.str(rt, RSCRATCH3, 0);
+        }
+    }
+    /// FP load (ldr_d) with safe large-offset handling.
+    fn ldr_d_safe(&mut self, dt: u8, rn: u8, off: i32) {
+        if off >= 0 && (off as u32) <= 32760 && off & 7 == 0 {
+            self.ldr_d(dt, rn, off);
+        } else {
+            self.mov64(RSCRATCH3, off as u64);
+            self.add_rr(RSCRATCH3, RSCRATCH3, rn);
+            self.ldr_d(dt, RSCRATCH3, 0);
+        }
+    }
+
     /// 32-bit immediate store via temp register
     fn str_imm32(&mut self, rn: u8, off: i32, imm: u32) {
         self.mov32(RSCRATCH, imm);
@@ -851,7 +894,7 @@ impl<'a> Asm<'a> {
         let i = Self::iidx(self.cur);
         if irt_isnum(t) {
             if ins.is_guard() {
-                self.code.ldr_w(RSCRATCH, RBASE, disp + 4);
+                self.code.ldr_w_safe(RSCRATCH, RBASE, disp + 4);
                 let tisnum_hi: u64 = 0xFFF9_0000;
                 self.code.mov64(RSCRATCH2, tisnum_hi);
                 self.code.cmp_rr(RSCRATCH, RSCRATCH2);
@@ -859,13 +902,13 @@ impl<'a> Asm<'a> {
             }
             if self.last_use[i] != 0 || self.needs_env[i] {
                 let d = self.alloc(0)?;
-                self.code.ldr_d(d, RBASE, disp);
+                self.code.ldr_d_safe(d, RBASE, disp);
                 self.def(d);
             }
             return Ok(());
         }
         if self.needs_env[i] {
-            self.code.ldr(RSCRATCH, RBASE, disp);
+            self.code.ldr_safe(RSCRATCH, RBASE, disp);
             self.code.str(RSCRATCH, RENV, Self::env_ofs(self.cur));
             self.env_valid[i] = true;
         }
@@ -875,13 +918,13 @@ impl<'a> Asm<'a> {
         let ty = irt_type(t);
         if ty == IRT_NIL {
             self.code.mov64(RSCRATCH2, (-1i64) as u64);
-            self.code.ldr(RSCRATCH, RBASE, disp);
+            self.code.ldr_safe(RSCRATCH, RBASE, disp);
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         } else if ty <= IRT_TRUE {
             let itype = !(ty as u32);
             let bits = ((itype as u64) << 15) | 0x7FFF;
-            self.code.ldr_w(RSCRATCH, RBASE, disp + 4);
+            self.code.ldr_w_safe(RSCRATCH, RBASE, disp + 4);
             self.code.mov64(RSCRATCH2, bits);
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
@@ -890,7 +933,7 @@ impl<'a> Asm<'a> {
             // 32-bit word (bits 47-50 of the full 64-bit NaN-boxed value),
             // matching LuaJIT's UBFX approach.
             let nibble = !(irt_type(t) as u32) & 0xF;
-            self.code.ldr_w(RSCRATCH, RBASE, disp + 4);
+            self.code.ldr_w_safe(RSCRATCH, RBASE, disp + 4);
             self.code.ubfx_w(RSCRATCH, RSCRATCH, 15, 4);
             self.code.mov32(RSCRATCH2, nibble);
             self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
@@ -1483,13 +1526,13 @@ impl<'a> Asm<'a> {
                 if let Some(rg) = self.loc[Self::iidx(rref)] {
                     self.code.str_d(rg, RBASE, disp);
                 } else {
-                    self.code.ldr(RSCRATCH, RENV, Self::env_ofs(rref));
-                    self.code.str(RSCRATCH, RBASE, disp);
+                    self.code.ldr_safe(RSCRATCH, RENV, Self::env_ofs(rref));
+                    self.code.str_safe(RSCRATCH, RBASE, disp);
                 }
             } else {
                 self.code
                     .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, rref));
-                self.code.str(RSCRATCH, RBASE, disp);
+                self.code.str_safe(RSCRATCH, RBASE, disp);
             }
         }
     }

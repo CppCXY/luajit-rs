@@ -1931,4 +1931,29 @@ mod tests {
             306.0,
         );
     }
+
+    /// `continue` in a while loop must produce the same result with JIT
+    /// compiled as without.  Regression test: ARM64 side-trace recording
+    /// from the continue exit was silently executing the wrong body code.
+    #[test]
+    fn while_continue_correctness() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // simple: sum values where (i & 4) != 0 (i.e. bit 2 set)
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local i=0 while i<100 do i=i+1 if(i&4)==0 then continue end s=s+i end return s",
+            ),
+            2476.0,
+        );
+        // full: with extra continue range (70-80) and break at 95
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local i=0 while i<100 do i=i+1 if(i&4)==0 then continue end if i>=70 and i<=80 then continue end if i==95 then break end s=s+i end return s",
+            ),
+            1830.0,
+        );
+    }
 }
