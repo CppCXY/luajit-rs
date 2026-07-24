@@ -1835,14 +1835,68 @@ mod tests {
         let g = lua.global();
         // Check if trace was assembled on native-arch targets.
         let jforl = find_op(pt, BCOp::JFORL);
-        if jforl.is_some() {
-            let rootno = crate::bc::bc_d(pt.as_ref().bc[jforl.unwrap()]);
+        if let Some(jforl_pc) = jforl {
+            let rootno = crate::bc::bc_d(pt.as_ref().bc[jforl_pc]);
             if let Some(tr) = g.jit.trace[rootno as usize].as_deref() {
                 let has_mcode = tr.mcode.is_some();
                 let arch = format!("{:?}", g.jit.arch);
-                eprintln!("diag_loop_gets_mcode: arch={arch} mcode={has_mcode} link={:?} nins={}",
-                    tr.linktype, tr.ir.nins());
+                // If we expect native mcode but didn't get it, fail explicitly.
+                if !has_mcode {
+                    panic!(
+                        "trace not assembled on {arch}: nins={} nsnap={} link={:?}",
+                        tr.ir.nins(),
+                        tr.snap.len(),
+                        tr.linktype,
+                    );
+                }
             }
         }
+    }
+
+    /// Minimal type-change exit: simpler version of diag_type_change_exit
+    /// without the EQ guard — x starts as number, type changes mid-loop.
+    #[test]
+    fn diag_type_change_only() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // x = 10 for first 5 iters, then x = '2' for remaining 5.
+        // s = 5*10 + 5*2 = 50 + 10 = 60
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=10 for i=1,10 do if i==6 then x='2' end s=s+x end return s",
+            ),
+            60.0,
+        );
+    }
+
+    /// Force no-asm: portable executor should always give correct results.
+    #[test]
+    fn diag_type_change_noasm() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        lua.global().jit.no_asm = true;
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,300 do if i==250 then x='2' end s=s+x end return s",
+            ),
+            351.0,
+        );
+    }
+
+    /// JIT-off: pure interpreter should always work.
+    #[test]
+    fn diag_type_change_jitoff() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        lua.global().jit.set_on(false);
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,300 do if i==250 then x='2' end s=s+x end return s",
+            ),
+            351.0,
+        );
     }
 }
