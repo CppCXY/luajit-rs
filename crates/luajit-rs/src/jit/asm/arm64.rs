@@ -149,6 +149,19 @@ impl Emit {
     fn ror_rr(&mut self, rd: u8, rn: u8, rm: u8) {
         self.u32(0x9AC0_2C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32));
     }
+    /// SBFM Xd, Xn, #immr, #imms — signed bitfield move (ASR immediate).
+    fn sbfm64(&mut self, rd: u8, rn: u8, immr: u8, imms: u8) {
+        debug_assert!(immr <= 63 && imms <= 63);
+        let n: u32 = 1; // 64-bit
+        self.u32(
+            0x9340_0000
+                | (n << 22)
+                | ((immr as u32) << 16)
+                | ((imms as u32) << 10)
+                | ((rn as u32) << 5)
+                | (rd as u32),
+        );
+    }
     // 32-bit shifts
     fn lsl_w(&mut self, wd: u8, wn: u8, wm: u8) {
         self.u32(0x1AC0_2000 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32));
@@ -858,9 +871,17 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         } else {
-            // FIXME: GC type guard (ASR+CMN) fires spuriously on both
-            // QEMU and M1 — needs further investigation.
+            let itype = !(ty as u32);
+            let bits = ((itype as u64) << 47) | ((1u64 << 47) - 1);
+            self.code.mov64(RSCRATCH2, bits);
             self.code.ldr(RSCRATCH, RBASE, disp);
+            self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
+            // ASR #47 — extract and sign-extend the type field
+            self.code.sbfm64(RSCRATCH, RSCRATCH, 47, 63);
+            // Compare lower 32 bits with the expected itype pattern
+            self.code.mov32(RSCRATCH2, itype);
+            self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
+            self.guard(cond::NE);
         }
         Ok(())
     }
@@ -1409,7 +1430,21 @@ impl<'a> Asm<'a> {
                 self.fixups.push((eq_pos, eq_guard_idx));
             }
         } else {
-            // FIXME: non-numeric EQ/NE guard fires spuriously
+            // Non-numeric EQ/NE: compare full 64-bit representations.
+            let fst = ins.op1 as IRRef;
+            let snd = ins.op2 as IRRef;
+            self.gpr_load_ref(RSCRATCH, fst);
+            if snd == fst {
+                self.code.cmp_rr(RSCRATCH, RSCRATCH);
+            } else {
+                self.gpr_load_ref(RSCRATCH2, snd);
+                self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+            }
+            if eq {
+                self.guard(cond::NE);
+            } else {
+                self.guard(cond::EQ);
+            }
         }
         Ok(())
     }
