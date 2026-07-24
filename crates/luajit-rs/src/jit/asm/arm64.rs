@@ -1768,6 +1768,26 @@ impl<'a> Asm<'a> {
                         self.code.ldr_d(rg, RENV, Self::env_ofs(lref));
                     }
                 }
+                // Handle non-number (NPHI) loop-carried values:
+                // copy rref → lref via env (analogous to x64's
+                // asm_loop_back buffered parallel move for non-FP values).
+                // Number-free GC values like string keys never live in
+                // FP registers, so they are carried via env slots.
+                for p in self.phis.iter().filter(|p| !p.num) {
+                    if p.rref >= REF_BIAS {
+                        let i = Self::iidx(p.lref);
+                        debug_assert!(self.env_valid[Self::iidx(p.rref)]);
+                        self.code.ldr(RSCRATCH, RENV, Self::env_ofs(p.rref));
+                        self.code.str(RSCRATCH, RENV, Self::env_ofs(p.lref));
+                        self.env_valid[i] = true;
+                    } else {
+                        // Constant: materialize and store.
+                        self.code
+                            .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, p.rref));
+                        self.code.str(RSCRATCH, RENV, Self::env_ofs(p.lref));
+                        self.env_valid[Self::iidx(p.lref)] = true;
+                    }
+                }
                 // Restore invariant (non-PHI-lref) register state that
                 // changed since the LOOP snapshot (analogous to x64's
                 // asm_loop_back step 4). Values parked at the LOOP head
