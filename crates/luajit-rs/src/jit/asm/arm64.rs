@@ -1322,14 +1322,18 @@ impl<'a> Asm<'a> {
     fn asm_bitop(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let op = ins.op();
         let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
-        self.code.fcvtzs_x(RSCRATCH, sx);
         if !matches!(op, IROp::BNOT | IROp::BSWAP) {
             let sy = if ins.op2 == ins.op1 {
                 sx
             } else {
                 self.fetch_fp(ins.op2 as IRRef, pin(sx))?
             };
+            // Convert op2 first (may clobber RSCRATCH via fetch_fp), then
+            // convert op1 into RSCRATCH (now safe).
             self.code.fcvtzs_x(RSCRATCH2, sy);
+            self.code.fcvtzs_x(RSCRATCH, sx);
+        } else {
+            self.code.fcvtzs_x(RSCRATCH, sx);
         }
         // 32-bit operations
         match op {

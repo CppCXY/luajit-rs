@@ -2,7 +2,7 @@ name: Luajit2 Test Suite
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
 
 env:
@@ -22,6 +22,9 @@ jobs:
           - name: windows-x64
             os: windows-latest
             exe: target/release/luajit-rs.exe
+          - name: macosx-arm64
+            os: macosx-latest
+            exe: target/release/luajit-rs
     steps:
       - uses: actions/checkout@v4
 
