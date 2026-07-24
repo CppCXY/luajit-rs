@@ -176,6 +176,19 @@ impl Emit {
     fn rev_w(&mut self, wd: u8, wn: u8) {
         self.u32(0x5AC0_0800 | ((wn as u32) << 5) | (wd as u32));
     }
+    /// UBFX Wd, Wn, #lsb, #width — unsigned bitfield extract (32-bit).
+    fn ubfx_w(&mut self, wd: u8, wn: u8, lsb: u8, width: u8) {
+        debug_assert!(width >= 1 && lsb + width <= 32);
+        let immr = lsb;
+        let imms = lsb + width - 1;
+        self.u32(
+            0x5300_0000
+                | ((immr as u32) << 16)
+                | ((imms as u32) << 10)
+                | ((wn as u32) << 5)
+                | (wd as u32),
+        );
+    }
 
     // ── load/store pair ──
     fn stp(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) {
@@ -871,15 +884,13 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         } else {
-            let itype = !(ty as u32);
-            let bits = ((itype as u64) << 47) | ((1u64 << 47) - 1);
-            self.code.mov64(RSCRATCH2, bits);
-            self.code.ldr(RSCRATCH, RBASE, disp);
-            self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
-            // ASR #47 — extract and sign-extend the type field
-            self.code.sbfm64(RSCRATCH, RSCRATCH, 47, 63);
-            // Compare lower 32 bits with the expected itype pattern
-            self.code.mov32(RSCRATCH2, itype);
+            // GC type guard: extract the 4-bit type nibble from the upper
+            // 32-bit word (bits 47-50 of the full 64-bit NaN-boxed value),
+            // matching LuaJIT's UBFX approach.
+            let nibble = !(irt_type(t) as u32) & 0xF;
+            self.code.ldr_w(RSCRATCH, RBASE, disp + 4);
+            self.code.ubfx_w(RSCRATCH, RSCRATCH, 15, 4);
+            self.code.mov32(RSCRATCH2, nibble);
             self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         }
@@ -927,10 +938,10 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(RSCRATCH2, RSCRATCH3);
             self.guard(cond::NE);
         } else {
-            self.code.ldr(RSCRATCH2, RSCRATCH, 0);
-            self.code
-                .u32(0x936F_FC00 | ((RSCRATCH2 as u32) << 5) | (RSCRATCH2 as u32)); // asr x10, x10, #47
-            self.code.mov32(RSCRATCH3, !(ty as u32));
+            let nibble = !(ty as u32) & 0xF;
+            self.code.ldr_w(RSCRATCH2, RSCRATCH, 4);
+            self.code.ubfx_w(RSCRATCH2, RSCRATCH2, 15, 4);
+            self.code.mov32(RSCRATCH3, nibble);
             self.code.cmp_rr_w(RSCRATCH2, RSCRATCH3);
             self.guard(cond::NE);
         }
@@ -1037,8 +1048,11 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(0, RSCRATCH2);
             self.guard(cond::NE);
         } else {
-            self.code.u32(0x936F_FC00 | (RSCRATCH as u32)); // asr x9, x0, #47 (was lsr/ubfm)
-            self.code.mov32(RSCRATCH2, !(ty as u32));
+            // GC type: extract 4-bit type nibble from helper return value
+            // in x0 (bits 47-50), matching LuaJIT's UBFX approach.
+            let nibble = !(ty as u32) & 0xF;
+            self.code.ubfx_w(RSCRATCH, 0, 15, 4); // ubfx w9, w0, #15, #4
+            self.code.mov32(RSCRATCH2, nibble);
             self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         }
