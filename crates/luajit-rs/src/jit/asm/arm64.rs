@@ -1051,9 +1051,13 @@ impl<'a> Asm<'a> {
             self.guard(cond::NE);
         } else {
             // GC type: extract 4-bit type nibble from helper return value
-            // in x0 (bits 47-50), matching LuaJIT's UBFX approach.
+            // in x0 (bits 47-50 of the full 64-bit NaN-boxed value).
+            // Shift right by 32 to bring the upper half into the low word,
+            // then UBFX bits 18:15 (which correspond to bits 50:47 of
+            // the original value), matching LuaJIT's UBFX approach.
+            self.code.u32(0xD360_FC00 | (RSCRATCH as u32)); // lsr x9, x0, #32
             let nibble = !(ty as u32) & 0xF;
-            self.code.ubfx_w(RSCRATCH, 0, 15, 4); // ubfx w9, w0, #15, #4
+            self.code.ubfx_w(RSCRATCH, RSCRATCH, 15, 4);
             self.code.mov32(RSCRATCH2, nibble);
             self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);

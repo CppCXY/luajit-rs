@@ -46,15 +46,6 @@ jobs:
 
       - name: Test (release)
         run: cargo test --release --workspace
-
-      - name: Lua integration tests
-        shell: bash
-        run: |
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            pwsh -Command ".\run_tests.ps1 -Release"
-          else
-            bash run_tests.sh --release
-          fi
           
   cross-check:
     name: cross-check (${{ matrix.target }})
