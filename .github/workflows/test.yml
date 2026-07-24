@@ -22,8 +22,8 @@ jobs:
           - name: windows-x64
             os: windows-latest
             exe: target/release/luajit-rs.exe
-          - name: macosx-arm64
-            os: macosx-latest
+          - name: macos-arm64
+            os: macos-latest
             exe: target/release/luajit-rs
     steps:
       - uses: actions/checkout@v4
