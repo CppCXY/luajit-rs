@@ -1899,4 +1899,36 @@ mod tests {
             351.0,
         );
     }
+
+    /// Type change very early (iteration 5 out of 300): trace is recorded
+    /// before the change point, but has plenty of time to re-enter after.
+    #[test]
+    fn diag_type_change_early() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // x=1 for iter 1-4, x='2' for iter 5-500. s = 4*1 + 496*2 = 996
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,500 do if i==5 then x='2' end s=s+x end return s",
+            ),
+            996.0,
+        );
+    }
+
+    /// Type change very late (iteration 295 out of 300): trace records with
+    /// x=1, runs many iterations compiled, then exits near the end.
+    #[test]
+    fn diag_type_change_late() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // x=1 for iter 1-294, x='2' for iter 295-300. s = 294 + 6*2 = 306
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,300 do if i==295 then x='2' end s=s+x end return s",
+            ),
+            306.0,
+        );
+    }
 }
