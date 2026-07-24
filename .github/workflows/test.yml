@@ -2,7 +2,7 @@ name: Luajit2 Test Suite
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
 
 env:
@@ -22,6 +22,9 @@ jobs:
           - name: windows-x64
             os: windows-latest
             exe: target/release/luajit-rs.exe
+          - name: macosx-arm64
+            os: macosx-latest
+            exe: target/release/luajit-rs
     steps:
       - uses: actions/checkout@v4
 
@@ -46,4 +49,9 @@ jobs:
         shell: bash
         run: |
           cd tests/luajit2_test
+          ../../"${{ matrix.exe }}" test.lua
+      - name: Run luajit3 test suite
+        shell: bash
+        run: |
+          cd tests/luajit3_test
           ../../"${{ matrix.exe }}" test.lua

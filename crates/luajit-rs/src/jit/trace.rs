@@ -1777,4 +1777,183 @@ mod tests {
             10100.0,
         );
     }
+
+    // ── ARM64 diagnostic tests ───────────────────────────────────────────
+
+    /// Simplest possible traced loop: one accumulator, one addition.
+    #[test]
+    fn diag_simple_add_loop() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_num(jit_run(&mut lua, "local s=0 for i=1,300 do s=s+1 end return s"), 300.0);
+    }
+
+    /// Loop with comparison guard (EQ) that fires on the last iteration.
+    #[test]
+    fn diag_eq_guard_loop() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // if i == 250 then s = s + 100 else s = s + 1 end
+        // 249*1 + 1*100 + 50*1 = 249 + 100 + 50 = 399
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 for i=1,300 do if i==250 then s=s+100 else s=s+1 end end return s",
+            ),
+            399.0,
+        );
+    }
+
+    /// Loop where a variable changes type mid-execution: the SLOAD
+    /// type guard must fire, then the interpreter takes over.
+    #[test]
+    fn diag_type_change_exit() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // x=1 for 249 iters, then x='2' at iter 250.
+        // s = 249*1 + 2 + 50*2 = 249 + 2 + 100 = 351
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,300 do if i==250 then x='2' end s=s+x end return s",
+            ),
+            351.0,
+        );
+    }
+
+    /// Verify the trace was actually assembled (mcode present).
+    #[test]
+    fn diag_loop_gets_mcode() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local s=0 for i=1,300 do s=s+i end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(45150.0));
+        let g = lua.global();
+        // Check if trace was assembled on native-arch targets.
+        let jforl = find_op(pt, BCOp::JFORL);
+        if let Some(jforl_pc) = jforl {
+            let rootno = crate::bc::bc_d(pt.as_ref().bc[jforl_pc]);
+            if let Some(tr) = g.jit.trace[rootno as usize].as_deref() {
+                let has_mcode = tr.mcode.is_some();
+                let arch = format!("{:?}", g.jit.arch);
+                // If we expect native mcode but didn't get it, fail explicitly.
+                if !has_mcode {
+                    panic!(
+                        "trace not assembled on {arch}: nins={} nsnap={} link={:?}",
+                        tr.ir.nins(),
+                        tr.snap.len(),
+                        tr.linktype,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Minimal type-change exit: simpler version of diag_type_change_exit
+    /// without the EQ guard — x starts as number, type changes mid-loop.
+    #[test]
+    fn diag_type_change_only() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // x = 10 for first 5 iters, then x = '2' for remaining 5.
+        // s = 5*10 + 5*2 = 50 + 10 = 60
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=10 for i=1,10 do if i==6 then x='2' end s=s+x end return s",
+            ),
+            60.0,
+        );
+    }
+
+    /// Force no-asm: portable executor should always give correct results.
+    #[test]
+    fn diag_type_change_noasm() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        lua.global().jit.no_asm = true;
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,300 do if i==250 then x='2' end s=s+x end return s",
+            ),
+            351.0,
+        );
+    }
+
+    /// JIT-off: pure interpreter should always work.
+    #[test]
+    fn diag_type_change_jitoff() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        lua.global().jit.set_on(false);
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,300 do if i==250 then x='2' end s=s+x end return s",
+            ),
+            351.0,
+        );
+    }
+
+    /// Type change very early (iteration 5 out of 300): trace is recorded
+    /// before the change point, but has plenty of time to re-enter after.
+    #[test]
+    fn diag_type_change_early() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // x=1 for iter 1-4, x='2' for iter 5-500. s = 4*1 + 496*2 = 996
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,500 do if i==5 then x='2' end s=s+x end return s",
+            ),
+            996.0,
+        );
+    }
+
+    /// Type change very late (iteration 295 out of 300): trace records with
+    /// x=1, runs many iterations compiled, then exits near the end.
+    #[test]
+    fn diag_type_change_late() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // x=1 for iter 1-294, x='2' for iter 295-300. s = 294 + 6*2 = 306
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,300 do if i==295 then x='2' end s=s+x end return s",
+            ),
+            306.0,
+        );
+    }
+
+    /// `continue` in a while loop must produce the same result with JIT
+    /// compiled as without.  Regression test: ARM64 side-trace recording
+    /// from the continue exit was silently executing the wrong body code.
+    #[test]
+    fn while_continue_correctness() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // simple: sum values where (i & 4) != 0 (i.e. bit 2 set)
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local i=0 while i<100 do i=i+1 if(i&4)==0 then continue end s=s+i end return s",
+            ),
+            2476.0,
+        );
+        // full: with extra continue range (70-80) and break at 95
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local i=0 while i<100 do i=i+1 if(i&4)==0 then continue end if i>=70 and i<=80 then continue end if i==95 then break end s=s+i end return s",
+            ),
+            1830.0,
+        );
+    }
 }

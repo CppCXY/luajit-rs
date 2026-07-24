@@ -149,6 +149,19 @@ impl Emit {
     fn ror_rr(&mut self, rd: u8, rn: u8, rm: u8) {
         self.u32(0x9AC0_2C00 | ((rm as u32) << 16) | ((rn as u32) << 5) | (rd as u32));
     }
+    /// SBFM Xd, Xn, #immr, #imms — signed bitfield move (ASR immediate).
+    fn sbfm64(&mut self, rd: u8, rn: u8, immr: u8, imms: u8) {
+        debug_assert!(immr <= 63 && imms <= 63);
+        let n: u32 = 1; // 64-bit
+        self.u32(
+            0x9340_0000
+                | (n << 22)
+                | ((immr as u32) << 16)
+                | ((imms as u32) << 10)
+                | ((rn as u32) << 5)
+                | (rd as u32),
+        );
+    }
     // 32-bit shifts
     fn lsl_w(&mut self, wd: u8, wn: u8, wm: u8) {
         self.u32(0x1AC0_2000 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32));
@@ -162,6 +175,19 @@ impl Emit {
 
     fn rev_w(&mut self, wd: u8, wn: u8) {
         self.u32(0x5AC0_0800 | ((wn as u32) << 5) | (wd as u32));
+    }
+    /// UBFX Wd, Wn, #lsb, #width — unsigned bitfield extract (32-bit).
+    fn ubfx_w(&mut self, wd: u8, wn: u8, lsb: u8, width: u8) {
+        debug_assert!(width >= 1 && lsb + width <= 32);
+        let immr = lsb;
+        let imms = lsb + width - 1;
+        self.u32(
+            0x5300_0000
+                | ((immr as u32) << 16)
+                | ((imms as u32) << 10)
+                | ((wn as u32) << 5)
+                | (wd as u32),
+        );
     }
 
     // ── load/store pair ──
@@ -234,6 +260,49 @@ impl Emit {
         self.u32(
             0xFD00_0000 | ((((off / 8) as u32) & 0xFFF) << 10) | ((rn as u32) << 5) | (dt as u32),
         );
+    }
+
+    /// Load a 32-bit word from [rn + off], handling offsets that exceed the
+    /// 12-bit LDR immediate field (max 16380 bytes).  Uses RSCRATCH3 as
+    /// a temporary address register.
+    fn ldr_w_safe(&mut self, rt: u8, rn: u8, off: i32) {
+        if off >= 0 && (off as u32) <= 16380 && off & 3 == 0 {
+            self.ldr_w(rt, rn, off);
+        } else {
+            self.mov64(RSCRATCH3, off as u64);
+            self.add_rr(RSCRATCH3, RSCRATCH3, rn);
+            self.ldr_w(rt, RSCRATCH3, 0);
+        }
+    }
+    /// 64-bit load (ldr) with safe large-offset handling.
+    fn ldr_safe(&mut self, rt: u8, rn: u8, off: i32) {
+        if off >= 0 && (off as u32) <= 32760 && off & 7 == 0 {
+            self.ldr(rt, rn, off);
+        } else {
+            self.mov64(RSCRATCH3, off as u64);
+            self.add_rr(RSCRATCH3, RSCRATCH3, rn);
+            self.ldr(rt, RSCRATCH3, 0);
+        }
+    }
+    /// 64-bit store (str) with safe large-offset handling.
+    fn str_safe(&mut self, rt: u8, rn: u8, off: i32) {
+        if off >= 0 && (off as u32) <= 32760 && off & 7 == 0 {
+            self.str(rt, rn, off);
+        } else {
+            self.mov64(RSCRATCH3, off as u64);
+            self.add_rr(RSCRATCH3, RSCRATCH3, rn);
+            self.str(rt, RSCRATCH3, 0);
+        }
+    }
+    /// FP load (ldr_d) with safe large-offset handling.
+    fn ldr_d_safe(&mut self, dt: u8, rn: u8, off: i32) {
+        if off >= 0 && (off as u32) <= 32760 && off & 7 == 0 {
+            self.ldr_d(dt, rn, off);
+        } else {
+            self.mov64(RSCRATCH3, off as u64);
+            self.add_rr(RSCRATCH3, RSCRATCH3, rn);
+            self.ldr_d(dt, RSCRATCH3, 0);
+        }
     }
 
     /// 32-bit immediate store via temp register
@@ -794,8 +863,10 @@ impl<'a> Asm<'a> {
             if let Some(i) = ready {
                 let (d, s) = pending.remove(i);
                 if parked == Some(s) {
-                    self.code.str(RSCRATCH3, RENV, Self::env_ofs(d));
+                    // Parked value lives in RSCRATCH; copy it to the destination.
+                    self.code.str(RSCRATCH, RENV, Self::env_ofs(d));
                 } else {
+                    // Load from source via RSCRATCH3, keeping RSCRATCH for parking.
                     self.code.ldr(RSCRATCH3, RENV, Self::env_ofs(s));
                     self.code.str(RSCRATCH3, RENV, Self::env_ofs(d));
                 }
@@ -805,7 +876,7 @@ impl<'a> Asm<'a> {
             } else {
                 debug_assert!(parked.is_none(), "one scratch, one cycle at a time");
                 let d0 = pending[0].0;
-                self.code.ldr(RSCRATCH3, RENV, Self::env_ofs(d0));
+                self.code.ldr(RSCRATCH, RENV, Self::env_ofs(d0));
                 parked = Some(d0);
             }
         }
@@ -823,7 +894,7 @@ impl<'a> Asm<'a> {
         let i = Self::iidx(self.cur);
         if irt_isnum(t) {
             if ins.is_guard() {
-                self.code.ldr_w(RSCRATCH, RBASE, disp + 4);
+                self.code.ldr_w_safe(RSCRATCH, RBASE, disp + 4);
                 let tisnum_hi: u64 = 0xFFF9_0000;
                 self.code.mov64(RSCRATCH2, tisnum_hi);
                 self.code.cmp_rr(RSCRATCH, RSCRATCH2);
@@ -831,13 +902,13 @@ impl<'a> Asm<'a> {
             }
             if self.last_use[i] != 0 || self.needs_env[i] {
                 let d = self.alloc(0)?;
-                self.code.ldr_d(d, RBASE, disp);
+                self.code.ldr_d_safe(d, RBASE, disp);
                 self.def(d);
             }
             return Ok(());
         }
         if self.needs_env[i] {
-            self.code.ldr(RSCRATCH, RBASE, disp);
+            self.code.ldr_safe(RSCRATCH, RBASE, disp);
             self.code.str(RSCRATCH, RENV, Self::env_ofs(self.cur));
             self.env_valid[i] = true;
         }
@@ -847,20 +918,26 @@ impl<'a> Asm<'a> {
         let ty = irt_type(t);
         if ty == IRT_NIL {
             self.code.mov64(RSCRATCH2, (-1i64) as u64);
-            self.code.ldr(RSCRATCH, RBASE, disp);
+            self.code.ldr_safe(RSCRATCH, RBASE, disp);
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         } else if ty <= IRT_TRUE {
             let itype = !(ty as u32);
             let bits = ((itype as u64) << 15) | 0x7FFF;
-            self.code.ldr_w(RSCRATCH, RBASE, disp + 4);
+            self.code.ldr_w_safe(RSCRATCH, RBASE, disp + 4);
             self.code.mov64(RSCRATCH2, bits);
             self.code.cmp_rr(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         } else {
-            // FIXME: GC type guard (ASR+CMN) fires spuriously on both
-            // QEMU and M1 — needs further investigation.
-            self.code.ldr(RSCRATCH, RBASE, disp);
+            // GC type guard: extract the 4-bit type nibble from the upper
+            // 32-bit word (bits 47-50 of the full 64-bit NaN-boxed value),
+            // matching LuaJIT's UBFX approach.
+            let nibble = !(irt_type(t) as u32) & 0xF;
+            self.code.ldr_w_safe(RSCRATCH, RBASE, disp + 4);
+            self.code.ubfx_w(RSCRATCH, RSCRATCH, 15, 4);
+            self.code.mov32(RSCRATCH2, nibble);
+            self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
+            self.guard(cond::NE);
         }
         Ok(())
     }
@@ -906,10 +983,10 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(RSCRATCH2, RSCRATCH3);
             self.guard(cond::NE);
         } else {
-            self.code.ldr(RSCRATCH2, RSCRATCH, 0);
-            self.code
-                .u32(0x936F_FC00 | ((RSCRATCH2 as u32) << 5) | (RSCRATCH2 as u32)); // asr x10, x10, #47
-            self.code.mov32(RSCRATCH3, !(ty as u32));
+            let nibble = !(ty as u32) & 0xF;
+            self.code.ldr_w(RSCRATCH2, RSCRATCH, 4);
+            self.code.ubfx_w(RSCRATCH2, RSCRATCH2, 15, 4);
+            self.code.mov32(RSCRATCH3, nibble);
             self.code.cmp_rr_w(RSCRATCH2, RSCRATCH3);
             self.guard(cond::NE);
         }
@@ -1016,8 +1093,15 @@ impl<'a> Asm<'a> {
             self.code.cmp_rr(0, RSCRATCH2);
             self.guard(cond::NE);
         } else {
-            self.code.u32(0x936F_FC00 | (RSCRATCH as u32)); // asr x9, x0, #47 (was lsr/ubfm)
-            self.code.mov32(RSCRATCH2, !(ty as u32));
+            // GC type: extract 4-bit type nibble from helper return value
+            // in x0 (bits 47-50 of the full 64-bit NaN-boxed value).
+            // Shift right by 32 to bring the upper half into the low word,
+            // then UBFX bits 18:15 (which correspond to bits 50:47 of
+            // the original value), matching LuaJIT's UBFX approach.
+            self.code.u32(0xD360_FC00 | (RSCRATCH as u32)); // lsr x9, x0, #32
+            let nibble = !(ty as u32) & 0xF;
+            self.code.ubfx_w(RSCRATCH, RSCRATCH, 15, 4);
+            self.code.mov32(RSCRATCH2, nibble);
             self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
             self.guard(cond::NE);
         }
@@ -1238,14 +1322,18 @@ impl<'a> Asm<'a> {
     fn asm_bitop(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let op = ins.op();
         let sx = self.fetch_fp(ins.op1 as IRRef, 0)?;
-        self.code.fcvtzs_x(RSCRATCH, sx);
         if !matches!(op, IROp::BNOT | IROp::BSWAP) {
             let sy = if ins.op2 == ins.op1 {
                 sx
             } else {
                 self.fetch_fp(ins.op2 as IRRef, pin(sx))?
             };
+            // Convert op2 first (may clobber RSCRATCH via fetch_fp), then
+            // convert op1 into RSCRATCH (now safe).
             self.code.fcvtzs_x(RSCRATCH2, sy);
+            self.code.fcvtzs_x(RSCRATCH, sx);
+        } else {
+            self.code.fcvtzs_x(RSCRATCH, sx);
         }
         // 32-bit operations
         match op {
@@ -1409,7 +1497,21 @@ impl<'a> Asm<'a> {
                 self.fixups.push((eq_pos, eq_guard_idx));
             }
         } else {
-            // FIXME: non-numeric EQ/NE guard fires spuriously
+            // Non-numeric EQ/NE: compare full 64-bit representations.
+            let fst = ins.op1 as IRRef;
+            let snd = ins.op2 as IRRef;
+            self.gpr_load_ref(RSCRATCH, fst);
+            if snd == fst {
+                self.code.cmp_rr(RSCRATCH, RSCRATCH);
+            } else {
+                self.gpr_load_ref(RSCRATCH2, snd);
+                self.code.cmp_rr(RSCRATCH, RSCRATCH2);
+            }
+            if eq {
+                self.guard(cond::NE);
+            } else {
+                self.guard(cond::EQ);
+            }
         }
         Ok(())
     }
@@ -1428,13 +1530,13 @@ impl<'a> Asm<'a> {
                 if let Some(rg) = self.loc[Self::iidx(rref)] {
                     self.code.str_d(rg, RBASE, disp);
                 } else {
-                    self.code.ldr(RSCRATCH, RENV, Self::env_ofs(rref));
-                    self.code.str(RSCRATCH, RBASE, disp);
+                    self.code.ldr_safe(RSCRATCH, RENV, Self::env_ofs(rref));
+                    self.code.str_safe(RSCRATCH, RBASE, disp);
                 }
             } else {
                 self.code
                     .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, rref));
-                self.code.str(RSCRATCH, RBASE, disp);
+                self.code.str_safe(RSCRATCH, RBASE, disp);
             }
         }
     }
@@ -1479,6 +1581,42 @@ impl<'a> Asm<'a> {
                 IROp::NOP | IROp::BASE => {}
                 IROp::LOOP => {
                     if self.loop_pos.is_none() {
+                        // 1. Kill dead registers.
+                        for rg in 0..NREG as u8 {
+                            let dead = match self.owner[rg as usize] {
+                                Owner::Ins(o) => self.last_use[Self::iidx(o)] <= self.cur,
+                                Owner::Konst(k) => self.klast_use[Self::kidx(k)] <= self.cur,
+                                Owner::None => false,
+                            };
+                            if dead {
+                                self.steal_quiet(rg);
+                            }
+                        }
+                        // 2. Park invariant (non-PHI-lref) live values in env so that
+                        //    register-stealing later in the variant body does not lose
+                        //    loop-invariant data (analogous to x64's asm_loop_head).
+                        for rg in 0..NREG as u8 {
+                            if let Owner::Ins(o) = self.owner[rg as usize] {
+                                if self.phis.iter().any(|p| p.num && p.lref == o) {
+                                    continue; // Loop-carried PHI: back edge handles it.
+                                }
+                                let i = Self::iidx(o);
+                                if !self.env_valid[i] {
+                                    self.code.str_d(rg, RENV, Self::env_ofs(o));
+                                    self.env_valid[i] = true;
+                                }
+                            }
+                        }
+                        // 3. Invalidate stale pre-roll env copies for register-homed
+                        //    PHI lrefs: the back edge refreshes their env slot.
+                        for p in self.phis.iter() {
+                            let i = Self::iidx(p.lref);
+                            if p.num && self.loc[i].is_some() && !self.needs_env[i] {
+                                self.env_valid[i] = false;
+                            }
+                        }
+                        // 4. Snapshot register ownership for back-edge restoration.
+                        self.s0 = self.owner;
                         self.loop_pos = Some(self.code.len());
                         self.phi_homes = self
                             .phis
@@ -1675,6 +1813,57 @@ impl<'a> Asm<'a> {
                 for &(lref, rg) in &self.phi_homes {
                     if self.reg_of(lref).is_none() && self.env_valid[Self::iidx(lref)] {
                         self.code.ldr_d(rg, RENV, Self::env_ofs(lref));
+                    }
+                }
+                // Handle non-number (NPHI) loop-carried values:
+                // copy rref → lref via env (analogous to x64's
+                // asm_loop_back buffered parallel move for non-FP values).
+                // Number-free GC values like string keys never live in
+                // FP registers, so they are carried via env slots.
+                for p in self.phis.iter().filter(|p| !p.num) {
+                    if p.rref >= REF_BIAS {
+                        let i = Self::iidx(p.lref);
+                        debug_assert!(self.env_valid[Self::iidx(p.rref)]);
+                        self.code.ldr(RSCRATCH, RENV, Self::env_ofs(p.rref));
+                        self.code.str(RSCRATCH, RENV, Self::env_ofs(p.lref));
+                        self.env_valid[i] = true;
+                    } else {
+                        // Constant: materialize and store.
+                        self.code
+                            .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, p.rref));
+                        self.code.str(RSCRATCH, RENV, Self::env_ofs(p.lref));
+                        self.env_valid[Self::iidx(p.lref)] = true;
+                    }
+                }
+                // Restore invariant (non-PHI-lref) register state that
+                // changed since the LOOP snapshot (analogous to x64's
+                // asm_loop_back step 4). Values parked at the LOOP head
+                // are reloaded from env; constants are re-materialized.
+                for rg in 0..NREG as u8 {
+                    let so = self.s0[rg as usize];
+                    if so == Owner::None || so == self.owner[rg as usize] {
+                        continue;
+                    }
+                    let is_phi = match so {
+                        Owner::Ins(o) => {
+                            self.phis.iter().any(|p| p.num && p.lref == o)
+                        }
+                        _ => false,
+                    };
+                    if is_phi {
+                        continue;
+                    }
+                    match so {
+                        Owner::Ins(x) => {
+                            debug_assert!(self.env_valid[Self::iidx(x)]);
+                            self.code.ldr_d(rg, RENV, Self::env_ofs(x));
+                        }
+                        Owner::Konst(k) => {
+                            self.code
+                                .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, k));
+                            self.code.fmov_fp(rg, RSCRATCH);
+                        }
+                        Owner::None => unreachable!(),
                     }
                 }
                 let off = (lp as i64 - self.code.len() as i64) as i32 / 4;
