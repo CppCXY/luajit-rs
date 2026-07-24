@@ -847,6 +847,17 @@ impl<'a> Asm<'a> {
         let disp = (ins.op1 as i32 - 2) * 8;
         let t = ins.t();
         let i = Self::iidx(self.cur);
+        // DIAG: print SLOAD info to stderr for ARM64 debugging.
+        eprintln!(
+            "DIAG SLOAD cur={} op1={} op2={} t=0x{:x} guard={} disp={} disp+4={}",
+            self.cur,
+            ins.op1 as i32,
+            ins.op2 as i32,
+            t,
+            ins.is_guard(),
+            disp,
+            disp + 4,
+        );
         if irt_isnum(t) {
             if ins.is_guard() {
                 self.code.ldr_w(RSCRATCH, RBASE, disp + 4);
