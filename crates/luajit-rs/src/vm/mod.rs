@@ -1498,7 +1498,8 @@ impl Interp {
                     {
                         let pt = cl.proto.as_ref();
                         let link = unsafe { (*bp.sub(1)).to_bits() };
-                        if (pt.flags & PROTO_VARARG) == 0 && (link & FRAME_TYPE_MASK) != FRAME_VARG {
+                        if (pt.flags & PROTO_VARARG) == 0 && (link & FRAME_TYPE_MASK) != FRAME_VARG
+                        {
                             let nargs = bc_d(ins) as usize - 1;
                             let fs_need = cur_base!()
                                 + a.max(nargs as u32) as usize

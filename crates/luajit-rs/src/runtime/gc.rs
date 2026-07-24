@@ -636,11 +636,10 @@ impl<'g> Marker<'g> {
                 Gray::Proto(p) => {
                     let pt = p.as_ref();
                     // Mark the source name string (not stored in kgc).
-                    if let Some(sid) = pt.source {
-                        if let Some(ptr) = self.strings.try_lookup(sid) {
+                    if let Some(sid) = pt.source
+                        && let Some(ptr) = self.strings.try_lookup(sid) {
                             ptr.set_marked();
                         }
-                    }
                     for k in &pt.kgc {
                         match k {
                             KGc::Str(sid) => {

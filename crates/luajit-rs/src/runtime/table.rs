@@ -564,11 +564,12 @@ impl LuaTable {
         self.sync_aptr();
         let newcap = self.array.capacity() * std::mem::size_of::<LuaValue>()
             + self.node.capacity() * std::mem::size_of::<Node>();
-        if newcap > oldcap {
-            if !self.table_extra.is_null() {
-                unsafe { *self.table_extra += newcap - oldcap; }
+        if newcap > oldcap
+            && !self.table_extra.is_null() {
+                unsafe {
+                    *self.table_extra += newcap - oldcap;
+                }
             }
-        }
     }
 
     /// Count integer array keys per power-of-two bucket, per `countarray`.

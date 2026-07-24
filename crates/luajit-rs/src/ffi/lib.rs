@@ -6,7 +6,7 @@
 
 use std::ffi::CString;
 
-use crate::err::{LuaError, LuaResult};
+use crate::err::LuaResult;
 use crate::ffi::clib;
 use crate::ffi::parser::parse;
 use crate::ffi::{
@@ -475,9 +475,7 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let Some((_field_type_id, offset)) = field_offset(cts, target_id, &name) else {
-        return Err(l.runtime_error(
-            format!("ffi: no member '{}' in cdata", name).as_bytes(),
-        ));
+        return Err(l.runtime_error(format!("ffi: no member '{}' in cdata", name).as_bytes()));
     };
 
     let v = val.as_number().unwrap_or(0.0) as i32;

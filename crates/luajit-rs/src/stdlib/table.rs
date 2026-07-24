@@ -190,7 +190,11 @@ fn tab_unpack(l: &mut LuaState) -> LuaResult<i32> {
 fn tab_new(l: &mut LuaState) -> LuaResult<i32> {
     let narr = arg(l, 0).as_number().unwrap_or(0.0) as u32;
     let nrec = arg(l, 1).as_number().unwrap_or(0.0) as u32;
-    let hbits = if nrec == 0 { 0 } else { (nrec as u32).next_power_of_two().trailing_zeros() };
+    let hbits = if nrec == 0 {
+        0
+    } else {
+        nrec.next_power_of_two().trailing_zeros()
+    };
     let t = l.heap().alloc_table(LuaTable::new(narr, hbits));
     push(l, LuaValue::table(t));
     Ok(1)

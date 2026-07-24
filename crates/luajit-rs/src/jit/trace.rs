@@ -422,7 +422,9 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             None
         };
         let arch = js.arch;
-        if !js.no_asm && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target, arch) {
+        if !js.no_asm
+            && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target, arch)
+        {
             if js.trace_dump {
                 eprintln!(
                     "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",

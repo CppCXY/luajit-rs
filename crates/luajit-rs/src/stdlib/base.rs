@@ -342,7 +342,7 @@ fn call_reader(l: &mut LuaState, reader: LuaValue) -> Result<Vec<u8>, Vec<u8>> {
                 Ok(s)
             }
         }
-        Err(e) => {
+        Err(_e) => {
             l.top = saved_top;
             l.base = saved_base;
             Err(b"reader function error".to_vec())
@@ -399,8 +399,12 @@ fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
                     l.stack[l.base] = LuaValue::NIL;
                     l.stack[l.base + 1] = l.global().heap.str_value(
                         l.global().heap.intern(
-                            format!("error calling reader: {}", String::from_utf8_lossy(e.as_ref())).as_bytes()
-                        )
+                            format!(
+                                "error calling reader: {}",
+                                String::from_utf8_lossy(e.as_ref())
+                            )
+                            .as_bytes(),
+                        ),
                     );
                     l.top = l.base + 2;
                     return Ok(2);

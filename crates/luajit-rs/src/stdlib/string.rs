@@ -223,9 +223,10 @@ fn gsub_fn(
     let mut pos = 0;
     let mut count = 0;
     loop {
-        if let Some(limit) = max {
-            if count >= limit { break; }
-        }
+        if let Some(limit) = max
+            && count >= limit {
+                break;
+            }
         match crate::stdlib::pattern::find(s, pat, pos) {
             Ok(Some((m_start, m_end, caps))) => {
                 out.extend_from_slice(&s[pos..m_start]);
@@ -253,7 +254,9 @@ fn gsub_fn(
                 }
                 count += 1;
                 if m_end == m_start {
-                    if m_end == s.len() { break; }
+                    if m_end == s.len() {
+                        break;
+                    }
                     out.push(s[m_end]);
                     pos = m_end + 1;
                 } else {

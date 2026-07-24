@@ -190,11 +190,8 @@ fn loop_unroll(rec: &mut Record) -> Result<(), TraceError> {
         // loop body duplicates the metatable-nil guard, bloating
         // machine code and hurting QEMU throughput.
         let mode = IR_MODE[ir.op() as usize];
-        let is_load = irm_kind(mode) == IRM_L
-            && ir.op() == IROp::FLOAD;
-        if (irm_kind(mode) == IRM_N || is_load)
-            && op1 == ir.op1 as IRRef
-            && op2 == ir.op2 as IRRef
+        let is_load = irm_kind(mode) == IRM_L && ir.op() == IROp::FLOAD;
+        if (irm_kind(mode) == IRM_N || is_load) && op1 == ir.op1 as IRRef && op2 == ir.op2 as IRRef
         {
             subst[iidx(ins)] = ins as IRRef1; // Regular invariant ins.
             ins += 1;

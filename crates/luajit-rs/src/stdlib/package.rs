@@ -112,10 +112,7 @@ fn pushmodule(l: &mut LuaState, modname: &[u8]) -> crate::gc::GcPtr<LuaTable> {
         return t;
     }
     let t = l.heap().alloc_table(LuaTable::new(0, 4));
-    l.global()
-        .globals
-        .as_mut()
-        .set(name_v, LuaValue::table(t));
+    l.global().globals.as_mut().set(name_v, LuaValue::table(t));
     t
 }
 
@@ -222,12 +219,11 @@ fn resolve_path(l: &mut LuaState, envname: &str, def: &[u8]) -> Vec<u8> {
     }
     {
         let pat: &[u8] = &[LUA_EXECDIR];
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent() {
                 let dir = parent.to_string_lossy().into_owned().into_bytes();
                 s = gsub(&s, pat, &dir);
             }
-        }
     }
     let sid = l.heap().intern(&s);
     l.str_static(sid).to_vec()
@@ -280,11 +276,10 @@ fn lib_loadlib(l: &mut LuaState) -> LuaResult<i32> {
     let n = 3usize;
     l.stack_ensure(l.base + n);
     l.stack[l.base] = LuaValue::NIL;
-    l.stack[l.base + 1] = l
-        .heap()
-        .str_value(l.heap().intern(
-            b"dynamic libraries not enabled; no support for target OS",
-        ));
+    l.stack[l.base + 1] = l.heap().str_value(
+        l.heap()
+            .intern(b"dynamic libraries not enabled; no support for target OS"),
+    );
     l.stack[l.base + 2] = l.heap().str_value(l.heap().intern(b"absent"));
     l.top = l.base + n;
     Ok(3)
@@ -306,8 +301,7 @@ fn lib_seeall(l: &mut LuaState) -> LuaResult<i32> {
         }
     };
     let k = str_key(l, b"__index");
-    mt.as_mut()
-        .set(k, LuaValue::table(l.global().globals));
+    mt.as_mut().set(k, LuaValue::table(l.global().globals));
     Ok(0)
 }
 
@@ -335,8 +329,7 @@ fn lib_module(l: &mut LuaState) -> LuaResult<i32> {
     };
     let k_package = str_key(l, b"_PACKAGE");
     let pkg_sid = l.heap().intern(pkg_slice);
-    tab.as_mut()
-        .set(k_package, l.heap().str_value(pkg_sid));
+    tab.as_mut().set(k_package, l.heap().str_value(pkg_sid));
 
     for i in 1..nargs {
         let opt = arg(l, i);
@@ -365,10 +358,7 @@ fn loader_preload(l: &mut LuaState) -> LuaResult<i32> {
         None => String::from("?"),
     };
     let msg = format!("\n\tno field package.preload['{}']", name_s);
-    push(
-        l,
-        l.heap().str_value(l.heap().intern(msg.as_bytes())),
-    );
+    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
     Ok(1)
 }
 
@@ -435,10 +425,7 @@ fn loader_c(l: &mut LuaState) -> LuaResult<i32> {
         None => String::from("?"),
     };
     let msg = format!("\n\tno C loader for module '{}'", name_s);
-    push(
-        l,
-        l.heap().str_value(l.heap().intern(msg.as_bytes())),
-    );
+    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
     Ok(1)
 }
 
@@ -448,10 +435,7 @@ fn loader_croot(l: &mut LuaState) -> LuaResult<i32> {
         None => String::from("?"),
     };
     let msg = format!("\n\tno C root loader for module '{}'", name_s);
-    push(
-        l,
-        l.heap().str_value(l.heap().intern(msg.as_bytes())),
-    );
+    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
     Ok(1)
 }
 
@@ -486,8 +470,7 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let mut errs: Vec<Vec<u8>> = Vec::new();
-    let mut found_loader = LuaValue::NIL;
-
+    let found_loader;
     let mut idx: i32 = 1;
     loop {
         let loader = loaders_tab.as_ref().get_int(idx);
@@ -519,11 +502,7 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
             Err(_) => {
                 loaded.as_mut().set(name_v, LuaValue::NIL);
                 return Err(l.runtime_error(
-                    format!(
-                        "error loading module '{}'",
-                        String::from_utf8_lossy(&name)
-                    )
-                    .as_bytes(),
+                    format!("error loading module '{}'", String::from_utf8_lossy(&name)).as_bytes(),
                 ));
             }
         }
@@ -552,7 +531,13 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
 
 fn tab_new_preload(l: &mut LuaState) -> LuaResult<i32> {
     let k_table = str_key(l, b"table");
-    let table_tab = l.global().globals.as_ref().get_str(k_table).as_table().unwrap();
+    let table_tab = l
+        .global()
+        .globals
+        .as_ref()
+        .get_str(k_table)
+        .as_table()
+        .unwrap();
     let k_new = str_key(l, b"new");
     push(l, table_tab.as_ref().get_str(k_new));
     Ok(1)
@@ -618,10 +603,14 @@ pub fn open(l: &mut LuaState) {
         let preload = sub_table(l, pkg, b"preload");
         let env = l.global().globals;
         let tab_new_val = LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
-            f: tab_new_preload, env, upvals: Vec::new(),
+            f: tab_new_preload,
+            env,
+            upvals: Vec::new(),
         })));
         let jit_profile_val = LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
-            f: jit_profile_preload, env, upvals: Vec::new(),
+            f: jit_profile_preload,
+            env,
+            upvals: Vec::new(),
         })));
         let tab_new_k = str_key(l, b"table.new");
         preload.as_mut().set(tab_new_k, tab_new_val);

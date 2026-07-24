@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unusual_byte_groupings,
+    dead_code,
+    clippy::wrong_self_convention,
+    clippy::type_complexity,
+    clippy::needless_range_loop
+)]
 /// AArch64 trace assembler: translates SSA IR into ARM64 native code.
 ///
 /// Register conventions:
@@ -183,14 +190,14 @@ impl Emit {
         );
     }
     fn stp_pre(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) {
-        let o = (off / 8) as i32;
+        let o = (off / 8);
         let imm7 = (o as u32) & 0x7F;
         self.u32(
             0xA980_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | (rt1 as u32),
         );
     }
     fn ldp_post(&mut self, rt1: u8, rt2: u8, rn: u8, off: i32) {
-        let o = (off / 8) as i32;
+        let o = (off / 8);
         let imm7 = (o as u32) & 0x7F;
         self.u32(
             0xA8C0_0000 | (imm7 << 15) | ((rt2 as u32) << 10) | ((rn as u32) << 5) | (rt1 as u32),
@@ -953,11 +960,10 @@ impl<'a> Asm<'a> {
         self.code.mov64(RSCRATCH, addr);
         self.code.blr(RSCRATCH);
         for &p in &self.phis {
-            if let Some(rg) = self.loc[Self::iidx(p.lref)] {
-                if rg <= 7 || rg >= 16 {
+            if let Some(rg) = self.loc[Self::iidx(p.lref)]
+                && (rg <= 7 || rg >= 16) {
                     self.code.ldr_d(rg, RENV, Self::env_ofs(p.lref));
                 }
-            }
         }
         for &(rg, o) in &saved {
             if !phi_lrefs.contains(&o) {
@@ -1243,30 +1249,30 @@ impl<'a> Asm<'a> {
         }
         // 32-bit operations
         match op {
-            IROp::BNOT => self.code.mvn_w(RSCRATCH as u8, RSCRATCH as u8),
-            IROp::BSWAP => self.code.rev_w(RSCRATCH as u8, RSCRATCH as u8),
+            IROp::BNOT => self.code.mvn_w(RSCRATCH, RSCRATCH),
+            IROp::BSWAP => self.code.rev_w(RSCRATCH, RSCRATCH),
             IROp::BAND => self
                 .code
-                .and_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+                .and_w(RSCRATCH, RSCRATCH, RSCRATCH2),
             IROp::BOR => self
                 .code
-                .orr_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+                .orr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
             IROp::BXOR => self
                 .code
-                .eor_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+                .eor_w(RSCRATCH, RSCRATCH, RSCRATCH2),
             IROp::BSHL => self
                 .code
-                .lsl_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+                .lsl_w(RSCRATCH, RSCRATCH, RSCRATCH2),
             IROp::BSHR => self
                 .code
-                .lsr_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+                .lsr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
             IROp::BSAR => self
                 .code
-                .asr_w(RSCRATCH as u8, RSCRATCH as u8, RSCRATCH2 as u8),
+                .asr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
             _ => {}
         }
         let d = self.alloc(0)?;
-        self.code.scvtf_w(d, RSCRATCH as u8); // Wn → Dd signed i32→f64
+        self.code.scvtf_w(d, RSCRATCH); // Wn → Dd signed i32→f64
         self.def(d);
         Ok(())
     }
@@ -1692,14 +1698,14 @@ impl<'a> Asm<'a> {
                 // Stack headroom check: new_base + room > stack_end → exit
                 let room = (255 + 8) * 8;
                 self.code.mov64(RSCRATCH, (delta + room) as u64);
-                self.code.add_rr(RSCRATCH, RSCRATCH, RBASE as u8);
+                self.code.add_rr(RSCRATCH, RSCRATCH, RBASE);
                 self.code
                     .mov64(RSCRATCH2, super::super::exec::stack_end_cell_addr());
                 self.code.ldr(RSCRATCH3, RSCRATCH2, 0);
                 self.code.cmp_rr(RSCRATCH, RSCRATCH3);
                 self.guard(cond::HI);
                 self.code.mov64(RSCRATCH, delta as u64);
-                self.code.add_rr(RBASE as u8, RBASE as u8, RSCRATCH);
+                self.code.add_rr(RBASE, RBASE, RSCRATCH);
             }
             self.code.mov64(RSCRATCH, target as u64);
             self.code.br(RSCRATCH);
@@ -1838,6 +1844,7 @@ fn hex_dump(buf: &[u8]) -> String {
 }
 
 /// Quick A64 disassembler for debugging. Covers the instructions we emit.
+#[allow(clippy::bad_bit_mask)]
 fn disasm_a64(w: u32, _addr: usize) -> String {
     let rd = (w & 0x1F) as u8;
     let rn = ((w >> 5) & 0x1F) as u8;
@@ -1944,9 +1951,9 @@ fn disasm_a64(w: u32, _addr: usize) -> String {
     }
     if w & 0xFC00_0000 == 0x1400_0000 {
         let off = if imm26 & 0x2000000 != 0 {
-            (imm26 as i32) - 0x4000000
+            imm26 - 0x4000000
         } else {
-            imm26 as i32
+            imm26
         };
         return format!("b {}", off);
     }

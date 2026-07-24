@@ -1,0 +1,49 @@
+name: Luajit2 Test Suite
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: luajit2 (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            exe: target/release/luajit-rs
+          - name: windows-x64
+            os: windows-latest
+            exe: target/release/luajit-rs.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.name }}-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.name }}-test-
+
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+      - name: Run luajit2 test suite
+        shell: bash
+        run: |
+          cd tests/luajit2_test
+          ../../"${{ matrix.exe }}" test.lua

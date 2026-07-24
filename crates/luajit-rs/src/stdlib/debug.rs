@@ -4,20 +4,16 @@ use crate::gc::GcPtr;
 use crate::state::LuaState;
 use crate::stdlib::{arg, err_bad_arg, nargs, push};
 use crate::table::LuaTable;
-use crate::value::LuaValue;
+use crate::value::{LJ_TFALSE, LJ_TTRUE, LuaValue};
 use crate::vm::FRAME_TYPE_MASK;
 
-fn set_basemt_for(
-    l: &mut LuaState,
-    o: &LuaValue,
-    mt: Option<GcPtr<LuaTable>>,
-) {
+fn set_basemt_for(l: &mut LuaState, o: &LuaValue, mt: Option<GcPtr<LuaTable>>) {
     let g = l.global();
     g.set_basemt(o.itype(), mt);
-    if o.itype() == crate::value::LJ_TFALSE {
-        g.set_basemt(crate::value::LJ_TTRUE, mt);
-    } else if o.itype() == crate::value::LJ_TTRUE {
-        g.set_basemt(crate::value::LJ_TFALSE, mt);
+    if o.itype() == LJ_TFALSE {
+        g.set_basemt(LJ_TTRUE, mt);
+    } else if o.itype() == LJ_TTRUE {
+        g.set_basemt(LJ_TFALSE, mt);
     }
 }
 
@@ -55,7 +51,9 @@ fn walk_frames(l: &LuaState, mut level: i32) -> Option<(usize, GcPtr<crate::func
         }
         let func = l.stack[slot - 2];
         let mut link = l.stack[slot - 1].to_bits();
-        while (link & FRAME_TYPE_MASK) == 3 /* FRAME_VARG */ {
+        while (link & FRAME_TYPE_MASK) == 3
+        /* FRAME_VARG */
+        {
             slot = slot.saturating_sub((link >> 3) as usize);
             if slot < 2 {
                 return None;
@@ -94,11 +92,11 @@ fn str_val(l: &mut LuaState, s: &str) -> LuaValue {
 // ── debug.getinfo ───────────────────────────────────────────────────────────
 
 // Flags for what-to-return:
-const WHAT_S: u8 = 1;   // source, short_src, linedefined, lastlinedefined, what
-const WHAT_L: u8 = 2;   // currentline
-const WHAT_N: u8 = 4;   // name, namewhat
-const WHAT_U: u8 = 8;   // nup, nparams, isvararg
-const WHAT_F: u8 = 16;  // func
+const WHAT_S: u8 = 1; // source, short_src, linedefined, lastlinedefined, what
+const WHAT_L: u8 = 2; // currentline
+const WHAT_N: u8 = 4; // name, namewhat
+const WHAT_U: u8 = 8; // nup, nparams, isvararg
+const WHAT_F: u8 = 16; // func
 
 fn parse_what(what: &str) -> u8 {
     let mut flags = 0u8;
@@ -153,54 +151,80 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let t = l.heap().alloc_table(LuaTable::new(0, 3));
-    let g = l.global();
-    let globals = g.globals;
-
     match gf.as_ref() {
-        crate::func::GcFunc::Lua(cl) => {
+        GcFunc::Lua(cl) => {
             let pt = cl.proto.as_ref();
             if flags & WHAT_S != 0 {
-                let src = pt.source.and_then(|sid| {
-                    l.heap().strings.try_lookup(sid).map(|_ptr| {
-                        String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned()
+                let src = pt
+                    .source
+                    .and_then(|sid| {
+                        l.heap().strings.try_lookup(sid).map(|_ptr| {
+                            String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned()
+                        })
                     })
-                }).unwrap_or_else(|| "=?".to_string());
+                    .unwrap_or_else(|| "=?".to_string());
 
                 let short_src = if src.starts_with('@') || src.starts_with('=') {
-                    src[1..].rsplit(&['\\', '/'][..]).next().unwrap_or(&src[1..]).to_string()
+                    src[1..]
+                        .rsplit(&['\\', '/'][..])
+                        .next()
+                        .unwrap_or(&src[1..])
+                        .to_string()
                 } else {
-                    src.rsplit(&['\\', '/'][..]).next().unwrap_or(&src).to_string()
+                    src.rsplit(&['\\', '/'][..])
+                        .next()
+                        .unwrap_or(&src)
+                        .to_string()
                 };
 
                 t.as_mut().set_str(str_val(l, "source"), str_val(l, &src));
-                t.as_mut().set_str(str_val(l, "short_src"), str_val(l, &short_src));
-                t.as_mut().set_str(str_val(l, "linedefined"), LuaValue::number(pt.firstline as f64));
-                t.as_mut().set_str(str_val(l, "lastlinedefined"), LuaValue::number((pt.firstline + pt.numline - 1) as f64));
-                t.as_mut().set_str(str_val(l, "what"),
-                    if pt.source.map_or(false, |sid| {
+                t.as_mut()
+                    .set_str(str_val(l, "short_src"), str_val(l, &short_src));
+                t.as_mut().set_str(
+                    str_val(l, "linedefined"),
+                    LuaValue::number(pt.firstline as f64),
+                );
+                t.as_mut().set_str(
+                    str_val(l, "lastlinedefined"),
+                    LuaValue::number((pt.firstline + pt.numline - 1) as f64),
+                );
+                t.as_mut().set_str(
+                    str_val(l, "what"),
+                    if pt.source.is_some_and(|sid| {
                         let b = l.heap().strings.get(sid);
                         b.starts_with(b"@") || b.starts_with(b"=")
-                    }) && pt.firstline == 0 {
+                    }) && pt.firstline == 0
+                    {
                         str_val(l, "main")
                     } else if pt.firstline == 0 {
                         str_val(l, "C")
                     } else {
                         str_val(l, "Lua")
-                    });
+                    },
+                );
             }
             if flags & WHAT_L != 0 {
-                let cur_pc = l.debug_pc.saturating_sub(1).min(pt.lines.len().saturating_sub(1));
+                let cur_pc = l
+                    .debug_pc
+                    .saturating_sub(1)
+                    .min(pt.lines.len().saturating_sub(1));
                 let cur_line = if cur_pc < pt.lines.len() {
                     pt.lines[cur_pc] as f64
                 } else {
                     pt.firstline as f64
                 };
-                t.as_mut().set_str(str_val(l, "currentline"), LuaValue::number(cur_line));
+                t.as_mut()
+                    .set_str(str_val(l, "currentline"), LuaValue::number(cur_line));
             }
             if flags & WHAT_U != 0 {
-                t.as_mut().set_str(str_val(l, "nups"), LuaValue::number(cl.upvals.len() as f64));
-                t.as_mut().set_str(str_val(l, "nparams"), LuaValue::number(pt.numparams as f64));
-                t.as_mut().set_str(str_val(l, "isvararg"), LuaValue::boolean(pt.flags & crate::proto::PROTO_VARARG != 0));
+                t.as_mut()
+                    .set_str(str_val(l, "nups"), LuaValue::number(cl.upvals.len() as f64));
+                t.as_mut()
+                    .set_str(str_val(l, "nparams"), LuaValue::number(pt.numparams as f64));
+                t.as_mut().set_str(
+                    str_val(l, "isvararg"),
+                    LuaValue::boolean(pt.flags & crate::proto::PROTO_VARARG != 0),
+                );
             }
             if flags & WHAT_F != 0 {
                 t.as_mut().set_str(str_val(l, "func"), l.stack[slot - 2]);
@@ -214,17 +238,23 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
         crate::func::GcFunc::C(_) => {
             if flags & WHAT_S != 0 {
                 t.as_mut().set_str(str_val(l, "source"), str_val(l, "=[C]"));
-                t.as_mut().set_str(str_val(l, "short_src"), str_val(l, "[C]"));
-                t.as_mut().set_str(str_val(l, "linedefined"), LuaValue::number(-1.0));
-                t.as_mut().set_str(str_val(l, "lastlinedefined"), LuaValue::number(-1.0));
+                t.as_mut()
+                    .set_str(str_val(l, "short_src"), str_val(l, "[C]"));
+                t.as_mut()
+                    .set_str(str_val(l, "linedefined"), LuaValue::number(-1.0));
+                t.as_mut()
+                    .set_str(str_val(l, "lastlinedefined"), LuaValue::number(-1.0));
                 t.as_mut().set_str(str_val(l, "what"), str_val(l, "C"));
             }
             if flags & WHAT_L != 0 {
-                t.as_mut().set_str(str_val(l, "currentline"), LuaValue::number(-1.0));
+                t.as_mut()
+                    .set_str(str_val(l, "currentline"), LuaValue::number(-1.0));
             }
             if flags & WHAT_U != 0 {
-                t.as_mut().set_str(str_val(l, "nups"), LuaValue::number(0.0));
-                t.as_mut().set_str(str_val(l, "nparams"), LuaValue::number(0.0));
+                t.as_mut()
+                    .set_str(str_val(l, "nups"), LuaValue::number(0.0));
+                t.as_mut()
+                    .set_str(str_val(l, "nparams"), LuaValue::number(0.0));
                 t.as_mut().set_str(str_val(l, "isvararg"), LuaValue::FALSE);
             }
             if flags & WHAT_F != 0 {
@@ -245,11 +275,16 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
 
 fn lib_getmetatable(l: &mut LuaState) -> LuaResult<i32> {
     let o = arg(l, 0);
-    if let Some(t) = o.as_table() {
-        if let Some(mt) = t.as_ref().metatable {
+    if let Some(t) = o.as_table()
+        && let Some(mt) = t.as_ref().metatable {
             push(l, LuaValue::table(mt));
             return Ok(1);
         }
+    // Check base metatable for non-table types (string, number, etc.)
+    let it = o.itype();
+    if let Some(mt) = l.global().basemt_of(it) {
+        push(l, LuaValue::table(mt));
+        return Ok(1);
     }
     push(l, LuaValue::NIL);
     Ok(1)
@@ -268,8 +303,8 @@ fn lib_getfenv(l: &mut LuaState) -> LuaResult<i32> {
     let o = arg(l, 0);
     let env = match o.as_func() {
         Some(f) => match f.as_ref() {
-            crate::func::GcFunc::Lua(c) => c.env,
-            crate::func::GcFunc::C(c) => c.env,
+            GcFunc::Lua(c) => c.env,
+            GcFunc::C(c) => c.env,
         },
         _ => l.global().globals,
     };
@@ -285,8 +320,8 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
     };
     if let Some(f) = o.as_func() {
         match f.as_mut() {
-            crate::func::GcFunc::Lua(c) => c.env = tab,
-            crate::func::GcFunc::C(c) => c.env = tab,
+            GcFunc::Lua(c) => c.env = tab,
+            GcFunc::C(c) => c.env = tab,
         }
     }
     push(l, LuaValue::number(0.0));
@@ -320,7 +355,9 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
         }
         let func = l.stack[slot - 2];
         let mut cur_link = l.stack[slot - 1].to_bits();
-        while (cur_link & FRAME_TYPE_MASK) == 3 /* FRAME_VARG */ {
+        while (cur_link & FRAME_TYPE_MASK) == 3
+        /* FRAME_VARG */
+        {
             slot = slot.saturating_sub((cur_link >> 3) as usize);
             if slot < 2 {
                 break;
@@ -333,16 +370,19 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
             match fv.as_ref() {
                 crate::func::GcFunc::Lua(cl) => {
                     let pt = cl.proto.as_ref();
-                    let src = pt.source.and_then(|sid| {
-                        l.heap().strings.try_lookup(sid).map(|_| {
-                            let bytes = l.heap().strings.get(sid);
-                            if bytes.starts_with(&[b'@']) || bytes.starts_with(&[b'=']) {
-                                String::from_utf8_lossy(&bytes[1..]).into_owned()
-                            } else {
-                                String::from_utf8_lossy(bytes).into_owned()
-                            }
+                    let src = pt
+                        .source
+                        .and_then(|sid| {
+                            l.heap().strings.try_lookup(sid).map(|_| {
+                                let bytes = l.heap().strings.get(sid);
+                                if bytes.starts_with(b"@") || bytes.starts_with(b"=") {
+                                    String::from_utf8_lossy(&bytes[1..]).into_owned()
+                                } else {
+                                    String::from_utf8_lossy(bytes).into_owned()
+                                }
+                            })
                         })
-                    }).unwrap_or_else(|| "(unknown)".to_string());
+                        .unwrap_or_else(|| "(unknown)".to_string());
 
                     let pc = if first {
                         l.debug_pc.saturating_sub(1)
@@ -369,7 +409,7 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
                     ));
                     first = false;
                 }
-                crate::func::GcFunc::C(_) => {
+                GcFunc::C(_) => {
                     trace.push_str("\t[C]: in function\n");
                     first = false;
                 }
@@ -377,7 +417,7 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
         }
 
         // Walk to caller
-        if (frame_type as u64) == 0 && cur_link != 0 {
+        if frame_type == 0 && cur_link != 0 {
             slot = (cur_link >> 3) as usize;
         } else {
             break;
