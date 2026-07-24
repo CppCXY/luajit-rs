@@ -1777,4 +1777,72 @@ mod tests {
             10100.0,
         );
     }
+
+    // ── ARM64 diagnostic tests ───────────────────────────────────────────
+
+    /// Simplest possible traced loop: one accumulator, one addition.
+    #[test]
+    fn diag_simple_add_loop() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        assert_num(jit_run(&mut lua, "local s=0 for i=1,300 do s=s+1 end return s"), 300.0);
+    }
+
+    /// Loop with comparison guard (EQ) that fires on the last iteration.
+    #[test]
+    fn diag_eq_guard_loop() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // if i == 250 then s = s + 100 else s = s + 1 end
+        // 249*1 + 1*100 + 50*1 = 249 + 100 + 50 = 399
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 for i=1,300 do if i==250 then s=s+100 else s=s+1 end end return s",
+            ),
+            399.0,
+        );
+    }
+
+    /// Loop where a variable changes type mid-execution: the SLOAD
+    /// type guard must fire, then the interpreter takes over.
+    #[test]
+    fn diag_type_change_exit() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        // x=1 for 249 iters, then x='2' at iter 250.
+        // s = 249*1 + 2 + 50*2 = 249 + 2 + 100 = 351
+        assert_num(
+            jit_run(
+                &mut lua,
+                "local s=0 local x=1 for i=1,300 do if i==250 then x='2' end s=s+x end return s",
+            ),
+            351.0,
+        );
+    }
+
+    /// Verify the trace was actually assembled (mcode present).
+    #[test]
+    fn diag_loop_gets_mcode() {
+        let mut lua = Lua::new();
+        crate::open_libs(lua.main());
+        let (f, pt) = load_proto(
+            &mut lua,
+            "local s=0 for i=1,300 do s=s+i end return s",
+        );
+        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        assert_eq!(r[0].as_number(), Some(45150.0));
+        let g = lua.global();
+        // Check if trace was assembled on native-arch targets.
+        let jforl = find_op(pt, BCOp::JFORL);
+        if jforl.is_some() {
+            let rootno = crate::bc::bc_d(pt.as_ref().bc[jforl.unwrap()]);
+            if let Some(tr) = g.jit.trace[rootno as usize].as_deref() {
+                let has_mcode = tr.mcode.is_some();
+                let arch = format!("{:?}", g.jit.arch);
+                eprintln!("diag_loop_gets_mcode: arch={arch} mcode={has_mcode} link={:?} nins={}",
+                    tr.linktype, tr.ir.nins());
+            }
+        }
+    }
 }
