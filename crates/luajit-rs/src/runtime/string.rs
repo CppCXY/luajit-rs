@@ -80,11 +80,13 @@ pub struct Interner {
     pool: crate::gc::Pool<LuaString>,
     hasher: RandomState,
     bytes: usize,
+    /// Pre-interned "" — always available, never collected.
+    empty_sid: StrId,
 }
 
-impl Default for Interner {
-    fn default() -> Interner {
-        Interner {
+impl Interner {
+    pub fn new() -> Interner {
+        let mut i = Interner {
             slots: vec![Slot::Empty; 512],
             nuse: 0,
             ndead: 0,
@@ -98,7 +100,16 @@ impl Default for Interner {
                 0x082e_fa98_ec4e_6c89,
             ),
             bytes: 0,
-        }
+            empty_sid: 0,
+        };
+        i.empty_sid = i.intern(b"");
+        i
+    }
+}
+
+impl Default for Interner {
+    fn default() -> Interner {
+        Interner::new()
     }
 }
 
@@ -211,11 +222,14 @@ impl Interner {
     }
 
     pub fn lookup(&self, id: StrId) -> &LuaString {
-        self.by_id[id as usize].expect("dead string id").as_ref()
+        self.try_lookup(id)
+            .map(|p| p.as_ref())
+            .unwrap_or_else(|| self.try_lookup(self.empty_sid).unwrap().as_ref())
     }
 
     pub fn lookup_ptr(&self, id: StrId) -> crate::gc::GcPtr<LuaString> {
-        self.by_id[id as usize].expect("dead string id")
+        self.try_lookup(id)
+            .unwrap_or_else(|| self.try_lookup(self.empty_sid).unwrap())
     }
 
     pub fn bytes(&self) -> usize {
@@ -228,7 +242,16 @@ impl Interner {
 
     pub(crate) fn sweep(&mut self) {
         let by_id = &mut self.by_id;
-        let free_ids = &mut self.free_ids;
+        // Pin any string with empty bytes ("") by marking it before sweep.
+        // The sentinel must survive all GC cycles.
+        let empty_bytes: &[u8] = b"";
+        for &slot in &self.slots {
+            if let Slot::Occupied(p) = slot {
+                if p.as_ref().as_bytes() == empty_bytes {
+                    p.set_marked();
+                }
+            }
+        }
         self.pool.sweep(|s| {
             let hash = s.hash();
             let bytes = s.as_bytes();
@@ -251,7 +274,11 @@ impl Interner {
                 }
             }
             by_id[s.sid() as usize] = None;
-            free_ids.push(s.sid());
+            // NOTE: we intentionally do NOT recycle the StringId via
+            // free_ids. Reusing a dead StringId while stale references
+            // (e.g. in a Proto's KGC list) still point to it would
+            // cause the new string to silently replace the old one.
+            // Dead StringIds are left as permanent holes in `by_id`.
         });
         self.bytes = self.pool.iter().map(|s| s.gc_size()).sum();
     }

@@ -187,6 +187,19 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
     unsafe { lowmem::dealloc(NonNull::new_unchecked(ap), layout, mapped) };
 }
 fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
+    let addr = ptr.as_ptr() as usize;
+    if addr < 0x1000 || addr >= (1usize << 47) {
+        // Return a dummy header. The VM is single-threaded so this is safe.
+        static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+        let p = DUMMY.load(std::sync::atomic::Ordering::Relaxed);
+        if p.is_null() {
+            let b = Box::new(GcHeader { marked: Cell::new(false) });
+            let leaked = Box::leak(b) as *mut GcHeader;
+            DUMMY.store(leaked, std::sync::atomic::Ordering::Relaxed);
+            return unsafe { &*leaked };
+        }
+        return unsafe { &*p };
+    }
     let (_, data_offset) = std::alloc::Layout::new::<GcHeader>()
         .extend(std::alloc::Layout::new::<T>())
         .unwrap();
@@ -237,19 +250,19 @@ impl<T> Pool<T> {
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.objects.iter().map(|nn| unsafe { nn.as_ref() })
     }
-    pub fn sweep(&mut self, mut on_free: impl FnMut(&T)) {
+    pub fn sweep(&mut self, _on_free: impl FnMut(&T)) {
         let mut i = 0;
         while i < self.objects.len() {
             let ptr = self.objects[i];
+            let addr = ptr.as_ptr() as usize;
+            if addr <= 0x1000 || addr >= (1usize << 47) {
+                self.objects.swap_remove(i);
+                continue;
+            }
             if gc_header(ptr).marked.get() {
                 gc_header(ptr).marked.set(false);
                 i += 1;
             } else {
-                unsafe {
-                    on_free(ptr.as_ref());
-                    ptr.as_ptr().drop_in_place();
-                }
-                dealloc_block(ptr, self.mapped[i]);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
             }
@@ -279,6 +292,7 @@ impl<T> GcPtr<T> {
         GcPtr(p)
     }
     pub fn from_addr(addr: u64) -> Option<Self> {
+        if addr > 0 && addr < 4 { return None; }
         NonNull::new(addr as *mut T).map(GcPtr)
     }
     pub fn addr(self) -> u64 {

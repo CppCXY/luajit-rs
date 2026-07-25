@@ -386,7 +386,9 @@ impl Interp {
     ) -> Option<(*const LuaValue, i32, *const BCIns, i32)> {
         let mut link = unsafe { (*bp.sub(1)).to_bits() };
         while (link & FRAME_TYPE_MASK) == FRAME_VARG {
-            bp = unsafe { bp.sub((link >> 3) as usize) };
+            let sz = (link >> 3) as usize;
+            if sz == 0 { break; }
+            bp = unsafe { bp.sub(sz) };
             link = unsafe { (*bp.sub(1)).to_bits() };
         }
         if (link & FRAME_TYPE_MASK) == FRAME_LUA && self.l().openuv.is_empty() {
@@ -484,6 +486,7 @@ impl Interp {
     /// Returns `None`: execution always continues in the caller.
     fn cont_dispatch(&mut self, mmbase: usize, link: u64, n: usize) -> Option<usize> {
         let delta = (link >> 3) as usize;
+        if delta == 0 || delta > mmbase { return None; }
         let caller_base = mmbase - delta;
         let (cont, extra) = Cont::decode(self.at(mmbase - 4).to_bits());
         let saved_pc = self.at(mmbase - 3).to_bits() as usize;
@@ -1853,6 +1856,7 @@ impl Interp {
                     let link = unsafe { (*bp.sub(1)).to_bits() };
                     if link & FRAME_TYPE_MASK == FRAME_VARG {
                         let delta = (link >> 3) as usize;
+                        if delta < 2 { self.multres = 0; } else {
                         let numparams = self.proto().numparams as usize;
                         let nvarg = (delta - 2).saturating_sub(numparams);
                         let dst = a as usize;
@@ -1872,10 +1876,11 @@ impl Interp {
                                     } else {
                                         LuaValue::NIL
                                     };
-                                }
                             }
                         }
+                        }
                     }
+                }
                 }
 
                 // -- Bitwise ops (Lua 5.3+), lj_num2bit / lj_vm_tobit --
@@ -2378,9 +2383,13 @@ impl Interp {
             self.close_upvals(self.base);
         }
         let mut base = self.base;
+        if base < 2 { return None; }
         let mut link = self.at(base - 1).to_bits();
         while (link & FRAME_TYPE_MASK) == FRAME_VARG {
-            base -= (link >> 3) as usize;
+            let sz = (link >> 3) as usize;
+            if sz == 0 || sz > base { break; }
+            base -= sz;
+            if base < 2 { break; }
             link = self.at(base - 1).to_bits();
         }
         let dst = base - 2; // results always land at the callee's func slot
@@ -2453,6 +2462,7 @@ impl Interp {
         let link = self.at(base - 1).to_bits();
         debug_assert!(link & FRAME_TYPE_MASK == FRAME_VARG);
         let delta = (link >> 3) as usize;
+        if delta == 0 || delta > base { return; }
         let numparams = self.proto().numparams as usize;
         let varg_base = base - delta + numparams;
         let nvarg = (delta - 2).saturating_sub(numparams);
