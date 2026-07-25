@@ -57,6 +57,13 @@ pub fn opt_fold(buf: &mut IrBuf, fins: IRIns) -> Result<TRef, TraceError> {
             // Allocations (IRM_A) and unoptimizable loads/stores: emit raw.
             return Ok(buf.emit_ins(fins));
         }
+        // Constant ops (KGC, KINT64, KNUM) have op12 == 0 and must NOT
+        // go through CSE — they already de-duplicate in their constructor.
+        // CSE would match any two constants of the same opcode and return
+        // the wrong ref.
+        if matches!(fins.op(), IROp::KGC | IROp::KINT64 | IROp::KNUM) {
+            return Ok(buf.emit_ins(fins));
+        }
         match fold_step(buf, &mut fins)? {
             Step::Retry => continue,
             Step::Ref(r) => return Ok(tref(r, buf.ir(r).t())),
