@@ -13,7 +13,7 @@ const NIL_NODE: u32 = u32::MAX;
 /// index into `LuaTable::node` instead of a raw pointer (`MRef`), which keeps
 /// the exact algorithm but stays memory-safe.
 #[derive(Clone, Copy)]
-struct Node {
+pub(crate) struct Node {
     val: LuaValue,
     key: LuaValue,
     next: u32,

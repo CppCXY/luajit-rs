@@ -1,36 +1,30 @@
-use std::mem::MaybeUninit;
+use std::cell::Cell;
 use std::ptr::NonNull;
 
-/// Default slots per pool page. `Pool::with_page_size` picks a per-type
-/// count so pages stay near a sensible byte size: small objects (upvalues,
-/// strings) pack many per page, huge ones (thread states) only a few.
-const POOL_PAGE_DEFAULT: usize = 64;
-
-/// A pool slot. `data` must stay the first field (`repr(C)`) so a pointer to
-/// the payload can be cast back to the slot for freeing and for the mark
-/// bit (the slot header is our stand-in for LuaJIT's `GCheader.marked`).
+/// Header placed immediately before every GC-allocated object. The
+/// memory layout is [GcHeader | T], and `GcPtr<T>` points to T.
+/// The mark bit replaces the old `Slot.marked`.
 #[repr(C)]
-struct Slot<T> {
-    data: MaybeUninit<T>,
-    live: bool,
-    marked: bool,
+struct GcHeader {
+    marked: Cell<bool>,
 }
 
-/// Low-address page memory for the pools. GC object addresses travel in
-/// the 47-bit payload of a NaN-boxed `LuaValue`; on platforms whose
-/// user-space VA exceeds 47 bits (e.g. Linux/AArch64 with 48-bit VA) the
-/// global allocator can return pointers above that limit, so the pages
-/// fall back to hint-probed `mmap` like LuaJIT's `lj_alloc` does.
+fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
+    unsafe {
+        let p = (ptr.as_ptr() as *const u8).sub(std::mem::size_of::<GcHeader>());
+        &*(p as *const GcHeader)
+    }
+}
+
+/// Low-address allocator for GC objects. The global allocator (mimalloc
+/// or system malloc) is tried first; if it returns a pointer above the
+/// 47-bit NaN-boxing limit, we fall back to hinted OS mmap.
 mod lowmem {
     use std::alloc::Layout;
     use std::ptr::NonNull;
 
-    /// NaN-boxed pointers must fit the 47-bit LuaValue payload.
     const LIMIT: u64 = 1 << 47;
 
-    /// Allocate `layout` with the whole block below 2^47. The flag in
-    /// the result records whether the block came from the OS mapper
-    /// (true) or the global allocator (false).
     pub fn alloc(layout: Layout) -> (NonNull<u8>, bool) {
         unsafe {
             let p = std::alloc::alloc(layout);
@@ -47,10 +41,6 @@ mod lowmem {
         }
     }
 
-    /// Free a block from `alloc`.
-    ///
-    /// # Safety
-    /// `ptr`/`layout`/`mapped` must match a single previous `alloc`.
     pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout, mapped: bool) {
         if mapped {
             os_free(ptr.as_ptr(), layout.size().max(1));
@@ -59,10 +49,6 @@ mod lowmem {
         }
     }
 
-    /// Pseudo-random probe hints in [2^38, 2^46], 64K aligned. The seed
-    /// is global so successive allocations never replay the same hint
-    /// sequence (a page already mapped at a hint would fail every later
-    /// probe otherwise).
     fn next_random_hint() -> u64 {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
@@ -77,15 +63,11 @@ mod lowmem {
         ((1u64 << 38) + (s % ((1u64 << 46) - (1u64 << 38)))) & !0xFFFF
     }
 
-    /// Bump pointer past the last successful mapping: consecutive pages
-    /// pack into one region instead of burning fresh probe hints.
     fn hint_state() -> &'static std::sync::atomic::AtomicU64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         &NEXT
     }
 
-    /// Probe loop shared by the OS backends: `map(hint, size)` returns a
-    /// mapping (kernel-placed anywhere on some systems) or null.
     fn probe<F: Fn(u64, usize) -> *mut u8>(
         size: usize,
         map: F,
@@ -120,8 +102,6 @@ mod lowmem {
         const MAP_ANON: i32 = 0x20;
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         const MAP_ANON: i32 = 0x1000;
-        /// The hint is only binding on Linux (elsewhere the kernel may
-        /// place the mapping anywhere; the result is checked either way).
         #[cfg(any(target_os = "linux", target_os = "android"))]
         const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -157,8 +137,6 @@ mod lowmem {
 
     #[cfg(windows)]
     fn os_alloc_low(size: usize) -> Option<NonNull<u8>> {
-        // Practically unreachable (Windows user space is 47-bit), kept
-        // for completeness.
         const MEM_COMMIT: u32 = 0x1000;
         const MEM_RESERVE: u32 = 0x2000;
         const PAGE_READWRITE: u32 = 0x04;
@@ -207,7 +185,7 @@ mod lowmem {
 
         #[test]
         fn alloc_dealloc_roundtrip() {
-            let layout = Layout::from_size_align(4096, 16).unwrap();
+            let layout = std::alloc::Layout::from_size_align(4096, 16).unwrap();
             let (p, mapped) = alloc(layout);
             assert!((p.as_ptr() as u64) + 4096 <= LIMIT);
             unsafe {
@@ -218,8 +196,6 @@ mod lowmem {
 
         #[test]
         fn os_probe_survives_hundreds_of_pages() {
-            // Regression: the hint sequence must not replay (a replayed
-            // hint hits its own earlier mapping and fails forever).
             let size = 1 << 16;
             let mut pages = Vec::new();
             for i in 0..300 {
@@ -238,115 +214,70 @@ mod lowmem {
     }
 }
 
-/// One pool page: a raw array of slots in low memory (see `lowmem`).
-/// Live objects are dropped by `Pool::sweep`/`Pool::drop`; the page only
-/// releases the memory.
-struct RawPage<T> {
-    ptr: NonNull<Slot<T>>,
-    cap: usize,
-    mapped: bool,
+fn alloc_block<T>(v: T) -> (NonNull<T>, bool) {
+    let (layout, data_offset) = std::alloc::Layout::new::<GcHeader>()
+        .extend(std::alloc::Layout::new::<T>())
+        .unwrap();
+    let layout = layout.pad_to_align();
+    let (raw, mapped) = lowmem::alloc(layout);
+    unsafe {
+        let header = raw.as_ptr() as *mut GcHeader;
+        header.write(GcHeader {
+            marked: Cell::new(false),
+        });
+    }
+    let data_ptr = unsafe { raw.as_ptr().add(data_offset) as *mut T };
+    unsafe { data_ptr.write(v) };
+    (unsafe { NonNull::new_unchecked(data_ptr) }, mapped)
 }
 
-impl<T> RawPage<T> {
-    fn layout(cap: usize) -> std::alloc::Layout {
-        std::alloc::Layout::array::<Slot<T>>(cap).expect("pool page layout overflow")
-    }
-
-    fn new(cap: usize) -> RawPage<T> {
-        let (raw, mapped) = lowmem::alloc(Self::layout(cap));
-        let ptr = raw.cast::<Slot<T>>();
-        unsafe {
-            for i in 0..cap {
-                ptr.as_ptr().add(i).write(Slot {
-                    data: MaybeUninit::uninit(),
-                    live: false,
-                    marked: false,
-                });
-            }
-        }
-        RawPage { ptr, cap, mapped }
-    }
-
-    fn slots(&self) -> &[Slot<T>] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.cap) }
-    }
-
-    fn slots_mut(&mut self) -> &mut [Slot<T>] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) }
-    }
+fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
+    let (layout, _) = std::alloc::Layout::new::<GcHeader>()
+        .extend(std::alloc::Layout::new::<T>())
+        .unwrap();
+    let layout = layout.pad_to_align();
+    let alloc_ptr =
+        unsafe { (data.as_ptr() as *mut u8).sub(std::mem::size_of::<GcHeader>()) };
+    unsafe { lowmem::dealloc(NonNull::new_unchecked(alloc_ptr), layout, mapped) };
 }
 
-impl<T> Drop for RawPage<T> {
-    fn drop(&mut self) {
-        unsafe { lowmem::dealloc(self.ptr.cast(), Self::layout(self.cap), self.mapped) };
-    }
-}
-
-/// A typed, stable-address object pool.
-///
-/// Objects are allocated inside fixed-size pages (`Box<[Slot<T>]>`); pages
-/// are never reallocated or moved, so a `GcPtr<T>` stays valid for the life
-/// of the pool (or until the object is explicitly freed). The per-page slot
-/// count is chosen at construction so objects of different sizes get pages
-/// of roughly the same byte size (small objects → many slots; huge objects
-/// → few).
+/// Object pool: each object is individually allocated via the global
+/// allocator, tracked in a Vec. No pages, no slots, no free-list
+/// fragmentation. Sweep is O(allocated objects), memory is returned
+/// to the allocator on free.
 pub struct Pool<T> {
-    pages: Vec<RawPage<T>>,
-    free: Vec<NonNull<Slot<T>>>,
+    objects: Vec<NonNull<T>>,
+    mapped: Vec<bool>,
     live: usize,
-    page_cap: usize,
 }
 
 impl<T> Pool<T> {
-    pub fn with_page_size(page_cap: usize) -> Pool<T> {
+    pub fn with_page_size(_page_cap: usize) -> Pool<T> {
         Pool {
-            pages: Vec::new(),
-            free: Vec::new(),
+            objects: Vec::new(),
+            mapped: Vec::new(),
             live: 0,
-            page_cap: page_cap.max(1),
         }
     }
 
-    /// Legacy shortcut: 64 slots per page (medium-sized objects).
     pub fn new() -> Pool<T> {
-        Pool::with_page_size(POOL_PAGE_DEFAULT)
-    }
-
-    fn add_page(&mut self) {
-        let mut page = RawPage::new(self.page_cap);
-        for s in page.slots_mut().iter_mut().rev() {
-            self.free.push(NonNull::from(s));
-        }
-        self.pages.push(page);
+        Pool::with_page_size(0)
     }
 
     pub fn alloc(&mut self, v: T) -> GcPtr<T> {
-        if self.free.is_empty() {
-            self.add_page();
-        }
-        let mut slot = self.free.pop().unwrap();
+        let (nn, mapped) = alloc_block(v);
+        self.objects.push(nn);
+        self.mapped.push(mapped);
         self.live += 1;
-        unsafe {
-            let s = slot.as_mut();
-            debug_assert!(!s.live);
-            s.data.write(v);
-            s.live = true;
-            s.marked = false;
-            GcPtr::new(NonNull::new_unchecked(s.data.as_mut_ptr()))
-        }
+        GcPtr::new(nn)
     }
 
-    /// Return an object's slot to the free list, dropping the object.
-    /// The caller must guarantee no live `GcPtr` to it remains (this is the
-    /// collector's job once implemented).
     pub fn free(&mut self, p: GcPtr<T>) {
-        unsafe {
-            let slot = p.0.as_ptr() as *mut Slot<T>;
-            debug_assert!((*slot).live);
-            (*slot).data.assume_init_drop();
-            (*slot).live = false;
-            self.free.push(NonNull::new_unchecked(slot));
-        }
+        unsafe { p.0.as_ptr().drop_in_place() };
+        let idx = self.objects.iter().position(|&x| x == p.0).unwrap();
+        dealloc_block(p.0, self.mapped[idx]);
+        self.objects.swap_remove(idx);
+        self.mapped.swap_remove(idx);
         self.live -= 1;
     }
 
@@ -358,41 +289,29 @@ impl<T> Pool<T> {
         self.live == 0
     }
 
-    /// Iterate all live objects (linear page walk, used by GC sweeps).
     pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.pages
-            .iter()
-            .flat_map(|p| p.slots().iter())
-            .filter(|s| s.live)
-            .map(|s| unsafe { s.data.assume_init_ref() })
+        self.objects.iter().map(|nn| unsafe { nn.as_ref() })
     }
 
-    /// Sweep phase: free every live-but-unmarked object (calling `on_free`
-    /// with it just before it is dropped) and clear the mark on survivors.
-    /// The pool equivalent of LuaJIT's `gc_sweep` over the GC object chain.
     pub fn sweep(&mut self, mut on_free: impl FnMut(&T)) {
-        let mut free = std::mem::take(&mut self.free);
-        let mut live = 0;
-        for page in &mut self.pages {
-            for s in page.slots_mut() {
-                if !s.live {
-                    continue;
+        let mut i = 0;
+        while i < self.objects.len() {
+            let ptr = self.objects[i];
+            let header = gc_header(ptr);
+            if header.marked.get() {
+                header.marked.set(false);
+                i += 1;
+            } else {
+                unsafe {
+                    on_free(ptr.as_ref());
+                    ptr.as_ptr().drop_in_place();
                 }
-                if s.marked {
-                    s.marked = false;
-                    live += 1;
-                } else {
-                    unsafe {
-                        on_free(s.data.assume_init_ref());
-                        s.data.assume_init_drop();
-                    }
-                    s.live = false;
-                    free.push(NonNull::from(s));
-                }
+                dealloc_block(ptr, self.mapped[i]);
+                self.objects.swap_remove(i);
+                self.mapped.swap_remove(i);
             }
         }
-        self.free = free;
-        self.live = live;
+        self.live = self.objects.len();
     }
 }
 
@@ -404,25 +323,17 @@ impl<T> Default for Pool<T> {
 
 impl<T> Drop for Pool<T> {
     fn drop(&mut self) {
-        for page in &mut self.pages {
-            for s in page.slots_mut() {
-                if s.live {
-                    unsafe { s.data.assume_init_drop() };
-                    s.live = false;
-                }
-            }
+        for (i, &nn) in self.objects.iter().enumerate() {
+            unsafe { nn.as_ptr().drop_in_place() };
+            dealloc_block(nn, self.mapped[i]);
         }
+        self.objects.clear();
     }
 }
 
-/// A pointer to a pool-allocated GC object.
-///
-/// This is the Rust stand-in for LuaJIT's `GCRef`: the raw address fits the
-/// 47-bit payload of a `LuaValue`. Dereferencing is safe *by convention*:
-/// objects live in stable pool pages, the collector only frees objects
-/// proven unreachable, and the VM is single-threaded. All `unsafe` is
-/// confined here. Every `GcPtr` must point into a `Pool` slot (the mark
-/// bit lives in the slot header behind the payload).
+/// A pointer to a GC-allocated object. Fits in the 47-bit NaN-boxed
+/// payload of a `LuaValue`. The GC header (mark bit) lives immediately
+/// before the pointed-to data.
 pub struct GcPtr<T>(NonNull<T>);
 
 impl<T> GcPtr<T> {
@@ -454,20 +365,15 @@ impl<T> GcPtr<T> {
         unsafe { &mut *self.0.as_ptr() }
     }
 
-    #[inline]
-    fn slot(self) -> *mut Slot<T> {
-        self.0.as_ptr() as *mut Slot<T>
-    }
-
-    /// The mark bit in the pool-slot header (LuaJIT's `gch.marked`).
+    /// The mark bit in the GC header (LuaJIT's `gch.marked`).
     #[inline]
     pub fn is_marked(self) -> bool {
-        unsafe { (*self.slot()).marked }
+        gc_header(self.0).marked.get()
     }
 
     #[inline]
     pub fn set_marked(self) {
-        unsafe { (*self.slot()).marked = true }
+        gc_header(self.0).marked.set(true);
     }
 }
 
@@ -825,12 +731,11 @@ mod tests {
     fn free_slots_are_reused() {
         let mut pool: Pool<String> = Pool::new();
         let a = pool.alloc("a".to_string());
-        let addr = a.addr();
         pool.free(a);
         assert_eq!(pool.len(), 0);
         let b = pool.alloc("b".to_string());
-        assert_eq!(b.addr(), addr);
         assert_eq!(b.as_ref(), "b");
+        assert_eq!(pool.len(), 1);
     }
 
     #[test]
