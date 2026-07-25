@@ -69,6 +69,13 @@ name = "luajit-rs"
 version = "0.1.0"
 dependencies = [
  "ahash",
+]
+
+[[package]]
+name = "luajit-rs-cli"
+version = "0.1.0"
+dependencies = [
+ "luajit-rs",
  "mimalloc",
 ]
 

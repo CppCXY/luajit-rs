@@ -8,10 +8,6 @@ authors = ["CppCXY"]
 name = "luajit_rs"
 path = "src/lib.rs"
 
-[[bin]]
-name = "luajit-rs"
-path = "src/main.rs"
 
 [dependencies]
-ahash = "0.8"
-mimalloc = "0.1"
+ahash.workspace = true

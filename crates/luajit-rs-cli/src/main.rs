@@ -164,7 +164,7 @@ fn loadline(lua: &mut luajit_rs::state::Lua) -> Result<Option<String>, String> {
                 }
                 None => return Ok(None),
             },
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.to_string()),
         }
     }
 }
