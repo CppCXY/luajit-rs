@@ -1849,53 +1849,73 @@ impl Record {
                 nres = 1;
             }
             Recff::TableInsert => {
-                // Push form only: t[#t+1] = v (the builtin stores raw,
-                // no metatable check). The ASTORE bounds guard exits on
-                // the growth iterations; the interpreter then resizes.
-                if nargs != 2 {
-                    return Err(TraceError::NYIBC); // Positional insert NYI.
-                }
                 let tab = self.base_ref(a + 2);
-                let val = self.base_ref(a + 3);
                 if !tref_istab(tab) {
                     return Err(TraceError::NYIBC);
                 }
                 let Some(t) = argv[0].as_table() else {
                     return Err(TraceError::NYIBC);
                 };
-                let lenv = t.as_ref().len();
-                // Record only the in-bounds fast path.
-                if lenv + 1 >= t.as_ref().asize {
+                if nargs == 2 {
+                    // Push form: t[#t+1] = v.
+                    let val = self.base_ref(a + 3);
+                    let lenv = t.as_ref().len();
+                    if lenv + 1 >= t.as_ref().asize {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let len = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_NUM),
+                        tref_ref(tab),
+                        IRCALL_TAB_LEN,
+                    ));
+                    let one = self.cur.ir.knum(1.0);
+                    let k = self
+                        .cur
+                        .ir
+                        .emitir(irtn(IROp::ADD), tref_ref(len), tref_ref(one))?;
+                    let carg = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CARG, IRT_NIL),
+                        tref_ref(k),
+                        tref_ref(val),
+                    ));
+                    self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::ASTORE, IRT_NIL),
+                        tref_ref(tab),
+                        tref_ref(carg),
+                    ));
+                } else if nargs == 3 {
+                    // Positional form: table.insert(t, pos, v).
+                    let posv = argv[1];
+                    let posn = posv.as_number().ok_or(TraceError::NYIBC)?;
+                    let pi = posn as i32;
+                    if pi as f64 != posn || pi < 1 {
+                        return Err(TraceError::NYIBC);
+                    }
+                    if (pi as u32) >= t.as_ref().asize {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let key = self.base_ref(a + 3);
+                    if !tref_isnum(key) {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let val = self.base_ref(a + 4);
+                    let carg = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CARG, IRT_NIL),
+                        tref_ref(key),
+                        tref_ref(val),
+                    ));
+                    self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::ASTORE, IRT_NIL),
+                        tref_ref(tab),
+                        tref_ref(carg),
+                    ));
+                } else {
                     return Err(TraceError::NYIBC);
                 }
-                let len = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CALLL, IRT_NUM),
-                    tref_ref(tab),
-                    IRCALL_TAB_LEN,
-                ));
-                let one = self.cur.ir.knum(1.0);
-                let k = self
-                    .cur
-                    .ir
-                    .emitir(irtn(IROp::ADD), tref_ref(len), tref_ref(one))?;
-                let carg = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CARG, IRT_NIL),
-                    tref_ref(k),
-                    tref_ref(val),
-                ));
-                self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::ASTORE, IRT_NIL),
-                    tref_ref(tab),
-                    tref_ref(carg),
-                ));
                 self.needsnap = true;
                 nres = 0;
             }
             Recff::TableRemove => {
-                // Pop form only: v = t[#t]; t[#t] = nil; return v.
-                if nargs != 1 {
-                    return Err(TraceError::NYIBC); // Positional remove NYI.
-                }
                 let tab = self.base_ref(a + 2);
                 if !tref_istab(tab) {
                     return Err(TraceError::NYIBC);
@@ -1903,44 +1923,85 @@ impl Record {
                 let Some(t) = argv[0].as_table() else {
                     return Err(TraceError::NYIBC);
                 };
-                let lenv = t.as_ref().len();
-                // Stay on the array fast path (the empty and hash-part
-                // boundaries exit to the interpreter).
-                if lenv == 0 || lenv >= t.as_ref().asize {
+                if nargs == 1 {
+                    // Pop form: t[#t] = nil; return v.
+                    let lenv = t.as_ref().len();
+                    if lenv == 0 || lenv >= t.as_ref().asize {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let vv = t.as_ref().get_int(lenv as i32);
+                    if vv.is_nil() {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let len = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_NUM),
+                        tref_ref(tab),
+                        IRCALL_TAB_LEN,
+                    ));
+                    let zero = self.cur.ir.knum(0.0);
+                    self.cur
+                        .ir
+                        .emitir(irtg(IROp::GT, IRT_NUM), tref_ref(len), tref_ref(zero))?;
+                    let ty = Self::value_irt(vv);
+                    let v = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::ALOAD, IRT_GUARD | ty),
+                        tref_ref(tab),
+                        tref_ref(len),
+                    ));
+                    let carg = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CARG, IRT_NIL),
+                        tref_ref(len),
+                        tref_ref(TREF_NIL),
+                    ));
+                    self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::ASTORE, IRT_NIL),
+                        tref_ref(tab),
+                        tref_ref(carg),
+                    ));
+                    self.needsnap = true;
+                    res[0] = v;
+                    nres = 1;
+                } else if nargs == 2 {
+                    // Positional form: table.remove(t, pos).
+                    let posv = argv[1];
+                    let posn = posv.as_number().ok_or(TraceError::NYIBC)?;
+                    let pi = posn as i32;
+                    if pi as f64 != posn || pi < 1 {
+                        return Err(TraceError::NYIBC);
+                    }
+                    if (pi as u32) >= t.as_ref().asize {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let vv = t.as_ref().get_int(pi);
+                    if vv.is_nil() {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let key = self.base_ref(a + 3);
+                    if !tref_isnum(key) {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let ty = Self::value_irt(vv);
+                    let v = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::ALOAD, IRT_GUARD | ty),
+                        tref_ref(tab),
+                        tref_ref(key),
+                    ));
+                    let carg = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CARG, IRT_NIL),
+                        tref_ref(key),
+                        tref_ref(TREF_NIL),
+                    ));
+                    self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::ASTORE, IRT_NIL),
+                        tref_ref(tab),
+                        tref_ref(carg),
+                    ));
+                    self.needsnap = true;
+                    res[0] = v;
+                    nres = 1;
+                } else {
                     return Err(TraceError::NYIBC);
                 }
-                let vv = t.as_ref().get_int(lenv as i32);
-                if vv.is_nil() {
-                    return Err(TraceError::NYIBC);
-                }
-                let len = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CALLL, IRT_NUM),
-                    tref_ref(tab),
-                    IRCALL_TAB_LEN,
-                ));
-                let zero = self.cur.ir.knum(0.0);
-                self.cur
-                    .ir
-                    .emitir(irtg(IROp::GT, IRT_NUM), tref_ref(len), tref_ref(zero))?;
-                let ty = Self::value_irt(vv);
-                let v = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::ALOAD, IRT_GUARD | ty),
-                    tref_ref(tab),
-                    tref_ref(len),
-                ));
-                let carg = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CARG, IRT_NIL),
-                    tref_ref(len),
-                    tref_ref(TREF_NIL),
-                ));
-                self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::ASTORE, IRT_NIL),
-                    tref_ref(tab),
-                    tref_ref(carg),
-                ));
-                self.needsnap = true;
-                res[0] = v;
-                nres = 1;
             }
             Recff::TableConcat => {
                 // (t [, sep]) form only; the helper returns nil for an
@@ -1974,6 +2035,49 @@ impl Record {
                 ));
                 self.rec_gcstep(l);
                 nres = 1;
+            }
+            Recff::Type => {
+                let arg0 = self.base_ref(a + 2);
+                let ty = tref_type(arg0);
+                let name: &[u8] = match ty {
+                    IRT_NIL => b"nil",
+                    IRT_TRUE | IRT_FALSE => b"boolean",
+                    IRT_NUM | IRT_INT => b"number",
+                    IRT_STR => b"string",
+                    IRT_TAB => b"table",
+                    IRT_FUNC => b"function",
+                    _ => return Err(TraceError::NYIBC),
+                };
+                let sid = l.heap().intern(name);
+                let v = l.heap().str_value(sid);
+                res[0] = self.cur.ir.kgc(v.to_bits(), IRT_STR);
+                nres = 1;
+            }
+            Recff::RawGet => {
+                let tabv = argv[0];
+                let keyv = argv[1];
+                let tab = self.base_ref(a + 2);
+                let key = self.base_ref(a + 3);
+                res[0] = self.rec_tget(tabv, tab, keyv, key)?;
+                nres = 1;
+            }
+            Recff::RawSet => {
+                let tabv = argv[0];
+                let keyv = argv[1];
+                let tab = self.base_ref(a + 2);
+                let key = self.base_ref(a + 3);
+                let val = self.base_ref(a + 4);
+                self.rec_tset(l, tabv, tab, keyv, key, val)?;
+                nres = 0;
+            }
+            Recff::ToNumber => {
+                let arg0 = self.base_ref(a + 2);
+                if tref_isnum(arg0) || tref_isint(arg0) {
+                    res[0] = arg0;
+                    nres = 1;
+                } else {
+                    return Err(TraceError::NYIBC);
+                }
             }
         }
         // Write the results; pad/discard per the call's wanted count.
@@ -2655,16 +2759,11 @@ enum Recff {
     Ceil,
     Sqrt,
     Abs,
-    /// The hidden ipairs() iterator (recff_ipairs_aux).
     IpairsAux,
-    /// next(t, k) — the pairs() iterator (recff_next).
     Next,
-    /// math.min / math.max (variadic compare-select chains).
     MathMin,
     MathMax,
-    /// math.fmod (an IRCALL helper).
     Fmod,
-    /// bit.* (TOBIT conversions + the fused int32 ops).
     Tobit,
     Bnot,
     Band,
@@ -2676,21 +2775,23 @@ enum Recff {
     Rol,
     Ror,
     Bswap,
-    /// string.* (IRCALL helpers; sub/char allocate + GCSTEP).
     StrLen,
     StrByte,
     StrSub,
     StrChar,
-    /// table.* (raw array ops + IRCALL helpers).
     TableInsert,
     TableRemove,
     TableConcat,
+    Type,
+    RawGet,
+    RawSet,
+    ToNumber,
 }
 
 fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
     use crate::func::CFunction;
     use crate::stdlib::{base, bit, math, string, table};
-    let entries: [(CFunction, Recff); 27] = [
+    let entries: [(CFunction, Recff); 31] = [
         (math::floor, Recff::Floor),
         (math::ceil, Recff::Ceil),
         (math::sqrt, Recff::Sqrt),
@@ -2718,6 +2819,10 @@ fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
         (table::tab_insert, Recff::TableInsert),
         (table::tab_remove, Recff::TableRemove),
         (table::tab_concat, Recff::TableConcat),
+        (base::lib_type, Recff::Type),
+        (base::lib_rawget, Recff::RawGet),
+        (base::lib_rawset, Recff::RawSet),
+        (base::lib_tonumber, Recff::ToNumber),
     ];
     entries
         .iter()

@@ -314,7 +314,9 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
                 super::opt_dce::opt_dce(&mut rec.cur);
                 super::opt_narrow::opt_narrow(&mut rec.cur.ir);
                 match super::opt_loop::opt_loop(&mut rec) {
-                    Ok(true) => {}
+                    Ok(true) => {
+                        super::opt_ivar::opt_ivar(&mut rec.cur.ir);
+                    }
                     Ok(false) => {
                         // Fixable failure (TYPEINS/GFAIL), already undone:
                         // continue recording, i.e. unroll the loop once

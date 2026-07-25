@@ -26,7 +26,7 @@ fn lib_print(l: &mut LuaState) -> LuaResult<i32> {
     Ok(0)
 }
 
-fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
+pub fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
     let name: &[u8] = if v.is_nil() {
         b"nil"
@@ -56,7 +56,7 @@ fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
+pub fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
     let r = if v.is_number() {
         v
@@ -208,7 +208,7 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
-fn lib_rawget(l: &mut LuaState) -> LuaResult<i32> {
+pub fn lib_rawget(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
     let k = arg(l, 1);
     let tab = match t.as_table() {
@@ -219,7 +219,7 @@ fn lib_rawget(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn lib_rawset(l: &mut LuaState) -> LuaResult<i32> {
+pub fn lib_rawset(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
     let k = arg(l, 1);
     let v = arg(l, 2);
