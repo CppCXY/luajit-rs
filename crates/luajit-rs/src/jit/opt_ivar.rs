@@ -141,11 +141,7 @@ pub fn opt_ivar(buf: &mut IrBuf) {
                 // Compute initial = phi_lref * scale in pre-roll area.
                 let phi_lref = buf.ir(phi).op1 as IRRef;
                 // Emit the initial computation.
-                let init_ins = IRIns::new(
-                    buf.ir(r).ot,
-                    phi_lref,
-                    scale_ref,
-                );
+                let init_ins = IRIns::new(buf.ir(r).ot, phi_lref, scale_ref);
                 let tr = buf.emit_ins(init_ins);
                 tref_ref(tr)
             };
@@ -161,11 +157,7 @@ pub fn opt_ivar(buf: &mut IrBuf) {
             buf.emit_ins(phi_ins);
 
             // Emit ADD(phi_ref, scaled_step) as the back-edge value.
-            let add_ins = IRIns::new(
-                irtn(IROp::ADD),
-                phi_ref,
-                tref_ref(scaled_step),
-            );
+            let add_ins = IRIns::new(irtn(IROp::ADD), phi_ref, tref_ref(scaled_step));
             let add_ref = tref_ref(buf.emit_ins(add_ins));
 
             // Fix the PHI's rref.
@@ -332,12 +324,7 @@ mod tests {
         );
 
         let body_shift = buf.nins();
-        emit_raw(
-            &mut buf,
-            irtn(IROp::BSHL),
-            phi_ref,
-            tref_ref(shift),
-        );
+        emit_raw(&mut buf, irtn(IROp::BSHL), phi_ref, tref_ref(shift));
 
         let _nins_before = buf.nins();
         opt_ivar(&mut buf);

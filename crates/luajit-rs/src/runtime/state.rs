@@ -27,19 +27,15 @@ pub struct GcHeap {
     pub funcs: Pool<GcFunc>,
     pub upvals: Pool<crate::func::Upval>,
     pub cdatas: Pool<crate::runtime::cdata::CData>,
-    /// Threads (the main thread and all coroutines). Coroutines are
-    /// collected by the GC like any other object; the main thread is a
-    /// permanent root.
     pub threads: Pool<LuaState>,
-    /// Allocation estimate for non-string objects (strings are tracked by
-    /// the interner itself, which travels to the parser and back).
     pub total: usize,
-    /// Next collection when `total + strings.bytes() + table_extra` crosses this.
     pub threshold: usize,
-    /// Bytes of off-book table growth (Vec capacity) not tracked by `total`.
     pub table_extra: usize,
-    /// Accumulated GC debt — paid down at safe points (C call boundaries).
     pub debt: usize,
+    pub gc_state: crate::gc::GcState,
+    pub gc_gray: Vec<crate::gc::Gray>,
+    pub gc_sweep_pool: u8,
+    pub gc_step_size: usize,
 }
 
 impl Default for GcHeap {
@@ -56,6 +52,10 @@ impl Default for GcHeap {
             threshold: crate::gc::GC_THRESHOLD_MIN,
             table_extra: 0,
             debt: 0,
+            gc_state: crate::gc::GcState::Pause,
+            gc_gray: Vec::new(),
+            gc_sweep_pool: 0,
+            gc_step_size: crate::gc::GC_STEP_SIZE,
         }
     }
 }
@@ -74,8 +74,10 @@ impl GcHeap {
 
     pub fn alloc_table(&mut self, mut t: LuaTable) -> GcPtr<LuaTable> {
         t.table_extra = &mut self.table_extra as *mut usize;
-        self.total += t.gc_size();
-        self.account_alloc(t.gc_size());
+        t.heap = self as *const GcHeap;
+        let size = t.gc_size();
+        self.total += size;
+        crate::gc::gc_step(self, size);
         self.tables.alloc(t)
     }
 
@@ -505,9 +507,7 @@ impl LuaState {
                                 self.heap().strings.try_lookup(sid).map(|_ptr| {
                                     let bytes = self.heap().strings.get(sid);
                                     // Strip leading '@' or '=' for display.
-                                    let s = if bytes.starts_with(b"@")
-                                        || bytes.starts_with(b"=")
-                                    {
+                                    let s = if bytes.starts_with(b"@") || bytes.starts_with(b"=") {
                                         &bytes[1..]
                                     } else {
                                         bytes

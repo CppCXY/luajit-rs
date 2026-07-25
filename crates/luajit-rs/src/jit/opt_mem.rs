@@ -39,15 +39,13 @@ fn fwd_aload(buf: &IrBuf, fins: &IRIns) -> Option<IRRef> {
     let tab = fins.op1 as IRRef;
     let key = fins.op2 as IRRef;
     // Find nearest matching store: tab == store.tab && CARG.key == key.
-    find_matching_store(buf, tab, key)
-        .map(|fwd| fwd.val)
+    find_matching_store(buf, tab, key).map(|fwd| fwd.val)
 }
 
 fn fwd_fload(buf: &IrBuf, fins: &IRIns) -> Option<IRRef> {
     let obj = fins.op1 as IRRef;
     let fid = fins.op2; // field ID (literal or constant)
-    find_matching_fstore(buf, obj, fid)
-        .map(|fwd| fwd.val)
+    find_matching_fstore(buf, obj, fid).map(|fwd| fwd.val)
 }
 
 // ── DSE helpers ─────────────────────────────────────────────────────────
@@ -176,7 +174,12 @@ mod tests {
         let val = buf.knum(42.0);
 
         // ASTORE(tab, key=idx, val=42)
-        let carg = emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx), tref_ref(val));
+        let carg = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx),
+            tref_ref(val),
+        );
         emit_raw(
             &mut buf,
             irt(IROp::ASTORE, IRT_NIL),
@@ -185,7 +188,11 @@ mod tests {
         );
 
         // ALOAD(tab, idx) should forward to val=42
-        let ins = IRIns::new(irt(IROp::ALOAD, IRT_GUARD | IRT_NUM), tref_ref(tab), tref_ref(idx));
+        let ins = IRIns::new(
+            irt(IROp::ALOAD, IRT_GUARD | IRT_NUM),
+            tref_ref(tab),
+            tref_ref(idx),
+        );
         let fwd = try_fwd(&buf, &ins);
         assert_eq!(fwd, Some(tref_ref(val)));
     }
@@ -200,8 +207,12 @@ mod tests {
         let val2 = buf.knum(20.0);
 
         // ASTORE(tab, idx1, val1)
-        let carg1 =
-            emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx1), tref_ref(val1));
+        let carg1 = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx1),
+            tref_ref(val1),
+        );
         emit_raw(
             &mut buf,
             irt(IROp::ASTORE, IRT_NIL),
@@ -209,8 +220,12 @@ mod tests {
             tref_ref(carg1),
         );
         // ASTORE(tab, idx2, val2) — different key, no aliasing
-        let carg2 =
-            emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx2), tref_ref(val2));
+        let carg2 = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx2),
+            tref_ref(val2),
+        );
         emit_raw(
             &mut buf,
             irt(IROp::ASTORE, IRT_NIL),
@@ -219,7 +234,11 @@ mod tests {
         );
 
         // ALOAD(tab, idx1) should forward to val1 (second store was to a different key)
-        let ins = IRIns::new(irt(IROp::ALOAD, IRT_GUARD | IRT_NUM), tref_ref(tab), tref_ref(idx1));
+        let ins = IRIns::new(
+            irt(IROp::ALOAD, IRT_GUARD | IRT_NUM),
+            tref_ref(tab),
+            tref_ref(idx1),
+        );
         let fwd = try_fwd(&buf, &ins);
         assert_eq!(fwd, Some(tref_ref(val1)));
     }
@@ -232,7 +251,12 @@ mod tests {
         let val = buf.knum(42.0);
 
         // ASTORE(tab, idx, val)
-        let carg = emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx), tref_ref(val));
+        let carg = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx),
+            tref_ref(val),
+        );
         emit_raw(
             &mut buf,
             irt(IROp::ASTORE, IRT_NIL),
@@ -248,7 +272,11 @@ mod tests {
         );
 
         // ALOAD(tab, idx) should NOT forward (blocked by HSTORE)
-        let ins = IRIns::new(irt(IROp::ALOAD, IRT_GUARD | IRT_NUM), tref_ref(tab), tref_ref(idx));
+        let ins = IRIns::new(
+            irt(IROp::ALOAD, IRT_GUARD | IRT_NUM),
+            tref_ref(tab),
+            tref_ref(idx),
+        );
         let fwd = try_fwd(&buf, &ins);
         assert_eq!(fwd, None);
     }
@@ -262,8 +290,12 @@ mod tests {
         let val2 = buf.knum(20.0);
 
         // ASTORE(tab, idx, val1)
-        let carg1 =
-            emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx), tref_ref(val1));
+        let carg1 = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx),
+            tref_ref(val1),
+        );
         emit_raw(
             &mut buf,
             irt(IROp::ASTORE, IRT_NIL),
@@ -272,13 +304,13 @@ mod tests {
         );
 
         // ASTORE(tab, idx, val2) — overwrites previous store
-        let carg2 =
-            emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx), tref_ref(val2));
-        let store2_ins = IRIns::new(
-            irt(IROp::ASTORE, IRT_NIL),
-            tref_ref(tab),
-            tref_ref(carg2),
+        let carg2 = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx),
+            tref_ref(val2),
         );
+        let store2_ins = IRIns::new(irt(IROp::ASTORE, IRT_NIL), tref_ref(tab), tref_ref(carg2));
         let nins_before = buf.nins();
         let dse_res = try_dse(&mut buf, &store2_ins);
         assert!(dse_res, "DSE should eliminate the overwritten first store");
@@ -302,8 +334,12 @@ mod tests {
         let val2 = buf.knum(20.0);
 
         // ASTORE(tab, idx, val1)
-        let carg1 =
-            emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx), tref_ref(val1));
+        let carg1 = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx),
+            tref_ref(val1),
+        );
         emit_raw(
             &mut buf,
             irt(IROp::ASTORE, IRT_NIL),
@@ -320,13 +356,13 @@ mod tests {
         );
 
         // ASTORE(tab, idx, val2) — should NOT eliminate the first store
-        let carg2 =
-            emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx), tref_ref(val2));
-        let store2_ins = IRIns::new(
-            irt(IROp::ASTORE, IRT_NIL),
-            tref_ref(tab),
-            tref_ref(carg2),
+        let carg2 = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx),
+            tref_ref(val2),
         );
+        let store2_ins = IRIns::new(irt(IROp::ASTORE, IRT_NIL), tref_ref(tab), tref_ref(carg2));
         let dse_res = try_dse(&mut buf, &store2_ins);
         assert!(!dse_res, "DSE should NOT eliminate when a load intervenes");
     }
@@ -339,7 +375,12 @@ mod tests {
         let val = buf.knum(42.0);
 
         // ASTORE(tab, idx, val) in pre-roll
-        let carg = emit_raw(&mut buf, irt(IROp::CARG, IRT_NIL), tref_ref(idx), tref_ref(val));
+        let carg = emit_raw(
+            &mut buf,
+            irt(IROp::CARG, IRT_NIL),
+            tref_ref(idx),
+            tref_ref(val),
+        );
         emit_raw(
             &mut buf,
             irt(IROp::ASTORE, IRT_NIL),
@@ -351,7 +392,11 @@ mod tests {
         emit_raw(&mut buf, irt(IROp::LOOP, IRT_NIL), 0, 0);
 
         // ALOAD(tab, idx) in loop body — should NOT forward across LOOP
-        let ins = IRIns::new(irt(IROp::ALOAD, IRT_GUARD | IRT_NUM), tref_ref(tab), tref_ref(idx));
+        let ins = IRIns::new(
+            irt(IROp::ALOAD, IRT_GUARD | IRT_NUM),
+            tref_ref(tab),
+            tref_ref(idx),
+        );
         let fwd = try_fwd(&buf, &ins);
         assert_eq!(fwd, None, "FWD must not forward across LOOP boundary");
     }

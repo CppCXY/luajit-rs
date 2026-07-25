@@ -163,9 +163,10 @@ fn split_suffix(s: &[u8]) -> (&[u8], NumSuffix) {
     let len = s.len();
     // Handle 'i' / 'I' suffix (imaginary / complex)
     if let Some((last, rest)) = s.split_last()
-        && (*last == b'i' || *last == b'I') {
-            return (rest, NumSuffix::Imag);
-        }
+        && (*last == b'i' || *last == b'I')
+    {
+        return (rest, NumSuffix::Imag);
+    }
     if len >= 3 {
         let last3 = &s[len - 3..];
         if (last3[0] == b'U' || last3[0] == b'u')

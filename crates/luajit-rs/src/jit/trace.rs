@@ -1789,7 +1789,10 @@ mod tests {
     fn diag_simple_add_loop() {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
-        assert_num(jit_run(&mut lua, "local s=0 for i=1,300 do s=s+1 end return s"), 300.0);
+        assert_num(
+            jit_run(&mut lua, "local s=0 for i=1,300 do s=s+1 end return s"),
+            300.0,
+        );
     }
 
     /// Loop with comparison guard (EQ) that fires on the last iteration.
@@ -1830,10 +1833,7 @@ mod tests {
     fn diag_loop_gets_mcode() {
         let mut lua = Lua::new();
         crate::open_libs(lua.main());
-        let (f, pt) = load_proto(
-            &mut lua,
-            "local s=0 for i=1,300 do s=s+i end return s",
-        );
+        let (f, pt) = load_proto(&mut lua, "local s=0 for i=1,300 do s=s+i end return s");
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(45150.0));
         let g = lua.global();

@@ -74,6 +74,9 @@ pub struct LuaTable {
     /// Pointer to `GcHeap.table_extra` for GC-debt accounting during
     /// on-trace `Vec`-backed array resizes. Set by `alloc_table`.
     pub(crate) table_extra: *mut usize,
+    /// Back-pointer to the owning GcHeap, for the write barrier during
+    /// incremental GC. Set by `alloc_table`.
+    pub(crate) heap: *const crate::state::GcHeap,
 }
 
 impl Default for LuaTable {
@@ -99,6 +102,7 @@ impl LuaTable {
             nomm: !0,
             metatable: None,
             table_extra: std::ptr::null_mut(),
+            heap: std::ptr::null(),
         };
         if hbits != 0 {
             t.new_hpart(hbits);
@@ -431,14 +435,19 @@ impl LuaTable {
     pub fn dup(&self) -> LuaTable {
         let mut t = LuaTable {
             array: self.array.clone(),
-            node: if self.hmask > 0 { self.node.clone() } else { Vec::new() },
+            node: if self.hmask > 0 {
+                self.node.clone()
+            } else {
+                Vec::new()
+            },
             asize: self.asize,
             aptr: std::ptr::null_mut(),
             hmask: self.hmask,
             freetop: self.freetop,
             nomm: 0, // Keys with metamethod names may be present (lj_tab_dup).
             metatable: None,
-            table_extra: self.table_extra,
+            table_extra: std::ptr::null_mut(),
+            heap: std::ptr::null(),
         };
         for v in t.array.iter_mut() {
             if v.is_table() {
@@ -604,12 +613,11 @@ impl LuaTable {
         self.sync_aptr();
         let newcap = self.array.capacity() * std::mem::size_of::<LuaValue>()
             + self.node_len() * std::mem::size_of::<Node>();
-        if newcap > oldcap
-            && !self.table_extra.is_null() {
-                unsafe {
-                    *self.table_extra += newcap - oldcap;
-                }
+        if newcap > oldcap && !self.table_extra.is_null() {
+            unsafe {
+                *self.table_extra += newcap - oldcap;
             }
+        }
     }
 
     /// Count integer array keys per power-of-two bucket, per `countarray`.

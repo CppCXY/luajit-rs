@@ -1088,8 +1088,7 @@ impl<'a> Asm<'a> {
             match op {
                 IROp::ADD => self.code.extend_from_slice(&[0x01, 0xC8]), // add eax, ecx
                 IROp::SUB => self.code.extend_from_slice(&[0x29, 0xC8]), // sub eax, ecx
-                IROp::MUL => self.code
-                    .extend_from_slice(&[0x0F, 0xAF, 0xC1]), // imul eax, ecx
+                IROp::MUL => self.code.extend_from_slice(&[0x0F, 0xAF, 0xC1]), // imul eax, ecx
                 IROp::NEG => self.code.extend_from_slice(&[0xF7, 0xD8]), // neg eax
                 _ => {}
             }

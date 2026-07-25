@@ -34,14 +34,14 @@ pub fn opt_narrow(buf: &mut IrBuf) {
 
             // Arithmetic: narrow if both operands are narrowable.
             IROp::ADD | IROp::SUB | IROp::MUL => {
-                irt_isnum(ins.t()) && narrowable_operand(buf, ins.op1 as IRRef, &narrowable)
+                irt_isnum(ins.t())
+                    && narrowable_operand(buf, ins.op1 as IRRef, &narrowable)
                     && narrowable_operand(buf, ins.op2 as IRRef, &narrowable)
             }
 
             // Unary: narrow if the operand is narrowable.
             IROp::NEG => {
-                irt_isnum(ins.t())
-                    && narrowable_operand(buf, ins.op1 as IRRef, &narrowable)
+                irt_isnum(ins.t()) && narrowable_operand(buf, ins.op1 as IRRef, &narrowable)
             }
 
             // PHI: narrow if both incoming edges produce INT.
@@ -52,9 +52,16 @@ pub fn opt_narrow(buf: &mut IrBuf) {
             }
 
             // Comparison guards: narrow if both operands are narrowable.
-            IROp::LT | IROp::GE | IROp::LE | IROp::GT
-            | IROp::ULT | IROp::UGE | IROp::ULE | IROp::UGT
-            | IROp::EQ | IROp::NE => {
+            IROp::LT
+            | IROp::GE
+            | IROp::LE
+            | IROp::GT
+            | IROp::ULT
+            | IROp::UGE
+            | IROp::ULE
+            | IROp::UGT
+            | IROp::EQ
+            | IROp::NE => {
                 narrowable_operand(buf, ins.op1 as IRRef, &narrowable)
                     && narrowable_operand(buf, ins.op2 as IRRef, &narrowable)
             }
@@ -112,12 +119,7 @@ mod tests {
         let _ = a;
         let add_ref = buf.nins();
         // Manually emit a NUM-typed ADD with INT operands (simulating recorder output)
-        emit_raw(
-            &mut buf,
-            irtn(IROp::ADD),
-            tref_ref(k1),
-            tref_ref(k2),
-        );
+        emit_raw(&mut buf, irtn(IROp::ADD), tref_ref(k1), tref_ref(k2));
 
         opt_narrow(&mut buf);
 
@@ -137,12 +139,7 @@ mod tests {
         let k1 = buf.kint(3);
         let k2 = buf.knum(5.0);
         let add_ref = buf.nins();
-        emit_raw(
-            &mut buf,
-            irtn(IROp::ADD),
-            tref_ref(k1),
-            tref_ref(k2),
-        );
+        emit_raw(&mut buf, irtn(IROp::ADD), tref_ref(k1), tref_ref(k2));
 
         opt_narrow(&mut buf);
 
@@ -185,12 +182,7 @@ mod tests {
 
         // ADD(INT, INT)
         let add_ref = buf.nins();
-        emit_raw(
-            &mut buf,
-            irtn(IROp::ADD),
-            tref_ref(k1),
-            tref_ref(k2),
-        );
+        emit_raw(&mut buf, irtn(IROp::ADD), tref_ref(k1), tref_ref(k2));
 
         // LT(ADD_result, KINT) — comparison should narrow since ADD is narrowable
         let cmp_ref = buf.nins();
@@ -213,12 +205,7 @@ mod tests {
         let k = buf.kint(0);
         // PHI(INT, INT)
         let phi_ref = buf.nins();
-        emit_raw(
-            &mut buf,
-            irt(IROp::PHI, IRT_NUM),
-            tref_ref(k),
-            tref_ref(k),
-        );
+        emit_raw(&mut buf, irt(IROp::PHI, IRT_NUM), tref_ref(k), tref_ref(k));
 
         opt_narrow(&mut buf);
 
@@ -237,12 +224,7 @@ mod tests {
         let k2 = buf.knum(2.5);
         // ADD with one NUM = stays NUM
         let add_ref = buf.nins();
-        emit_raw(
-            &mut buf,
-            irtn(IROp::ADD),
-            tref_ref(k1),
-            tref_ref(k2),
-        );
+        emit_raw(&mut buf, irtn(IROp::ADD), tref_ref(k1), tref_ref(k2));
 
         let k3 = buf.kint(10);
         // LT with ADD result and INT — ADD is NUM, so comparison stays NUM
@@ -277,12 +259,7 @@ mod tests {
 
         // ADD(SLOAD, step) → loop variable increment
         let add_ref = buf.nins();
-        emit_raw(
-            &mut buf,
-            irtn(IROp::ADD),
-            tref_ref(sload),
-            tref_ref(step),
-        );
+        emit_raw(&mut buf, irtn(IROp::ADD), tref_ref(sload), tref_ref(step));
 
         // LT(ADD, stop) → loop guard
         let cmp_ref = buf.nins();

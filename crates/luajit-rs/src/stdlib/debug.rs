@@ -276,10 +276,11 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_getmetatable(l: &mut LuaState) -> LuaResult<i32> {
     let o = arg(l, 0);
     if let Some(t) = o.as_table()
-        && let Some(mt) = t.as_ref().metatable {
-            push(l, LuaValue::table(mt));
-            return Ok(1);
-        }
+        && let Some(mt) = t.as_ref().metatable
+    {
+        push(l, LuaValue::table(mt));
+        return Ok(1);
+    }
     // Check base metatable for non-table types (string, number, etc.)
     let it = o.itype();
     if let Some(mt) = l.global().basemt_of(it) {

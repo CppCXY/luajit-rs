@@ -1064,9 +1064,10 @@ impl<'a> Asm<'a> {
         self.code.blr(RSCRATCH);
         for &p in &self.phis {
             if let Some(rg) = self.loc[Self::iidx(p.lref)]
-                && (rg <= 7 || rg >= 16) {
-                    self.code.ldr_d(rg, RENV, Self::env_ofs(p.lref));
-                }
+                && (rg <= 7 || rg >= 16)
+            {
+                self.code.ldr_d(rg, RENV, Self::env_ofs(p.lref));
+            }
         }
         for &(rg, o) in &saved {
             if !phi_lrefs.contains(&o) {
@@ -1365,27 +1366,13 @@ impl<'a> Asm<'a> {
         match op {
             IROp::BNOT => self.code.mvn_w(RSCRATCH, RSCRATCH),
             IROp::BSWAP => self.code.rev_w(RSCRATCH, RSCRATCH),
-            IROp::BAND => self
-                .code
-                .and_w(RSCRATCH, RSCRATCH, RSCRATCH2),
-            IROp::BOR => self
-                .code
-                .orr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
-            IROp::BXOR => self
-                .code
-                .eor_w(RSCRATCH, RSCRATCH, RSCRATCH2),
-            IROp::BSHL => self
-                .code
-                .lsl_w(RSCRATCH, RSCRATCH, RSCRATCH2),
-            IROp::BSHR => self
-                .code
-                .lsr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
-            IROp::BSAR => self
-                .code
-                .asr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
-            IROp::BROR => self
-                .code
-                .ror_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BAND => self.code.and_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BOR => self.code.orr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BXOR => self.code.eor_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BSHL => self.code.lsl_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BSHR => self.code.lsr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BSAR => self.code.asr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BROR => self.code.ror_w(RSCRATCH, RSCRATCH, RSCRATCH2),
             IROp::BROL => {
                 self.code.neg_w(RSCRATCH3, RSCRATCH2);
                 self.code.ror_w(RSCRATCH, RSCRATCH, RSCRATCH3);
@@ -1480,11 +1467,7 @@ impl<'a> Asm<'a> {
         if irt_isint(ins.t()) {
             // Integer comparison: convert FP→INT, then compare in W registers.
             let f = self.fetch_fp(x, 0)?;
-            let s = if y == x {
-                f
-            } else {
-                self.fetch_fp(y, pin(f))?
-            };
+            let s = if y == x { f } else { self.fetch_fp(y, pin(f))? };
             self.code.fcvtzs_w(RSCRATCH, f);
             self.code.fcvtzs_w(RSCRATCH2, s);
             self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
@@ -1756,29 +1739,29 @@ impl<'a> Asm<'a> {
                         self.code.scvtf_w(d, RSCRATCH);
                         self.def(d);
                     } else {
-                    let op = ins.op();
-                    let (mut a, mut b) = (ins.op1 as IRRef, ins.op2 as IRRef);
-                    // Only swap when both are refs: swapping a constant into
-                    // the destination position causes the destination register
-                    // to hold stale constant bits on loop re-entry.
-                    if matches!(op, IROp::ADD | IROp::MUL)
-                        && b >= REF_BIAS
-                        && !self.dying(a)
-                        && self.dying(b)
-                        && self.reg_of(b).is_some()
-                    {
-                        std::mem::swap(&mut a, &mut b);
-                    }
-                    let d = self.into_dst(a)?;
-                    let rhs = if b == a { d } else { self.fetch_fp(b, pin(d))? };
-                    match op {
-                        IROp::ADD => self.code.fadd(d, d, rhs),
-                        IROp::SUB => self.code.fsub(d, d, rhs),
-                        IROp::MUL => self.code.fmul(d, d, rhs),
-                        IROp::DIV => self.code.fdiv(d, d, rhs),
-                        _ => {}
-                    }
-                    self.def(d);
+                        let op = ins.op();
+                        let (mut a, mut b) = (ins.op1 as IRRef, ins.op2 as IRRef);
+                        // Only swap when both are refs: swapping a constant into
+                        // the destination position causes the destination register
+                        // to hold stale constant bits on loop re-entry.
+                        if matches!(op, IROp::ADD | IROp::MUL)
+                            && b >= REF_BIAS
+                            && !self.dying(a)
+                            && self.dying(b)
+                            && self.reg_of(b).is_some()
+                        {
+                            std::mem::swap(&mut a, &mut b);
+                        }
+                        let d = self.into_dst(a)?;
+                        let rhs = if b == a { d } else { self.fetch_fp(b, pin(d))? };
+                        match op {
+                            IROp::ADD => self.code.fadd(d, d, rhs),
+                            IROp::SUB => self.code.fsub(d, d, rhs),
+                            IROp::MUL => self.code.fmul(d, d, rhs),
+                            IROp::DIV => self.code.fdiv(d, d, rhs),
+                            _ => {}
+                        }
+                        self.def(d);
                     }
                 }
                 IROp::MIN | IROp::MAX => {
@@ -1913,8 +1896,10 @@ impl<'a> Asm<'a> {
                         self.env_valid[i] = true;
                     } else {
                         // Constant: materialize and store.
-                        self.code
-                            .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, p.rref));
+                        self.code.mov64(
+                            RSCRATCH,
+                            super::super::exec::const_bits(&self.tr.ir, p.rref),
+                        );
                         self.code.str(RSCRATCH, RENV, Self::env_ofs(p.lref));
                         self.env_valid[Self::iidx(p.lref)] = true;
                     }
@@ -1929,9 +1914,7 @@ impl<'a> Asm<'a> {
                         continue;
                     }
                     let is_phi = match so {
-                        Owner::Ins(o) => {
-                            self.phis.iter().any(|p| p.num && p.lref == o)
-                        }
+                        Owner::Ins(o) => self.phis.iter().any(|p| p.num && p.lref == o),
                         _ => false,
                     };
                     if is_phi {
