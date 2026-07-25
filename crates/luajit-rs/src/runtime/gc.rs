@@ -775,10 +775,16 @@ pub fn full_gc(g: &mut GlobalState) {
         total += size_thread(th);
     }
     heap.total = total;
-    heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
+    let new_threshold =
+        ((total + heap.strings.bytes()) * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
+    // Do not let the threshold collapse after a large heap was swept:
+    // gradual deflation avoids excessive GC cycles when the live set
+    // is small but the pool page count (and thus sweep cost) is large.
+    heap.threshold = new_threshold.max(heap.threshold / 2);
     // Table growth is now baked into the live estimate (gc_size counts
     // the grown capacities): reset the growth debt.
     heap.table_extra = 0;
+    heap.debt = 0;
 }
 
 /// Allocation-time cost bookkeeping (the `lj_mem_newgco` side).

@@ -102,11 +102,42 @@ impl LuaTable {
         };
         if hbits != 0 {
             t.new_hpart(hbits);
-        } else {
-            t.node = vec![Node::EMPTY]; // shared nil node
         }
+        // NOTE: no vec![Node::EMPTY] here — the empty hash part shares a
+        // single static EMPTY node globally, avoiding an allocation per table.
         t.sync_aptr();
         t
+    }
+
+    /// Shared EMPTY node for tables without a hash part. A single static
+    /// node avoids allocating `vec![EMPTY]` for every TNEW 0,0.
+    fn empty_node() -> &'static Node {
+        static EMPTY: Node = Node {
+            val: LuaValue::NIL,
+            key: LuaValue::NIL,
+            next: NIL_NODE,
+        };
+        &EMPTY
+    }
+
+    /// Access a node by index, falling back to the static EMPTY node
+    /// when the table has no hash part. This avoids allocating a Vec
+    /// holding a copy of the EMPTY node.
+    fn node_slot(&self, idx: u32) -> &Node {
+        if self.hmask > 0 {
+            &self.node[idx as usize]
+        } else {
+            Self::empty_node()
+        }
+    }
+    fn node_slot_mut(&mut self, idx: u32) -> &mut Node {
+        debug_assert!(self.hmask > 0, "cannot mutate the shared EMPTY node");
+        &mut self.node[idx as usize]
+    }
+
+    /// Number of hash nodes; 0 when there is no hash part.
+    fn node_len(&self) -> usize {
+        if self.hmask > 0 { self.node.len() } else { 0 }
     }
 
     /// Refresh the JIT mirror of the array data pointer. Must run after
@@ -173,7 +204,7 @@ impl LuaTable {
     pub fn gc_size(&self) -> usize {
         std::mem::size_of::<LuaTable>()
             + self.array.capacity() * std::mem::size_of::<LuaValue>()
-            + self.node.capacity() * std::mem::size_of::<Node>()
+            + self.node_len() * std::mem::size_of::<Node>()
     }
 
     /// The main hash-slot index for `key` (`hashkey` + `hashmask`).
@@ -204,7 +235,7 @@ impl LuaTable {
         }
         let mut n = self.hash_slot(key);
         loop {
-            let node = &self.node[n as usize];
+            let node = self.node_slot(n);
             if node.key == key {
                 return node.val;
             }
@@ -232,7 +263,7 @@ impl LuaTable {
         debug_assert!(key.is_string());
         let mut n = self.hash_slot(key);
         loop {
-            let node = &self.node[n as usize];
+            let node = self.node_slot(n);
             if node.key == key {
                 return node.val;
             }
@@ -250,9 +281,13 @@ impl LuaTable {
     pub fn set_str(&mut self, key: LuaValue, val: LuaValue) {
         debug_assert!(key.is_string());
         self.nomm = 0; // Clear metamethod cache (BC_TSETS does the same).
+        if !self.has_hpart() {
+            self.set(key, val);
+            return;
+        }
         let mut n = self.hash_slot(key);
         loop {
-            let node = &mut self.node[n as usize];
+            let node = self.node_slot_mut(n);
             if node.key == key {
                 node.val = val;
                 return;
@@ -276,9 +311,11 @@ impl LuaTable {
             self.array[k as usize] = v;
             return;
         }
-        if k > 0 && (k as u32) == self.asize {
-            let new_sz = (self.asize * 2).clamp(4, LJ_MAX_ASIZE);
-            self.reasize(new_sz - 1);
+        // Grow the array to cover key `k` when it's beyond the current
+        // boundary. Avoids the expensive hash/rehash path for sequential
+        // integer keys on fresh tables (e.g. {1,2,3,4,5}).
+        if k > 0 && (k as u32) < LJ_MAX_ASIZE {
+            self.reasize(k as u32);
             self.array[k as usize] = v;
             return;
         }
@@ -301,10 +338,10 @@ impl LuaTable {
         if self.has_hpart() {
             let mut n = self.hash_slot(key);
             loop {
-                if self.node[n as usize].key == key {
+                if self.node_slot(n).key == key {
                     return self.asize + n + 1;
                 }
-                let next = self.node[n as usize].next;
+                let next = self.node_slot(n).next;
                 if next == NIL_NODE {
                     break;
                 }
@@ -331,7 +368,7 @@ impl LuaTable {
         }
         idx -= self.asize;
         while self.has_hpart() && idx <= self.hmask {
-            let nd = &self.node[idx as usize];
+            let nd = self.node_slot(idx);
             if !nd.val.is_nil() {
                 return Some((nd.key, nd.val));
             }
@@ -394,7 +431,7 @@ impl LuaTable {
     pub fn dup(&self) -> LuaTable {
         let mut t = LuaTable {
             array: self.array.clone(),
-            node: self.node.clone(),
+            node: if self.hmask > 0 { self.node.clone() } else { Vec::new() },
             asize: self.asize,
             aptr: std::ptr::null_mut(),
             hmask: self.hmask,
@@ -437,11 +474,11 @@ impl LuaTable {
             if self.has_hpart() {
                 let mut n = self.hash_slot(key);
                 loop {
-                    if self.node[n as usize].key == key {
-                        self.node[n as usize].val = val;
+                    if self.node_slot(n).key == key {
+                        self.node_slot_mut(n).val = val;
                         return;
                     }
-                    let next = self.node[n as usize].next;
+                    let next = self.node_slot(n).next;
                     if next == NIL_NODE {
                         break;
                     }
@@ -450,7 +487,7 @@ impl LuaTable {
             }
             match self.try_new_key(key) {
                 Some(slot) => {
-                    self.node[slot as usize].val = val;
+                    self.node_slot_mut(slot).val = val;
                     return;
                 }
                 None => continue, // Table was rehashed: retry insertion.
@@ -468,9 +505,9 @@ impl LuaTable {
             return None;
         }
         let n = self.hash_slot(key);
-        if self.node[n as usize].val.is_nil() {
+        if self.node_slot(n).val.is_nil() {
             // Main position is free: use it directly.
-            self.node[n as usize].key = normalize_key(key);
+            self.node_slot_mut(n).key = normalize_key(key);
             return Some(n);
         }
 
@@ -482,32 +519,36 @@ impl LuaTable {
                 return None;
             }
             freenode -= 1;
-            if self.node[freenode as usize].key.is_nil() {
+            if self.node_slot(freenode).key.is_nil() {
                 break;
             }
         }
         self.freetop = freenode;
 
-        let collide = self.hash_slot(self.node[n as usize].key);
+        let collide = self.hash_slot(self.node_slot(n).key);
         if collide != n {
             // Colliding node is not in its main position: move it away.
             let mut pred = collide;
-            while self.node[pred as usize].next != n {
-                pred = self.node[pred as usize].next;
+            while self.node_slot(pred).next != n {
+                pred = self.node_slot(pred).next;
             }
-            self.node[pred as usize].next = freenode;
-            self.node[freenode as usize].val = self.node[n as usize].val;
-            self.node[freenode as usize].key = self.node[n as usize].key;
-            self.node[freenode as usize].next = self.node[n as usize].next;
-            self.node[n as usize].next = NIL_NODE;
-            self.node[n as usize].val = LuaValue::NIL;
-            self.node[n as usize].key = normalize_key(key);
+            let n_val = self.node_slot(n).val;
+            let n_key = self.node_slot(n).key;
+            let n_next = self.node_slot(n).next;
+            self.node_slot_mut(pred).next = freenode;
+            self.node_slot_mut(freenode).val = n_val;
+            self.node_slot_mut(freenode).key = n_key;
+            self.node_slot_mut(freenode).next = n_next;
+            self.node_slot_mut(n).next = NIL_NODE;
+            self.node_slot_mut(n).val = LuaValue::NIL;
+            self.node_slot_mut(n).key = normalize_key(key);
             Some(n)
         } else {
             // Insert new node into the chain after the main position.
-            self.node[freenode as usize].next = self.node[n as usize].next;
-            self.node[n as usize].next = freenode;
-            self.node[freenode as usize].key = normalize_key(key);
+            let n_next = self.node_slot(n).next;
+            self.node_slot_mut(freenode).next = n_next;
+            self.node_slot_mut(n).next = freenode;
+            self.node_slot_mut(freenode).key = normalize_key(key);
             Some(freenode)
         }
     }
@@ -521,7 +562,7 @@ impl LuaTable {
     pub fn resize(&mut self, asize: u32, hbits: u32) {
         assert!(asize <= LJ_MAX_ASIZE, "table overflow");
         let oldcap = self.array.capacity() * std::mem::size_of::<LuaValue>()
-            + self.node.capacity() * std::mem::size_of::<Node>();
+            + self.node_len() * std::mem::size_of::<Node>();
         let oldasize = self.asize;
         let oldnode = std::mem::take(&mut self.node);
         let oldhmask = self.hmask;
@@ -533,8 +574,7 @@ impl LuaTable {
 
         if hbits != 0 {
             self.new_hpart(hbits);
-        } else {
-            self.node = vec![Node::EMPTY];
+        } else if oldhmask != 0 {
             self.hmask = 0;
             self.freetop = 0;
         }
@@ -563,7 +603,7 @@ impl LuaTable {
 
         self.sync_aptr();
         let newcap = self.array.capacity() * std::mem::size_of::<LuaValue>()
-            + self.node.capacity() * std::mem::size_of::<Node>();
+            + self.node_len() * std::mem::size_of::<Node>();
         if newcap > oldcap
             && !self.table_extra.is_null() {
                 unsafe {

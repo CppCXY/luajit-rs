@@ -106,11 +106,11 @@ fn tab_move(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn tab_pack(l: &mut LuaState) -> LuaResult<i32> {
+pub fn tab_pack(l: &mut LuaState) -> LuaResult<i32> {
     let n = nargs(l);
     let t = l
         .heap()
-        .alloc_table(crate::table::LuaTable::new(n as u32, 0));
+        .alloc_table(crate::table::LuaTable::new(n as u32 + 1, 1));
     for i in 0..n {
         t.as_mut().set_int(i as i32 + 1, arg(l, i));
     }

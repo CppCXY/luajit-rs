@@ -6,6 +6,10 @@ pub mod stdlib;
 pub mod util;
 pub mod vm;
 
+use mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 pub use compiler::{bc, dump, lex, parse};
 pub use runtime::{func, gc, meta, proto, state, string, table, value};
 pub use stdlib::open_libs;

@@ -2274,7 +2274,7 @@ impl Interp {
         l.top = args_base + nargs;
         // C-call boundary is a GC safe point (args anchored, frames below).
         let g = l.global();
-        if g.heap.should_collect() || g.heap.debt > 0 {
+        if g.heap.should_collect() || g.heap.debt > 4096 {
             crate::gc::full_gc(g);
             g.heap.debt = 0;
         }
