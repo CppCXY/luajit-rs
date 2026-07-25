@@ -78,6 +78,7 @@ mod lowmem {
     #[cfg(unix)]
     fn os_alloc_low(size: usize) -> Option<NonNull<u8>> {
         const PROT_RW: i32 = 3;
+        const MAP_PRIVATE: i32 = 0x02;
         const MAP_ANON: i32 = if cfg!(any(target_os = "linux", target_os = "android")) {
             0x20
         } else {

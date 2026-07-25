@@ -2379,18 +2379,27 @@ impl Interp {
     /// slot all come from the CALL instruction at the stored return PC.
     /// Returns `Some(n)` when a host (`FRAME_C`) entry returns.
     fn do_return(&mut self, src: usize, n: usize) -> Option<usize> {
+        // sp and the frame link at self.base-1 may be stale from a C-call
+        // stack resize (push -> stack_ensure) inside a JIT helper or the
+        // interpreter.  Re-read both from the canonical LuaState stack Vec.
+        self.sp = self.l().stack.as_mut_ptr();
         if !self.l().openuv.is_empty() {
             self.close_upvals(self.base);
         }
         let mut base = self.base;
         if base < 2 { return None; }
-        let mut link = self.at(base - 1).to_bits();
+        let mut link = self.l().stack[base - 1].to_bits();
+        // A NIL link means we cannot determine the caller. Bail out so the
+        // interpreter can continue with the next opcode (a Lua-level error
+        // will surface if the state is too corrupted).
+        if link == u64::MAX { return None; }
         while (link & FRAME_TYPE_MASK) == FRAME_VARG {
             let sz = (link >> 3) as usize;
             if sz == 0 || sz > base { break; }
             base -= sz;
             if base < 2 { break; }
-            link = self.at(base - 1).to_bits();
+            link = self.l().stack[base - 1].to_bits();
+            if link == u64::MAX { return None; }
         }
         let dst = base - 2; // results always land at the callee's func slot
         for i in 0..n {
