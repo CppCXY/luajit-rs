@@ -258,7 +258,7 @@ impl Interp {
             sp,
             base: 0,
             pc: 0,
-            cl: GcPtr::from_addr(8).unwrap(), // placeholder; set by enter_lua
+            cl: GcPtr::from_addr(0x100).unwrap(), // placeholder; set by enter_lua
             bcp: std::ptr::null(),
             knp: std::ptr::null(),
             ksp: std::ptr::null(),
