@@ -21,6 +21,7 @@
 
 use super::TraceError;
 use super::ir::*;
+use super::opt_mem;
 
 /// Terminal outcomes of one rule-matching pass.
 enum Step {
@@ -42,10 +43,18 @@ enum Step {
 pub fn opt_fold(buf: &mut IrBuf, fins: IRIns) -> Result<TRef, TraceError> {
     let mut fins = fins;
     loop {
-        // Loads, stores and allocations must not reach plain CSE. LuaJIT
-        // routes them to FWD/DSE any/any rules; until lj_opt_mem exists
-        // they are emitted raw (conservative and sound).
-        if irm_kind(IR_MODE[fins.op() as usize]) != IRM_N {
+        let kind = irm_kind(IR_MODE[fins.op() as usize]);
+        if kind != IRM_N {
+            if kind == IRM_L {
+                // Load: try store-to-load forwarding.
+                if let Some(val) = opt_mem::try_fwd(buf, &fins) {
+                    return Ok(tref(val, buf.ir(val).t()));
+                }
+            } else if kind == IRM_S {
+                // Store: try dead store elimination.
+                let _ = opt_mem::try_dse(buf, &fins);
+            }
+            // Allocations (IRM_A) and unoptimizable loads/stores: emit raw.
             return Ok(buf.emit_ins(fins));
         }
         match fold_step(buf, &mut fins)? {

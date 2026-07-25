@@ -120,6 +120,19 @@ impl Emit {
     fn mvn_w(&mut self, wd: u8, wm: u8) {
         self.u32(0x2A20_03E0 | ((wm as u32) << 16) | (wd as u32));
     }
+    // 32-bit arithmetic
+    fn add_w(&mut self, wd: u8, wn: u8, wm: u8) {
+        self.u32(0x0B00_0000 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32));
+    }
+    fn sub_w(&mut self, wd: u8, wn: u8, wm: u8) {
+        self.u32(0x4B00_0000 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32));
+    }
+    fn mul_w(&mut self, wd: u8, wn: u8, wm: u8) {
+        self.u32(0x1B00_7C00 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32));
+    }
+    fn sdiv_w(&mut self, wd: u8, wn: u8, wm: u8) {
+        self.u32(0x1AC0_0C00 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32));
+    }
 
     fn add_imm(&mut self, rd: u8, rn: u8, imm: u32) {
         self.u32(0x9100_0000 | ((imm & 0xFFF) << 10) | ((rn as u32) << 5) | (rd as u32));
@@ -175,6 +188,12 @@ impl Emit {
 
     fn rev_w(&mut self, wd: u8, wn: u8) {
         self.u32(0x5AC0_0800 | ((wn as u32) << 5) | (wd as u32));
+    }
+    fn neg_w(&mut self, wd: u8, wm: u8) {
+        self.u32(0x4B00_03E0 | ((wm as u32) << 16) | (wd as u32)); // SUB Wd, WZR, Wm
+    }
+    fn ror_w(&mut self, wd: u8, wn: u8, wm: u8) {
+        self.u32(0x1AC0_2C00 | ((wm as u32) << 16) | ((wn as u32) << 5) | (wd as u32));
     }
     /// UBFX Wd, Wn, #lsb, #width — unsigned bitfield extract (32-bit).
     fn ubfx_w(&mut self, wd: u8, wn: u8, lsb: u8, width: u8) {
@@ -576,6 +595,8 @@ impl<'a> Asm<'a> {
                 | IROp::BSHL
                 | IROp::BSHR
                 | IROp::BSAR
+                | IROp::BROL
+                | IROp::BROR
                 | IROp::BNOT
                 | IROp::BSWAP => {
                     a.mark_use(ins.op1 as IRRef, r);
@@ -658,7 +679,9 @@ impl<'a> Asm<'a> {
                 let rr = snap_ref(*sn);
                 if rr >= REF_BIAS {
                     a.mark_use(rr, lu);
-                    a.needs_env[Self::iidx(rr)] = true;
+                    if !irt_isnum(tr.ir.ir(rr).t()) && !irt_isint(tr.ir.ir(rr).t()) {
+                        a.needs_env[Self::iidx(rr)] = true;
+                    }
                 }
             }
         }
@@ -1357,6 +1380,13 @@ impl<'a> Asm<'a> {
             IROp::BSAR => self
                 .code
                 .asr_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BROR => self
+                .code
+                .ror_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+            IROp::BROL => {
+                self.code.neg_w(RSCRATCH3, RSCRATCH2);
+                self.code.ror_w(RSCRATCH, RSCRATCH, RSCRATCH3);
+            }
             _ => {}
         }
         let d = self.alloc(0)?;
@@ -1442,8 +1472,34 @@ impl<'a> Asm<'a> {
 
     // COMP: ordered/unordered FP comparison guards
     fn asm_comp(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        debug_assert!(irt_isnum(ins.t()) && ins.is_guard());
+        debug_assert!((irt_isnum(ins.t()) || irt_isint(ins.t())) && ins.is_guard());
         let (x, y) = (ins.op1 as IRRef, ins.op2 as IRRef);
+        if irt_isint(ins.t()) {
+            // Integer comparison: convert FP→INT, then compare in W registers.
+            let f = self.fetch_fp(x, 0)?;
+            let s = if y == x {
+                f
+            } else {
+                self.fetch_fp(y, pin(f))?
+            };
+            self.code.fcvtzs_w(RSCRATCH, f);
+            self.code.fcvtzs_w(RSCRATCH2, s);
+            self.code.cmp_rr_w(RSCRATCH, RSCRATCH2);
+            let a64cc = match ins.op() {
+                IROp::LT => cond::GE, // exit if a >= b
+                IROp::GE => cond::LT, // exit if a < b
+                IROp::LE => cond::GT, // exit if a > b
+                IROp::GT => cond::LE, // exit if a <= b
+                // Unsigned: same condition codes as FP.
+                IROp::ULT => cond::CS,
+                IROp::UGE => cond::CC,
+                IROp::ULE => cond::HI,
+                IROp::UGT => cond::LS,
+                _ => unreachable!(),
+            };
+            self.guard(a64cc);
+            return Ok(());
+        }
         // Same mapping as x64: operand order chosen so branch direction matches NaN handling.
         // x64 CC_B(0x2)→LO, CC_BE(0x6)→LS, CC_A(0x7)→HI, CC_AE(0x3)→HS
         let (fst, snd, a64cc) = match ins.op() {
@@ -1670,9 +1726,33 @@ impl<'a> Asm<'a> {
                 | IROp::BSHL
                 | IROp::BSHR
                 | IROp::BSAR
+                | IROp::BROL
+                | IROp::BROR
                 | IROp::BNOT
                 | IROp::BSWAP => self.asm_bitop(&ins)?,
                 IROp::ADD | IROp::SUB | IROp::MUL | IROp::DIV => {
+                    let op = ins.op();
+                    if irt_isint(ins.t()) {
+                        // Integer arithmetic: convert FP→INT, do W-op, convert back.
+                        let f = self.fetch_fp(ins.op1 as IRRef, 0)?;
+                        let s = if ins.op2 == ins.op1 {
+                            f
+                        } else {
+                            self.fetch_fp(ins.op2 as IRRef, pin(f))?
+                        };
+                        self.code.fcvtzs_w(RSCRATCH, f);
+                        self.code.fcvtzs_w(RSCRATCH2, s);
+                        match op {
+                            IROp::ADD => self.code.add_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+                            IROp::SUB => self.code.sub_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+                            IROp::MUL => self.code.mul_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+                            IROp::DIV => self.code.sdiv_w(RSCRATCH, RSCRATCH, RSCRATCH2),
+                            _ => {}
+                        }
+                        let d = self.alloc(0)?;
+                        self.code.scvtf_w(d, RSCRATCH);
+                        self.def(d);
+                    } else {
                     let op = ins.op();
                     let (mut a, mut b) = (ins.op1 as IRRef, ins.op2 as IRRef);
                     // Only swap when both are refs: swapping a constant into
@@ -1696,6 +1776,7 @@ impl<'a> Asm<'a> {
                         _ => {}
                     }
                     self.def(d);
+                    }
                 }
                 IROp::MIN | IROp::MAX => {
                     let (a, b) = (ins.op1 as IRRef, ins.op2 as IRRef);
@@ -1876,7 +1957,23 @@ impl<'a> Asm<'a> {
         } else if matches!(self.tr.linktype, TraceLink::Uprec | TraceLink::Tailrec)
             && self.tr.link == self.tr.traceno
         {
-            return Err(TraceError::NYIIR); // recursive tail NYI
+            self.snapidx = lastsnap;
+            self.tail_restore(lastsnap);
+            let delta = (self.tr.snap[lastsnap].baseslot as i32 - 2) * 8;
+            let room = (255 + 8) * 8;
+            self.code.mov64(RSCRATCH, (delta + room) as u64);
+            self.code.add_rr(RSCRATCH, RSCRATCH, RBASE);
+            self.code
+                .mov64(RSCRATCH2, super::super::exec::stack_end_cell_addr());
+            self.code.ldr(RSCRATCH3, RSCRATCH2, 0);
+            self.code.cmp_rr(RSCRATCH, RSCRATCH3);
+            self.guard(cond::HI);
+            if delta != 0 {
+                self.code.mov64(RSCRATCH, delta as u64);
+                self.code.add_rr(RBASE, RBASE, RSCRATCH);
+            }
+            let off = (inner as i64 - self.code.len() as i64) as i32 / 4;
+            self.code.b(off);
         } else if self.tr.linktype == TraceLink::Root
             && let Some(target) = self.link
         {

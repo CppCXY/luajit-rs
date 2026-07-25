@@ -62,6 +62,10 @@ const CC_NE: u8 = 0x5;
 const CC_BE: u8 = 0x6;
 const CC_A: u8 = 0x7;
 const CC_P: u8 = 0xA;
+const CC_L: u8 = 0xC;
+const CC_GE: u8 = 0xD;
+const CC_LE: u8 = 0xE;
+const CC_G: u8 = 0xF;
 
 /// High dword of the smallest GC-tagged value (`LJ_TISNUM << 15`): any
 /// value whose high dword is below this is a number (same check as
@@ -370,7 +374,7 @@ impl<'a> Asm<'a> {
                 let rref = snap_ref(*sn);
                 if rref >= REF_BIAS {
                     a.mark_use(rref, live_until);
-                    if !irt_isnum(tr.ir.ir(rref).t()) {
+                    if !irt_isnum(tr.ir.ir(rref).t()) && !irt_isint(tr.ir.ir(rref).t()) {
                         a.needs_env[Self::iidx(rref)] = true;
                     }
                 }
@@ -1067,6 +1071,33 @@ impl<'a> Asm<'a> {
 
     fn asm_arith(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         let op = ins.op();
+        if irt_isint(ins.t()) {
+            // Integer arithmetic: convert FP→INT, do integer op, convert back.
+            let f = self.fetch_xmm(ins.op1 as IRRef, 0)?;
+            if !matches!(op, IROp::NEG) {
+                let s = if ins.op2 == ins.op1 {
+                    f
+                } else {
+                    self.fetch_xmm(ins.op2 as IRRef, pin(f))?
+                };
+                self.cvttsd2si_r64(RAX, f);
+                self.cvttsd2si_r64(RCX, s);
+            } else {
+                self.cvttsd2si_r64(RAX, f);
+            }
+            match op {
+                IROp::ADD => self.code.extend_from_slice(&[0x01, 0xC8]), // add eax, ecx
+                IROp::SUB => self.code.extend_from_slice(&[0x29, 0xC8]), // sub eax, ecx
+                IROp::MUL => self.code
+                    .extend_from_slice(&[0x0F, 0xAF, 0xC1]), // imul eax, ecx
+                IROp::NEG => self.code.extend_from_slice(&[0xF7, 0xD8]), // neg eax
+                _ => {}
+            }
+            let d = self.alloc(0)?;
+            self.cvtsi2sd_r32(d, RAX);
+            self.def(d);
+            return Ok(());
+        }
         let (mut a, mut b) = (ins.op1 as IRRef, ins.op2 as IRRef);
         // Reuse a dying register operand for commutative ops. MIN/MAX are
         // not symmetric (minsd picks the second operand on ties/NaN).
@@ -1129,6 +1160,32 @@ impl<'a> Asm<'a> {
     fn asm_comp(&mut self, ins: &IRIns) -> Result<(), TraceError> {
         debug_assert!((irt_isnum(ins.t()) || irt_isint(ins.t())) && ins.is_guard());
         let (x, y) = (ins.op1 as IRRef, ins.op2 as IRRef);
+        if irt_isint(ins.t()) {
+            // Integer comparison: convert FP→INT, then cmp+guard.
+            let f = self.fetch_xmm(x, 0)?;
+            let s = if y == x {
+                f
+            } else {
+                self.fetch_xmm(y, pin(f))?
+            };
+            self.cvttsd2si_r64(RAX, f);
+            self.cvttsd2si_r64(RCX, s);
+            self.cmp_rr64(RAX, RCX);
+            let cc = match ins.op() {
+                IROp::LT => CC_GE, // exit if a >= b
+                IROp::GE => CC_L,  // exit if a < b
+                IROp::LE => CC_G,  // exit if a > b
+                IROp::GT => CC_LE, // exit if a <= b
+                // Unsigned: same condition codes as FP.
+                IROp::ULT => CC_AE,
+                IROp::UGE => CC_B,
+                IROp::ULE => CC_A,
+                IROp::UGT => CC_BE,
+                _ => unreachable!(),
+            };
+            self.guard(cc);
+            return Ok(());
+        }
         let (fst, snd, cc) = match ins.op() {
             IROp::LT => (y, x, CC_BE),
             IROp::GE => (x, y, CC_B),

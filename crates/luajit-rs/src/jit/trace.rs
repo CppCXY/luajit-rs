@@ -306,12 +306,13 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             rec.mergesnap = true;
             rec.snap_add();
             rec.mergesnap = true; // In case recording continues below.
-            // LJ_TRACE_END: DCE + loop unrolling for self-linking loops.
+            // LJ_TRACE_END: DCE + narrowing + loop unrolling for self-linking loops.
             if link == TraceLink::Loop
                 && lnk == rec.cur.traceno
                 && rec.framedepth + rec.retdepth == 0
             {
                 super::opt_dce::opt_dce(&mut rec.cur);
+                super::opt_narrow::opt_narrow(&mut rec.cur.ir);
                 match super::opt_loop::opt_loop(&mut rec) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -422,6 +423,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             None
         };
         let arch = js.arch;
+        super::opt_narrow::opt_narrow(&mut trace.ir);
         if !js.no_asm
             && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target, arch)
         {
