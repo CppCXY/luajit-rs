@@ -9,13 +9,6 @@ struct GcHeader {
     marked: Cell<bool>,
 }
 
-fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
-    unsafe {
-        let p = (ptr.as_ptr() as *const u8).sub(std::mem::size_of::<GcHeader>());
-        &*(p as *const GcHeader)
-    }
-}
-
 /// Low-address allocator for GC objects. The global allocator (mimalloc
 /// or system malloc) is tried first; if it returns a pointer above the
 /// 47-bit NaN-boxing limit, we fall back to hinted OS mmap.
@@ -220,9 +213,9 @@ fn alloc_block<T>(v: T) -> (NonNull<T>, bool) {
         .unwrap();
     let layout = layout.pad_to_align();
     let (raw, mapped) = lowmem::alloc(layout);
+    let header_ptr = raw.as_ptr() as *mut GcHeader;
     unsafe {
-        let header = raw.as_ptr() as *mut GcHeader;
-        header.write(GcHeader {
+        header_ptr.write(GcHeader {
             marked: Cell::new(false),
         });
     }
@@ -232,13 +225,29 @@ fn alloc_block<T>(v: T) -> (NonNull<T>, bool) {
 }
 
 fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
-    let (layout, _) = std::alloc::Layout::new::<GcHeader>()
+    let (layout, data_offset) = std::alloc::Layout::new::<GcHeader>()
         .extend(std::alloc::Layout::new::<T>())
         .unwrap();
     let layout = layout.pad_to_align();
+    // Reconstruct the start of the allocation block from the data pointer
+    // and the precomputed offset (handles alignment padding correctly).
     let alloc_ptr =
-        unsafe { (data.as_ptr() as *mut u8).sub(std::mem::size_of::<GcHeader>()) };
+        unsafe { (data.as_ptr() as *mut u8).sub(data_offset) };
     unsafe { lowmem::dealloc(NonNull::new_unchecked(alloc_ptr), layout, mapped) };
+}
+
+/// Get a reference to the GcHeader for a GC object. The header is at
+/// a fixed `data_offset` before the data pointer (preserved from
+/// allocation time). We reconstruct the offset by calling Layout::extend
+/// again — the result is deterministic for a given T.
+fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
+    let (_, data_offset) = std::alloc::Layout::new::<GcHeader>()
+        .extend(std::alloc::Layout::new::<T>())
+        .unwrap();
+    unsafe {
+        let p = (ptr.as_ptr() as *const u8).sub(data_offset);
+        &*(p as *const GcHeader)
+    }
 }
 
 /// Object pool: each object is individually allocated via the global
