@@ -805,7 +805,10 @@ impl<'a> Asm<'a> {
         }
     }
     fn gpr_load_ref(&mut self, rd: u8, r: IRRef) {
-        if r >= REF_BIAS {
+        if r == REF_BIAS {
+            // VARG / REF_BASE: load the Lua stack base pointer (x19).
+            self.code.add_rr(rd, RBASE, 31); // add rd, x19, xzr = mov rd, x19
+        } else if r >= REF_BIAS {
             self.code.ldr(rd, RENV, Self::env_ofs(r));
         } else {
             self.code

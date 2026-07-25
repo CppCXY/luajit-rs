@@ -1037,18 +1037,32 @@ pub extern "C" fn jit_varg(base_ptr: u64, frame_link: u64, packed: u64) -> u64 {
     let delta = (frame_link >> 3) as usize;
     let nvarg = (delta - 2).saturating_sub(numparams as usize);
     let base = base_ptr as *mut LuaValue;
-    let src = unsafe { base.sub(delta).add(numparams as usize) };
+    // In a Stitch trace the base_ptr points to the caller's frame,
+    // not the callee's.  Detect this: the callee's frame link (at
+    // base-2 for a normal trace) carries FRAME_VARG, while the
+    // caller's does not.
+    let is_callee = unsafe { ((*base.sub(2)).to_bits() & FRAME_TYPE_MASK) == FRAME_VARG };
+    let callee_base: *mut LuaValue = if is_callee {
+        base
+    } else {
+        unsafe { base.add(delta + 2) }
+    };
+    let src = if is_callee {
+        unsafe { base.sub(delta).add(numparams as usize) }
+    } else {
+        unsafe { base.add(numparams as usize) }
+    };
     let actual = if want == 0 {
         nvarg
     } else {
         nvarg.min(want as usize)
     };
     for i in 0..actual {
-        unsafe { *base.add(dst as usize + i) = *src.add(i) };
+        unsafe { *callee_base.add(dst as usize + i) = *src.add(i) };
     }
     if want > 0 {
         for i in actual..(want as usize) {
-            unsafe { *base.add(dst as usize + i) = LuaValue::NIL };
+            unsafe { *callee_base.add(dst as usize + i) = LuaValue::NIL };
         }
     }
     actual as u64
