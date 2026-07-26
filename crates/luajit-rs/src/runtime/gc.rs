@@ -336,6 +336,7 @@ impl<T> Pool<T> {
             if addr <= 0x1000 || addr >= (1usize << 47) {
                 eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
+                self.mapped.swap_remove(i);
                 continue;
             }
             if gc_header(ptr).marked.get() {
@@ -361,11 +362,13 @@ impl<T> Pool<T> {
             if addr <= 0x1000 || addr >= (1usize << 47) {
                 eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
+                self.mapped.swap_remove(i);
                 continue;
             }
             let h = gc_header(ptr);
             let alive = h.marked.get() || !h.is_dead(current_white);
             if alive {
+                h.change_white();
                 h.marked.set(false);
                 i += 1;
             } else {
