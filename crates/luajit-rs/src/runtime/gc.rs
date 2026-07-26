@@ -453,8 +453,7 @@ impl<'g> Marker<'g> {
                 KGc::ProtoRef(c) => this.mark_proto(*c),
                 KGc::Table(t) => t.gc_traverse(|v| this.mark_value(v)),
                 KGc::TableRef(t) => t.as_ref().gc_traverse(|v| this.mark_value(v)),
-                KGc::Proto(child) => Self::mark_kgc_slice(this, &child.kgc),
-                KGc::CData(_) => {}
+                KGc::Proto(_) | KGc::CData(_) => {}
             }
         }
     }
