@@ -32,7 +32,7 @@ impl GcHeader {
     pub fn new(current_white: u8, kind: GcObjectKind, size: u32) -> Self {
         let c = if current_white == 0 { BIT_WHITE0 } else { BIT_WHITE1 };
         Self {
-            marked: Cell::new(true),
+            marked: Cell::new(false),
             bits: Cell::new(c),
             kind: kind as u8,
             _pad: [0; 2],
