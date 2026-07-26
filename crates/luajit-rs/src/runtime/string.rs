@@ -282,6 +282,9 @@ impl Interner {
         });
         self.bytes = self.pool.iter().map(|s| s.gc_size()).sum();
     }
+    pub(crate) fn update_current_white(&self, cw: u8) {
+        self.pool.update_current_white(cw);
+    }
 }
 
 #[cfg(test)]

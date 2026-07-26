@@ -80,6 +80,7 @@ impl GcHeap {
         t.heap = self as *const GcHeap;
         let size = t.gc_size();
         self.total += size;
+        self.account_alloc(size);
         crate::gc::gc_step(self, size);
         self.tables.alloc(t)
     }
@@ -89,7 +90,9 @@ impl GcHeap {
     pub fn alloc_table_jit(&mut self, mut t: LuaTable) -> GcPtr<LuaTable> {
         t.table_extra = &mut self.table_extra as *mut usize;
         t.heap = self as *const GcHeap;
-        self.total += t.gc_size();
+        let size = t.gc_size();
+        self.total += size;
+        self.account_alloc(size);
         self.tables.alloc(t)
     }
 
@@ -126,7 +129,9 @@ impl GcHeap {
         &mut self,
         cd: crate::runtime::cdata::CData,
     ) -> GcPtr<crate::runtime::cdata::CData> {
-        self.total += std::mem::size_of::<crate::runtime::cdata::CData>() + cd.data.len();
+        let size = std::mem::size_of::<crate::runtime::cdata::CData>() + cd.data.len();
+        self.total += size;
+        self.account_alloc(size);
         self.cdatas.alloc(cd)
     }
 

@@ -238,14 +238,14 @@ mod lowmem {
     }
 }
 
-fn alloc_block<T>(v: T, kind: GcObjectKind, alloc_size: u32) -> (NonNull<T>, bool) {
+fn alloc_block<T>(v: T, kind: GcObjectKind, alloc_size: u32, current_white: u8) -> (NonNull<T>, bool) {
     let (layout, data_offset) = std::alloc::Layout::new::<GcHeader>()
         .extend(std::alloc::Layout::new::<T>())
         .unwrap();
     let layout = layout.pad_to_align();
     let (raw, mapped) = lowmem::alloc(layout);
     unsafe {
-        (raw.as_ptr() as *mut GcHeader).write(GcHeader::new(0, kind, alloc_size));
+        (raw.as_ptr() as *mut GcHeader).write(GcHeader::new(current_white, kind, alloc_size));
     }
     let dp = unsafe { raw.as_ptr().add(data_offset) as *mut T };
     unsafe { dp.write(v) };
@@ -293,16 +293,18 @@ pub struct Pool<T> {
     mapped: Vec<bool>,
     live: usize,
     kind: GcObjectKind,
+    current_white: Cell<u8>,
 }
 impl<T> Pool<T> {
     pub fn with_page_size(_: usize) -> Self {
         Self::new(GcObjectKind::Table)
     }
     pub fn new(kind: GcObjectKind) -> Self {
-        Self { objects: Vec::new(), mapped: Vec::new(), live: 0, kind }
+        Self { objects: Vec::new(), mapped: Vec::new(), live: 0, kind, current_white: Cell::new(0) }
     }
     pub fn alloc(&mut self, v: T) -> GcPtr<T> {
-        let (nn, m) = alloc_block(v, self.kind, std::mem::size_of::<T>() as u32);
+        let cw = self.current_white.get();
+        let (nn, m) = alloc_block(v, self.kind, std::mem::size_of::<T>() as u32, cw);
         self.objects.push(nn);
         self.mapped.push(m);
         self.live += 1;
@@ -364,7 +366,6 @@ impl<T> Pool<T> {
             let h = gc_header(ptr);
             let alive = h.marked.get() || !h.is_dead(current_white);
             if alive {
-                h.change_white();
                 h.marked.set(false);
                 i += 1;
             } else {
@@ -376,6 +377,9 @@ impl<T> Pool<T> {
             }
         }
         self.live = self.objects.len();
+    }
+    pub fn update_current_white(&self, cw: u8) {
+        self.current_white.set(cw);
     }
 }
 impl<T> Default for Pool<T> {
@@ -822,6 +826,14 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
             heap.gc_sweep_pool = done;
             if done >= 6 {
                 heap.current_white ^= 1;
+                let cw = heap.current_white;
+                heap.strings.update_current_white(cw);
+                heap.tables.update_current_white(cw);
+                heap.funcs.update_current_white(cw);
+                heap.protos.update_current_white(cw);
+                heap.upvals.update_current_white(cw);
+                heap.threads.update_current_white(cw);
+                heap.cdatas.update_current_white(cw);
                 heap.gc_state = GcState::Pause;
                 let mut total = 0usize;
                 for t in heap.tables.iter() {
@@ -903,6 +915,14 @@ pub fn full_gc(g: &mut GlobalState) {
     g.heap.upvals.sweep_tricolor(cw, |_| {});
     g.heap.protos.sweep_tricolor(cw, |_| {});
     g.heap.current_white ^= 1;
+    let ncw = g.heap.current_white;
+    g.heap.strings.update_current_white(ncw);
+    g.heap.tables.update_current_white(ncw);
+    g.heap.funcs.update_current_white(ncw);
+    g.heap.protos.update_current_white(ncw);
+    g.heap.upvals.update_current_white(ncw);
+    g.heap.threads.update_current_white(ncw);
+    g.heap.cdatas.update_current_white(ncw);
     let mut total = 0usize;
     for t in g.heap.tables.iter() {
         total += t.gc_size();
