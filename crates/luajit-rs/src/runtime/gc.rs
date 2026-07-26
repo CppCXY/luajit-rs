@@ -1,9 +1,83 @@
 use std::cell::Cell;
 use std::ptr::NonNull;
 
+// ── Re-export generational GC types ────────────────────────────────────
+pub use super::gc_gen::header::{Age, GcObjectKind};
+
 #[repr(C)]
-struct GcHeader {
-    marked: Cell<bool>,
+pub struct GcHeader {
+    /// Old `marked` flag — kept for backward compat during sweep.
+    /// true = alive, false = dead (to be swept).
+    pub(crate) marked: Cell<bool>,
+    /// Age (3 bits) + tri-color (WHITE0/WHITE1/BLACK, 3 bits) + reserved.
+    pub(crate) bits: Cell<u8>,
+    /// Object type tag for deallocation.
+    pub(crate) kind: u8,
+    _pad: [u8; 2],
+    /// Position in the owning GcList (for O(1) swap-remove).
+    pub(crate) index: Cell<u32>,
+    /// Allocation-time size estimate for GC pacing.
+    pub(crate) alloc_size: Cell<u32>,
+}
+
+// ── Backward-compatible color/age helpers on GcHeader ──────────────────
+
+const BIT_WHITE0: u8 = 0b0000_1000;
+const BIT_WHITE1: u8 = 0b0001_0000;
+const BIT_BLACK:  u8 = 0b0010_0000;
+const COLOR_MASK: u8 = BIT_WHITE0 | BIT_WHITE1 | BIT_BLACK;
+const AGE_MASK:   u8 = 0b0000_0111;
+
+impl GcHeader {
+    pub fn new(current_white: u8, kind: GcObjectKind, size: u32) -> Self {
+        let c = if current_white == 0 { BIT_WHITE0 } else { BIT_WHITE1 };
+        Self {
+            marked: Cell::new(true),
+            bits: Cell::new(c),
+            kind: kind as u8,
+            _pad: [0; 2],
+            index: Cell::new(0),
+            alloc_size: Cell::new(size),
+        }
+    }
+
+    fn rb(&self) -> u8 { self.bits.get() }
+    fn wb(&self, v: u8) { self.bits.set(v); }
+
+    pub fn is_white(&self) -> bool {
+        (self.rb() & COLOR_MASK) != BIT_BLACK && (self.rb() & COLOR_MASK) != 0
+    }
+    pub fn is_black(&self) -> bool { (self.rb() & BIT_BLACK) != 0 }
+    pub fn change_white(&self) {
+        let b = self.rb();
+        if b & BIT_WHITE0 != 0 {
+            self.wb((b & !BIT_WHITE0) | BIT_WHITE1);
+        } else {
+            self.wb((b & !BIT_WHITE1) | BIT_WHITE0);
+        }
+    }
+    pub fn nw2black(&self) { self.wb((self.rb() & !COLOR_MASK) | BIT_BLACK); }
+    pub fn make_gray(&self) { self.wb(self.rb() & !COLOR_MASK); }
+    pub fn is_dead(&self, current_white: u8) -> bool {
+        if current_white == 0 { self.rb() & BIT_WHITE1 != 0 }
+        else { self.rb() & BIT_WHITE0 != 0 }
+    }
+    pub fn otherwhite(current_white: u8) -> u8 {
+        if current_white == 0 { BIT_WHITE1 } else { BIT_WHITE0 }
+    }
+
+    pub fn age(&self) -> Age {
+        match self.rb() & AGE_MASK {
+            0 => Age::New, 1 => Age::Survival, 2 => Age::Old0,
+            3 => Age::Old1, 4 => Age::Old, 5 => Age::Touched1,
+            6 => Age::Touched2, _ => Age::Old,
+        }
+    }
+    pub fn set_age(&self, a: Age) { self.wb((self.rb() & !AGE_MASK) | (a as u8)); }
+    pub fn is_old(&self) -> bool { self.age().is_old() }
+    pub fn kind_tag(&self) -> GcObjectKind {
+        GcObjectKind::from_u8(self.kind).unwrap_or(GcObjectKind::Table)
+    }
 }
 
 // ── Low-address allocator ───────────────────────────────────────────────
@@ -164,16 +238,14 @@ mod lowmem {
     }
 }
 
-fn alloc_block<T>(v: T) -> (NonNull<T>, bool) {
+fn alloc_block<T>(v: T, kind: GcObjectKind, alloc_size: u32) -> (NonNull<T>, bool) {
     let (layout, data_offset) = std::alloc::Layout::new::<GcHeader>()
         .extend(std::alloc::Layout::new::<T>())
         .unwrap();
     let layout = layout.pad_to_align();
     let (raw, mapped) = lowmem::alloc(layout);
     unsafe {
-        (raw.as_ptr() as *mut GcHeader).write(GcHeader {
-            marked: Cell::new(true), // allocated = live
-        });
+        (raw.as_ptr() as *mut GcHeader).write(GcHeader::new(0, kind, alloc_size));
     }
     let dp = unsafe { raw.as_ptr().add(data_offset) as *mut T };
     unsafe { dp.write(v) };
@@ -199,7 +271,7 @@ fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
         static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
         let p = DUMMY.load(std::sync::atomic::Ordering::Relaxed);
         if p.is_null() {
-            let b = Box::new(GcHeader { marked: Cell::new(false) });
+            let b = Box::new(GcHeader::new(0, GcObjectKind::Table, 0));
             let leaked = Box::leak(b) as *mut GcHeader;
             DUMMY.store(leaked, std::sync::atomic::Ordering::Relaxed);
             return unsafe { &*leaked };
@@ -220,20 +292,17 @@ pub struct Pool<T> {
     objects: Vec<NonNull<T>>,
     mapped: Vec<bool>,
     live: usize,
+    kind: GcObjectKind,
 }
 impl<T> Pool<T> {
     pub fn with_page_size(_: usize) -> Self {
-        Self {
-            objects: Vec::new(),
-            mapped: Vec::new(),
-            live: 0,
-        }
+        Self::new(GcObjectKind::Table)
     }
-    pub fn new() -> Self {
-        Self::with_page_size(0)
+    pub fn new(kind: GcObjectKind) -> Self {
+        Self { objects: Vec::new(), mapped: Vec::new(), live: 0, kind }
     }
     pub fn alloc(&mut self, v: T) -> GcPtr<T> {
-        let (nn, m) = alloc_block(v);
+        let (nn, m) = alloc_block(v, self.kind, std::mem::size_of::<T>() as u32);
         self.objects.push(nn);
         self.mapped.push(m);
         self.live += 1;
@@ -257,6 +326,7 @@ impl<T> Pool<T> {
         self.objects.iter().map(|nn| unsafe { nn.as_ref() })
     }
     pub fn sweep(&mut self, mut on_free: impl FnMut(&T)) {
+        // Old marked-only sweep (backward compat).
         let mut i = 0;
         while i < self.objects.len() {
             let ptr = self.objects[i];
@@ -279,10 +349,40 @@ impl<T> Pool<T> {
         }
         self.live = self.objects.len();
     }
+    /// Tri-color sweep: uses current_white to decide alive/dead.
+    /// Surviving objects get change_white() and marked.set(false).
+    pub fn sweep_tricolor(&mut self, current_white: u8, mut on_free: impl FnMut(&T)) {
+        let other_white = GcHeader::otherwhite(current_white);
+        let mut i = 0;
+        while i < self.objects.len() {
+            let ptr = self.objects[i];
+            let addr = ptr.as_ptr() as usize;
+            if addr <= 0x1000 || addr >= (1usize << 47) {
+                eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
+                self.objects.swap_remove(i);
+                continue;
+            }
+            let h = gc_header(ptr);
+            // Conservative: keep alive if EITHER old marked says so OR tri-color says so.
+            let alive = h.marked.get() || !h.is_dead(other_white);
+            if alive {
+                h.change_white();
+                h.marked.set(false);
+                i += 1;
+            } else {
+                unsafe { on_free(ptr.as_ref()); }
+                unsafe { ptr.as_ptr().drop_in_place(); }
+                dealloc_block(ptr, self.mapped[i]);
+                self.objects.swap_remove(i);
+                self.mapped.swap_remove(i);
+            }
+        }
+        self.live = self.objects.len();
+    }
 }
 impl<T> Default for Pool<T> {
     fn default() -> Self {
-        Self::new()
+        Self::new(GcObjectKind::Table)
     }
 }
 impl<T> Drop for Pool<T> {
@@ -323,7 +423,10 @@ impl<T> GcPtr<T> {
     }
 
     pub fn set_marked(self) {
-        gc_header(self.0).marked.set(true)
+        let h = gc_header(self.0);
+        h.marked.set(true);
+        // Also mark in tri-color bits (may crash if bits is at wrong offset)
+        h.nw2black();
     }
 }
 
@@ -693,15 +796,15 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                     1
                 }
                 1 => {
-                    heap.tables.sweep(|_| {});
+                    heap.tables.sweep_tricolor(heap.current_white, |_| {});
                     2
                 }
                 2 => {
-                    heap.funcs.sweep(|_| {});
+                    heap.funcs.sweep_tricolor(heap.current_white, |_| {});
                     3
                 }
                 3 => {
-                    heap.threads.sweep(|th| {
+                    heap.threads.sweep_tricolor(heap.current_white, |th| {
                         for &uv in &th.openuv {
                             uv.as_mut().close();
                         }
@@ -709,17 +812,18 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                     4
                 }
                 4 => {
-                    heap.upvals.sweep(|_| {});
+                    heap.upvals.sweep_tricolor(heap.current_white, |_| {});
                     5
                 }
                 5 => {
-                    heap.protos.sweep(|_| {});
+                    heap.protos.sweep_tricolor(heap.current_white, |_| {});
                     6
                 }
                 _ => 6,
             };
             heap.gc_sweep_pool = done;
             if done >= 6 {
+                heap.current_white ^= 1;
                 heap.gc_state = GcState::Pause;
                 let mut total = 0usize;
                 for t in heap.tables.iter() {
@@ -789,16 +893,18 @@ pub fn full_gc(g: &mut GlobalState) {
         }
     }
     m.propagate();
+    let cw = g.heap.current_white;
     g.heap.strings.sweep();
-    g.heap.tables.sweep(|_| {});
-    g.heap.funcs.sweep(|_| {});
-    g.heap.threads.sweep(|th| {
+    g.heap.tables.sweep_tricolor(cw, |_| {});
+    g.heap.funcs.sweep_tricolor(cw, |_| {});
+    g.heap.threads.sweep_tricolor(cw, |th| {
         for &uv in &th.openuv {
             uv.as_mut().close();
         }
     });
-    g.heap.upvals.sweep(|_| {});
-    g.heap.protos.sweep(|_| {});
+    g.heap.upvals.sweep_tricolor(cw, |_| {});
+    g.heap.protos.sweep_tricolor(cw, |_| {});
+    g.heap.current_white ^= 1;
     let mut total = 0usize;
     for t in g.heap.tables.iter() {
         total += t.gc_size();
@@ -836,7 +942,7 @@ mod tests {
     use super::*;
     #[test]
     fn alloc_addresses_are_stable_across_growth() {
-        let mut p: Pool<u64> = Pool::new();
+        let mut p: Pool<u64> = Pool::new(GcObjectKind::Table);
         let f = p.alloc(42);
         let a = f.addr();
         for i in 0..10000u64 {
@@ -847,7 +953,7 @@ mod tests {
     }
     #[test]
     fn free_slots_are_reused() {
-        let mut p: Pool<String> = Pool::new();
+        let mut p: Pool<String> = Pool::new(GcObjectKind::String);
         let a = p.alloc("a".into());
         p.free(a);
         assert_eq!(p.len(), 0);
@@ -857,7 +963,7 @@ mod tests {
     }
     #[test]
     fn iter_visits_only_live() {
-        let mut p: Pool<u32> = Pool::new();
+        let mut p: Pool<u32> = Pool::new(GcObjectKind::Table);
         let a = p.alloc(1);
         p.alloc(2);
         p.free(a);

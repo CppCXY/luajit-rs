@@ -92,7 +92,7 @@ impl Interner {
             ndead: 0,
             by_id: Vec::new(),
             free_ids: Vec::new(),
-            pool: crate::gc::Pool::new(),
+            pool: crate::gc::Pool::new(crate::gc::GcObjectKind::String),
             hasher: RandomState::with_seeds(
                 0x243f_6a88_85a3_08d3,
                 0x1319_8a2e_0370_7344,

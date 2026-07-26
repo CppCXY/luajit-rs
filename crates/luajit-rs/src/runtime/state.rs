@@ -1,7 +1,7 @@
 use std::ptr::NonNull;
 
 use crate::func::{CClosure, CFunction, GcFunc, LuaClosure};
-use crate::gc::{GcPtr, Pool};
+use crate::gc::{GcPtr, Pool, GcObjectKind};
 use crate::proto::Proto;
 use crate::string::{Interner, StrId};
 use crate::table::LuaTable;
@@ -36,18 +36,20 @@ pub struct GcHeap {
     pub gc_gray: Vec<crate::gc::Gray>,
     pub gc_sweep_pool: u8,
     pub gc_step_size: usize,
+    /// Tri-color white bit (0 or 1), flips each GC cycle.
+    pub current_white: u8,
 }
 
 impl Default for GcHeap {
     fn default() -> GcHeap {
         GcHeap {
             strings: Interner::default(),
-            protos: Pool::with_page_size(16),
-            tables: Pool::with_page_size(64),
-            funcs: Pool::with_page_size(64),
-            upvals: Pool::with_page_size(128),
-            cdatas: Pool::with_page_size(32),
-            threads: Pool::with_page_size(4),
+            protos: Pool::new(GcObjectKind::Proto),
+            tables: Pool::new(GcObjectKind::Table),
+            funcs: Pool::new(GcObjectKind::Func),
+            upvals: Pool::new(GcObjectKind::Upval),
+            cdatas: Pool::new(GcObjectKind::CData),
+            threads: Pool::new(GcObjectKind::Thread),
             total: 0,
             threshold: crate::gc::GC_THRESHOLD_MIN,
             table_extra: 0,
@@ -56,6 +58,7 @@ impl Default for GcHeap {
             gc_gray: Vec::new(),
             gc_sweep_pool: 0,
             gc_step_size: crate::gc::GC_STEP_SIZE,
+            current_white: 0,
         }
     }
 }
