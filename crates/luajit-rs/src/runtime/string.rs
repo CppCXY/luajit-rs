@@ -240,7 +240,7 @@ impl Interner {
         unsafe { std::slice::from_raw_parts(self.get(id).as_ptr(), self.get(id).len()) }
     }
 
-    pub(crate) fn sweep(&mut self) {
+    pub(crate) fn sweep(&mut self, current_white: u8) {
         let by_id = &mut self.by_id;
         // Pin any string with empty bytes ("") by marking it before sweep.
         // The sentinel must survive all GC cycles.
@@ -252,7 +252,7 @@ impl Interner {
                 }
             }
         }
-        self.pool.sweep(|s| {
+        self.pool.sweep_tricolor(current_white, |s| {
             let hash = s.hash();
             let bytes = s.as_bytes();
             let mask = self.slots.len() - 1;

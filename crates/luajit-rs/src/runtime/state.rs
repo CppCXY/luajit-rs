@@ -318,6 +318,15 @@ pub enum Suspend {
     Return { base: usize, slot: usize },
 }
 
+impl Suspend {
+    pub fn call_cl(&self) -> Option<GcPtr<GcFunc>> {
+        match self {
+            Suspend::Call { cl, .. } => Some(*cl),
+            _ => None,
+        }
+    }
+}
+
 /// A Lua execution thread, corresponding to LuaJIT's `lua_State`.
 ///
 /// Owns its value stack and open-upvalue list, and holds a back-pointer to

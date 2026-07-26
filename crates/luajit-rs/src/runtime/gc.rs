@@ -262,12 +262,13 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
         .unwrap();
     let layout = layout.pad_to_align();
     let ap = unsafe { (data.as_ptr() as *mut u8).sub(data_offset) };
+    debug_assert!(unsafe { (*(ap as *const GcHeader)).kind <= 7 },
+        "dealloc_block: corrupt kind T={}", std::any::type_name::<T>());
     unsafe { lowmem::dealloc(NonNull::new_unchecked(ap), layout, mapped) };
 }
 fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
     let addr = ptr.as_ptr() as usize;
     if addr < 0x1000 || addr >= (1usize << 47) {
-        // Return a dummy header. The VM is single-threaded so this is safe.
         static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
         let p = DUMMY.load(std::sync::atomic::Ordering::Relaxed);
         if p.is_null() {
@@ -282,8 +283,10 @@ fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
         .extend(std::alloc::Layout::new::<T>())
         .unwrap();
     unsafe {
-        let p = (ptr.as_ptr() as *const u8).sub(data_offset);
-        &*(p as *const GcHeader)
+        let p = (ptr.as_ptr() as *const u8).sub(data_offset) as *const GcHeader;
+        let h = &*p;
+        debug_assert!(h.kind <= 7, "gc_header: corrupt kind={} T={}", h.kind, std::any::type_name::<T>());
+        h
     }
 }
 
@@ -366,9 +369,12 @@ impl<T> Pool<T> {
                 continue;
             }
             let h = gc_header(ptr);
-            let alive = h.marked.get() || !h.is_dead(current_white);
+            let was_marked = h.marked.get();
+            let alive = was_marked || !h.is_dead(current_white);
             if alive {
-                h.change_white();
+                if was_marked {
+                    h.change_white();
+                }
                 h.marked.set(false);
                 i += 1;
             } else {
@@ -604,6 +610,9 @@ impl<'g> Marker<'g> {
                     for &uv in &l.openuv {
                         self.mark_upval(uv);
                     }
+                    if let Some(cl) = l.suspend.call_cl() {
+                        cl.set_marked();
+                    }
                     for s in l.stack[l.top..].iter_mut() {
                         *s = LuaValue::NIL;
                     }
@@ -671,6 +680,9 @@ impl<'g> Marker<'g> {
                     self.mark_value(l.errval);
                     for &uv in &l.openuv {
                         self.mark_upval(uv);
+                    }
+                    if let Some(cl) = l.suspend.call_cl() {
+                        cl.set_marked();
                     }
                     for s in l.stack[l.top..].iter_mut() {
                         *s = LuaValue::NIL;
@@ -797,7 +809,7 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
             // Sweep one pool per step for fairness.
             let done = match heap.gc_sweep_pool {
                 0 => {
-                    heap.strings.sweep();
+                    heap.strings.sweep(heap.current_white);
                     1
                 }
                 1 => {
@@ -906,8 +918,11 @@ pub fn full_gc(g: &mut GlobalState) {
         }
     }
     m.propagate();
+    debug_assert!(g.globals.is_marked(), "globals not marked after propagate");
+    debug_assert!(g.registry.is_marked(), "registry not marked after propagate");
+    debug_assert!(g.main().is_marked(), "main thread not marked after propagate");
     let cw = g.heap.current_white;
-    g.heap.strings.sweep();
+    g.heap.strings.sweep(cw);
     g.heap.tables.sweep_tricolor(cw, |_| {});
     g.heap.funcs.sweep_tricolor(cw, |_| {});
     g.heap.threads.sweep_tricolor(cw, |th| {
