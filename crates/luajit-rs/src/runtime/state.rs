@@ -81,6 +81,15 @@ impl GcHeap {
         self.tables.alloc(t)
     }
 
+    /// JIT-safe alloc: track the size but skip the incremental GC step.
+    /// The trace is responsible for its own GCSTEP guard.
+    pub fn alloc_table_jit(&mut self, mut t: LuaTable) -> GcPtr<LuaTable> {
+        t.table_extra = &mut self.table_extra as *mut usize;
+        t.heap = self as *const GcHeap;
+        self.total += t.gc_size();
+        self.tables.alloc(t)
+    }
+
     pub fn alloc_proto(&mut self, p: Proto) -> GcPtr<Proto> {
         self.total += p.gc_size();
         self.account_alloc(p.gc_size());

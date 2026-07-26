@@ -935,7 +935,7 @@ pub extern "C" fn jit_str_char(c_bits: u64) -> u64 {
 
 /// BC_TNEW: a fresh empty table (the interpreter ignores the size hint).
 pub extern "C" fn jit_tnew() -> u64 {
-    let t = jit_heap().alloc_table(crate::table::LuaTable::new(0, 0));
+    let t = jit_heap().alloc_table_jit(crate::table::LuaTable::new(0, 0));
     LuaValue::table(t).to_bits()
 }
 
@@ -943,7 +943,7 @@ pub extern "C" fn jit_tnew() -> u64 {
 /// of the prototype's KGc template (stable: Box or pool).
 pub extern "C" fn jit_tdup(templ_addr: u64) -> u64 {
     let templ = unsafe { &*(templ_addr as usize as *const crate::table::LuaTable) };
-    let t = jit_heap().alloc_table(templ.dup());
+    let t = jit_heap().alloc_table_jit(templ.dup());
     LuaValue::table(t).to_bits()
 }
 
