@@ -69,39 +69,62 @@ fn handle_fd(l: &LuaState, i: usize) -> Option<usize> {
 /// Build a file-handle table for a registered file id.
 fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
     let t = l.heap().alloc_table(LuaTable::new(0, 3));
-    let entries: [(&[u8], crate::func::CFunction); 4] = [
-        (b"read", handle_read),
-        (b"write", handle_write),
-        (b"lines", handle_lines),
-        (b"close", handle_close),
-    ];
+    let fd_val = LuaValue::number(id as f64);
     let env = l.global().globals;
-    for (name, f) in entries {
-        let sid = l.heap().intern(name);
-        let k = l.heap().str_value(sid);
-        let fref = l.heap().alloc_func(GcFunc::C(CClosure {
-            f,
-            env,
-            upvals: Vec::new(),
-        }));
-        t.as_mut().set(k, LuaValue::func(fref));
+    macro_rules! bind {
+        ($name:expr, $f:ident) => {{
+            let sid = l.heap().intern($name);
+            let k = l.heap().str_value(sid);
+            let fref = l.heap().alloc_func(GcFunc::C(CClosure {
+                f: $f,
+                env,
+                upvals: vec![fd_val],
+            }));
+            t.as_mut().set(k, LuaValue::func(fref));
+        }};
     }
+    bind!(b"read", handle_read_fd);
+    bind!(b"write", handle_write_fd);
+    bind!(b"lines", handle_lines_fd);
+    bind!(b"close", handle_close_fd);
+
+    // Keep __fd key for tostring/debugging compatibility.
     let fd_sid = l.heap().intern(b"__fd");
     let fd_k = l.heap().str_value(fd_sid);
-    t.as_mut().set(fd_k, LuaValue::number(id as f64));
+    t.as_mut().set(fd_k, fd_val);
 
-    // Set __tostring metatable so the handle can be printed.
+    // Anchor on Lua stack before metatable alloc may trigger GC.
+    push(l, LuaValue::table(t));
+
     let mt = l.heap().alloc_table(LuaTable::new(0, 2));
     let ts_ref = l.heap().alloc_func(GcFunc::C(CClosure {
         f: handle_tostring,
         env,
-        upvals: Vec::new(),
+        upvals: vec![fd_val],
     }));
     let ts_key = l.heap().str_value(l.heap().intern(b"__tostring"));
     mt.as_mut().set(ts_key, LuaValue::func(ts_ref));
     t.as_mut().metatable = Some(mt);
 
+    l.top -= 1; // pop anchor
     LuaValue::table(t)
+}
+
+fn fd_from_upval(l: &LuaState) -> usize {
+    l.upvalue(0).as_number().unwrap_or(-1.0) as usize
+}
+fn handle_read_fd(l: &mut LuaState) -> LuaResult<i32> { do_read(l, Some(fd_from_upval(l)), 1) }
+fn handle_write_fd(l: &mut LuaState) -> LuaResult<i32> { do_write(l, Some(fd_from_upval(l)), 1) }
+fn handle_lines_fd(l: &mut LuaState) -> LuaResult<i32> {
+    let it = make_lines_iter(l, fd_from_upval(l));
+    push(l, it);
+    Ok(1)
+}
+fn handle_close_fd(l: &mut LuaState) -> LuaResult<i32> {
+    let fd = fd_from_upval(l);
+    if let Some(slot) = FILES.lock().unwrap().get_mut(fd) { *slot = None; }
+    push(l, LuaValue::TRUE);
+    Ok(1)
 }
 
 fn handle_tostring(l: &mut LuaState) -> LuaResult<i32> {

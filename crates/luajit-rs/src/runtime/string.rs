@@ -2,7 +2,7 @@ use ahash::RandomState;
 
 pub type StrId = u32;
 
-const INLINE_CAP: usize = 22;
+const INLINE_CAP: usize = 40;
 
 enum Repr {
     Inline { len: u8, buf: [u8; INLINE_CAP] },

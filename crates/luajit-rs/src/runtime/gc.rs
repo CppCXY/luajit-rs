@@ -4,7 +4,6 @@ use std::ptr::NonNull;
 #[repr(C)]
 struct GcHeader {
     marked: Cell<bool>,
-    freed: Cell<bool>,
 }
 
 // ── Low-address allocator ───────────────────────────────────────────────
@@ -173,8 +172,7 @@ fn alloc_block<T>(v: T) -> (NonNull<T>, bool) {
     let (raw, mapped) = lowmem::alloc(layout);
     unsafe {
         (raw.as_ptr() as *mut GcHeader).write(GcHeader {
-            marked: Cell::new(false),
-            freed: Cell::new(false),
+            marked: Cell::new(true), // allocated = live
         });
     }
     let dp = unsafe { raw.as_ptr().add(data_offset) as *mut T };
@@ -201,7 +199,7 @@ fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
         static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
         let p = DUMMY.load(std::sync::atomic::Ordering::Relaxed);
         if p.is_null() {
-            let b = Box::new(GcHeader { marked: Cell::new(false), freed: Cell::new(false) });
+            let b = Box::new(GcHeader { marked: Cell::new(false) });
             let leaked = Box::leak(b) as *mut GcHeader;
             DUMMY.store(leaked, std::sync::atomic::Ordering::Relaxed);
             return unsafe { &*leaked };
@@ -273,7 +271,6 @@ impl<T> Pool<T> {
                 i += 1;
             } else {
                 unsafe { on_free(ptr.as_ref()); }
-                gc_header(ptr).freed.set(true);
                 unsafe { ptr.as_ptr().drop_in_place(); }
                 dealloc_block(ptr, self.mapped[i]);
                 self.objects.swap_remove(i);
@@ -314,16 +311,10 @@ impl<T> GcPtr<T> {
     
 
     pub fn as_ref<'a>(self) -> &'a T {
-        if gc_header(self.0).freed.get() {
-            eprintln!("USE-AFTER-FREE: GcPtr::as_ref on freed object at {:p}", self.0.as_ptr());
-        }
         unsafe { &*self.0.as_ptr() }
     }
 
     pub fn as_mut<'a>(self) -> &'a mut T {
-        if gc_header(self.0).freed.get() {
-            eprintln!("USE-AFTER-FREE: GcPtr::as_mut on freed object at {:p}", self.0.as_ptr());
-        }
         unsafe { &mut *self.0.as_ptr() }
     }
 
@@ -451,6 +442,22 @@ impl<'g> Marker<'g> {
             self.mark_value(uv.as_ref().get());
         }
     }
+    fn mark_kgc_slice(this: &mut Self, kgc: &[KGc]) {
+        for k in kgc {
+            match k {
+                KGc::Str(sid) => {
+                    if let Some(ptr) = this.strings.try_lookup(*sid) {
+                        ptr.set_marked();
+                    }
+                }
+                KGc::ProtoRef(c) => this.mark_proto(*c),
+                KGc::Table(t) => t.gc_traverse(|v| this.mark_value(v)),
+                KGc::TableRef(t) => t.as_ref().gc_traverse(|v| this.mark_value(v)),
+                KGc::Proto(child) => Self::mark_kgc_slice(this, &child.kgc),
+                KGc::CData(_) => {}
+            }
+        }
+    }
     fn propagate(&mut self) {
         while let Some(g) = self.gray.pop() {
             match g {
@@ -478,18 +485,7 @@ impl<'g> Marker<'g> {
                         ptr.set_marked();
                     }
                     for k in &pt.kgc {
-                        match k {
-                            KGc::Str(sid) => {
-                                if let Some(ptr) = self.strings.try_lookup(*sid) {
-                                    ptr.set_marked();
-                                }
-                            }
-                            KGc::ProtoRef(c) => self.mark_proto(*c),
-                            KGc::Table(t) => t.gc_traverse(|v| self.mark_value(v)),
-                            KGc::TableRef(t) => t.as_ref().gc_traverse(|v| self.mark_value(v)),
-                            KGc::Proto(_) => unreachable!(),
-                            KGc::CData(_) => {}
-                        }
+                        Self::mark_kgc_slice(self, std::slice::from_ref(k));
                     }
                 }
                 Gray::Thread(th) => {
