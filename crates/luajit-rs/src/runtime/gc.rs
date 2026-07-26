@@ -352,7 +352,6 @@ impl<T> Pool<T> {
     /// Tri-color sweep: uses current_white to decide alive/dead.
     /// Surviving objects get change_white() and marked.set(false).
     pub fn sweep_tricolor(&mut self, current_white: u8, mut on_free: impl FnMut(&T)) {
-        let other_white = GcHeader::otherwhite(current_white);
         let mut i = 0;
         while i < self.objects.len() {
             let ptr = self.objects[i];
@@ -363,8 +362,7 @@ impl<T> Pool<T> {
                 continue;
             }
             let h = gc_header(ptr);
-            // Conservative: keep alive if EITHER old marked says so OR tri-color says so.
-            let alive = h.marked.get() || !h.is_dead(other_white);
+            let alive = h.marked.get() || !h.is_dead(current_white);
             if alive {
                 h.change_white();
                 h.marked.set(false);
