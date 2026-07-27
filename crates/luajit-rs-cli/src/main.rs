@@ -13,10 +13,10 @@
 //!   -          Execute stdin (non-interactive)
 
 use std::io::{self, BufRead, IsTerminal, Read, Write};
-use std::path::Path;
 use std::process::exit;
 
-use luajit_rs::state::Lua;
+use luajit_rs::api::{self, Lua};
+use luajit_rs::internal;
 
 const LUA_PROMPT: &str = "> ";
 const LUA_PROMPT2: &str = ">> ";
@@ -89,14 +89,12 @@ fn collectargs(argv: &[String]) -> Result<Args, String> {
     })
 }
 
-fn create_arg_table(l: &mut luajit_rs::state::LuaState, args: &[String], argn: usize) {
+fn create_arg_table(l: &mut internal::LuaState, args: &[String], argn: usize) {
     let g = l.global();
     let script_idx = argn.min(args.len().saturating_sub(1));
     let total = args.len() - script_idx;
-    let t = g
-        .heap
-        .alloc_table(luajit_rs::runtime::table::LuaTable::new(0, 1));
-    use luajit_rs::value::LuaValue;
+    let t = g.heap.alloc_table(internal::LuaTable::new(0, 1));
+    use luajit_rs::api::LuaValue;
     if script_idx < args.len() {
         let name = args[script_idx].as_str();
         let sid = g.heap.intern(name.as_bytes());
@@ -143,20 +141,19 @@ fn incomplete(err: &str) -> bool {
     err.contains("<eof>")
 }
 
-fn loadline(lua: &mut luajit_rs::state::Lua) -> Result<Option<String>, String> {
-    let ll = lua.main();
+fn loadline(ll: &mut internal::LuaState) -> Result<Option<Vec<u8>>, String> {
     let first = match pushline(LUA_PROMPT) {
         Some(s) => s,
         None => return Ok(None),
     };
     let mut buf = if let Some(rest) = first.strip_prefix('=') {
-        format!("return {}", rest)
+        format!("return {rest}")
     } else {
         first
     };
     loop {
-        match luajit_rs::state::load(ll, buf.as_bytes().to_vec(), "=stdin") {
-            Ok(_) => return Ok(Some(buf)),
+        match internal::state::load(ll, buf.as_bytes().to_vec(), "=stdin") {
+            Ok(_) => return Ok(Some(buf.into_bytes())),
             Err(e) if incomplete(&e) => match pushline(LUA_PROMPT2) {
                 Some(line) => {
                     buf.push('\n');
@@ -169,39 +166,38 @@ fn loadline(lua: &mut luajit_rs::state::Lua) -> Result<Option<String>, String> {
     }
 }
 
-fn dotty(lua: &mut luajit_rs::state::Lua) -> i32 {
-    while let Ok(Some(chunk)) = loadline(lua) {
-        let ll = lua.main();
-        let f = match luajit_rs::state::load(ll, chunk.as_bytes().to_vec(), "=stdin") {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("luajit-rs: {}", e);
-                continue;
-            }
-        };
-        match luajit_rs::vm::call(ll, f, &[]) {
-            Ok(results) => {
-                if !results.is_empty() {
-                    let key = ll.heap().str_value(ll.heap().intern(b"print"));
-                    let print_fn = ll.global().globals.as_ref().get_str(key);
+fn error_msg(ll: &internal::LuaState) -> String {
+    api::error_message(ll)
+}
+
+fn dotty(ll: &mut internal::LuaState) -> i32 {
+    while let Ok(Some(chunk)) = loadline(ll) {
+        if api::lual_loadstring(ll, &chunk).is_err() {
+            eprintln!("luajit-rs: compile error");
+            continue;
+        }
+        match api::lua_pcall(ll, 0, -1, 0) {
+            Ok(()) => {
+                let nresults = api::lua_gettop(ll);
+                if nresults > 0 {
+                    let g = ll.global();
+                    let print_sid = g.heap.intern(b"print");
+                    let key = g.heap.str_value(print_sid);
+                    let print_fn = g.globals.as_ref().get_str(key);
                     if print_fn.is_func() {
-                        let mut args: Vec<luajit_rs::value::LuaValue> =
-                            results.into_iter().collect();
+                        let mut args: Vec<internal::LuaValue> = (0..nresults)
+                            .map(|i| api::lua_peek(ll, (i + 1) as i32))
+                            .collect();
                         args.insert(0, print_fn);
-                        let _ = luajit_rs::vm::call(ll, args[0], &args[1..]);
+                        let _ = internal::call(ll, args[0], &args[1..]);
                     }
                 }
+                api::lua_settop(ll, 0);
             }
-            Err(luajit_rs::err::LuaError::Runtime) => {
-                let ev = ll.errval;
-                let msg = if let Some(sid) = ev.as_string_id() {
-                    String::from_utf8_lossy(ll.heap().strings.get(sid)).into_owned()
-                } else {
-                    format!("{:?}", ev)
-                };
-                eprintln!("luajit-rs: {}", msg);
+            Err(internal::LuaError::Runtime) => {
+                eprintln!("luajit-rs: {}", error_msg(ll));
             }
-            Err(luajit_rs::err::LuaError::Yield) => {
+            Err(internal::LuaError::Yield) => {
                 eprintln!("luajit-rs: attempt to yield from outside a coroutine");
             }
         }
@@ -210,74 +206,52 @@ fn dotty(lua: &mut luajit_rs::state::Lua) -> i32 {
     0
 }
 
-fn error_msg(ll: &luajit_rs::state::LuaState) -> String {
-    let ev = ll.errval;
-    if let Some(sid) = ev.as_string_id() {
-        String::from_utf8_lossy(ll.heap().strings.get(sid)).into_owned()
-    } else {
-        format!("{:?}", ev)
-    }
-}
-
-fn dofile(lua: &mut luajit_rs::state::Lua, name: &str) -> i32 {
-    let ll = lua.main();
+fn dofile(lua: &mut Lua, name: &str) -> i32 {
+    let ll = api::lua_main(lua);
     let src = match std::fs::read(name) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("luajit-rs: cannot open {}: {}", name, e);
+            eprintln!("luajit-rs: cannot open {name}: {e}");
             return 1;
         }
     };
-    let chunkname = format!(
-        "@{}",
-        std::path::absolute(Path::new(name))
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| name.to_string())
-    );
-    let f = match luajit_rs::state::load(ll, src, &chunkname) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("luajit-rs: {}", e);
-            return 1;
-        }
-    };
-    match luajit_rs::vm::call(ll, f, &[]) {
-        Ok(_) => 0,
-        Err(luajit_rs::err::LuaError::Runtime) => {
+    if api::lual_loadstring(ll, &src).is_err() {
+        eprintln!("luajit-rs: compile error in {name}");
+        return 1;
+    }
+    match api::lua_pcall(ll, 0, 0, 0) {
+        Ok(()) => 0,
+        Err(internal::LuaError::Runtime) => {
             eprintln!("luajit-rs: {}", error_msg(ll));
             1
         }
-        Err(luajit_rs::err::LuaError::Yield) => {
+        Err(internal::LuaError::Yield) => {
             eprintln!("luajit-rs: attempt to yield");
             1
         }
     }
 }
 
-fn dostring(lua: &mut luajit_rs::state::Lua, s: &str, name: &str) -> i32 {
-    let ll = lua.main();
-    let f = match luajit_rs::state::load(ll, s.as_bytes().to_vec(), name) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("luajit-rs: {}", e);
-            return 1;
-        }
-    };
-    match luajit_rs::vm::call(ll, f, &[]) {
-        Ok(_) => 0,
-        Err(luajit_rs::err::LuaError::Runtime) => {
+fn dostring(lua: &mut Lua, s: &str, name: &str) -> i32 {
+    let ll = api::lua_main(lua);
+    if api::lual_loadstring(ll, s.as_bytes()).is_err() {
+        eprintln!("luajit-rs: compile error in {name}");
+        return 1;
+    }
+    match api::lua_pcall(ll, 0, 0, 0) {
+        Ok(()) => 0,
+        Err(internal::LuaError::Runtime) => {
             eprintln!("luajit-rs: {}", error_msg(ll));
             1
         }
-        Err(luajit_rs::err::LuaError::Yield) => {
+        Err(internal::LuaError::Yield) => {
             eprintln!("luajit-rs: attempt to yield");
             1
         }
     }
 }
 
-fn run_args(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) -> i32 {
+fn run_args(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
     let mut i = 1;
     while i < argn {
         let a = argv[i].as_str();
@@ -303,25 +277,18 @@ fn run_args(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) -> i3
                     i += 1;
                     argv[i].as_str()
                 };
-                let ll = lua.main();
-                let require = ll
-                    .global()
-                    .globals
-                    .as_ref()
-                    .get_str(ll.heap().str_value(ll.heap().intern(b"require")));
-                if require.is_func() {
-                    let name_sid = ll.heap().intern(name.as_bytes());
-                    let name_v = ll.heap().str_value(name_sid);
-                    match luajit_rs::vm::call(ll, require, &[name_v]) {
-                        Ok(_) => {}
-                        Err(luajit_rs::err::LuaError::Runtime) => {
-                            eprintln!("luajit-rs: {}", error_msg(ll));
-                            return 1;
-                        }
-                        Err(luajit_rs::err::LuaError::Yield) => {
-                            eprintln!("luajit-rs: attempt to yield");
-                            return 1;
-                        }
+                let ll = api::lua_main(lua);
+                api::lua_getglobal(ll, "require");
+                api::lua_pushstring(ll, name.as_bytes());
+                match api::lua_pcall(ll, 1, 0, 0) {
+                    Ok(()) => {}
+                    Err(internal::LuaError::Runtime) => {
+                        eprintln!("luajit-rs: {}", error_msg(ll));
+                        return 1;
+                    }
+                    Err(internal::LuaError::Yield) => {
+                        eprintln!("luajit-rs: attempt to yield");
+                        return 1;
                     }
                 }
             }
@@ -333,8 +300,8 @@ fn run_args(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) -> i3
                     argv[i].as_str()
                 };
                 match cmd {
-                    "on" => lua.main().global().jit.set_on(true),
-                    "off" => lua.main().global().jit.set_on(false),
+                    "on" => api::lua_raw(lua).global().jit.set_on(true),
+                    "off" => api::lua_raw(lua).global().jit.set_on(false),
                     _ => {
                         eprintln!(
                             "luajit-rs: unknown luaJIT command or jit.* modules not installed"
@@ -376,9 +343,8 @@ fn install_crash_handler() {
         unsafe {
             let rec = &*(*ep).record;
             if rec.code != 0xC0000005 {
-                return 0; // EXCEPTION_CONTINUE_SEARCH
+                return 0;
             }
-            // CONTEXT.Rip is at offset 0xF8 on x64.
             let rip = *((*ep).context.add(0xF8) as *const u64);
             let rsp = *((*ep).context.add(0x98) as *const u64);
             let fault = if rec.num_params >= 2 { rec.info[1] } else { 0 };
@@ -398,7 +364,7 @@ fn install_crash_handler() {
     }
 }
 
-fn handle_script(lua: &mut luajit_rs::state::Lua, argv: &[String], argn: usize) -> i32 {
+fn handle_script(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
     if argn >= argv.len() {
         return 0;
     }
@@ -422,16 +388,15 @@ fn main() {
     let flags = match collectargs(&args) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("luajit-rs: {}", e);
+            eprintln!("luajit-rs: {e}");
             eprintln!("usage: {} [options] [script [args...]]", args[0]);
             exit(1);
         }
     };
 
-    let mut lua = Lua::new();
-    luajit_rs::open_libs(lua.main());
+    let mut lua = api::lual_newstate();
     if std::env::var("LUAJIT_RS_JIT").as_deref() == Ok("off") {
-        lua.global().jit.set_on(false);
+        api::lua_raw(&mut lua).global().jit.set_on(false);
     }
 
     if !flags.noenv
@@ -445,10 +410,10 @@ fn main() {
     }
 
     if flags.version && !flags.interactive {
-        println!("{}", VERSION);
+        println!("{VERSION}");
     }
 
-    create_arg_table(lua.main(), &args, flags.argn as usize);
+    create_arg_table(api::lua_main(&mut lua), &args, flags.argn as usize);
 
     if run_args(&mut lua, &args, flags.argn as usize) != 0 {
         exit(1);
@@ -463,13 +428,15 @@ fn main() {
 
     if flags.interactive {
         if flags.version {
-            println!("{}", VERSION);
+            println!("{VERSION}");
         }
-        dotty(&mut lua);
+        let ll = api::lua_main(&mut lua);
+        dotty(ll);
     } else if (flags.argn as usize) >= args.len() && !flags.exec && !flags.version {
         if stdin_is_tty() {
-            println!("{}", VERSION);
-            dotty(&mut lua);
+            println!("{VERSION}");
+            let ll = api::lua_main(&mut lua);
+            dotty(ll);
         } else {
             let mut src = Vec::new();
             if io::stdin().read_to_end(&mut src).is_err() {

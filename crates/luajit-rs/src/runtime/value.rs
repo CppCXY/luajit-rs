@@ -210,6 +210,22 @@ impl LuaValue {
         LuaValue::gcval(LJ_TCDATA, p.addr())
     }
 
+    pub fn is_userdata(self) -> bool {
+        self.itype() == LJ_TUDATA
+    }
+
+    pub fn as_userdata(self) -> Option<GcPtr<crate::runtime::userdata::GcUserData>> {
+        if self.is_userdata() {
+            GcPtr::from_addr(self.gc_addr())
+        } else {
+            None
+        }
+    }
+
+    pub fn userdata(p: GcPtr<crate::runtime::userdata::GcUserData>) -> LuaValue {
+        LuaValue::gcval(LJ_TUDATA, p.addr())
+    }
+
     /// `tvisgcv`: value references a GC object (string, table, function, ...).
     pub fn is_gcv(self) -> bool {
         (LJ_TISGCV..=LJ_TSTR).contains(&self.itype())
@@ -308,6 +324,8 @@ impl std::fmt::Debug for LuaValue {
             LJ_TSTR => write!(f, "str@{:#x}", self.gc_addr()),
             LJ_TTAB => write!(f, "table@{:#x}", self.gc_addr()),
             LJ_TFUNC => write!(f, "func@{:#x}", self.gc_addr()),
+            LJ_TCDATA => write!(f, "cdata@{:#x}", self.gc_addr()),
+            LJ_TUDATA => write!(f, "userdata@{:#x}", self.gc_addr()),
             _ => write!(f, "{}", f64::from_bits(self.0)),
         }
     }

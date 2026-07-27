@@ -7,4 +7,5 @@ pub mod proto;
 pub mod state;
 pub mod string;
 pub mod table;
+pub mod userdata;
 pub mod value;

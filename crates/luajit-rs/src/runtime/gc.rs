@@ -532,7 +532,7 @@ use crate::func::{GcFunc, Upval};
 use crate::proto::{KGc, Proto};
 use crate::state::{GcHeap, GlobalState, LuaState};
 use crate::table::LuaTable;
-use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LuaValue};
+use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LJ_TUDATA, LuaValue};
 
 pub(crate) const GC_PAUSE: usize = 200;
 pub(crate) const GC_THRESHOLD_MIN: usize = 64 * 1024;
@@ -551,6 +551,7 @@ pub enum Gray {
     Func(GcPtr<GcFunc>),
     Proto(GcPtr<Proto>),
     Thread(GcPtr<LuaState>),
+    UserData(GcPtr<crate::runtime::userdata::GcUserData>),
 }
 
 struct Marker<'g> {
@@ -587,6 +588,19 @@ impl<'g> Marker<'g> {
                 {
                     p.set_marked();
                     self.gray.push(Gray::Thread(p));
+                }
+            }
+            LJ_TUDATA => {
+                if let Some(p) = v.as_userdata()
+                    && !p.is_marked()
+                {
+                    p.set_marked();
+                    // Userdata itself holds no GC-reachable Lua objects
+                    // (the inner Box<dyn Any> is managed by Rust).
+                    // However, the metatable must be marked.
+                    if let Some(mt) = p.as_ref().metatable {
+                        self.mark_table(mt);
+                    }
                 }
             }
             _ => {}
@@ -677,6 +691,10 @@ impl<'g> Marker<'g> {
                         *s = LuaValue::NIL;
                     }
                 }
+                Gray::UserData(_) => {
+                    // inner Box<dyn Any> contains no Lua GC objects.
+                    // Metatable was already marked in mark_value.
+                }
             }
         }
     }
@@ -748,6 +766,7 @@ impl<'g> Marker<'g> {
                         *s = LuaValue::NIL;
                     }
                 }
+                Gray::UserData(_) => {}
             }
         }
         self.gray.is_empty()
@@ -801,6 +820,16 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
             {
                 p.set_marked();
                 heap.gc_gray.push(Gray::Thread(p));
+            }
+        }
+        LJ_TUDATA => {
+            if let Some(p) = val.as_userdata()
+                && !p.is_marked()
+            {
+                p.set_marked();
+                if let Some(mt) = p.as_ref().metatable {
+                    barrier_fwd(heap, LuaValue::table(mt));
+                }
             }
         }
         _ => {}
@@ -896,10 +925,14 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                     heap.protos.sweep_tricolor(heap.current_white, |_| {});
                     6
                 }
-                _ => 6,
+                6 => {
+                    heap.userdatas.sweep_tricolor(heap.current_white, |_| {});
+                    7
+                }
+                _ => 7,
             };
             heap.gc_sweep_pool = done;
-            if done >= 6 {
+            if done >= 7 {
                 heap.current_white ^= 1;
                 let cw = heap.current_white;
                 heap.strings.update_current_white(cw);
@@ -909,6 +942,7 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                 heap.upvals.update_current_white(cw);
                 heap.threads.update_current_white(cw);
                 heap.cdatas.update_current_white(cw);
+                heap.userdatas.update_current_white(cw);
                 heap.gc_state = GcState::Pause;
                 let mut total = 0usize;
                 for t in heap.tables.iter() {
@@ -998,6 +1032,7 @@ pub fn full_gc(g: &mut GlobalState) {
     });
     g.heap.upvals.sweep_tricolor(cw, |_| {});
     g.heap.protos.sweep_tricolor(cw, |_| {});
+    g.heap.userdatas.sweep_tricolor(cw, |_| {});
     g.heap.current_white ^= 1;
     let ncw = g.heap.current_white;
     g.heap.strings.update_current_white(ncw);
@@ -1007,6 +1042,7 @@ pub fn full_gc(g: &mut GlobalState) {
     g.heap.upvals.update_current_white(ncw);
     g.heap.threads.update_current_white(ncw);
     g.heap.cdatas.update_current_white(ncw);
+    g.heap.userdatas.update_current_white(ncw);
     let mut total = 0usize;
     for t in g.heap.tables.iter() {
         total += t.gc_size();

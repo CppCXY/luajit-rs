@@ -51,6 +51,7 @@ pub enum GcObjectKind {
     Thread = 4,
     Proto = 5,
     CData = 6,
+    UserData = 7,
 }
 
 impl GcObjectKind {
@@ -63,6 +64,7 @@ impl GcObjectKind {
             4 => Some(Self::Thread),
             5 => Some(Self::Proto),
             6 => Some(Self::CData),
+            7 => Some(Self::UserData),
             _ => None,
         }
     }

@@ -27,6 +27,7 @@ pub struct GcHeap {
     pub funcs: Pool<GcFunc>,
     pub upvals: Pool<crate::func::Upval>,
     pub cdatas: Pool<crate::runtime::cdata::CData>,
+    pub userdatas: Pool<crate::runtime::userdata::GcUserData>,
     pub threads: Pool<LuaState>,
     pub total: usize,
     pub threshold: usize,
@@ -49,6 +50,7 @@ impl Default for GcHeap {
             funcs: Pool::new(GcObjectKind::Func),
             upvals: Pool::new(GcObjectKind::Upval),
             cdatas: Pool::new(GcObjectKind::CData),
+            userdatas: Pool::new(GcObjectKind::UserData),
             threads: Pool::new(GcObjectKind::Thread),
             total: 0,
             threshold: crate::gc::GC_THRESHOLD_MIN,
@@ -139,6 +141,16 @@ impl GcHeap {
         self.total += size;
         self.account_alloc(size);
         self.cdatas.alloc(cd)
+    }
+
+    pub fn alloc_userdata(
+        &mut self,
+        ud: crate::runtime::userdata::GcUserData,
+    ) -> GcPtr<crate::runtime::userdata::GcUserData> {
+        let size = std::mem::size_of::<crate::runtime::userdata::GcUserData>();
+        self.total += size;
+        self.account_alloc(size);
+        self.userdatas.alloc(ud)
     }
 
     pub fn intern(&mut self, s: &[u8]) -> StrId {
