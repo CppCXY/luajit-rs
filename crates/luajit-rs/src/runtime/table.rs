@@ -711,14 +711,17 @@ impl LuaTable {
     }
 
     /// Grow the array part to cover integer keys up to `nasize`, per
-    /// `lj_tab_reasize`.
+    /// `lj_tab_reasize`. Rounds up to the next power of 2 so that
+    /// `asize` grows in steps (2, 4, 8, …), letting the JIT's ASTORE
+    /// fast path stay in effect for many iterations without a GC step.
     pub fn reasize(&mut self, nasize: u32) {
         let hbits = if self.hmask > 0 {
             fls(self.hmask) + 1
         } else {
             0
         };
-        self.resize(nasize + 1, hbits);
+        let asize = ((nasize + 1).next_power_of_two()).min(LJ_MAX_ASIZE);
+        self.resize(asize, hbits);
     }
 }
 
