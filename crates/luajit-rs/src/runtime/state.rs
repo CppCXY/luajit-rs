@@ -71,7 +71,12 @@ impl GcHeap {
         let live = self.total + self.strings.bytes() + self.table_extra;
         if live >= self.threshold {
             self.debt += size;
-            self.threshold = live + 16384; // Bump forward to avoid constant checks
+            // Bump the threshold proportionally so that a JIT trace that
+            // allocates rapidly (e.g. a table-append loop) doesn't trigger
+            // the GCSTEP guard again after a constant 16 KiB margin, which
+            // would be consumed immediately by the next few allocations.
+            self.threshold =
+                live + ((live * crate::gc::GC_PAUSE) / 100).max(16384);
         }
     }
 
@@ -92,6 +97,8 @@ impl GcHeap {
         t.heap = self as *const GcHeap;
         let size = t.gc_size();
         self.total += size;
+        // Advance the threshold so the GCSTEP guard does not fire
+        // immediately just because the live set grew a little.
         self.account_alloc(size);
         self.tables.alloc(t)
     }

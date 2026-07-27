@@ -474,7 +474,7 @@ use crate::state::{GcHeap, GlobalState, LuaState};
 use crate::table::LuaTable;
 use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LuaValue};
 
-const GC_PAUSE: usize = 200;
+pub(crate) const GC_PAUSE: usize = 200;
 pub(crate) const GC_THRESHOLD_MIN: usize = 64 * 1024;
 
 // Incremental GC state.
