@@ -18,8 +18,8 @@ use std::process::exit;
 use luajit_rs::internal::state::{Lua, load};
 use luajit_rs::internal::table::LuaTable;
 use luajit_rs::{
-    LuaError, LuaState, LuaValue, error_message, internal, lua_getglobal, lua_gettop, lua_main,
-    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring, lual_newstate,
+    LuaError, LuaState, LuaValue, internal, lua_error_message, lua_getglobal, lua_gettop,
+    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring,
 };
 
 const LUA_PROMPT: &str = "> ";
@@ -170,7 +170,7 @@ fn loadline(ll: &mut LuaState) -> Result<Option<Vec<u8>>, String> {
 }
 
 fn error_msg(ll: &LuaState) -> String {
-    error_message(ll)
+    lua_error_message(ll)
 }
 
 fn dotty(ll: &mut LuaState) -> i32 {
@@ -210,7 +210,7 @@ fn dotty(ll: &mut LuaState) -> i32 {
 }
 
 fn dofile(lua: &mut Lua, name: &str) -> i32 {
-    let ll = lua_main(lua);
+    let ll = lua.main();
     let src = match std::fs::read(name) {
         Ok(s) => s,
         Err(e) => {
@@ -236,7 +236,7 @@ fn dofile(lua: &mut Lua, name: &str) -> i32 {
 }
 
 fn dostring(lua: &mut Lua, s: &str, name: &str) -> i32 {
-    let ll = lua_main(lua);
+    let ll = lua.main();
     if lual_loadstring(ll, s.as_bytes()).is_err() {
         eprintln!("luajit-rs: compile error in {name}");
         return 1;
@@ -280,7 +280,7 @@ fn run_args(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
                     i += 1;
                     argv[i].as_str()
                 };
-                let ll = lua_main(lua);
+                let ll = lua.main();
                 lua_getglobal(ll, "require");
                 lua_pushstring(ll, name.as_bytes());
                 match lua_pcall(ll, 1, 0, 0) {
@@ -397,7 +397,7 @@ fn main() {
         }
     };
 
-    let mut lua = lual_newstate();
+    let mut lua = Lua::new();
     if std::env::var("LUAJIT_RS_JIT").as_deref() == Ok("off") {
         lua.global().jit.set_on(false);
     }
@@ -416,7 +416,7 @@ fn main() {
         println!("{VERSION}");
     }
 
-    create_arg_table(lua_main(&mut lua), &args, flags.argn as usize);
+    create_arg_table(lua.main(), &args, flags.argn as usize);
 
     if run_args(&mut lua, &args, flags.argn as usize) != 0 {
         exit(1);
@@ -433,12 +433,12 @@ fn main() {
         if flags.version {
             println!("{VERSION}");
         }
-        let ll = lua_main(&mut lua);
+        let ll = lua.main();
         dotty(ll);
     } else if (flags.argn as usize) >= args.len() && !flags.exec && !flags.version {
         if stdin_is_tty() {
             println!("{VERSION}");
-            let ll = lua_main(&mut lua);
+            let ll = lua.main();
             dotty(ll);
         } else {
             let mut src = Vec::new();

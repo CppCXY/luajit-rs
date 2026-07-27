@@ -172,6 +172,6 @@ impl<'a> LibBuilder<'a> {
 #[macro_export]
 macro_rules! lual_reg {
     ($l:expr, $name:expr, $target:expr) => {
-        $crate::stdlib::reg::LibBuilder::new($l, $name, $target)
+        $crate::LibBuilder::new($l, $name, $target)
     };
 }

@@ -613,6 +613,12 @@ pub struct Lua {
     g: Box<GlobalState>,
 }
 
+impl Default for Lua {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Lua {
     pub fn new() -> Lua {
         let mut lua = Lua {

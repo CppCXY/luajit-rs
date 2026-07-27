@@ -24,7 +24,7 @@ const FRAME_C: u64 = 1;
 /// Maximum resume nesting (Rust-stack protection, LJ_MAX_CSTACK-ish).
 const MAX_RESUME_DEPTH: u32 = 200;
 
-enum Outcome {
+pub(crate) enum Outcome {
     /// Coroutine finished; `n` results at `co.stack[0..n]`.
     Done(usize),
     /// Coroutine yielded; `n` values at `co.stack[slot..slot+n]`.
@@ -36,7 +36,7 @@ enum Outcome {
 /// The shared resume core: validates status, moves `nargs` arguments from
 /// `l.stack[args_at..]` onto `co`'s stack, runs it and classifies the
 /// outcome. Maintains `cur_l` and both status fields.
-fn do_resume(
+pub(crate) fn do_resume(
     l: &mut LuaState,
     co_ref: StateRef,
     args_at: usize,

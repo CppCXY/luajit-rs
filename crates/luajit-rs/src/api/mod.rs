@@ -2,10 +2,11 @@
 //! argument, mirroring the Lua 5.1 / LuaJIT C API naming conventions.
 //!
 //! ```rust,no_run
-//! use luajit_rs::api::*;
+//! use luajit_rs::*;
 //!
-//! let mut lua = lual_newstate();
-//! let l = lua_main(&mut lua);
+//! let mut lua = Lua::new();
+//! lual_openlibs(lua.main());
+//! let l = lua.main();
 //! lual_loadstring(l, b"return 1 + 2").unwrap();
 //! lua_pcall(l, 0, 1, 0).unwrap();
 //! assert!((lua_tonumber(l, -1) - 3.0).abs() < 0.001);
@@ -14,74 +15,82 @@ use crate::err::{LuaError, LuaResult};
 use crate::func::{CClosure, CFunction, GcFunc};
 use crate::runtime::gc::full_gc;
 use crate::runtime::userdata::GcUserData;
-use crate::state::{self, Lua, LuaState};
+use crate::state::{self, LuaState, StateRef};
 use crate::stdlib::open_libs as open_stdlib;
 use crate::table::LuaTable;
+use crate::util::strfmt;
 use crate::value::{LJ_TTAB, LJ_TUDATA};
 
-// Re-export LuaValue for convenience.
 pub use crate::value::LuaValue;
 
-// ── Universe handle ────────────────────────────────────────────────────
+// ── Auxiliary library ─────────────────────────────────────────────────
 
-/// Extract an error message from a LuaState after a `Runtime` error.
-pub fn error_message(l: &LuaState) -> String {
+/// Open all standard Lua libraries into the given state.
+pub fn lual_openlibs(l: &mut LuaState) {
+    open_stdlib(l);
+}
+
+// ── Error ──────────────────────────────────────────────────────────────
+
+/// Extract the error object from a state as a human-readable string.
+pub fn lua_error_message(l: &LuaState) -> String {
     let ev = l.errval;
     if let Some(sid) = ev.as_string_id() {
         String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned()
     } else if let Some(n) = ev.as_number() {
-        crate::util::strfmt::g14(n)
+        strfmt::g14(n)
     } else {
         format!("{:?}", ev)
     }
 }
 
-/// Opaque handle owning the entire Lua universe.
-/// Destroyed by dropping — no explicit `lua_close` needed.
-
-/// Create a new Lua universe with all standard libraries open.
-pub fn lual_newstate() -> Lua {
-    Lua::new()
+/// Raise a Lua error. The error object must be on top of the stack;
+/// it is popped and stored in `l.errval`.
+pub fn lua_error(l: &mut LuaState) -> LuaResult<()> {
+    if l.top > l.base {
+        l.top -= 1;
+        l.errval = l.stack[l.top];
+        l.stack[l.top] = LuaValue::NIL;
+    }
+    Err(LuaError::Runtime)
 }
 
-/// Open all standard libraries into the given state.
-pub fn lual_openlibs(l: &mut LuaState) {
-    open_stdlib(l);
-}
-
-/// Return a mutable reference to the main thread's LuaState.
-/// All `lua_*` API functions operate on this reference.
-pub fn lua_main(lua: &mut Lua) -> &mut LuaState {
-    lua.main()
+/// Convenience: push a formatted error message then call `lua_error`.
+/// Equivalent to `lua_pushstring(l, msg); lua_error(l)`.
+pub fn lual_error(l: &mut LuaState, msg: impl AsRef<[u8]>) -> LuaResult<()> {
+    lua_pushstring(l, msg.as_ref());
+    lua_error(l)
 }
 
 // ── Load & execute ─────────────────────────────────────────────────────
 
-/// Load a Lua chunk as a function onto the stack.
-/// Returns `Ok(())` on success, `Err(LuaError::Runtime)` on syntax error.
 pub fn lual_loadstring(l: &mut LuaState, src: &[u8]) -> LuaResult<()> {
     match state::load(l, src.to_vec(), "=(load)") {
         Ok(f) => {
-            l.stack_ensure(l.top + 1);
-            l.stack[l.top] = f;
-            l.top += 1;
+            lua_pushraw(l, f);
             Ok(())
         }
-        Err(_) => Err(LuaError::Runtime),
+        Err(msg) => {
+            lua_pushstring(l, msg.as_bytes());
+            Err(LuaError::Runtime)
+        }
     }
 }
 
-/// Load a Lua chunk from a file.
 pub fn lual_loadfile(l: &mut LuaState, path: &str) -> LuaResult<()> {
-    match std::fs::read(path) {
-        Ok(src) => lual_loadstring(l, &src),
-        Err(_) => Err(LuaError::Runtime),
+    let src = match std::fs::read(path) {
+        Ok(s) => s,
+        Err(e) => {
+            lua_pushstring(l, format!("cannot open {path}: {e}").as_bytes());
+            return Err(LuaError::Runtime);
+        }
+    };
+    match lual_loadstring(l, &src) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
-/// Protected call: pops `nargs` values + function, pushes results.
-/// `errfunc` is the stack index of an error handler (0 = none).
-/// Returns `Ok(())` on success, `Err` on runtime error.
 pub fn lua_pcall(l: &mut LuaState, nargs: i32, nresults: i32, _errfunc: i32) -> LuaResult<()> {
     let func = lua_index(l, -(nargs + 1));
     let mut args = Vec::with_capacity(nargs as usize);
@@ -96,13 +105,11 @@ pub fn lua_pcall(l: &mut LuaState, nargs: i32, nresults: i32, _errfunc: i32) -> 
             results.len().min(nresults as usize)
         };
         for v in results.into_iter().take(want) {
-            lua_pushvalue(l, v);
+            lua_pushraw(l, v);
         }
     })
 }
 
-/// Unprotected call. On error, the error is propagated via the return
-/// value (no longjmp — use `lua_pcall` for protected calls).
 pub fn lua_call(l: &mut LuaState, nargs: i32, nresults: i32) -> LuaResult<()> {
     let func = lua_index(l, -(nargs + 1));
     let mut args = Vec::with_capacity(nargs as usize);
@@ -112,7 +119,7 @@ pub fn lua_call(l: &mut LuaState, nargs: i32, nresults: i32) -> LuaResult<()> {
     lua_settop(l, lua_gettop(l) as i32 - nargs - 1);
     crate::vm::call(l, func, &args).map(|results| {
         for v in results.into_iter().take(nresults as usize) {
-            lua_pushvalue(l, v);
+            lua_pushraw(l, v);
         }
     })
 }
@@ -120,31 +127,31 @@ pub fn lua_call(l: &mut LuaState, nargs: i32, nresults: i32) -> LuaResult<()> {
 // ── Stack push ────────────────────────────────────────────────────────
 
 pub fn lua_pushnil(l: &mut LuaState) {
-    lua_pushvalue(l, LuaValue::NIL);
+    lua_pushraw(l, LuaValue::NIL);
 }
 
 pub fn lua_pushnumber(l: &mut LuaState, n: f64) {
-    lua_pushvalue(l, LuaValue::number(n));
+    lua_pushraw(l, LuaValue::number(n));
 }
 
 pub fn lua_pushinteger(l: &mut LuaState, n: i64) {
-    lua_pushvalue(l, LuaValue::number(n as f64));
+    lua_pushraw(l, LuaValue::number(n as f64));
 }
 
 pub fn lua_pushstring(l: &mut LuaState, s: &[u8]) {
     let sid = l.global().heap.intern(s);
     let v = l.global().heap.str_value(sid);
-    lua_pushvalue(l, v);
+    lua_pushraw(l, v);
 }
 
 pub fn lua_pushboolean(l: &mut LuaState, b: bool) {
-    lua_pushvalue(l, LuaValue::boolean(b));
+    lua_pushraw(l, LuaValue::boolean(b));
 }
 
-pub fn lua_pushvalue(l: &mut LuaState, v: LuaValue) {
-    l.stack_ensure(l.top + 1);
-    l.stack[l.top] = v;
-    l.top += 1;
+/// Push a copy of the element at the given valid index onto the stack.
+pub fn lua_pushvalue(l: &mut LuaState, idx: i32) {
+    let v = lua_index(l, idx);
+    lua_pushraw(l, v);
 }
 
 pub fn lua_pushcfunction(l: &mut LuaState, f: CFunction) {
@@ -155,13 +162,30 @@ pub fn lua_pushcfunction(l: &mut LuaState, f: CFunction) {
         env,
         upvals: vec![],
     }));
-    lua_pushvalue(l, LuaValue::func(fref));
+    lua_pushraw(l, LuaValue::func(fref));
+}
+
+pub fn lua_pushthread(l: &mut LuaState) {
+    let co = l.self_ref();
+    lua_pushraw(l, LuaValue::thread(co));
+}
+
+/// Push an arbitrary `LuaValue` without any conversion.
+/// This is the low-level building block used by all other `lua_push*` functions.
+pub fn lua_pushraw(l: &mut LuaState, v: LuaValue) {
+    l.stack_ensure(l.top + 1);
+    l.stack[l.top] = v;
+    l.top += 1;
 }
 
 // ── Stack query ───────────────────────────────────────────────────────
 
 pub fn lua_isnil(l: &LuaState, idx: i32) -> bool {
     lua_index(l, idx).is_nil()
+}
+
+pub fn lua_isboolean(l: &LuaState, idx: i32) -> bool {
+    lua_index(l, idx).is_bool()
 }
 
 pub fn lua_isnumber(l: &LuaState, idx: i32) -> bool {
@@ -180,6 +204,10 @@ pub fn lua_isfunction(l: &LuaState, idx: i32) -> bool {
     lua_index(l, idx).is_func()
 }
 
+pub fn lua_isthread(l: &LuaState, idx: i32) -> bool {
+    lua_index(l, idx).is_thread()
+}
+
 pub fn lua_isuserdata(l: &LuaState, idx: i32) -> bool {
     lua_index(l, idx).is_userdata()
 }
@@ -190,15 +218,17 @@ pub fn lua_iscdata(l: &LuaState, idx: i32) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LuaType {
-    Nil,
-    Boolean,
-    Number,
-    String,
-    Table,
-    Function,
-    Userdata,
-    Thread,
-    Unknown,
+    None = -1,
+    Nil = 0,
+    Boolean = 1,
+    LightUserdata = 2,
+    Number = 3,
+    String = 4,
+    Table = 5,
+    Function = 6,
+    Userdata = 7,
+    Thread = 8,
+    CData = 10,
 }
 
 pub fn lua_type(l: &LuaState, idx: i32) -> LuaType {
@@ -219,22 +249,26 @@ pub fn lua_type(l: &LuaState, idx: i32) -> LuaType {
         LuaType::Userdata
     } else if v.is_thread() {
         LuaType::Thread
+    } else if v.is_cdata() {
+        LuaType::CData
     } else {
-        LuaType::Unknown
+        LuaType::None
     }
 }
 
 pub fn lua_typename(_l: &LuaState, tp: LuaType) -> &'static str {
     match tp {
+        LuaType::None => "no value",
         LuaType::Nil => "nil",
         LuaType::Boolean => "boolean",
+        LuaType::LightUserdata => "lightuserdata",
         LuaType::Number => "number",
         LuaType::String => "string",
         LuaType::Table => "table",
         LuaType::Function => "function",
         LuaType::Userdata => "userdata",
         LuaType::Thread => "thread",
-        LuaType::Unknown => "no value",
+        LuaType::CData => "cdata",
     }
 }
 
@@ -255,20 +289,17 @@ pub fn lua_toboolean(l: &LuaState, idx: i32) -> bool {
     }
 }
 
-/// Returns a byte slice into the interned string data.
-/// The pointer is stable (pool-allocated), so the caller may keep it
-/// across other Lua calls.
 pub fn lua_tolstring(l: &LuaState, idx: i32) -> &[u8] {
     let v = lua_index(l, idx);
     if let Some(s) = v.as_string() {
         s.as_ref().as_bytes()
-    } else if let Some(_n) = v.as_number() {
-        // In LuaJIT, tonumber gives a temporary string — we can't easily
-        // return a stable reference here. Return empty slice for now.
-        &[]
     } else {
         &[]
     }
+}
+
+pub fn lua_tothread(l: &LuaState, idx: i32) -> Option<StateRef> {
+    lua_index(l, idx).as_thread()
 }
 
 pub fn lua_objlen(l: &LuaState, idx: i32) -> usize {
@@ -308,12 +339,6 @@ pub fn lua_pop(l: &mut LuaState, n: i32) {
     lua_settop(l, -(n + 1));
 }
 
-/// Push a copy of the value at `idx`.
-pub fn lua_pushvalue_at(l: &mut LuaState, idx: i32) {
-    let v = lua_index(l, idx);
-    lua_pushvalue(l, v);
-}
-
 pub fn lua_remove(l: &mut LuaState, idx: i32) {
     let abs = lua_absindex(l, idx);
     if abs < l.base || abs >= l.top {
@@ -348,8 +373,6 @@ pub fn lua_insert(l: &mut LuaState, idx: i32) {
     l.stack[abs] = v;
 }
 
-// ── Abs index ─────────────────────────────────────────────────────────
-
 pub fn lua_absindex(l: &LuaState, idx: i32) -> usize {
     if idx > 0 {
         l.base + (idx as usize) - 1
@@ -365,7 +388,7 @@ pub fn lua_getglobal(l: &mut LuaState, name: &str) {
     let key = l.global().heap.str_value(sid);
     let globals = l.global().globals;
     let v = globals.as_ref().get(key);
-    lua_pushvalue(l, v);
+    lua_pushraw(l, v);
 }
 
 pub fn lua_setglobal(l: &mut LuaState, name: &str) {
@@ -390,7 +413,7 @@ pub fn lua_register(l: &mut LuaState, name: &str, f: CFunction) {
 
 pub fn lua_newtable(l: &mut LuaState) {
     let t = l.global().heap.alloc_table(LuaTable::new(0, 0));
-    lua_pushvalue(l, LuaValue::table(t));
+    lua_pushraw(l, LuaValue::table(t));
 }
 
 pub fn lua_getfield(l: &mut LuaState, idx: i32, k: &str) {
@@ -399,9 +422,9 @@ pub fn lua_getfield(l: &mut LuaState, idx: i32, k: &str) {
         let sid = l.global().heap.intern(k.as_bytes());
         let lk = l.global().heap.str_value(sid);
         let v = t.as_ref().get(lk);
-        lua_pushvalue(l, v);
+        lua_pushraw(l, v);
     } else {
-        lua_pushvalue(l, LuaValue::NIL);
+        lua_pushraw(l, LuaValue::NIL);
     }
 }
 
@@ -430,9 +453,9 @@ pub fn lua_gettable(l: &mut LuaState, idx: i32) {
     let tab = lua_index(l, idx);
     if let Some(t) = tab.as_table() {
         let v = t.as_ref().get(key);
-        lua_pushvalue(l, v);
+        lua_pushraw(l, v);
     } else {
-        lua_pushvalue(l, LuaValue::NIL);
+        lua_pushraw(l, LuaValue::NIL);
     }
 }
 
@@ -459,9 +482,9 @@ pub fn lua_rawgeti(l: &mut LuaState, idx: i32, n: i32) {
     let tab = lua_index(l, idx);
     if let Some(t) = tab.as_table() {
         let v = t.as_ref().get_int(n);
-        lua_pushvalue(l, v);
+        lua_pushraw(l, v);
     } else {
-        lua_pushvalue(l, LuaValue::NIL);
+        lua_pushraw(l, LuaValue::NIL);
     }
 }
 
@@ -478,10 +501,45 @@ pub fn lua_rawseti(l: &mut LuaState, idx: i32, n: i32) {
     }
 }
 
+// ── Raw get/set (bypass metamethods) ──────────────────────────────────
+
+pub fn lua_rawget(l: &mut LuaState, idx: i32) {
+    let key = if l.top > l.base {
+        l.top -= 1;
+        l.stack[l.top]
+    } else {
+        LuaValue::NIL
+    };
+    let tab = lua_index(l, idx);
+    if let Some(t) = tab.as_table() {
+        let v = t.as_ref().get(key);
+        lua_pushraw(l, v);
+    } else {
+        lua_pushraw(l, LuaValue::NIL);
+    }
+}
+
+pub fn lua_rawset(l: &mut LuaState, idx: i32) {
+    let val = if l.top > l.base {
+        l.top -= 1;
+        l.stack[l.top]
+    } else {
+        LuaValue::NIL
+    };
+    let key = if l.top > l.base {
+        l.top -= 1;
+        l.stack[l.top]
+    } else {
+        LuaValue::NIL
+    };
+    let tab = lua_index(l, idx);
+    if let Some(t) = tab.as_table() {
+        t.as_mut().set(key, val);
+    }
+}
+
 // ── Userdata ──────────────────────────────────────────────────────────
 
-/// Allocate `size` bytes, push a full userdata, return a mutable pointer
-/// to the raw memory block.
 pub fn lua_newuserdata(l: &mut LuaState, size: usize) -> *mut u8 {
     let data = vec![0u8; size].into_boxed_slice();
     let ud = GcUserData::new(data);
@@ -492,12 +550,10 @@ pub fn lua_newuserdata(l: &mut LuaState, size: usize) -> *mut u8 {
         .downcast_mut::<Box<[u8]>>()
         .unwrap()
         .as_mut_ptr();
-    lua_pushvalue(l, LuaValue::userdata(ptr));
+    lua_pushraw(l, LuaValue::userdata(ptr));
     data_ptr
 }
 
-/// Return the raw data pointer of the userdata at `idx`, or null if not
-/// a userdata.
 pub fn lua_touserdata(l: &LuaState, idx: i32) -> *mut u8 {
     let v = lua_index(l, idx);
     if let Some(ud) = v.as_userdata() {
@@ -513,8 +569,6 @@ pub fn lua_touserdata(l: &LuaState, idx: i32) -> *mut u8 {
 
 // ── Metatables ────────────────────────────────────────────────────────
 
-/// Create a new metatable `tname` in the registry. Returns 1 if newly
-/// created, 0 if the name already exists.
 pub fn lual_newmetatable(l: &mut LuaState, tname: &str) -> i32 {
     let g = l.global();
     let sid = g.heap.intern(tname.as_bytes());
@@ -528,17 +582,14 @@ pub fn lual_newmetatable(l: &mut LuaState, tname: &str) -> i32 {
     1
 }
 
-/// Push the metatable associated with `tname` from the registry, or nil.
 pub fn lual_getmetatable(l: &mut LuaState, tname: &str) {
     let sid = l.global().heap.intern(tname.as_bytes());
     let key = l.global().heap.str_value(sid);
     let registry = l.global().registry;
     let mt = registry.as_ref().get(key);
-    lua_pushvalue(l, mt);
+    lua_pushraw(l, mt);
 }
 
-/// Set the metatable of the value at `idx` from the value on top of the
-/// stack. Pops the metatable.
 pub fn lua_setmetatable(l: &mut LuaState, idx: i32) {
     let mt_v = if l.top > l.base {
         l.top -= 1;
@@ -563,7 +614,6 @@ pub fn lua_setmetatable(l: &mut LuaState, idx: i32) {
     }
 }
 
-/// Push the metatable of the value at `idx`, or false if none.
 pub fn lua_getmetatable(l: &mut LuaState, idx: i32) -> i32 {
     let v = lua_index(l, idx);
     let mt = match v.itype() {
@@ -572,15 +622,13 @@ pub fn lua_getmetatable(l: &mut LuaState, idx: i32) -> i32 {
         _ => None,
     };
     if let Some(mt) = mt {
-        lua_pushvalue(l, LuaValue::table(mt));
+        lua_pushraw(l, LuaValue::table(mt));
         1
     } else {
         0
     }
 }
 
-/// Check the value at `idx` is userdata with metatable `tname`.
-/// Returns the raw data pointer on success, null on failure.
 pub fn lual_checkudata(l: &LuaState, idx: i32, tname: &str) -> *mut u8 {
     let v = lua_index(l, idx);
     let ud = match v.as_userdata() {
@@ -606,21 +654,147 @@ pub fn lual_checkudata(l: &LuaState, idx: i32, tname: &str) -> *mut u8 {
         .unwrap_or(std::ptr::null_mut())
 }
 
-/// Raise a Lua error with the value on top of the stack.
-pub fn lua_error(l: &mut LuaState, err: &str) -> LuaResult<()> {
-    Err(l.runtime_error(err))
+// ── Coroutines ────────────────────────────────────────────────────────
+
+/// Create a new thread, push it on the stack, and return its `StateRef`.
+pub fn lua_newthread(l: &mut LuaState) -> StateRef {
+    let co = crate::state::new_thread(l);
+    lua_pushraw(l, LuaValue::thread(co));
+    co
+}
+
+/// Resume a coroutine `co` at stack index `-(nargs + 1)` with `nargs`
+/// arguments. Returns one of: 0 (finished), LUA_YIELD, or an error code.
+/// On success, results are on the calling thread's stack.
+pub const LUA_YIELD: i32 = 1;
+
+pub fn lua_resume(l: &mut LuaState, nargs: i32) -> LuaResult<i32> {
+    let co_v = lua_index(l, -(nargs + 1));
+    let co = match co_v.as_thread() {
+        Some(c) => c,
+        None => return Err(LuaError::Runtime),
+    };
+    let outcome =
+        crate::stdlib::coroutine::do_resume(l, co, l.top - nargs as usize, nargs as usize)?;
+    match outcome {
+        crate::stdlib::coroutine::Outcome::Done(n) => {
+            let co_state = co.as_mut();
+            for i in 0..n {
+                l.stack[l.base + i] = co_state.stack[i];
+            }
+            l.top = l.base + n;
+            Ok(0)
+        }
+        crate::stdlib::coroutine::Outcome::Yielded(slot, n) => {
+            let co_state = co.as_mut();
+            for i in 0..n {
+                l.stack[l.base + i] = co_state.stack[slot + i];
+            }
+            l.top = l.base + n;
+            Ok(LUA_YIELD)
+        }
+        crate::stdlib::coroutine::Outcome::Failed => Err(LuaError::Runtime),
+    }
+}
+
+/// Yield a coroutine. Returns `nresults` values to the resumer.
+pub fn lua_yield(l: &mut LuaState, nresults: i32) -> LuaResult<()> {
+    if l.is_main() {
+        return Err(l.runtime_error("attempt to yield from outside a coroutine"));
+    }
+    if !l.is_yieldable() {
+        return Err(l.runtime_error("attempt to yield across C-call boundary"));
+    }
+    if nresults >= 0 {
+        lua_settop(l, lua_gettop(l) as i32);
+        let base = l.base;
+        l.nyield = (l.top - base).min(nresults as usize) as u32;
+    }
+    Err(LuaError::Yield)
+}
+
+pub enum CoroutineStatus {
+    Running,
+    Suspended,
+    Normal,
+    Dead,
+}
+
+pub fn lua_status(l: &LuaState) -> CoroutineStatus {
+    use crate::state::CoStatus;
+    match l.status {
+        CoStatus::Running => CoroutineStatus::Running,
+        CoStatus::Suspended => CoroutineStatus::Suspended,
+        CoStatus::Normal => CoroutineStatus::Normal,
+        CoStatus::Dead => CoroutineStatus::Dead,
+    }
+}
+
+pub fn lua_isyieldable(l: &LuaState) -> bool {
+    l.is_yieldable()
+}
+
+pub fn lua_xmove(from: &mut LuaState, to: &mut LuaState, n: i32) {
+    if std::ptr::eq(from, to) {
+        return;
+    }
+    let count = n as usize;
+    let from_top = from.top;
+    let start = from_top - count;
+    for i in 0..count {
+        let v = from.stack[start + i];
+        to.stack_ensure(to.top + 1);
+        to.stack[to.top] = v;
+        to.top += 1;
+    }
+    from.top = start;
+    for i in start..from_top {
+        from.stack[i] = LuaValue::NIL;
+    }
 }
 
 // ── Garbage collection ────────────────────────────────────────────────
 
-pub fn lua_gc(l: &mut LuaState, _what: i32, _data: i32) -> i32 {
-    full_gc(l.global());
-    0
+pub const LUA_GCSTOP: i32 = 0;
+pub const LUA_GCRESTART: i32 = 1;
+pub const LUA_GCCOLLECT: i32 = 2;
+pub const LUA_GCCOUNT: i32 = 3;
+pub const LUA_GCSTEP: i32 = 5;
+
+pub fn lua_gc(l: &mut LuaState, what: i32, _data: i32) -> i32 {
+    match what {
+        LUA_GCCOLLECT => {
+            full_gc(l.global());
+            0
+        }
+        LUA_GCCOUNT => (l.global().heap.total / 1024) as i32,
+        _ => 0,
+    }
 }
 
-/// Peek at the value at `idx` without modifying the stack.
+// ── Miscellaneous ─────────────────────────────────────────────────────
+
 pub fn lua_peek(l: &LuaState, idx: i32) -> LuaValue {
     lua_index(l, idx)
+}
+
+pub fn lua_next(l: &mut LuaState, idx: i32) -> i32 {
+    let tab_v = lua_index(l, idx);
+    if let Some(t) = tab_v.as_table() {
+        let key = lua_index(l, -1);
+        if let Some((k, v)) = t.as_ref().next(key) {
+            lua_pop(l, 1);
+            lua_pushraw(l, k);
+            lua_pushraw(l, v);
+            return 1;
+        }
+        lua_pop(l, 1);
+        lua_pushraw(l, LuaValue::NIL);
+        return 0;
+    }
+    lua_pop(l, 1);
+    lua_pushraw(l, LuaValue::NIL);
+    0
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
