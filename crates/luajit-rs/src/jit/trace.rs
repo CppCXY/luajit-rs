@@ -670,7 +670,9 @@ mod tests {
     use crate::bc::{BCIns, BCOp, bc_d, bc_op};
     use crate::jit::ir::IROp;
     use crate::state::Lua;
+    use crate::stdlib::open_libs;
     use crate::value::LuaValue;
+    use crate::vm;
 
     fn load_proto(lua: &mut Lua, src: &str) -> (LuaValue, GcPtr<Proto>) {
         let f = crate::state::load(lua.main(), src.as_bytes().to_vec(), "=test").unwrap();
@@ -740,7 +742,7 @@ mod tests {
     #[test]
     fn numeric_forl_records_patches_and_executes() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, pt) = load_proto(
             &mut lua,
             "local s = 0 for i = 1, 200 do s = s + i end return s",
@@ -802,7 +804,7 @@ mod tests {
     #[test]
     fn trace_takes_side_exit_every_other_iteration() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The recorded parity branch fails every other iteration, forcing
         // a mid-trace guard exit, an interpreted tail and a re-entry.
         let (f, _pt) = load_proto(
@@ -819,7 +821,7 @@ mod tests {
     #[test]
     fn trace_survives_type_instability_via_exit() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // x flips to a string once the loop is compiled: the SLOAD
         // typecheck (or arith NYI abort during recording) must keep the
         // semantics intact either way.
@@ -840,7 +842,7 @@ mod tests {
     #[test]
     fn while_loop_records_via_loop_root() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, pt) = load_proto(
             &mut lua,
             "local s, i = 0, 0 while i < 500 do i = i + 1 s = s + 2 end return s",
@@ -863,7 +865,7 @@ mod tests {
     #[test]
     fn hot_exit_compiles_side_trace() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The parity branch exits the root trace every other iteration:
         // the exit turns hot, a side trace is recorded from the exit pc,
         // links back to the root (TRLINK_ROOT) and the parent exit is
@@ -903,7 +905,7 @@ mod tests {
     #[test]
     fn hopeless_side_exit_gets_blacklisted() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The taken branch calls an unrecordable builtin, so every side
         // trace attempt aborts; after hotexit+tryside tries the exit is
         // parked with SNAPCOUNT_DONE and never re-examined.
@@ -935,7 +937,7 @@ mod tests {
     #[test]
     fn side_trace_handover_keeps_norestore_slots() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // A variable loop bound is a READONLY/NORESTORE snapshot entry:
         // it is never written back to the Lua stack, but the env
         // hand-over to side traces must still see it (exit stubs flush
@@ -961,7 +963,7 @@ mod tests {
     #[test]
     fn nested_loop_side_trace_keeps_fori_semantics() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The outer back edge becomes a side trace of the inner loop and
         // re-enters it through JFORI: rec_for must record FORI semantics
         // (no index increment) there, or one iteration per outer round
@@ -980,7 +982,7 @@ mod tests {
     #[test]
     fn swap_phis_use_parallel_assignment() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // a,b = b,a builds a PHI cycle: the back edge must read both
         // right refs before writing either left ref.
         let (f, _pt) = load_proto(
@@ -999,7 +1001,7 @@ mod tests {
     #[test]
     fn portable_exec_runs_loop_optimized_ir() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // Differential test: strip the machine code from all traces and
         // re-run, forcing run_ir through the LOOP/PHI execution path.
         let (f, pt) = load_proto(
@@ -1019,7 +1021,7 @@ mod tests {
     #[test]
     fn unrecordable_loop_still_blacklists() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // Calls to non-recff C functions are unrecordable, so the
         // penalty machinery must eventually blacklist the FORL.
         let (f, pt) = load_proto(
@@ -1050,7 +1052,7 @@ mod tests {
     #[test]
     fn hot_loop_inlines_lua_call() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The hot loop records straight through g(): the callee identity
         // is guarded (EQ FUNC) and the body inlined — no call frame at
         // loop close, no FUNCF blacklisting.
@@ -1084,7 +1086,7 @@ mod tests {
     #[test]
     fn inlined_call_branch_exits_inside_callee_frame() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The branch in f() flips at i > 150000: the compiled trace's
         // guard fails *inside the inlined frame*, so the exit restores
         // the call frame (KFUNC + frame link constants) and the
@@ -1105,7 +1107,7 @@ mod tests {
     #[test]
     fn inlined_calls_nest_and_return_pairs() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, _pt) = load_proto(
             &mut lua,
             "local function two(x) return x, x + 0.5 end \
@@ -1125,7 +1127,7 @@ mod tests {
     #[test]
     fn recursion_hits_call_unroll_limit() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // Non-tail recursion exceeds JIT_P_callunroll during recording;
         // the trace aborts and the loop is eventually blacklisted, but
         // the semantics stay intact.
@@ -1143,7 +1145,7 @@ mod tests {
     #[test]
     fn deep_exit_seeds_side_trace_inside_callee() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The parity branch flips inside f(): the hot exit lies in the
         // inlined frame, so the side trace replays the KFUNC/frame-link
         // constants, rebuilds the frame stack and records from within
@@ -1180,7 +1182,7 @@ mod tests {
     #[test]
     fn tailcall_wrapper_is_inlined() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // wrap() forwards via CALLT: the frame is replaced in place and
         // the pending return still lands in the original caller.
         let (f, pt) = load_proto(
@@ -1201,7 +1203,7 @@ mod tests {
     #[test]
     fn closed_mutable_upvalue_loads_through_cell() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // k is assigned after capture (mutable) and mk has returned
         // (closed): the load compiles to a ULOAD of the constant cell
         // address with a type guard.
@@ -1224,7 +1226,7 @@ mod tests {
     #[test]
     fn open_upvalue_aliases_recorded_slot() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // t is mutable and its upvalue is open (the chunk is running):
         // the load forwards to the aliased frame-0 slot under the
         // closure-identity guard.
@@ -1242,7 +1244,7 @@ mod tests {
     #[test]
     fn table_array_load_store_compile() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // Fill (inserts + array growth via the HSTORE helper), then sum
         // (HLOAD specialized to numbers).
         let (f, pt) = load_proto(
@@ -1264,7 +1266,7 @@ mod tests {
     #[test]
     fn table_field_and_globals_compile() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // TGETS/TSETS on a hash field plus GGET/GSET on a global counter.
         let (f, _pt) = load_proto(
             &mut lua,
@@ -1282,7 +1284,7 @@ mod tests {
     #[test]
     fn nil_load_specializes_and_metatable_falls_back() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // t.missing stays nil (HLOAD specialized to NIL under the
         // metatable guard); u gets a metatable with __index mid-loop,
         // whose lookups must keep working through the fallback.
@@ -1306,7 +1308,7 @@ mod tests {
     #[test]
     fn math_fast_functions_record_inline() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // floor/sqrt/abs inline as FPMATH/ABS IR under the callee guard;
         // the -0.0 normalization matches the interpreter's push path.
         let (f, pt) = load_proto(
@@ -1336,7 +1338,7 @@ mod tests {
     #[test]
     fn recff_floor_normalizes_negative_zero() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The interpreter pushes through LuaValue::number (-0.0 -> +0.0):
         // the compiled trace must agree, so 1/floor(-0.0) stays +inf
         // (z * -1 produces a runtime -0.0).
@@ -1354,7 +1356,7 @@ mod tests {
     #[test]
     fn ipairs_loop_compiles_via_iterc() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // The ITERL root records the ITERC call to the builtin ipairs
         // iterator (recff_ipairs_aux: ctrl+1 + guarded array load).
         let (f, pt) = load_proto(
@@ -1387,7 +1389,7 @@ mod tests {
     #[test]
     fn ipairs_type_change_exits_cleanly() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // Element 1500 is a string: the HLOAD type guard exits and the
         // interpreter finishes the traversal (including the string).
         let (f, _pt) = load_proto(
@@ -1409,7 +1411,7 @@ mod tests {
     #[test]
     fn lua_iterator_function_inlines() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // A plain Lua iterator goes through rec_call_lua from ITERC.
         let (f, pt) = load_proto(
             &mut lua,
@@ -1436,7 +1438,7 @@ mod tests {
     #[test]
     fn pairs_loop_compiles_with_hash_phase_side_trace() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // pairs() traverses the array part (number keys) then the hash
         // part (string keys): the key-type guard exit at the phase
         // switch turns hot and grows a side trace, keeping the whole
@@ -1467,7 +1469,7 @@ mod tests {
     #[test]
     fn bit_ops_compile_with_range_guards() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // A hash-mix loop: shifts, or, xor, and. Element 150000 pushes an
         // out-of-range operand through the guard exit (the interpreter's
         // saturating cast takes over there).
@@ -1502,7 +1504,7 @@ mod tests {
     #[test]
     fn allocating_trace_reaches_gc_safe_points() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // A compiled append loop grows the table by megabytes: the
         // IR_GCSTEP guard must leave the trace so the boundary check can
         // collect (observable via the recomputed threshold).
@@ -1529,13 +1531,13 @@ mod tests {
     #[test]
     fn jit_off_never_triggers() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         lua.global().jit.set_on(false);
         let (f, pt) = load_proto(
             &mut lua,
             "local s = 0 for i = 1, 200000 do s = s + 1 end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200000.0));
         assert!(
             find_op(pt, BCOp::FORL).is_some(),
@@ -1554,7 +1556,7 @@ mod tests {
     #[test]
     fn string_concat_records() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, _pt) = load_proto(
             &mut lua,
             r#"local function f(a, b) return a .. b end return f("hello", "world")"#,
@@ -1567,7 +1569,7 @@ mod tests {
     #[test]
     fn string_concat_number() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, _pt) = load_proto(
             &mut lua,
             "local s = '' for i = 1, 100 do s = s .. i end return s",
@@ -1584,7 +1586,7 @@ mod tests {
     #[test]
     fn upvalue_write_records() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, _pt) = load_proto(
             &mut lua,
             "local x = 0; local function set(v) x = v end; set(42); return x",
@@ -1596,7 +1598,7 @@ mod tests {
     #[test]
     fn vararg_records() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, _pt) = load_proto(
             &mut lua,
             "local function f(...) local a,b = ...; return a + b end; return f(3, 4)",
@@ -1610,7 +1612,7 @@ mod tests {
     #[test]
     fn integer_narrowing_uses_kint_in_forl() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, pt) = load_proto(
             &mut lua,
             "local s = 0 for i = 1, 200 do s = s + i end return s",
@@ -1659,7 +1661,7 @@ mod tests {
     #[test]
     fn integer_narrowing_correctness_basic() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         assert_num(
             jit_run(&mut lua, "local s=0 for i=1,10000 do s=s+i end return s"),
             50005000.0,
@@ -1669,7 +1671,7 @@ mod tests {
     #[test]
     fn integer_narrowing_correctness_nested() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         assert_num(
             jit_run(
                 &mut lua,
@@ -1704,7 +1706,7 @@ mod tests {
     #[test]
     fn jit_correctness_arithmetic() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         assert_num(
             jit_run(&mut lua, "local s=0 for i=1,50000 do s=s+i end return s"),
             1250025000.0,
@@ -1725,7 +1727,7 @@ mod tests {
     #[test]
     fn jit_correctness_strcat() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         assert_str(
             jit_run(&mut lua, r#"local a,b="hello","world" return a..b"#),
             b"helloworld",
@@ -1739,7 +1741,7 @@ mod tests {
     #[test]
     fn jit_correctness_vararg() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         assert_num(
             jit_run(
                 &mut lua,
@@ -1752,7 +1754,7 @@ mod tests {
     #[test]
     fn jit_correctness_control_flow() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         assert_num(
             jit_run(
                 &mut lua,
@@ -1772,7 +1774,7 @@ mod tests {
     #[test]
     fn jit_correctness_tables() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         assert_num(
             jit_run(
                 &mut lua,
@@ -1788,7 +1790,7 @@ mod tests {
     #[test]
     fn diag_simple_add_loop() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         assert_num(
             jit_run(&mut lua, "local s=0 for i=1,300 do s=s+1 end return s"),
             300.0,
@@ -1799,7 +1801,7 @@ mod tests {
     #[test]
     fn diag_eq_guard_loop() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // if i == 250 then s = s + 100 else s = s + 1 end
         // 249*1 + 1*100 + 50*1 = 249 + 100 + 50 = 399
         assert_num(
@@ -1816,7 +1818,7 @@ mod tests {
     #[test]
     fn diag_type_change_exit() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // x=1 for 249 iters, then x='2' at iter 250.
         // s = 249*1 + 2 + 50*2 = 249 + 2 + 100 = 351
         assert_num(
@@ -1832,7 +1834,7 @@ mod tests {
     #[test]
     fn diag_loop_gets_mcode() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         let (f, pt) = load_proto(&mut lua, "local s=0 for i=1,300 do s=s+i end return s");
         let r = crate::vm::call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(45150.0));
@@ -1862,7 +1864,7 @@ mod tests {
     #[test]
     fn diag_type_change_only() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // x = 10 for first 5 iters, then x = '2' for remaining 5.
         // s = 5*10 + 5*2 = 50 + 10 = 60
         assert_num(
@@ -1878,7 +1880,7 @@ mod tests {
     #[test]
     fn diag_type_change_noasm() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         lua.global().jit.no_asm = true;
         assert_num(
             jit_run(
@@ -1893,7 +1895,7 @@ mod tests {
     #[test]
     fn diag_type_change_jitoff() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         lua.global().jit.set_on(false);
         assert_num(
             jit_run(
@@ -1909,7 +1911,7 @@ mod tests {
     #[test]
     fn diag_type_change_early() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // x=1 for iter 1-4, x='2' for iter 5-500. s = 4*1 + 496*2 = 996
         assert_num(
             jit_run(
@@ -1925,7 +1927,7 @@ mod tests {
     #[test]
     fn diag_type_change_late() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // x=1 for iter 1-294, x='2' for iter 295-300. s = 294 + 6*2 = 306
         assert_num(
             jit_run(
@@ -1942,7 +1944,7 @@ mod tests {
     #[test]
     fn while_continue_correctness() {
         let mut lua = Lua::new();
-        crate::open_libs(lua.main());
+        open_libs(lua.main());
         // simple: sum values where (i & 4) != 0 (i.e. bit 2 set)
         assert_num(
             jit_run(

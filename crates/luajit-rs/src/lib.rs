@@ -1,15 +1,27 @@
-pub mod api;
-pub mod compiler;
-pub mod ffi;
-pub mod internal;
-pub mod jit;
-pub mod runtime;
-pub mod stdlib;
-pub mod util;
-pub mod vm;
+mod api;
+mod compiler;
+mod ffi;
+mod jit;
+mod runtime;
+mod stdlib;
+mod util;
+mod vm;
 
-pub use compiler::{bc, dump, lex, parse};
-pub use runtime::{func, gc, meta, proto, state, string, table, value};
-pub use stdlib::open_libs;
-pub use util::{strfmt, strscan};
-pub use vm::err;
+use compiler::{bc, dump, lex, parse};
+use runtime::{func, gc, meta, proto, state, string, table, value};
+use util::{strfmt, strscan};
+use vm::err;
+
+// export the public API
+pub use api::*;
+pub use runtime::state::{Lua, LuaState};
+pub use stdlib::reg::{LibBuilder, LibTarget};
+pub use vm::err::{LuaError, LuaResult};
+
+pub mod internal {
+    pub use crate::compiler::*;
+    pub use crate::ffi::*;
+    pub use crate::jit::*;
+    pub use crate::runtime::*;
+    pub use crate::vm::{call, execute};
+}

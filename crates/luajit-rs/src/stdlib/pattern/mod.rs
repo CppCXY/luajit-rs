@@ -10,20 +10,24 @@
 //! 5. Recursion-limited to prevent stack overflow on pathological patterns
 
 mod class;
+#[allow(unused)]
 mod engine;
 
 /// Maximum number of captures, from C Lua's `LUA_MAXCAPTURES`.
 pub const LUA_MAXCAPTURES: usize = 32;
 
+#[allow(unused)]
 /// Maximum repetition count when matching `*` / `+` quantifiers.
 pub const MAX_REPETITION: usize = usize::MAX;
 
+#[allow(unused)]
 /// Recursion depth limit for the backtracking matcher.
 pub const RECURSION_LIMIT: usize = 200;
 
 /// Maximum match-call nesting depth (C Lua's `MAXCCALLS`).
 pub const MAXCCALLS_PATTERN: usize = 200;
 
+#[allow(unused)]
 pub use engine::{
     CaptureValue, find, find_all_matches, find_assume_valid, gsub, is_plain_pattern, validate,
 };

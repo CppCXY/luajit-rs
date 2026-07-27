@@ -10,13 +10,11 @@
 //! lua_pcall(l, 0, 1, 0).unwrap();
 //! assert!((lua_tonumber(l, -1) - 3.0).abs() < 0.001);
 //! ```
-
-use std::cell::UnsafeCell;
-
+use crate::err::{LuaError, LuaResult};
 use crate::func::{CClosure, CFunction, GcFunc};
+use crate::runtime::gc::full_gc;
 use crate::runtime::userdata::GcUserData;
-use crate::state::Lua as RawLua;
-use crate::state::LuaState;
+use crate::state::{self, Lua, LuaState};
 use crate::stdlib::open_libs as open_stdlib;
 use crate::table::LuaTable;
 use crate::value::{LJ_TTAB, LJ_TUDATA};
@@ -40,17 +38,10 @@ pub fn error_message(l: &LuaState) -> String {
 
 /// Opaque handle owning the entire Lua universe.
 /// Destroyed by dropping — no explicit `lua_close` needed.
-pub struct Lua {
-    raw: UnsafeCell<Box<RawLua>>,
-}
 
 /// Create a new Lua universe with all standard libraries open.
 pub fn lual_newstate() -> Lua {
-    let mut raw = RawLua::new();
-    open_stdlib(raw.main());
-    Lua {
-        raw: UnsafeCell::new(raw),
-    }
+    Lua::new()
 }
 
 /// Open all standard libraries into the given state.
@@ -61,49 +52,37 @@ pub fn lual_openlibs(l: &mut LuaState) {
 /// Return a mutable reference to the main thread's LuaState.
 /// All `lua_*` API functions operate on this reference.
 pub fn lua_main(lua: &mut Lua) -> &mut LuaState {
-    lua.raw.get_mut().main()
-}
-
-/// Return a mutable reference to the underlying raw `Lua` state.
-/// Use this for operations not covered by the `lua_*` API (e.g. JIT
-/// configuration, direct GC manipulation).
-pub fn lua_raw(lua: &mut Lua) -> &mut RawLua {
-    lua.raw.get_mut()
+    lua.main()
 }
 
 // ── Load & execute ─────────────────────────────────────────────────────
 
 /// Load a Lua chunk as a function onto the stack.
 /// Returns `Ok(())` on success, `Err(LuaError::Runtime)` on syntax error.
-pub fn lual_loadstring(l: &mut LuaState, src: &[u8]) -> crate::vm::err::LuaResult<()> {
-    match crate::state::load(l, src.to_vec(), "=(load)") {
+pub fn lual_loadstring(l: &mut LuaState, src: &[u8]) -> LuaResult<()> {
+    match state::load(l, src.to_vec(), "=(load)") {
         Ok(f) => {
             l.stack_ensure(l.top + 1);
             l.stack[l.top] = f;
             l.top += 1;
             Ok(())
         }
-        Err(_) => Err(crate::vm::err::LuaError::Runtime),
+        Err(_) => Err(LuaError::Runtime),
     }
 }
 
 /// Load a Lua chunk from a file.
-pub fn lual_loadfile(l: &mut LuaState, path: &str) -> crate::vm::err::LuaResult<()> {
+pub fn lual_loadfile(l: &mut LuaState, path: &str) -> LuaResult<()> {
     match std::fs::read(path) {
         Ok(src) => lual_loadstring(l, &src),
-        Err(_) => Err(crate::vm::err::LuaError::Runtime),
+        Err(_) => Err(LuaError::Runtime),
     }
 }
 
 /// Protected call: pops `nargs` values + function, pushes results.
 /// `errfunc` is the stack index of an error handler (0 = none).
 /// Returns `Ok(())` on success, `Err` on runtime error.
-pub fn lua_pcall(
-    l: &mut LuaState,
-    nargs: i32,
-    nresults: i32,
-    _errfunc: i32,
-) -> crate::vm::err::LuaResult<()> {
+pub fn lua_pcall(l: &mut LuaState, nargs: i32, nresults: i32, _errfunc: i32) -> LuaResult<()> {
     let func = lua_index(l, -(nargs + 1));
     let mut args = Vec::with_capacity(nargs as usize);
     for i in 0..nargs as usize {
@@ -124,7 +103,7 @@ pub fn lua_pcall(
 
 /// Unprotected call. On error, the error is propagated via the return
 /// value (no longjmp — use `lua_pcall` for protected calls).
-pub fn lua_call(l: &mut LuaState, nargs: i32, nresults: i32) -> crate::vm::err::LuaResult<()> {
+pub fn lua_call(l: &mut LuaState, nargs: i32, nresults: i32) -> LuaResult<()> {
     let func = lua_index(l, -(nargs + 1));
     let mut args = Vec::with_capacity(nargs as usize);
     for i in 0..nargs as usize {
@@ -209,40 +188,53 @@ pub fn lua_iscdata(l: &LuaState, idx: i32) -> bool {
     lua_index(l, idx).is_cdata()
 }
 
-pub fn lua_type(l: &LuaState, idx: i32) -> i32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LuaType {
+    Nil,
+    Boolean,
+    Number,
+    String,
+    Table,
+    Function,
+    Userdata,
+    Thread,
+    Unknown,
+}
+
+pub fn lua_type(l: &LuaState, idx: i32) -> LuaType {
     let v = lua_index(l, idx);
     if v.is_nil() {
-        0
+        LuaType::Nil
     } else if v.is_bool() {
-        1
+        LuaType::Boolean
     } else if v.is_number() {
-        3
+        LuaType::Number
     } else if v.is_string() {
-        4
+        LuaType::String
     } else if v.is_table() {
-        5
+        LuaType::Table
     } else if v.is_func() {
-        6
+        LuaType::Function
     } else if v.is_userdata() {
-        7
+        LuaType::Userdata
     } else if v.is_thread() {
-        8
+        LuaType::Thread
     } else {
-        -1
+        LuaType::Unknown
     }
 }
 
-pub fn lua_typename(_l: &LuaState, tp: i32) -> &'static str {
+pub fn lua_typename(_l: &LuaState, tp: LuaType) -> &'static str {
     match tp {
-        0 => "nil",
-        1 => "boolean",
-        3 => "number",
-        4 => "string",
-        5 => "table",
-        6 => "function",
-        7 => "userdata",
-        8 => "thread",
-        _ => "no value",
+        LuaType::Nil => "nil",
+        LuaType::Boolean => "boolean",
+        LuaType::Number => "number",
+        LuaType::String => "string",
+        LuaType::Table => "table",
+        LuaType::Function => "function",
+        LuaType::Userdata => "userdata",
+        LuaType::Thread => "thread",
+        LuaType::Unknown => "no value",
     }
 }
 
@@ -615,14 +607,14 @@ pub fn lual_checkudata(l: &LuaState, idx: i32, tname: &str) -> *mut u8 {
 }
 
 /// Raise a Lua error with the value on top of the stack.
-pub fn lua_error(_l: &mut LuaState) -> crate::vm::err::LuaResult<()> {
-    Err(crate::vm::err::LuaError::Runtime)
+pub fn lua_error(l: &mut LuaState, err: &str) -> LuaResult<()> {
+    Err(l.runtime_error(err))
 }
 
 // ── Garbage collection ────────────────────────────────────────────────
 
 pub fn lua_gc(l: &mut LuaState, _what: i32, _data: i32) -> i32 {
-    crate::gc::full_gc(l.global());
+    full_gc(l.global());
     0
 }
 

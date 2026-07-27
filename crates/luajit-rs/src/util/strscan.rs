@@ -155,10 +155,6 @@ fn scan_hex(s: &[u8]) -> Option<f64> {
     Some((mant as f64) * (exp as f64).exp2())
 }
 
-pub fn scan_bin(s: &[u8]) -> Option<f64> {
-    scan_bin_to_u64(s).map(|u| u as f64)
-}
-
 fn split_suffix(s: &[u8]) -> (&[u8], NumSuffix) {
     let len = s.len();
     // Handle 'i' / 'I' suffix (imaginary / complex)

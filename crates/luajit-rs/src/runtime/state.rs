@@ -1,7 +1,11 @@
 use std::ptr::NonNull;
 
+use crate::ffi::CTState;
 use crate::func::{CClosure, CFunction, GcFunc, LuaClosure};
 use crate::gc::{GcObjectKind, GcPtr, Pool};
+use crate::jit::JitState;
+use crate::meta;
+use crate::proto::KGc;
 use crate::proto::Proto;
 use crate::string::{Interner, StrId};
 use crate::table::LuaTable;
@@ -194,14 +198,14 @@ pub struct GlobalState {
     pub basemt: [Option<GcPtr<LuaTable>>; ITYPE_COUNT],
     /// Interned metamethod name strings, indexed by `MM` (LuaJIT's
     /// `GCROOT_MMNAME` roots, filled by `lj_meta_init`).
-    pub mmname: [LuaValue; crate::runtime::meta::MM_MAX],
+    pub mmname: [LuaValue; meta::MM_MAX],
     /// The currently running thread (LuaJIT's `cur_L`): the main thread or
     /// the innermost resumed coroutine.
     pub cur_l: Option<StateRef>,
     /// The JIT compiler state (LuaJIT embeds `jit_State` in `GG_State`).
-    pub jit: crate::jit::JitState,
+    pub jit: JitState,
     /// FFI C type system (lazy-initialised by `ffi.load` / first FFI call).
-    pub cts: Option<crate::ffi::CTState>,
+    pub cts: Option<CTState>,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
@@ -610,10 +614,10 @@ pub struct Lua {
 }
 
 impl Lua {
-    pub fn new() -> Box<Lua> {
-        let mut lua = Box::new(Lua {
+    pub fn new() -> Lua {
+        let mut lua = Lua {
             g: Box::new(GlobalState::new()),
-        });
+        };
         let gref = GlobalRef(NonNull::from(&*lua.g));
         let main_ref = lua.g.heap.alloc_thread(LuaState::new(gref, true));
         lua.g.main = Some(main_ref);
@@ -641,12 +645,6 @@ pub fn new_thread(l: &LuaState) -> StateRef {
     let g = l.global();
     let gref = GlobalRef(NonNull::from(&*g));
     g.heap.alloc_thread(LuaState::new(gref, false))
-}
-
-impl Default for Box<Lua> {
-    fn default() -> Box<Lua> {
-        Lua::new()
-    }
 }
 
 pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue, String> {
@@ -693,15 +691,15 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
 /// and resolving string constants into the `kstrv` fast-lookup table.
 pub fn register_proto(heap: &mut GcHeap, mut proto: Proto) -> GcPtr<Proto> {
     for i in 0..proto.kgc.len() {
-        if matches!(proto.kgc[i], crate::proto::KGc::Proto(_)) {
-            let taken = std::mem::replace(&mut proto.kgc[i], crate::proto::KGc::Str(0));
-            if let crate::proto::KGc::Proto(child) = taken {
+        if matches!(proto.kgc[i], KGc::Proto(_)) {
+            let taken = std::mem::replace(&mut proto.kgc[i], KGc::Str(0));
+            if let KGc::Proto(child) = taken {
                 let r = register_proto(heap, *child);
                 // Propagate parent source to child protos that don't have one.
                 if r.as_ref().source.is_none() {
                     r.as_mut().source = proto.source;
                 }
-                proto.kgc[i] = crate::proto::KGc::ProtoRef(r);
+                proto.kgc[i] = KGc::ProtoRef(r);
             }
         }
     }
@@ -709,7 +707,7 @@ pub fn register_proto(heap: &mut GcHeap, mut proto: Proto) -> GcPtr<Proto> {
         .kgc
         .iter()
         .map(|k| match k {
-            crate::proto::KGc::Str(sid) => {
+            KGc::Str(sid) => {
                 if let Some(ptr) = heap.strings.try_lookup(*sid) {
                     LuaValue::string(ptr)
                 } else {
@@ -777,7 +775,7 @@ mod tests {
                 );
                 let pt = c.proto.as_ref();
                 for k in &pt.kgc {
-                    if let crate::proto::KGc::ProtoRef(child) = k {
+                    if let KGc::ProtoRef(child) = k {
                         assert!(
                             child.as_ref().source.is_some(),
                             "child proto should inherit source"

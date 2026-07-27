@@ -22,7 +22,7 @@ pub mod sort;
 pub mod string;
 pub mod table;
 
-pub use reg::{LibBuilder, LibTarget};
+pub use reg::LibTarget;
 
 use crate::err::LuaResult;
 use crate::ffi;
@@ -220,29 +220,6 @@ pub fn err_bad_arg(
         n, func, expected, got
     );
     l.runtime_error(msg.as_bytes())
-}
-
-/// Create a named global table filled with C functions.
-pub fn make_lib(l: &mut LuaState, name: &[u8], entries: &[(&[u8], crate::func::CFunction)]) {
-    use crate::func::{CClosure, GcFunc};
-    let t = l.heap().alloc_table(crate::table::LuaTable::new(
-        0,
-        (entries.len() as u32).next_power_of_two().trailing_zeros(),
-    ));
-    for &(field, f) in entries {
-        let sid = l.heap().intern(field);
-        let env = l.global().globals;
-        let fref = l.heap().alloc_func(GcFunc::C(CClosure {
-            f,
-            env,
-            upvals: Vec::new(),
-        }));
-        let key = l.heap().str_value(sid);
-        t.as_mut().set(key, LuaValue::func(fref));
-    }
-    let name_sid = l.heap().intern(name);
-    let key = l.heap().str_value(name_sid);
-    l.global().globals.as_mut().set(key, LuaValue::table(t));
 }
 
 /// Install every standard library.

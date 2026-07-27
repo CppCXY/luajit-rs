@@ -15,8 +15,12 @@
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::process::exit;
 
-use luajit_rs::api::{self, Lua};
-use luajit_rs::internal;
+use luajit_rs::internal::state::{Lua, load};
+use luajit_rs::internal::table::LuaTable;
+use luajit_rs::{
+    LuaError, LuaState, LuaValue, error_message, internal, lua_getglobal, lua_gettop, lua_main,
+    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring, lual_newstate,
+};
 
 const LUA_PROMPT: &str = "> ";
 const LUA_PROMPT2: &str = ">> ";
@@ -89,12 +93,11 @@ fn collectargs(argv: &[String]) -> Result<Args, String> {
     })
 }
 
-fn create_arg_table(l: &mut internal::LuaState, args: &[String], argn: usize) {
+fn create_arg_table(l: &mut LuaState, args: &[String], argn: usize) {
     let g = l.global();
     let script_idx = argn.min(args.len().saturating_sub(1));
     let total = args.len() - script_idx;
-    let t = g.heap.alloc_table(internal::LuaTable::new(0, 1));
-    use luajit_rs::api::LuaValue;
+    let t = g.heap.alloc_table(LuaTable::new(0, 1));
     if script_idx < args.len() {
         let name = args[script_idx].as_str();
         let sid = g.heap.intern(name.as_bytes());
@@ -141,7 +144,7 @@ fn incomplete(err: &str) -> bool {
     err.contains("<eof>")
 }
 
-fn loadline(ll: &mut internal::LuaState) -> Result<Option<Vec<u8>>, String> {
+fn loadline(ll: &mut LuaState) -> Result<Option<Vec<u8>>, String> {
     let first = match pushline(LUA_PROMPT) {
         Some(s) => s,
         None => return Ok(None),
@@ -152,7 +155,7 @@ fn loadline(ll: &mut internal::LuaState) -> Result<Option<Vec<u8>>, String> {
         first
     };
     loop {
-        match internal::state::load(ll, buf.as_bytes().to_vec(), "=stdin") {
+        match load(ll, buf.as_bytes().to_vec(), "=stdin") {
             Ok(_) => return Ok(Some(buf.into_bytes())),
             Err(e) if incomplete(&e) => match pushline(LUA_PROMPT2) {
                 Some(line) => {
@@ -166,38 +169,38 @@ fn loadline(ll: &mut internal::LuaState) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-fn error_msg(ll: &internal::LuaState) -> String {
-    api::error_message(ll)
+fn error_msg(ll: &LuaState) -> String {
+    error_message(ll)
 }
 
-fn dotty(ll: &mut internal::LuaState) -> i32 {
+fn dotty(ll: &mut LuaState) -> i32 {
     while let Ok(Some(chunk)) = loadline(ll) {
-        if api::lual_loadstring(ll, &chunk).is_err() {
+        if lual_loadstring(ll, &chunk).is_err() {
             eprintln!("luajit-rs: compile error");
             continue;
         }
-        match api::lua_pcall(ll, 0, -1, 0) {
+        match lua_pcall(ll, 0, -1, 0) {
             Ok(()) => {
-                let nresults = api::lua_gettop(ll);
+                let nresults = lua_gettop(ll);
                 if nresults > 0 {
                     let g = ll.global();
                     let print_sid = g.heap.intern(b"print");
                     let key = g.heap.str_value(print_sid);
                     let print_fn = g.globals.as_ref().get_str(key);
                     if print_fn.is_func() {
-                        let mut args: Vec<internal::LuaValue> = (0..nresults)
-                            .map(|i| api::lua_peek(ll, (i + 1) as i32))
+                        let mut args: Vec<LuaValue> = (0..nresults)
+                            .map(|i| lua_peek(ll, (i + 1) as i32))
                             .collect();
                         args.insert(0, print_fn);
                         let _ = internal::call(ll, args[0], &args[1..]);
                     }
                 }
-                api::lua_settop(ll, 0);
+                lua_settop(ll, 0);
             }
-            Err(internal::LuaError::Runtime) => {
+            Err(LuaError::Runtime) => {
                 eprintln!("luajit-rs: {}", error_msg(ll));
             }
-            Err(internal::LuaError::Yield) => {
+            Err(LuaError::Yield) => {
                 eprintln!("luajit-rs: attempt to yield from outside a coroutine");
             }
         }
@@ -207,7 +210,7 @@ fn dotty(ll: &mut internal::LuaState) -> i32 {
 }
 
 fn dofile(lua: &mut Lua, name: &str) -> i32 {
-    let ll = api::lua_main(lua);
+    let ll = lua_main(lua);
     let src = match std::fs::read(name) {
         Ok(s) => s,
         Err(e) => {
@@ -215,17 +218,17 @@ fn dofile(lua: &mut Lua, name: &str) -> i32 {
             return 1;
         }
     };
-    if api::lual_loadstring(ll, &src).is_err() {
+    if lual_loadstring(ll, &src).is_err() {
         eprintln!("luajit-rs: compile error in {name}");
         return 1;
     }
-    match api::lua_pcall(ll, 0, 0, 0) {
+    match lua_pcall(ll, 0, 0, 0) {
         Ok(()) => 0,
-        Err(internal::LuaError::Runtime) => {
+        Err(LuaError::Runtime) => {
             eprintln!("luajit-rs: {}", error_msg(ll));
             1
         }
-        Err(internal::LuaError::Yield) => {
+        Err(LuaError::Yield) => {
             eprintln!("luajit-rs: attempt to yield");
             1
         }
@@ -233,18 +236,18 @@ fn dofile(lua: &mut Lua, name: &str) -> i32 {
 }
 
 fn dostring(lua: &mut Lua, s: &str, name: &str) -> i32 {
-    let ll = api::lua_main(lua);
-    if api::lual_loadstring(ll, s.as_bytes()).is_err() {
+    let ll = lua_main(lua);
+    if lual_loadstring(ll, s.as_bytes()).is_err() {
         eprintln!("luajit-rs: compile error in {name}");
         return 1;
     }
-    match api::lua_pcall(ll, 0, 0, 0) {
+    match lua_pcall(ll, 0, 0, 0) {
         Ok(()) => 0,
-        Err(internal::LuaError::Runtime) => {
+        Err(LuaError::Runtime) => {
             eprintln!("luajit-rs: {}", error_msg(ll));
             1
         }
-        Err(internal::LuaError::Yield) => {
+        Err(LuaError::Yield) => {
             eprintln!("luajit-rs: attempt to yield");
             1
         }
@@ -277,16 +280,16 @@ fn run_args(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
                     i += 1;
                     argv[i].as_str()
                 };
-                let ll = api::lua_main(lua);
-                api::lua_getglobal(ll, "require");
-                api::lua_pushstring(ll, name.as_bytes());
-                match api::lua_pcall(ll, 1, 0, 0) {
+                let ll = lua_main(lua);
+                lua_getglobal(ll, "require");
+                lua_pushstring(ll, name.as_bytes());
+                match lua_pcall(ll, 1, 0, 0) {
                     Ok(()) => {}
-                    Err(internal::LuaError::Runtime) => {
+                    Err(LuaError::Runtime) => {
                         eprintln!("luajit-rs: {}", error_msg(ll));
                         return 1;
                     }
-                    Err(internal::LuaError::Yield) => {
+                    Err(LuaError::Yield) => {
                         eprintln!("luajit-rs: attempt to yield");
                         return 1;
                     }
@@ -300,8 +303,8 @@ fn run_args(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
                     argv[i].as_str()
                 };
                 match cmd {
-                    "on" => api::lua_raw(lua).global().jit.set_on(true),
-                    "off" => api::lua_raw(lua).global().jit.set_on(false),
+                    "on" => lua.global().jit.set_on(true),
+                    "off" => lua.global().jit.set_on(false),
                     _ => {
                         eprintln!(
                             "luajit-rs: unknown luaJIT command or jit.* modules not installed"
@@ -394,9 +397,9 @@ fn main() {
         }
     };
 
-    let mut lua = api::lual_newstate();
+    let mut lua = lual_newstate();
     if std::env::var("LUAJIT_RS_JIT").as_deref() == Ok("off") {
-        api::lua_raw(&mut lua).global().jit.set_on(false);
+        lua.global().jit.set_on(false);
     }
 
     if !flags.noenv
@@ -413,7 +416,7 @@ fn main() {
         println!("{VERSION}");
     }
 
-    create_arg_table(api::lua_main(&mut lua), &args, flags.argn as usize);
+    create_arg_table(lua_main(&mut lua), &args, flags.argn as usize);
 
     if run_args(&mut lua, &args, flags.argn as usize) != 0 {
         exit(1);
@@ -430,12 +433,12 @@ fn main() {
         if flags.version {
             println!("{VERSION}");
         }
-        let ll = api::lua_main(&mut lua);
+        let ll = lua_main(&mut lua);
         dotty(ll);
     } else if (flags.argn as usize) >= args.len() && !flags.exec && !flags.version {
         if stdin_is_tty() {
             println!("{VERSION}");
-            let ll = api::lua_main(&mut lua);
+            let ll = lua_main(&mut lua);
             dotty(ll);
         } else {
             let mut src = Vec::new();
