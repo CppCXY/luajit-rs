@@ -18,8 +18,7 @@ use std::process::exit;
 use luajit_rs::internal::state::{Lua, load};
 use luajit_rs::internal::table::LuaTable;
 use luajit_rs::{
-    LuaError, LuaState, LuaValue, internal, lua_error_message, lua_getglobal, lua_gettop,
-    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring,
+    LuaError, LuaState, LuaValue, internal, lua_error_message, lua_getglobal, lua_gettop, lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring, lual_openlibs,
 };
 
 const LUA_PROMPT: &str = "> ";
@@ -398,6 +397,7 @@ fn main() {
     };
 
     let mut lua = Lua::new();
+    lual_openlibs(lua.main());
     if std::env::var("LUAJIT_RS_JIT").as_deref() == Ok("off") {
         lua.global().jit.set_on(false);
     }

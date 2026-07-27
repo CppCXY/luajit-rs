@@ -16,6 +16,7 @@ use crate::func::{CClosure, CFunction, GcFunc};
 use crate::runtime::gc::full_gc;
 use crate::runtime::userdata::GcUserData;
 use crate::state::{self, LuaState, StateRef};
+use crate::stdlib::coroutine::{Outcome, do_resume};
 use crate::stdlib::open_libs as open_stdlib;
 use crate::table::LuaTable;
 use crate::util::strfmt;
@@ -674,10 +675,9 @@ pub fn lua_resume(l: &mut LuaState, nargs: i32) -> LuaResult<i32> {
         Some(c) => c,
         None => return Err(LuaError::Runtime),
     };
-    let outcome =
-        crate::stdlib::coroutine::do_resume(l, co, l.top - nargs as usize, nargs as usize)?;
+    let outcome = do_resume(l, co, l.top - nargs as usize, nargs as usize)?;
     match outcome {
-        crate::stdlib::coroutine::Outcome::Done(n) => {
+        Outcome::Done(n) => {
             let co_state = co.as_mut();
             for i in 0..n {
                 l.stack[l.base + i] = co_state.stack[i];
@@ -685,7 +685,7 @@ pub fn lua_resume(l: &mut LuaState, nargs: i32) -> LuaResult<i32> {
             l.top = l.base + n;
             Ok(0)
         }
-        crate::stdlib::coroutine::Outcome::Yielded(slot, n) => {
+        Outcome::Yielded(slot, n) => {
             let co_state = co.as_mut();
             for i in 0..n {
                 l.stack[l.base + i] = co_state.stack[slot + i];
@@ -693,7 +693,7 @@ pub fn lua_resume(l: &mut LuaState, nargs: i32) -> LuaResult<i32> {
             l.top = l.base + n;
             Ok(LUA_YIELD)
         }
-        crate::stdlib::coroutine::Outcome::Failed => Err(LuaError::Runtime),
+        Outcome::Failed => Err(LuaError::Runtime),
     }
 }
 
