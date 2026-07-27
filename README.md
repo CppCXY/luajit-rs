@@ -8,22 +8,20 @@ The entire codebase was written by **DeepSeek**, with a human providing
 direction and review.
 
 > **Status: experimental.** The core language and standard library are
-> mostly functional. The tracing JIT works correctly on x86-64. ARM64
-> JIT is functional but the number-type guard in type-changing traces
-> has a known correctness bug (trace exits incorrectly produce wrong
-> results). The portable IR executor serves as a reliable fallback on
-> all architectures.
+> mostly functional. The tracing JIT works correctly on x86-64 and ARM64
+> JIT is functional.
 
 ## Highlights
 
-- **Lua 5.1 / LuaJIT3 dialect** plus most of the LuaJIT standard library.
+- **Lua 5.1 / LuaJIT3 Grammars** plus most of the LuaJIT standard library.
+- **Lua 5.5 GC Algorithm**
 - **Passes the LuaJIT 2/3 test suite** — 424 tests, all passing.
 - **Tracing JIT compiler** modeled on LuaJIT's design:
   - hot-path detection (hotcounts → penalties → blacklisting),
   - recording interpreter emitting SSA IR with snapshots,
   - FOLD / CSE / DCE and loop optimization (peeling + PHIs),
   - **x86-64 machine-code backend** (Windows & System V ABIs),
-  - **ARM64 machine-code backend** (type guards via UBFX, exit stubs),
+  - **ARM64 machine-code backend** (AArch64 ABI),
 - **Precise garbage collector** with trace GC safe points.
 - **FFI** with `cdef` parser, `new`/`cast`/`sizeof`/`alignof`, C types
   (struct/union/enum/complex/arrays/pointers), and native C function calls.
@@ -55,12 +53,7 @@ cd crates/luajit-rs/tests/luajit2_test
 | Windows x64         | ✓           | ✓                 | Fully working |
 | Linux x64           | ✓           | ✓                 | Fully working |
 | macOS x64           | ✓           | ✓                 | Fully working |
-| ARM64 (macOS/Linux) | ✓           | ~                 | Fully working |
-
-On ARM64, tracing JIT works for many workloads but has a correctness issue
-where the number SLOAD guard in type-changing traces does not fire correctly,
-causing wrong computations. Use `LUAJIT_RS_NOASM=1` to force the portable
-IR executor on ARM64, or `jit.off()` to use the interpreter.
+| ARM64 (macOS/Linux) | ✓           | ✓                 | Fully working |
 
 ## Debugging & tuning
 
