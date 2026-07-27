@@ -1,7 +1,7 @@
+pub mod collector;
 pub mod header;
 pub mod list;
-pub mod collector;
 
-pub use header::{GcHeader, Age, GcObjectKind};
+pub use collector::{Collector, GcKind, GcState};
+pub use header::{Age, GcHeader, GcObjectKind};
 pub use list::GcList;
-pub use collector::{GcState, GcKind, Collector};

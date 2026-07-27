@@ -246,10 +246,10 @@ impl Interner {
         // The sentinel must survive all GC cycles.
         let empty_bytes: &[u8] = b"";
         for &slot in &self.slots {
-            if let Slot::Occupied(p) = slot {
-                if p.as_ref().as_bytes() == empty_bytes {
-                    p.set_marked();
-                }
+            if let Slot::Occupied(p) = slot
+                && p.as_ref().as_bytes() == empty_bytes
+            {
+                p.set_marked();
             }
         }
         self.pool.sweep_tricolor(current_white, |s| {

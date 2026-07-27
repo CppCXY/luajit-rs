@@ -15,9 +15,9 @@ use std::cell::Cell;
 
 const BIT_WHITE0: u8 = 0b0000_1000; // bit 3
 const BIT_WHITE1: u8 = 0b0001_0000; // bit 4
-const BIT_BLACK:  u8 = 0b0010_0000; // bit 5
+const BIT_BLACK: u8 = 0b0010_0000; // bit 5
 const COLOR_MASK: u8 = BIT_WHITE0 | BIT_WHITE1 | BIT_BLACK;
-const AGE_MASK:   u8 = 0b0000_0111;
+const AGE_MASK: u8 = 0b0000_0111;
 
 // ── Age ────────────────────────────────────────────────────────────────
 
@@ -89,7 +89,11 @@ unsafe impl Sync for GcHeader {}
 impl GcHeader {
     pub fn new(current_white: u8, kind: GcObjectKind, alloc_size: u32) -> Self {
         debug_assert!(current_white == 0 || current_white == 1);
-        let c = if current_white == 0 { BIT_WHITE0 } else { BIT_WHITE1 };
+        let c = if current_white == 0 {
+            BIT_WHITE0
+        } else {
+            BIT_WHITE1
+        };
         Self {
             bits: Cell::new(c),
             kind: kind as u8,
@@ -100,9 +104,13 @@ impl GcHeader {
     }
 
     #[inline]
-    fn rb(&self) -> u8 { self.bits.get() }
+    fn rb(&self) -> u8 {
+        self.bits.get()
+    }
     #[inline]
-    fn wb(&self, v: u8) { self.bits.set(v); }
+    fn wb(&self, v: u8) {
+        self.bits.set(v);
+    }
 
     // -- Color --
 
@@ -137,7 +145,11 @@ impl GcHeader {
         }
     }
     pub fn otherwhite(current_white: u8) -> u8 {
-        if current_white == 0 { BIT_WHITE1 } else { BIT_WHITE0 }
+        if current_white == 0 {
+            BIT_WHITE1
+        } else {
+            BIT_WHITE0
+        }
     }
 
     // -- Age --
@@ -157,12 +169,18 @@ impl GcHeader {
     pub fn set_age(&self, age: Age) {
         self.wb((self.rb() & !AGE_MASK) | (age as u8));
     }
-    pub fn is_old(&self) -> bool { self.age().is_old() }
+    pub fn is_old(&self) -> bool {
+        self.age().is_old()
+    }
 
     // -- Size --
 
-    pub fn alloc_size(&self) -> u32 { self.alloc_size.get() }
-    pub fn set_alloc_size(&self, s: u32) { self.alloc_size.set(s); }
+    pub fn alloc_size(&self) -> u32 {
+        self.alloc_size.get()
+    }
+    pub fn set_alloc_size(&self, s: u32) {
+        self.alloc_size.set(s);
+    }
 
     pub fn kind(&self) -> GcObjectKind {
         GcObjectKind::from_u8(self.kind).unwrap_or(GcObjectKind::Table)

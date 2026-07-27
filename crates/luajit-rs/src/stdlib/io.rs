@@ -113,8 +113,12 @@ fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
 fn fd_from_upval(l: &LuaState) -> usize {
     l.upvalue(0).as_number().unwrap_or(-1.0) as usize
 }
-fn handle_read_fd(l: &mut LuaState) -> LuaResult<i32> { do_read(l, Some(fd_from_upval(l)), 1) }
-fn handle_write_fd(l: &mut LuaState) -> LuaResult<i32> { do_write(l, Some(fd_from_upval(l)), 1) }
+fn handle_read_fd(l: &mut LuaState) -> LuaResult<i32> {
+    do_read(l, Some(fd_from_upval(l)), 1)
+}
+fn handle_write_fd(l: &mut LuaState) -> LuaResult<i32> {
+    do_write(l, Some(fd_from_upval(l)), 1)
+}
 fn handle_lines_fd(l: &mut LuaState) -> LuaResult<i32> {
     let it = make_lines_iter(l, fd_from_upval(l));
     push(l, it);
@@ -122,7 +126,9 @@ fn handle_lines_fd(l: &mut LuaState) -> LuaResult<i32> {
 }
 fn handle_close_fd(l: &mut LuaState) -> LuaResult<i32> {
     let fd = fd_from_upval(l);
-    if let Some(slot) = FILES.lock().unwrap().get_mut(fd) { *slot = None; }
+    if let Some(slot) = FILES.lock().unwrap().get_mut(fd) {
+        *slot = None;
+    }
     push(l, LuaValue::TRUE);
     Ok(1)
 }
@@ -323,6 +329,7 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
 
 // -- Handle methods (self = arg 0) --------------------------------------------
 
+#[allow(dead_code)]
 fn handle_read(l: &mut LuaState) -> LuaResult<i32> {
     match handle_fd(l, 0) {
         Some(fd) => do_read(l, Some(fd), 1),
@@ -330,6 +337,7 @@ fn handle_read(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
+#[allow(dead_code)]
 fn handle_write(l: &mut LuaState) -> LuaResult<i32> {
     match handle_fd(l, 0) {
         Some(fd) => do_write(l, Some(fd), 1),
@@ -402,6 +410,7 @@ fn make_lines_iter(l: &mut LuaState, fd: usize) -> LuaValue {
     LuaValue::func(fref)
 }
 
+#[allow(dead_code)]
 fn handle_lines(l: &mut LuaState) -> LuaResult<i32> {
     match handle_fd(l, 0) {
         Some(fd) => {

@@ -387,7 +387,9 @@ impl Interp {
         let mut link = unsafe { (*bp.sub(1)).to_bits() };
         while (link & FRAME_TYPE_MASK) == FRAME_VARG {
             let sz = (link >> 3) as usize;
-            if sz == 0 { break; }
+            if sz == 0 {
+                break;
+            }
             bp = unsafe { bp.sub(sz) };
             link = unsafe { (*bp.sub(1)).to_bits() };
         }
@@ -486,7 +488,9 @@ impl Interp {
     /// Returns `None`: execution always continues in the caller.
     fn cont_dispatch(&mut self, mmbase: usize, link: u64, n: usize) -> Option<usize> {
         let delta = (link >> 3) as usize;
-        if delta == 0 || delta > mmbase { return None; }
+        if delta == 0 || delta > mmbase {
+            return None;
+        }
         let caller_base = mmbase - delta;
         let (cont, extra) = Cont::decode(self.at(mmbase - 4).to_bits());
         let saved_pc = self.at(mmbase - 3).to_bits() as usize;
@@ -1856,31 +1860,33 @@ impl Interp {
                     let link = unsafe { (*bp.sub(1)).to_bits() };
                     if link & FRAME_TYPE_MASK == FRAME_VARG {
                         let delta = (link >> 3) as usize;
-                        if delta < 2 { self.multres = 0; } else {
-                        let numparams = self.proto().numparams as usize;
-                        let nvarg = (delta - 2).saturating_sub(numparams);
-                        let dst = a as usize;
-                        let src = unsafe { bp.sub(delta).add(numparams) };
-                        if bc_b(ins) == 0 {
-                            for i in 0..nvarg {
-                                unsafe { *bp.add(dst + i) = *src.add(i) };
-                            }
-                            self.multres = nvarg;
-                            self.l().top = cur_base!() + dst + nvarg;
+                        if delta < 2 {
+                            self.multres = 0;
                         } else {
-                            let want = (bc_b(ins) - 1) as usize;
-                            for i in 0..want {
-                                unsafe {
-                                    *bp.add(dst + i) = if i < nvarg {
-                                        *src.add(i)
-                                    } else {
-                                        LuaValue::NIL
-                                    };
+                            let numparams = self.proto().numparams as usize;
+                            let nvarg = (delta - 2).saturating_sub(numparams);
+                            let dst = a as usize;
+                            let src = unsafe { bp.sub(delta).add(numparams) };
+                            if bc_b(ins) == 0 {
+                                for i in 0..nvarg {
+                                    unsafe { *bp.add(dst + i) = *src.add(i) };
+                                }
+                                self.multres = nvarg;
+                                self.l().top = cur_base!() + dst + nvarg;
+                            } else {
+                                let want = (bc_b(ins) - 1) as usize;
+                                for i in 0..want {
+                                    unsafe {
+                                        *bp.add(dst + i) = if i < nvarg {
+                                            *src.add(i)
+                                        } else {
+                                            LuaValue::NIL
+                                        };
+                                    }
+                                }
                             }
-                        }
                         }
                     }
-                }
                 }
 
                 // -- Bitwise ops (Lua 5.3+), lj_num2bit / lj_vm_tobit --
@@ -2387,19 +2393,29 @@ impl Interp {
             self.close_upvals(self.base);
         }
         let mut base = self.base;
-        if base < 2 { return None; }
+        if base < 2 {
+            return None;
+        }
         let mut link = self.l().stack[base - 1].to_bits();
         // A NIL link means we cannot determine the caller. Bail out so the
         // interpreter can continue with the next opcode (a Lua-level error
         // will surface if the state is too corrupted).
-        if link == u64::MAX { return None; }
+        if link == u64::MAX {
+            return None;
+        }
         while (link & FRAME_TYPE_MASK) == FRAME_VARG {
             let sz = (link >> 3) as usize;
-            if sz == 0 || sz > base { break; }
+            if sz == 0 || sz > base {
+                break;
+            }
             base -= sz;
-            if base < 2 { break; }
+            if base < 2 {
+                break;
+            }
             link = self.l().stack[base - 1].to_bits();
-            if link == u64::MAX { return None; }
+            if link == u64::MAX {
+                return None;
+            }
         }
         let dst = base - 2; // results always land at the callee's func slot
         for i in 0..n {
@@ -2471,7 +2487,9 @@ impl Interp {
         let link = self.at(base - 1).to_bits();
         debug_assert!(link & FRAME_TYPE_MASK == FRAME_VARG);
         let delta = (link >> 3) as usize;
-        if delta == 0 || delta > base { return; }
+        if delta == 0 || delta > base {
+            return;
+        }
         let numparams = self.proto().numparams as usize;
         let varg_base = base - delta + numparams;
         let nvarg = (delta - 2).saturating_sub(numparams);

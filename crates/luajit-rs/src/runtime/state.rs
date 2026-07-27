@@ -1,7 +1,7 @@
 use std::ptr::NonNull;
 
 use crate::func::{CClosure, CFunction, GcFunc, LuaClosure};
-use crate::gc::{GcPtr, Pool, GcObjectKind};
+use crate::gc::{GcObjectKind, GcPtr, Pool};
 use crate::proto::Proto;
 use crate::string::{Interner, StrId};
 use crate::table::LuaTable;
@@ -75,8 +75,7 @@ impl GcHeap {
             // allocates rapidly (e.g. a table-append loop) doesn't trigger
             // the GCSTEP guard again after a constant 16 KiB margin, which
             // would be consumed immediately by the next few allocations.
-            self.threshold =
-                live + ((live * crate::gc::GC_PAUSE) / 100).max(16384);
+            self.threshold = live + ((live * crate::gc::GC_PAUSE) / 100).max(16384);
         }
     }
 

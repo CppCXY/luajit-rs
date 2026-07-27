@@ -24,13 +24,17 @@ pub struct GcHeader {
 
 const BIT_WHITE0: u8 = 0b0000_1000;
 const BIT_WHITE1: u8 = 0b0001_0000;
-const BIT_BLACK:  u8 = 0b0010_0000;
+const BIT_BLACK: u8 = 0b0010_0000;
 const COLOR_MASK: u8 = BIT_WHITE0 | BIT_WHITE1 | BIT_BLACK;
-const AGE_MASK:   u8 = 0b0000_0111;
+const AGE_MASK: u8 = 0b0000_0111;
 
 impl GcHeader {
     pub fn new(current_white: u8, kind: GcObjectKind, size: u32) -> Self {
-        let c = if current_white == 0 { BIT_WHITE0 } else { BIT_WHITE1 };
+        let c = if current_white == 0 {
+            BIT_WHITE0
+        } else {
+            BIT_WHITE1
+        };
         Self {
             marked: Cell::new(false),
             bits: Cell::new(c),
@@ -41,13 +45,19 @@ impl GcHeader {
         }
     }
 
-    fn rb(&self) -> u8 { self.bits.get() }
-    fn wb(&self, v: u8) { self.bits.set(v); }
+    fn rb(&self) -> u8 {
+        self.bits.get()
+    }
+    fn wb(&self, v: u8) {
+        self.bits.set(v);
+    }
 
     pub fn is_white(&self) -> bool {
         (self.rb() & COLOR_MASK) != BIT_BLACK && (self.rb() & COLOR_MASK) != 0
     }
-    pub fn is_black(&self) -> bool { (self.rb() & BIT_BLACK) != 0 }
+    pub fn is_black(&self) -> bool {
+        (self.rb() & BIT_BLACK) != 0
+    }
     pub fn change_white(&self) {
         let b = self.rb();
         if b & BIT_WHITE0 != 0 {
@@ -56,25 +66,45 @@ impl GcHeader {
             self.wb((b & !BIT_WHITE1) | BIT_WHITE0);
         }
     }
-    pub fn nw2black(&self) { self.wb((self.rb() & !COLOR_MASK) | BIT_BLACK); }
-    pub fn make_gray(&self) { self.wb(self.rb() & !COLOR_MASK); }
+    pub fn nw2black(&self) {
+        self.wb((self.rb() & !COLOR_MASK) | BIT_BLACK);
+    }
+    pub fn make_gray(&self) {
+        self.wb(self.rb() & !COLOR_MASK);
+    }
     pub fn is_dead(&self, current_white: u8) -> bool {
-        if current_white == 0 { self.rb() & BIT_WHITE1 != 0 }
-        else { self.rb() & BIT_WHITE0 != 0 }
+        if current_white == 0 {
+            self.rb() & BIT_WHITE1 != 0
+        } else {
+            self.rb() & BIT_WHITE0 != 0
+        }
     }
     pub fn otherwhite(current_white: u8) -> u8 {
-        if current_white == 0 { BIT_WHITE1 } else { BIT_WHITE0 }
+        if current_white == 0 {
+            BIT_WHITE1
+        } else {
+            BIT_WHITE0
+        }
     }
 
     pub fn age(&self) -> Age {
         match self.rb() & AGE_MASK {
-            0 => Age::New, 1 => Age::Survival, 2 => Age::Old0,
-            3 => Age::Old1, 4 => Age::Old, 5 => Age::Touched1,
-            6 => Age::Touched2, _ => Age::Old,
+            0 => Age::New,
+            1 => Age::Survival,
+            2 => Age::Old0,
+            3 => Age::Old1,
+            4 => Age::Old,
+            5 => Age::Touched1,
+            6 => Age::Touched2,
+            _ => Age::Old,
         }
     }
-    pub fn set_age(&self, a: Age) { self.wb((self.rb() & !AGE_MASK) | (a as u8)); }
-    pub fn is_old(&self) -> bool { self.age().is_old() }
+    pub fn set_age(&self, a: Age) {
+        self.wb((self.rb() & !AGE_MASK) | (a as u8));
+    }
+    pub fn is_old(&self) -> bool {
+        self.age().is_old()
+    }
     pub fn kind_tag(&self) -> GcObjectKind {
         GcObjectKind::from_u8(self.kind).unwrap_or(GcObjectKind::Table)
     }
@@ -226,7 +256,7 @@ mod lowmem {
         fn os_probe_survives_hundreds_of_pages() {
             let s = 1 << 16;
             let mut v = Vec::new();
-            for i in 0..300 {
+            for _i in 0..300 {
                 let p = os_alloc_low(s).expect("fail");
                 unsafe { p.as_ptr().write_bytes(0x77, s) };
                 v.push(p);
@@ -238,7 +268,12 @@ mod lowmem {
     }
 }
 
-fn alloc_block<T>(v: T, kind: GcObjectKind, alloc_size: u32, current_white: u8) -> (NonNull<T>, bool) {
+fn alloc_block<T>(
+    v: T,
+    kind: GcObjectKind,
+    alloc_size: u32,
+    current_white: u8,
+) -> (NonNull<T>, bool) {
     let (layout, data_offset) = std::alloc::Layout::new::<GcHeader>()
         .extend(std::alloc::Layout::new::<T>())
         .unwrap();
@@ -253,7 +288,7 @@ fn alloc_block<T>(v: T, kind: GcObjectKind, alloc_size: u32, current_white: u8) 
 }
 fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
     let addr = data.as_ptr() as usize;
-    if addr < 0x1000 || addr >= (1usize << 47) {
+    if !(0x1000..(1usize << 47)).contains(&addr) {
         eprintln!("DEALLOC-BAD-PTR: {:p}", data.as_ptr());
         std::process::abort();
     }
@@ -262,14 +297,18 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
         .unwrap();
     let layout = layout.pad_to_align();
     let ap = unsafe { (data.as_ptr() as *mut u8).sub(data_offset) };
-    debug_assert!(unsafe { (*(ap as *const GcHeader)).kind <= 7 },
-        "dealloc_block: corrupt kind T={}", std::any::type_name::<T>());
+    debug_assert!(
+        unsafe { (*(ap as *const GcHeader)).kind <= 7 },
+        "dealloc_block: corrupt kind T={}",
+        std::any::type_name::<T>()
+    );
     unsafe { lowmem::dealloc(NonNull::new_unchecked(ap), layout, mapped) };
 }
 fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
     let addr = ptr.as_ptr() as usize;
-    if addr < 0x1000 || addr >= (1usize << 47) {
-        static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    if !(0x1000..(1usize << 47)).contains(&addr) {
+        static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> =
+            std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
         let p = DUMMY.load(std::sync::atomic::Ordering::Relaxed);
         if p.is_null() {
             let b = Box::new(GcHeader::new(0, GcObjectKind::Table, 0));
@@ -285,7 +324,12 @@ fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
     unsafe {
         let p = (ptr.as_ptr() as *const u8).sub(data_offset) as *const GcHeader;
         let h = &*p;
-        debug_assert!(h.kind <= 7, "gc_header: corrupt kind={} T={}", h.kind, std::any::type_name::<T>());
+        debug_assert!(
+            h.kind <= 7,
+            "gc_header: corrupt kind={} T={}",
+            h.kind,
+            std::any::type_name::<T>()
+        );
         h
     }
 }
@@ -303,7 +347,13 @@ impl<T> Pool<T> {
         Self::new(GcObjectKind::Table)
     }
     pub fn new(kind: GcObjectKind) -> Self {
-        Self { objects: Vec::new(), mapped: Vec::new(), live: 0, kind, current_white: Cell::new(0) }
+        Self {
+            objects: Vec::new(),
+            mapped: Vec::new(),
+            live: 0,
+            kind,
+            current_white: Cell::new(0),
+        }
     }
     pub fn alloc(&mut self, v: T) -> GcPtr<T> {
         let cw = self.current_white.get();
@@ -346,8 +396,12 @@ impl<T> Pool<T> {
                 gc_header(ptr).marked.set(false);
                 i += 1;
             } else {
-                unsafe { on_free(ptr.as_ref()); }
-                unsafe { ptr.as_ptr().drop_in_place(); }
+                unsafe {
+                    on_free(ptr.as_ref());
+                }
+                unsafe {
+                    ptr.as_ptr().drop_in_place();
+                }
                 dealloc_block(ptr, self.mapped[i]);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
@@ -378,8 +432,12 @@ impl<T> Pool<T> {
                 h.marked.set(false);
                 i += 1;
             } else {
-                unsafe { on_free(ptr.as_ref()); }
-                unsafe { ptr.as_ptr().drop_in_place(); }
+                unsafe {
+                    on_free(ptr.as_ref());
+                }
+                unsafe {
+                    ptr.as_ptr().drop_in_place();
+                }
                 dealloc_block(ptr, self.mapped[i]);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
@@ -413,14 +471,16 @@ impl<T> GcPtr<T> {
         GcPtr(p)
     }
     pub fn from_addr(addr: u64) -> Option<Self> {
-        if addr != 0 && addr < 0x100 { return None; }
+        if addr != 0 && addr < 0x100 {
+            return None;
+        }
         NonNull::new(addr as *mut T).map(GcPtr)
     }
     pub fn addr(self) -> u64 {
         self.0.as_ptr() as u64
     }
-    
 
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref<'a>(self) -> &'a T {
         unsafe { &*self.0.as_ptr() }
     }
@@ -919,8 +979,14 @@ pub fn full_gc(g: &mut GlobalState) {
     }
     m.propagate();
     debug_assert!(g.globals.is_marked(), "globals not marked after propagate");
-    debug_assert!(g.registry.is_marked(), "registry not marked after propagate");
-    debug_assert!(g.main().is_marked(), "main thread not marked after propagate");
+    debug_assert!(
+        g.registry.is_marked(),
+        "registry not marked after propagate"
+    );
+    debug_assert!(
+        g.main().is_marked(),
+        "main thread not marked after propagate"
+    );
     let cw = g.heap.current_white;
     g.heap.strings.sweep(cw);
     g.heap.tables.sweep_tricolor(cw, |_| {});

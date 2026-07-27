@@ -63,6 +63,12 @@ pub struct Collector {
     sweep_objects: Vec<NonNull<GcHeader>>,
 }
 
+impl Default for Collector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Collector {
     pub fn new() -> Self {
         Self {
@@ -156,11 +162,12 @@ impl Collector {
                         self.gc_state = GcState::Pause;
                         self.update_threshold();
                     }
-                    work -= GC_STEPSIZE as isize * 1024 / 8;
                     break;
                 }
             }
-            if work <= 0 { break; }
+            if work <= 0 {
+                break;
+            }
         }
 
         if self.gc_state == GcState::Pause {
