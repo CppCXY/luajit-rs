@@ -836,6 +836,23 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
     }
 }
 
+/// Back barrier: when a black table is modified during GC propagation,
+/// make it gray so the collector re-scans it.
+pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
+    if heap.gc_state != GcState::Propagate {
+        return;
+    }
+    let addr = t.addr() as usize;
+    if !(0x1000..(1usize << 47)).contains(&addr) {
+        return;
+    }
+    let h = gc_header(t.0);
+    if h.is_black() {
+        h.make_gray();
+        heap.gc_gray.push(Gray::Tab(t));
+    }
+}
+
 pub fn gc_step(heap: &mut GcHeap, size: usize) {
     let step = heap.gc_step_size.max(size);
     match heap.gc_state {

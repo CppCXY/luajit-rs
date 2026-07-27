@@ -13,7 +13,7 @@
 //! ```
 use crate::err::{LuaError, LuaResult};
 use crate::func::{CClosure, CFunction, GcFunc};
-use crate::runtime::gc::full_gc;
+use crate::runtime::gc::{barrier_back, barrier_fwd, full_gc};
 use crate::runtime::userdata::GcUserData;
 use crate::state::{self, LuaState, StateRef};
 use crate::stdlib::coroutine::{Outcome, do_resume};
@@ -403,6 +403,7 @@ pub fn lua_setglobal(l: &mut LuaState, name: &str) {
     let key = l.global().heap.str_value(sid);
     let globals = l.global().globals;
     globals.as_mut().set(key, v);
+    gc_table_write(l, globals, v);
 }
 
 pub fn lua_register(l: &mut LuaState, name: &str, f: CFunction) {
@@ -441,6 +442,7 @@ pub fn lua_setfield(l: &mut LuaState, idx: i32, k: &str) {
         let sid = l.global().heap.intern(k.as_bytes());
         let lk = l.global().heap.str_value(sid);
         t.as_mut().set(lk, val);
+        gc_table_write(l, t, val);
     }
 }
 
@@ -476,6 +478,7 @@ pub fn lua_settable(l: &mut LuaState, idx: i32) {
     let tab = lua_index(l, idx);
     if let Some(t) = tab.as_table() {
         t.as_mut().set(key, val);
+        gc_table_write(l, t, val);
     }
 }
 
@@ -499,6 +502,7 @@ pub fn lua_rawseti(l: &mut LuaState, idx: i32, n: i32) {
     let tab = lua_index(l, idx);
     if let Some(t) = tab.as_table() {
         t.as_mut().set_int(n, val);
+        gc_table_write(l, t, val);
     }
 }
 
@@ -536,6 +540,7 @@ pub fn lua_rawset(l: &mut LuaState, idx: i32) {
     let tab = lua_index(l, idx);
     if let Some(t) = tab.as_table() {
         t.as_mut().set(key, val);
+        gc_table_write(l, t, val);
     }
 }
 
@@ -571,15 +576,21 @@ pub fn lua_touserdata(l: &LuaState, idx: i32) -> *mut u8 {
 // ── Metatables ────────────────────────────────────────────────────────
 
 pub fn lual_newmetatable(l: &mut LuaState, tname: &str) -> i32 {
-    let g = l.global();
-    let sid = g.heap.intern(tname.as_bytes());
-    let key = g.heap.str_value(sid);
-    let registry = g.registry;
-    if !registry.as_ref().get(key).is_nil() {
-        return 0;
-    }
-    let mt = g.heap.alloc_table(LuaTable::new(0, 2));
-    registry.as_mut().set(key, LuaValue::table(mt));
+    let (registry, mt_val) = {
+        let g = l.global();
+        let sid = g.heap.intern(tname.as_bytes());
+        let key = g.heap.str_value(sid);
+        let registry = g.registry;
+        if !registry.as_ref().get(key).is_nil() {
+            return 0;
+        }
+        let mt = g.heap.alloc_table(LuaTable::new(0, 2));
+        let mt_val = LuaValue::table(mt);
+        registry.as_mut().set(key, mt_val);
+        (registry, mt_val)
+    };
+    barrier_back(&mut l.global().heap, registry);
+    barrier_fwd(&mut l.global().heap, mt_val);
     1
 }
 
@@ -798,6 +809,13 @@ pub fn lua_next(l: &mut LuaState, idx: i32) -> i32 {
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
+
+/// Apply both GC barriers after writing `val` into table `t`.
+fn gc_table_write(l: &mut LuaState, t: crate::gc::GcPtr<crate::table::LuaTable>, val: LuaValue) {
+    let g = l.global();
+    barrier_back(&mut g.heap, t);
+    barrier_fwd(&mut g.heap, val);
+}
 
 fn lua_index(l: &LuaState, idx: i32) -> LuaValue {
     let abs = lua_absindex(l, idx);
