@@ -836,16 +836,15 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
     }
 }
 
-/// Back barrier: when a black table is modified during GC propagation,
-/// make it gray so the collector re-scans it.
+/// Back barrier (LuaJIT `lj_gc_anybarriert`): called after every table
+/// store. If the table was already scanned (black), mark it gray so the
+/// collector rescans it during incremental propagation. No-op when the
+/// table is white or gray.
+///
+/// Unlike `barrier_fwd`, this only accesses the table's GC header — always
+/// a valid GC object pointer — so it is safe to call at every store site
+/// including from the VM interpreter.
 pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
-    if heap.gc_state != GcState::Propagate {
-        return;
-    }
-    let addr = t.addr() as usize;
-    if !(0x1000..(1usize << 47)).contains(&addr) {
-        return;
-    }
     let h = gc_header(t.0);
     if h.is_black() {
         h.make_gray();

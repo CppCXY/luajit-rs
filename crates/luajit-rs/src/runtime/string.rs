@@ -1,5 +1,7 @@
 use ahash::RandomState;
 
+use crate::runtime::gc::GcPtr;
+
 pub type StrId = u32;
 
 const INLINE_CAP: usize = 40;
@@ -217,7 +219,7 @@ impl Interner {
         self.by_id.is_empty()
     }
 
-    pub fn try_lookup(&self, id: StrId) -> Option<crate::gc::GcPtr<LuaString>> {
+    pub fn try_lookup(&self, id: StrId) -> Option<GcPtr<LuaString>> {
         self.by_id.get(id as usize).and_then(|o| *o)
     }
 
@@ -227,7 +229,7 @@ impl Interner {
             .unwrap_or_else(|| self.try_lookup(self.empty_sid).unwrap().as_ref())
     }
 
-    pub fn lookup_ptr(&self, id: StrId) -> crate::gc::GcPtr<LuaString> {
+    pub fn lookup_ptr(&self, id: StrId) -> GcPtr<LuaString> {
         self.try_lookup(id)
             .unwrap_or_else(|| self.try_lookup(self.empty_sid).unwrap())
     }

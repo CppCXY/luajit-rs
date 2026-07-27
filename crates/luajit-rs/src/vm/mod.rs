@@ -27,6 +27,7 @@ use crate::func::{GcFunc, LuaClosure, Upval};
 use crate::gc::GcPtr;
 use crate::jit::{HOTCOUNT_CALL, HOTCOUNT_LOOP};
 use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto};
+use crate::runtime::gc::barrier_back;
 use crate::runtime::meta::MM;
 use crate::state::{LuaState, Suspend};
 use crate::table::LuaTable;
@@ -1337,6 +1338,7 @@ impl Interp {
                         } else {
                             tab.as_mut().set(k, v);
                         }
+                        barrier_back(&mut self.l().global().heap, tab);
                     } else {
                         sync!();
                         match self.meta_tset(t, k, v)? {
@@ -1356,6 +1358,7 @@ impl Interp {
                     {
                         let k = self.kstr_at(bc_c(ins));
                         tab.as_mut().set_str(k, v);
+                        barrier_back(&mut self.l().global().heap, tab);
                     } else {
                         sync!();
                         match self.meta_tset(t, self.kstr_at(bc_c(ins)), v)? {
@@ -1374,6 +1377,7 @@ impl Interp {
                         && tab.as_ref().metatable.is_none()
                     {
                         tab.as_mut().set_int(bc_c(ins) as i32, v);
+                        barrier_back(&mut self.l().global().heap, tab);
                     } else {
                         sync!();
                         match self.meta_tset(t, LuaValue::number(bc_c(ins) as f64), v)? {
@@ -1406,6 +1410,7 @@ impl Interp {
                                 tab.as_mut().set(LuaValue::number(key as f64), v);
                             }
                         }
+                        barrier_back(&mut self.l().global().heap, tab);
                     } else {
                         sync!();
                         self.tsetm(a, bc_d(ins))?;

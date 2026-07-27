@@ -1,4 +1,6 @@
 use crate::gc::GcPtr;
+use crate::runtime::cdata::CData;
+use crate::runtime::userdata::GcUserData;
 use crate::string::{LuaString, StrId};
 
 /// A non-boxed 64-bit Lua value, bit-identical to LuaJIT's LJ_GC64 TValue
@@ -198,7 +200,7 @@ impl LuaValue {
         self.itype() == LJ_TCDATA
     }
 
-    pub fn as_cdata(self) -> Option<GcPtr<crate::runtime::cdata::CData>> {
+    pub fn as_cdata(self) -> Option<GcPtr<CData>> {
         if self.is_cdata() {
             GcPtr::from_addr(self.gc_addr())
         } else {
@@ -206,7 +208,7 @@ impl LuaValue {
         }
     }
 
-    pub fn cdata(p: GcPtr<crate::runtime::cdata::CData>) -> LuaValue {
+    pub fn cdata(p: GcPtr<CData>) -> LuaValue {
         LuaValue::gcval(LJ_TCDATA, p.addr())
     }
 
@@ -214,7 +216,7 @@ impl LuaValue {
         self.itype() == LJ_TUDATA
     }
 
-    pub fn as_userdata(self) -> Option<GcPtr<crate::runtime::userdata::GcUserData>> {
+    pub fn as_userdata(self) -> Option<GcPtr<GcUserData>> {
         if self.is_userdata() {
             GcPtr::from_addr(self.gc_addr())
         } else {
@@ -222,7 +224,7 @@ impl LuaValue {
         }
     }
 
-    pub fn userdata(p: GcPtr<crate::runtime::userdata::GcUserData>) -> LuaValue {
+    pub fn userdata(p: GcPtr<GcUserData>) -> LuaValue {
         LuaValue::gcval(LJ_TUDATA, p.addr())
     }
 
