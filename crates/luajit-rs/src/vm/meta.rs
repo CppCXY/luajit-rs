@@ -152,7 +152,6 @@ impl Interp {
 
     /// `lj_meta_arith`: coercion first, then arithmetic metamethod.
     /// Returns `Some(val)` when resolved or `None` for Lua continuation.
-    #[cold]
     pub(super) fn meta_arith(
         &mut self,
         mm: MM,
@@ -195,7 +194,6 @@ impl Interp {
     /// `lj_meta_comp`: ordered comparison slow path.  `op` follows the
     /// bytecode encoding: ISLT=0, ISGE=1, ISLE=2, ISGT=3.
     /// Returns `Some(cond)` when resolved inline, `None` for continuation.
-    #[cold]
     pub(super) fn meta_comp(
         &mut self,
         mut o1: LuaValue,
@@ -261,7 +259,6 @@ impl Interp {
     /// `lj_meta_equal`: `__eq` for two tables that are not raw-equal.
     /// Returns `Some(is_equal)` or `None` for Lua continuation.  `ne` is
     /// 0 for ISEQV, 1 for ISNEV (selects Condt/Condf).
-    #[cold]
     pub(super) fn meta_equal(
         &mut self,
         o1: LuaValue,
@@ -297,8 +294,7 @@ impl Interp {
         Ok(Some(false))
     }
 
-    /// `lj_meta_len`: `__len` metamethod (via execute recursion — cold).
-    #[cold]
+    /// `lj_meta_len`: `__len` metamethod (via execute recursion).
     pub(super) fn meta_len(&mut self, o: LuaValue) -> LuaResult<LuaValue> {
         let mo = meta_lookup(self.l().global(), o, MM::Len);
         if mo.is_nil() {

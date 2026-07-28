@@ -310,11 +310,36 @@ impl Interp {
         v
     }
 
+    /// Compute the stack slots needed for a Lua call frame at `func_slot`.
+    fn enter_lua_need(&self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize) -> usize {
+        let cl = match gf.as_ref() {
+            GcFunc::Lua(c) => c,
+            _ => unreachable!(),
+        };
+        let pt = cl.proto.as_ref();
+        let callbase = func_slot + 2;
+        if (pt.flags & PROTO_VARARG) != 0 {
+            (callbase + nargs + 2) + pt.numparams as usize + pt.framesize as usize + 16
+        } else {
+            callbase + pt.framesize as usize + 16
+        }
+    }
+
     /// Set up a Lua frame for the function at `func_slot` and switch the
     /// `Interp` fields to the callee. `link` is stored in the frame-link
     /// slot (`callbase - 1`); the caller must have synced its locals into
     /// the fields first. Mirrors LuaJIT's `ins_call` + FUNCF/FUNCV headers.
     fn enter_lua(&mut self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize, link: u64) {
+        let need = self.enter_lua_need(gf, func_slot, nargs);
+        let l = self.l();
+        l.stack_ensure(need);
+        self.sp = l.stack.as_mut_ptr();
+        self.enter_lua_sans_ensure(gf, func_slot, nargs, link);
+    }
+
+    /// Core of `enter_lua` without the `stack_ensure` — the caller has
+    /// already ensured enough space (possibly combining with mmcall data).
+    fn enter_lua_sans_ensure(&mut self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize, link: u64) {
         let cl = match gf.as_ref() {
             GcFunc::Lua(c) => c,
             _ => unreachable!(),
@@ -322,17 +347,6 @@ impl Interp {
         let pt = cl.proto.as_ref();
         let numparams = pt.numparams as usize;
         let callbase = func_slot + 2;
-
-        // Lazy stack growth: ensure the new frame's extent + margin fits.
-        let need = if (pt.flags & PROTO_VARARG) != 0 {
-            (callbase + nargs + 2) + numparams + pt.framesize as usize + 16
-        } else {
-            callbase + pt.framesize as usize + 16
-        };
-        let l = self.l();
-        l.stack_ensure(need);
-        // sp may have moved after Vec resize.
-        self.sp = l.stack.as_mut_ptr();
 
         self.set_at(callbase - 1, LuaValue::from_bits(link));
 
@@ -443,7 +457,12 @@ impl Interp {
         let func_slot = saved_base + self.proto().framesize as usize + 2;
         let mmbase = func_slot + 2;
         {
-            let need = mmbase + args.len() + 16;
+            // Combine mmcall overhead with the Lua frame's need so we only
+            // grow the stack once (avoid the double ensure in enter_lua).
+            let gf = mo.as_func().unwrap();
+            let mm_need = mmbase + args.len() + 16;
+            let lua_need = self.enter_lua_need(gf, func_slot, args.len());
+            let need = mm_need.max(lua_need);
             let l = self.l();
             l.stack_ensure(need);
             self.sp = l.stack.as_mut_ptr();
@@ -455,7 +474,7 @@ impl Interp {
             self.set_at(mmbase + i, v);
         }
         let link = (((mmbase - saved_base) as u64) << 3) | FRAME_CONT;
-        self.enter_lua(mo.as_func().unwrap(), func_slot, args.len(), link);
+        self.enter_lua_sans_ensure(mo.as_func().unwrap(), func_slot, args.len(), link);
     }
 
     /// Call a C-function metamethod inline (no continuation frame): the
