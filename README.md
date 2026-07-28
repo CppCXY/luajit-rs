@@ -111,7 +111,6 @@ Environment variables:
 | `LUAJIT_RS_NOASM=1`   | Skip native codegen; forces the portable IR executor on all architectures. |
 | `LUAJIT_RS_TRDUMP=1`  | Print compiled trace summaries (IR + mcode offsets). |
 | `LUAJIT_RS_TRDUMP=2`  | Also dump hex + disassembly of generated machine code. |
-| `LUAJIT_RS_JIT_ARCH`  | Override the auto-detected target architecture for assembly (`x64` / `arm64`). |
 | `LUA_PATH` / `LUA_CPATH` | Standard environment variables for `package.path` / `package.cpath`. |
 
 From Lua: `jit.off()` / `jit.on()` / `jit.flush()` / `jit.status()` /

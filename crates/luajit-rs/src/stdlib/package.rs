@@ -7,6 +7,7 @@
 
 use crate::err::{LuaError, LuaResult};
 use crate::func::{CClosure, GcFunc};
+use crate::runtime::func::CFunction;
 use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
@@ -546,7 +547,7 @@ fn tab_new_preload(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn jit_profile_preload(l: &mut LuaState) -> LuaResult<i32> {
-    let t = l.heap().alloc_table(crate::table::LuaTable::new(0, 1));
+    let t = l.heap().alloc_table(LuaTable::new(0, 1));
     push(l, LuaValue::table(t));
     Ok(1)
 }
@@ -625,7 +626,7 @@ pub fn open(l: &mut LuaState) {
         let loaders_tab = l.heap().alloc_table(LuaTable::new(0, 0));
         let env = l.global().globals;
 
-        let set_loader = |idx: i32, f: crate::func::CFunction| {
+        let set_loader = |idx: i32, f: CFunction| {
             let fref = l.heap().alloc_func(GcFunc::C(CClosure {
                 f,
                 env,

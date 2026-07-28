@@ -371,7 +371,7 @@ fn os_setlocale(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn os_tmpname(l: &mut LuaState) -> LuaResult<i32> {
-    let ts = super::time::unix_secs();
+    let ts = time::unix_secs();
     let name = format!("/tmp/lua_{}", ts);
     let sid = l.heap().intern(name.as_bytes());
     push(l, l.heap().str_value(sid));
