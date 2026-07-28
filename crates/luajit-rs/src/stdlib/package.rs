@@ -6,11 +6,12 @@
 //! `package.loaders` (four searchers), plus the global `module` and `require`.
 
 use crate::err::{LuaError, LuaResult};
-use crate::func::{CClosure, GcFunc};
-use crate::runtime::func::CFunction;
 use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
+use crate::{
+    lua_getfield, lua_getglobal, lua_gettop, lua_isnil, lua_newtable, lua_pop, lua_pushcfunction, lua_pushstring, lua_pushvalue, lua_rawseti, lua_register, lua_setfield, lua_setglobal,
+};
 
 use super::{arg, err_bad_arg, push};
 
@@ -206,9 +207,18 @@ fn searchpath(
 
 /// Resolve a path string from env + default, with `!` → exe-dir and `;;` → `;AUX;`
 fn resolve_path(l: &mut LuaState, envname: &str, def: &[u8]) -> Vec<u8> {
-    let mut s = std::env::var(envname)
-        .map(|v| v.into_bytes())
-        .unwrap_or_else(|_| def.to_vec());
+    let mut s = {
+        #[cfg(target_arch = "wasm32")]
+        {
+            def.to_vec()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::env::var(envname)
+                .map(|v| v.into_bytes())
+                .unwrap_or_else(|_| def.to_vec())
+        }
+    };
     {
         let pat: &[u8] = &[LUA_PATHSEP, LUA_PATHSEP];
         let repl: &[u8] = &[LUA_PATHSEP, AUXMARK, LUA_PATHSEP];
@@ -422,6 +432,7 @@ fn loader_lua(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
+#[allow(dead_code)]
 fn loader_c(l: &mut LuaState) -> LuaResult<i32> {
     let name_s = match arg(l, 0).as_string_id() {
         Some(sid) => String::from_utf8_lossy(l.str_static(sid)).into_owned(),
@@ -432,6 +443,7 @@ fn loader_c(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
+#[allow(dead_code)]
 fn loader_croot(l: &mut LuaState) -> LuaResult<i32> {
     let name_s = match arg(l, 0).as_string_id() {
         Some(sid) => String::from_utf8_lossy(l.str_static(sid)).into_owned(),
@@ -553,128 +565,97 @@ fn jit_profile_preload(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn open(l: &mut LuaState) {
-    let pkg = package_table(l);
-
-    // config
-    {
-        let k = str_key(l, b"config");
-        let sid = l.heap().intern(config_str());
-        pkg.as_mut().set(k, l.heap().str_value(sid));
+    // Ensure package table exists
+    lua_getglobal(l, "package");
+    if lua_isnil(l, -1) {
+        lua_pop(l, 1);
+        lua_newtable(l);
+        lua_setglobal(l, "package");
+        lua_getglobal(l, "package");
     }
+    let pkg_idx = lua_gettop(l) as i32;
 
-    // path & cpath
+    // config, path, cpath
+    lua_pushstring(l, config_str());
+    lua_setfield(l, pkg_idx, "config");
     {
-        let k = str_key(l, b"path");
         let path = resolve_path(l, "LUA_PATH", default_path());
-        let sid = l.heap().intern(&path);
-        pkg.as_mut().set(k, l.heap().str_value(sid));
+        lua_pushstring(l, &path);
     }
+    lua_setfield(l, pkg_idx, "path");
     {
-        let k = str_key(l, b"cpath");
         let cpath = resolve_path(l, "LUA_CPATH", default_cpath());
-        let sid = l.heap().intern(&cpath);
-        pkg.as_mut().set(k, l.heap().str_value(sid));
+        lua_pushstring(l, &cpath);
     }
+    lua_setfield(l, pkg_idx, "cpath");
 
-    // loaded & preload
-    let loaded = sub_table(l, pkg, b"loaded");
-    let _preload = sub_table(l, pkg, b"preload");
+    // loaded & preload sub-tables
+    ensure_sub_table(l, pkg_idx, "loaded");
+    ensure_sub_table(l, pkg_idx, "preload");
 
-    let g = l.global().globals;
-    for lib in [
-        b"string" as &[u8],
-        b"table",
-        b"math",
-        b"os",
-        b"io",
-        b"bit",
-        b"coroutine",
-        b"package",
-        b"jit",
+    // Copy loaded libs into package.loaded
+    lua_getfield(l, pkg_idx, "loaded");
+    let loaded_idx = lua_gettop(l) as i32;
+    for &lib in &[
+        "string",
+        "table",
+        "math",
+        "os",
+        "io",
+        "bit",
+        "coroutine",
+        "package",
+        "jit",
     ] {
-        let k = str_key(l, lib);
-        let v = g.as_ref().get_str(k);
-        if !v.is_nil() {
-            loaded.as_mut().set(k, v);
+        lua_getglobal(l, lib);
+        if !lua_isnil(l, -1) {
+            lua_setfield(l, loaded_idx, lib);
+        } else {
+            lua_pop(l, 1);
         }
     }
-    let gk = str_key(l, b"_G");
-    loaded.as_mut().set(gk, LuaValue::table(g));
+    lua_getglobal(l, "_G");
+    lua_setfield(l, loaded_idx, "_G");
+    lua_pop(l, 1); // pop loaded
 
-    // Register table.new and jit.profile as preload entries
-    {
-        let preload = sub_table(l, pkg, b"preload");
-        let env = l.global().globals;
-        let tab_new_val = LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
-            f: tab_new_preload,
-            env,
-            upvals: Vec::new(),
-        })));
-        let jit_profile_val = LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
-            f: jit_profile_preload,
-            env,
-            upvals: Vec::new(),
-        })));
-        let tab_new_k = str_key(l, b"table.new");
-        preload.as_mut().set(tab_new_k, tab_new_val);
-        let jit_profile_k = str_key(l, b"jit.profile");
-        preload.as_mut().set(jit_profile_k, jit_profile_val);
-    }
+    // preload entries: table.new, jit.profile
+    lua_getfield(l, pkg_idx, "preload");
+    let preload_idx = lua_gettop(l) as i32;
+    lua_pushcfunction(l, tab_new_preload);
+    lua_setfield(l, preload_idx, "table.new");
+    lua_pushcfunction(l, jit_profile_preload);
+    lua_setfield(l, preload_idx, "jit.profile");
+    lua_pop(l, 1); // pop preload
 
-    // loaders (preload, lua, c, croot) indexed 1..4
-    {
-        let loaders_tab = l.heap().alloc_table(LuaTable::new(0, 0));
-        let env = l.global().globals;
-
-        let set_loader = |idx: i32, f: CFunction| {
-            let fref = l.heap().alloc_func(GcFunc::C(CClosure {
-                f,
-                env,
-                upvals: Vec::new(),
-            }));
-            loaders_tab.as_mut().set_int(idx, LuaValue::func(fref));
-        };
-        set_loader(1, loader_preload);
-        set_loader(2, loader_lua);
-        set_loader(3, loader_c);
-        set_loader(4, loader_croot);
-
-        let k = str_key(l, b"loaders");
-        pkg.as_mut().set(k, LuaValue::table(loaders_tab));
-    }
+    // loaders (preload, lua) indexed 1..2
+    lua_newtable(l);
+    let loaders_idx = lua_gettop(l) as i32;
+    lua_pushcfunction(l, loader_preload);
+    lua_rawseti(l, loaders_idx, 1);
+    lua_pushcfunction(l, loader_lua);
+    lua_rawseti(l, loaders_idx, 2);
+    lua_setfield(l, pkg_idx, "loaders");
 
     // searchpath, loadlib, seeall
-    {
-        let env = l.global().globals;
-        let k = str_key(l, b"searchpath");
-        pkg.as_mut().set(
-            k,
-            LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
-                f: lib_searchpath,
-                env,
-                upvals: Vec::new(),
-            }))),
-        );
-        let k = str_key(l, b"loadlib");
-        pkg.as_mut().set(
-            k,
-            LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
-                f: lib_loadlib,
-                env,
-                upvals: Vec::new(),
-            }))),
-        );
-        let k = str_key(l, b"seeall");
-        pkg.as_mut().set(
-            k,
-            LuaValue::func(l.heap().alloc_func(GcFunc::C(CClosure {
-                f: lib_seeall,
-                env,
-                upvals: Vec::new(),
-            }))),
-        );
-    }
+    lua_pushcfunction(l, lib_searchpath);
+    lua_setfield(l, pkg_idx, "searchpath");
+    lua_pushcfunction(l, lib_loadlib);
+    lua_setfield(l, pkg_idx, "loadlib");
+    lua_pushcfunction(l, lib_seeall);
+    lua_setfield(l, pkg_idx, "seeall");
 
-    l.register(b"require", lib_require);
-    l.register(b"module", lib_module);
+    lua_pop(l, 1); // pop package table
+
+    lua_register(l, "require", lib_require);
+    lua_register(l, "module", lib_module);
+}
+
+fn ensure_sub_table(l: &mut LuaState, pkg_idx: i32, name: &str) {
+    lua_getfield(l, pkg_idx, name);
+    if lua_isnil(l, -1) {
+        lua_pop(l, 1);
+        lua_newtable(l);
+        lua_pushvalue(l, -1);
+        lua_setfield(l, pkg_idx, name);
+    }
 }
