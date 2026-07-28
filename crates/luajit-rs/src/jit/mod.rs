@@ -29,6 +29,7 @@
 
 mod asm;
 mod exec;
+#[allow(unused)]
 mod ir;
 mod mcode;
 mod opt_dce;
@@ -410,16 +411,7 @@ impl JitState {
             penalty: [HotPenalty::default(); PENALTY_SLOTS],
             penaltyslot: 0,
             prng: Prng::new(),
-            arch: {
-                let over = std::env::var("LUAJIT_RS_JIT_ARCH").unwrap_or_default();
-                if over.eq_ignore_ascii_case("arm64") || over.eq_ignore_ascii_case("aarch64") {
-                    self::asm::Arch::Arm64
-                } else if over.eq_ignore_ascii_case("x64") || over.eq_ignore_ascii_case("x86_64") {
-                    self::asm::Arch::X64
-                } else {
-                    self::asm::HOST_ARCH
-                }
-            },
+            arch: asm::HOST_ARCH,
             no_asm: std::env::var("LUAJIT_RS_NOASM").is_ok(),
             trace_dump: std::env::var("LUAJIT_RS_TRDUMP").is_ok(),
             trace_dump2: std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2"),
