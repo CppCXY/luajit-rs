@@ -292,3 +292,12 @@ mod tests {
         assert_eq!(f(), 42);
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+mod sys {
+    pub fn page_size() -> usize { 65536 }
+    pub fn alloc_rw(_len: usize) -> Option<*mut u8> { None }
+    pub fn protect(_ptr: *mut u8, _len: usize, _exec: bool) -> bool { false }
+    pub fn flush_icache(_ptr: *mut u8, _len: usize) {}
+    pub fn free(_ptr: *mut u8, _len: usize) {}
+}
