@@ -7,6 +7,7 @@ use crate::jit::JitState;
 use crate::meta;
 use crate::proto::KGc;
 use crate::proto::Proto;
+use crate::stdlib::PlatformInstant;
 use crate::string::{Interner, StrId};
 use crate::table::LuaTable;
 use crate::value::{GcRef, LJ_TFUNC, LJ_TTAB, LuaValue};
@@ -210,7 +211,7 @@ pub struct GlobalState {
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
     /// for cheap differencing at every `os.clock` call.
-    pub boot_time: f64,
+    pub(crate) boot_time: PlatformInstant,
     /// The main thread. Set once the owning [`Lua`] is pinned. The interpreter
     /// entry points use this when no explicit thread is supplied.
     main: Option<StateRef>,
@@ -218,17 +219,13 @@ pub struct GlobalState {
 
 impl GlobalState {
     fn new() -> GlobalState {
-        use std::time::UNIX_EPOCH;
-        let boot = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
+        let boot = PlatformInstant::now();
         let mut heap = GcHeap::default();
         let globals = heap.alloc_table(LuaTable::new(0, 1));
         let registry = heap.alloc_table(LuaTable::new(0, 1));
         // lj_meta_init: intern the metamethod names once.
-        let mut mmname = [LuaValue::NIL; crate::runtime::meta::MM_MAX];
-        for (i, name) in crate::runtime::meta::MM_NAMES.iter().enumerate() {
+        let mut mmname = [LuaValue::NIL; meta::MM_MAX];
+        for (i, name) in meta::MM_NAMES.iter().enumerate() {
             let sid = heap.intern(name);
             mmname[i] = heap.str_value(sid);
         }
@@ -239,7 +236,7 @@ impl GlobalState {
             basemt: [None; ITYPE_COUNT],
             mmname,
             cur_l: None,
-            jit: crate::jit::JitState::new(),
+            jit: JitState::new(),
             cts: None,
             boot_time: boot,
             main: None,

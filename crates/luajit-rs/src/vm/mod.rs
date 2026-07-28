@@ -25,7 +25,7 @@ pub mod err;
 use crate::err::{LuaError, LuaResult};
 use crate::func::{GcFunc, LuaClosure, Upval};
 use crate::gc::GcPtr;
-use crate::jit::{HOTCOUNT_CALL, HOTCOUNT_LOOP};
+use crate::jit::{HOTCOUNT_CALL, HOTCOUNT_LOOP, rec_abort_error, rec_ins, trace_exec, trace_hot};
 use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto};
 use crate::runtime::gc::barrier_back;
 use crate::runtime::meta::MM;
@@ -310,11 +310,36 @@ impl Interp {
         v
     }
 
+    /// Compute the stack slots needed for a Lua call frame at `func_slot`.
+    fn enter_lua_need(&self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize) -> usize {
+        let cl = match gf.as_ref() {
+            GcFunc::Lua(c) => c,
+            _ => unreachable!(),
+        };
+        let pt = cl.proto.as_ref();
+        let callbase = func_slot + 2;
+        if (pt.flags & PROTO_VARARG) != 0 {
+            (callbase + nargs + 2) + pt.numparams as usize + pt.framesize as usize + 16
+        } else {
+            callbase + pt.framesize as usize + 16
+        }
+    }
+
     /// Set up a Lua frame for the function at `func_slot` and switch the
     /// `Interp` fields to the callee. `link` is stored in the frame-link
     /// slot (`callbase - 1`); the caller must have synced its locals into
     /// the fields first. Mirrors LuaJIT's `ins_call` + FUNCF/FUNCV headers.
     fn enter_lua(&mut self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize, link: u64) {
+        let need = self.enter_lua_need(gf, func_slot, nargs);
+        let l = self.l();
+        l.stack_ensure(need);
+        self.sp = l.stack.as_mut_ptr();
+        self.enter_lua_sans_ensure(gf, func_slot, nargs, link);
+    }
+
+    /// Core of `enter_lua` without the `stack_ensure` — the caller has
+    /// already ensured enough space (possibly combining with mmcall data).
+    fn enter_lua_sans_ensure(&mut self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize, link: u64) {
         let cl = match gf.as_ref() {
             GcFunc::Lua(c) => c,
             _ => unreachable!(),
@@ -322,17 +347,6 @@ impl Interp {
         let pt = cl.proto.as_ref();
         let numparams = pt.numparams as usize;
         let callbase = func_slot + 2;
-
-        // Lazy stack growth: ensure the new frame's extent + margin fits.
-        let need = if (pt.flags & PROTO_VARARG) != 0 {
-            (callbase + nargs + 2) + numparams + pt.framesize as usize + 16
-        } else {
-            callbase + pt.framesize as usize + 16
-        };
-        let l = self.l();
-        l.stack_ensure(need);
-        // sp may have moved after Vec resize.
-        self.sp = l.stack.as_mut_ptr();
 
         self.set_at(callbase - 1, LuaValue::from_bits(link));
 
@@ -443,7 +457,12 @@ impl Interp {
         let func_slot = saved_base + self.proto().framesize as usize + 2;
         let mmbase = func_slot + 2;
         {
-            let need = mmbase + args.len() + 16;
+            // Combine mmcall overhead with the Lua frame's need so we only
+            // grow the stack once (avoid the double ensure in enter_lua).
+            let gf = mo.as_func().unwrap();
+            let mm_need = mmbase + args.len() + 16;
+            let lua_need = self.enter_lua_need(gf, func_slot, args.len());
+            let need = mm_need.max(lua_need);
             let l = self.l();
             l.stack_ensure(need);
             self.sp = l.stack.as_mut_ptr();
@@ -455,7 +474,7 @@ impl Interp {
             self.set_at(mmbase + i, v);
         }
         let link = (((mmbase - saved_base) as u64) << 3) | FRAME_CONT;
-        self.enter_lua(mo.as_func().unwrap(), func_slot, args.len(), link);
+        self.enter_lua_sans_ensure(mo.as_func().unwrap(), func_slot, args.len(), link);
     }
 
     /// Call a C-function metamethod inline (no continuation frame): the
@@ -564,7 +583,7 @@ impl Interp {
                 Err(e) => {
                     // An error raised while recording aborts the trace.
                     if rec {
-                        crate::jit::trace::rec_abort_error(self.l().global());
+                        rec_abort_error(self.l().global());
                     }
                     return Err(e);
                 }
@@ -839,7 +858,7 @@ impl Interp {
                 sync!();
                 let pt = self.lua_cl().proto;
                 let (pc, base) = (self.pc, self.base);
-                if !crate::jit::trace::rec_ins(self.l(), base, pt, pc) {
+                if !rec_ins(self.l(), base, pt, pc) {
                     return Ok(Flow::Rec); // Recording ended: switch modes.
                 }
                 resync!();
@@ -1455,8 +1474,7 @@ impl Interp {
                             // from the fresh frame.
                             if !REC && bc_op(head) == BCOp::JFUNCF {
                                 sync!();
-                                let r =
-                                    crate::jit::exec::trace_exec(self.l(), self.base, bc_d(head));
+                                let r = trace_exec(self.l(), self.base, bc_d(head));
                                 self.sp = self.l().stack.as_mut_ptr();
                                 self.pc = r.pc;
                                 if r.baseslot != 2 {
@@ -1542,8 +1560,7 @@ impl Interp {
                             let head = pt.bc[0];
                             if !REC && bc_op(head) == BCOp::JFUNCF {
                                 sync!();
-                                let r =
-                                    crate::jit::exec::trace_exec(self.l(), self.base, bc_d(head));
+                                let r = trace_exec(self.l(), self.base, bc_d(head));
                                 self.sp = self.l().stack.as_mut_ptr();
                                 self.pc = r.pc;
                                 if r.baseslot != 2 {
@@ -1720,7 +1737,7 @@ impl Interp {
                             sync!();
                             let jforl = (self.pc as i64 - 1 + bc_j(ins)) as usize;
                             let tno = bc_d(self.proto().bc[jforl]);
-                            let r = crate::jit::exec::trace_exec(self.l(), self.base, tno);
+                            let r = trace_exec(self.l(), self.base, tno);
                             self.sp = self.l().stack.as_mut_ptr();
                             self.pc = r.pc;
                             if r.baseslot != 2 {
@@ -1776,7 +1793,7 @@ impl Interp {
                         setreg!(a + FORL_IDX, nv);
                         setreg!(a + FORL_EXT, nv);
                         sync!();
-                        let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                        let r = trace_exec(self.l(), self.base, bc_d(ins));
                         self.sp = self.l().stack.as_mut_ptr();
                         self.pc = r.pc;
                         if r.baseslot != 2 {
@@ -1806,7 +1823,7 @@ impl Interp {
                     // Enter the compiled trace; the interpreter resumes at
                     // whatever snapshot the trace exits through.
                     sync!();
-                    let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                    let r = trace_exec(self.l(), self.base, bc_d(ins));
                     self.sp = self.l().stack.as_mut_ptr();
                     self.pc = r.pc;
                     if r.baseslot != 2 {
@@ -1848,7 +1865,7 @@ impl Interp {
                     if !first.is_nil() {
                         setreg!(a - 1, first);
                         sync!();
-                        let r = crate::jit::exec::trace_exec(self.l(), self.base, bc_d(ins));
+                        let r = trace_exec(self.l(), self.base, bc_d(ins));
                         self.sp = self.l().stack.as_mut_ptr();
                         self.pc = r.pc;
                         if r.baseslot != 2 {
@@ -2091,7 +2108,7 @@ impl Interp {
         let pt = self.lua_cl().proto;
         let pc = self.pc - 1;
         let base = self.base;
-        crate::jit::trace::trace_hot(self.l(), base, pt, pc);
+        trace_hot(self.l(), base, pt, pc);
         self.l().global().jit.state == crate::jit::TraceState::Record
     }
 
@@ -2100,7 +2117,7 @@ impl Interp {
     #[cold]
     fn hot_call(&mut self, pt: GcPtr<Proto>) -> bool {
         let base = self.base;
-        crate::jit::trace::trace_hot(self.l(), base, pt, 0);
+        trace_hot(self.l(), base, pt, 0);
         self.l().global().jit.state == crate::jit::TraceState::Record
     }
 

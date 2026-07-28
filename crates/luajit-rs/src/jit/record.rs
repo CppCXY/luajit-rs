@@ -30,9 +30,11 @@ pub const MAX_JSLOTS: usize = 250;
 pub const IRSLOAD_PARENT: u32 = 0x01;
 pub const IRSLOAD_FRAME: u32 = 0x02;
 pub const IRSLOAD_TYPECHECK: u32 = 0x04;
+#[allow(dead_code)]
 pub const IRSLOAD_CONVERT: u32 = 0x08;
 pub const IRSLOAD_READONLY: u32 = 0x10;
 pub const IRSLOAD_INHERIT: u32 = 0x20;
+#[allow(dead_code)]
 pub const IRSLOAD_KEYINDEX: u32 = 0x40;
 
 /// FPMATH sub-function literals (IRFPMDEF, ORDER FPM).

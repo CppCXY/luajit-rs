@@ -79,6 +79,13 @@ pub fn lual_loadstring(l: &mut LuaState, src: &[u8]) -> LuaResult<()> {
 }
 
 pub fn lual_loadfile(l: &mut LuaState, path: &str) -> LuaResult<()> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        lua_pushstring(l, b"loadfile not supported on WASM");
+        return Err(LuaError::Runtime);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     let src = match std::fs::read(path) {
         Ok(s) => s,
         Err(e) => {
@@ -89,6 +96,7 @@ pub fn lual_loadfile(l: &mut LuaState, path: &str) -> LuaResult<()> {
     match lual_loadstring(l, &src) {
         Ok(()) => Ok(()),
         Err(e) => Err(e),
+    }
     }
 }
 

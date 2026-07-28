@@ -1,6 +1,10 @@
 use std::cell::Cell;
 use std::ptr::NonNull;
 
+/// Maximum address for a valid GC pointer. On 64-bit hosts this is
+/// 2^47 (for NaN-boxing), on 32-bit/wasm32 it's the full address space.
+const ADDR_MAX: u64 = if cfg!(target_pointer_width = "64") { 1u64 << 47 } else { u32::MAX as u64 };
+
 // ── Re-export generational GC types ────────────────────────────────────
 pub use super::gc_gen::header::{Age, GcObjectKind};
 
@@ -111,6 +115,7 @@ impl GcHeader {
 }
 
 // ── Low-address allocator ───────────────────────────────────────────────
+#[cfg(not(target_arch = "wasm32"))]
 mod lowmem {
     use std::alloc::Layout;
     use std::ptr::NonNull;
@@ -268,6 +273,20 @@ mod lowmem {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod lowmem {
+    use std::alloc::Layout;
+    use std::ptr::NonNull;
+    pub fn alloc(layout: Layout) -> (NonNull<u8>, bool) {
+        let p = unsafe { std::alloc::alloc(layout) };
+        assert!(!p.is_null(), "alloc failed");
+        unsafe { (NonNull::new_unchecked(p), false) }
+    }
+    pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout, _mapped: bool) {
+        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout); }
+    }
+}
+
 fn alloc_block<T>(
     v: T,
     kind: GcObjectKind,
@@ -288,7 +307,7 @@ fn alloc_block<T>(
 }
 fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
     let addr = data.as_ptr() as usize;
-    if !(0x1000..(1usize << 47)).contains(&addr) {
+    if !(0x1000..ADDR_MAX as usize).contains(&addr) {
         eprintln!("DEALLOC-BAD-PTR: {:p}", data.as_ptr());
         std::process::abort();
     }
@@ -304,9 +323,10 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
     );
     unsafe { lowmem::dealloc(NonNull::new_unchecked(ap), layout, mapped) };
 }
+#[inline]
 fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
     let addr = ptr.as_ptr() as usize;
-    if !(0x1000..(1usize << 47)).contains(&addr) {
+    if !(0x1000..ADDR_MAX as usize).contains(&addr) {
         static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> =
             std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
         let p = DUMMY.load(std::sync::atomic::Ordering::Relaxed);
@@ -386,7 +406,7 @@ impl<T> Pool<T> {
         while i < self.objects.len() {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
-            if addr <= 0x1000 || addr >= (1usize << 47) {
+            if addr <= 0x1000 || addr >= ADDR_MAX as usize {
                 eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
@@ -416,7 +436,7 @@ impl<T> Pool<T> {
         while i < self.objects.len() {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
-            if addr <= 0x1000 || addr >= (1usize << 47) {
+            if addr <= 0x1000 || addr >= ADDR_MAX as usize {
                 eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
@@ -481,10 +501,12 @@ impl<T> GcPtr<T> {
     }
 
     #[allow(clippy::should_implement_trait)]
+    #[inline]
     pub fn as_ref<'a>(self) -> &'a T {
         unsafe { &*self.0.as_ptr() }
     }
 
+    #[inline]
     pub fn as_mut<'a>(self) -> &'a mut T {
         unsafe { &mut *self.0.as_ptr() }
     }
@@ -844,6 +866,7 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
 /// Unlike `barrier_fwd`, this only accesses the table's GC header — always
 /// a valid GC object pointer — so it is safe to call at every store site
 /// including from the VM interpreter.
+#[inline]
 pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
     let h = gc_header(t.0);
     if h.is_black() {
@@ -891,9 +914,12 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                     }
                 }
                 if let Some(rec) = &gs.jit.rec {
-                    m.mark_proto(rec.cur.startpt);
-                    for v in rec.cur.ir.kgc_values() {
-                        m.mark_value(v);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        m.mark_proto(rec.cur.startpt);
+                        for v in rec.cur.ir.kgc_values() {
+                            m.mark_value(v);
+                        }
                     }
                 }
             }
@@ -1022,9 +1048,12 @@ pub fn full_gc(g: &mut GlobalState) {
         }
     }
     if let Some(rec) = &g.jit.rec {
-        m.mark_proto(rec.cur.startpt);
-        for v in rec.cur.ir.kgc_values() {
-            m.mark_value(v);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            m.mark_proto(rec.cur.startpt);
+            for v in rec.cur.ir.kgc_values() {
+                m.mark_value(v);
+            }
         }
     }
     m.propagate();

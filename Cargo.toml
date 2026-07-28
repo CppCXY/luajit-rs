@@ -9,3 +9,4 @@ luajit-rs = { path = "crates/luajit-rs", version = "0.1.0" }
 
 mimalloc = { version = "0.1.52", features = ["v2"] }
 ahash = "0.8"
+js-sys = "0.3"

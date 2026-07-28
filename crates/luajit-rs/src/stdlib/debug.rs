@@ -2,7 +2,7 @@ use crate::err::LuaResult;
 use crate::func::GcFunc;
 use crate::gc::GcPtr;
 use crate::state::LuaState;
-use crate::stdlib::{arg, err_bad_arg, nargs, push};
+use crate::stdlib::{arg, err_bad_arg, nargs, push, pushv};
 use crate::table::LuaTable;
 use crate::value::{LJ_TFALSE, LJ_TTRUE, LuaValue};
 use crate::vm::FRAME_TYPE_MASK;
@@ -488,6 +488,114 @@ fn lib_upvaluejoin(l: &mut LuaState) -> LuaResult<i32> {
     Ok(0)
 }
 
+fn lib_setupvalue(l: &mut LuaState) -> LuaResult<i32> {
+    let f = arg(l, 0);
+    let idx = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+    let val = arg(l, 2);
+    match f.as_func() {
+        Some(gf) => match gf.as_ref() {
+            GcFunc::Lua(cl) => {
+                if idx < 1 || idx > cl.upvals.len() {
+                    push(l, LuaValue::NIL);
+                    return Ok(1);
+                }
+                let uv_idx = idx - 1;
+                let proto = cl.proto.as_ref();
+                if uv_idx < proto.uvnames.len() && !proto.uvnames[uv_idx].is_empty() {
+                    let sid = l.heap().intern(proto.uvnames[uv_idx].as_bytes());
+                    push(l, l.heap().str_value(sid));
+                } else {
+                    push(l, l.heap().str_value(l.heap().intern(b"")));
+                }
+                cl.upvals[uv_idx].as_mut().set(val);
+                Ok(1)
+            }
+            GcFunc::C(c) => {
+                if idx < 1 || idx > c.upvals.len() {
+                    push(l, LuaValue::NIL);
+                    return Ok(1);
+                }
+                push(l, l.heap().str_value(l.heap().intern(b"")));
+                let uv_idx = idx - 1;
+                l.set_upvalue(uv_idx, val);
+                Ok(1)
+            }
+        },
+        None => {
+            push(l, LuaValue::NIL);
+            Ok(1)
+        }
+    }
+}
+
+fn lib_getlocal(l: &mut LuaState) -> LuaResult<i32> {
+    let level = arg(l, 0).as_number().unwrap_or(0.0) as i32;
+    let local = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+    let (slot, gf) = match walk_frames(l, level) {
+        Some(s) => s,
+        None => {
+            push(l, LuaValue::NIL);
+            return Ok(1);
+        }
+    };
+    match gf.as_ref() {
+        GcFunc::Lua(cl) => {
+            let pt = cl.proto.as_ref();
+            let nlocals = pt.framesize as usize - 1;
+            if local < 1 || local > nlocals {
+                push(l, LuaValue::NIL);
+                return Ok(1);
+            }
+            let idx = slot + local - 1;
+            let name = str_val(l, "");
+            let val = if idx < l.stack.len() {
+                l.stack[idx]
+            } else {
+                LuaValue::NIL
+            };
+            pushv(l, &[name, val]);
+            Ok(2)
+        }
+        GcFunc::C(_) => {
+            push(l, LuaValue::NIL);
+            Ok(1)
+        }
+    }
+}
+
+fn lib_setlocal(l: &mut LuaState) -> LuaResult<i32> {
+    let level = arg(l, 0).as_number().unwrap_or(0.0) as i32;
+    let local = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+    let val = arg(l, 2);
+    let (slot, gf) = match walk_frames(l, level) {
+        Some(s) => s,
+        None => {
+            push(l, LuaValue::NIL);
+            return Ok(1);
+        }
+    };
+    match gf.as_ref() {
+        GcFunc::Lua(cl) => {
+            let pt = cl.proto.as_ref();
+            let nlocals = pt.framesize as usize - 1;
+            if local < 1 || local > nlocals {
+                push(l, LuaValue::NIL);
+                return Ok(1);
+            }
+            let idx = slot + local - 1;
+            push(l, l.heap().str_value(l.heap().intern(b"")));
+            if idx < l.stack.len() {
+                l.stack[idx] = val;
+            }
+            Ok(1)
+        }
+        GcFunc::C(_) => {
+            push(l, LuaValue::NIL);
+            Ok(1)
+        }
+    }
+}
+
 // ── open ────────────────────────────────────────────────────────────────────
 
 pub fn open(l: &mut LuaState) {
@@ -502,6 +610,9 @@ pub fn open(l: &mut LuaState) {
         .func(b"gethook", lib_gethook)
         .func(b"sethook", lib_sethook)
         .func(b"getupvalue", lib_getupvalue)
+        .func(b"setupvalue", lib_setupvalue)
+        .func(b"getlocal", lib_getlocal)
+        .func(b"setlocal", lib_setlocal)
         .func(b"upvaluejoin", lib_upvaluejoin)
         .build();
 }

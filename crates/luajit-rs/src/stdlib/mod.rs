@@ -21,13 +21,15 @@ pub mod reg;
 pub mod sort;
 pub mod string;
 pub mod table;
+mod time;
 
 pub use reg::LibTarget;
+pub(crate) use time::PlatformInstant;
 
 use crate::err::LuaResult;
-use crate::ffi;
 use crate::state::LuaState;
 use crate::value::LuaValue;
+use crate::{LuaError, ffi};
 
 /// `lua_push` a single result value. Writes into the result area
 /// at `base` and sets `top = base + 1`. Only safe for one-value
@@ -208,13 +210,7 @@ pub fn tostring_meta(l: &mut LuaState, v: LuaValue) -> LuaResult<Vec<u8>> {
 }
 
 /// Builtin error: `bad argument #N to 'func' (expected, got)`.
-pub fn err_bad_arg(
-    l: &mut LuaState,
-    n: u32,
-    func: &str,
-    expected: &str,
-    got: &str,
-) -> crate::err::LuaError {
+pub fn err_bad_arg(l: &mut LuaState, n: u32, func: &str, expected: &str, got: &str) -> LuaError {
     let msg = format!(
         "bad argument #{} to '{}' ({} expected, got {})",
         n, func, expected, got
@@ -235,5 +231,5 @@ pub fn open_libs(l: &mut LuaState) {
     io::open(l);
     package::open(l);
     debug::open(l);
-    ffi::lib::open(l);
+    ffi::open(l);
 }

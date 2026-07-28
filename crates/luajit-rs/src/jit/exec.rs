@@ -56,6 +56,7 @@ pub struct ExitResult {
 /// unlinked exit. The caller (JFORL/JLOOP dispatch arms) must have
 /// synced the frame and must switch to the recording dispatch when a
 /// side trace recording was started (jit.state == Record).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult {
     // Bind the heap for allocating helpers (string interning): traces
     // are executed strictly single-threaded per VM.
@@ -1066,4 +1067,9 @@ pub extern "C" fn jit_varg(base_ptr: u64, frame_link: u64, packed: u64) -> u64 {
         }
     }
     actual as u64
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn trace_exec(_l: &mut crate::state::LuaState, _base: usize, _traceno: u32) -> ExitResult {
+    ExitResult { pc: 0, exitno: 0, baseslot: 2, gcexit: false, shift: 0 }
 }

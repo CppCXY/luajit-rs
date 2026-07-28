@@ -14,6 +14,7 @@
 //!   makes them take two IR slots, which is purely a C memory-layout
 //!   trick (`ir[1].tv`).
 
+
 use super::TraceError;
 
 // -- IR opcodes (lj_ir.h IRDEF) --------------------------------------------
@@ -764,7 +765,15 @@ impl IrBuf {
     /// `emitir` macro. The recorder's main emission entry point.
     #[inline]
     pub fn emitir(&mut self, ot: u16, a: IRRef, b: IRRef) -> Result<TRef, TraceError> {
-        super::opt_fold::opt_fold(self, IRIns::new(ot, a, b))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            super::opt_fold::opt_fold(self, IRIns::new(ot, a, b))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let tr = self.emit_ins(IRIns::new(ot, a, b));
+            Ok(tr)
+        }
     }
 
     /// `lj_ir_rollback`: undo all instructions emitted at or above `r`,

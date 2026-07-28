@@ -13,10 +13,11 @@
 //! and `LuaValue::as_cdata()` for construction / access.
 //! Reference: LuaJIT/src/lj_ctype.h, lj_cdata.h, lj_cparse.h
 
-pub mod clib;
-pub mod lib;
-pub mod parser;
+mod clib;
+mod lib;
+mod parser;
 
+pub use lib::open;
 // ---------------------------------------------------------------------------
 // C type numbers (enum from lj_ctype.h)
 // ---------------------------------------------------------------------------

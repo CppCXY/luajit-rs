@@ -27,18 +27,22 @@
 //!   bytecode to the non-counting I* variants, which removes the check
 //!   from the hot path for good.
 
-pub mod asm;
-pub mod exec;
-pub mod ir;
-pub mod mcode;
-pub mod opt_dce;
-pub mod opt_fold;
-pub mod opt_ivar;
-pub mod opt_loop;
-pub mod opt_mem;
-pub mod opt_narrow;
-pub mod record;
-pub mod trace;
+mod asm;
+mod exec;
+#[allow(unused)]
+mod ir;
+mod mcode;
+mod opt_dce;
+mod opt_fold;
+mod opt_ivar;
+mod opt_loop;
+mod opt_mem;
+mod opt_narrow;
+mod record;
+mod trace;
+
+pub use exec::trace_exec;
+pub use trace::{rec_abort_error, rec_ins, trace_hot};
 
 use crate::bc::BCIns;
 use crate::gc::GcPtr;
@@ -315,11 +319,16 @@ pub struct Prng(u64);
 
 impl Prng {
     fn new() -> Prng {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        Prng(seed | 1)
+        #[cfg(target_arch = "wasm32")]
+        { return Prng(0x9E37_79B9_7F4A_7C15); }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15);
+            Prng(seed | 1)
+        }
     }
 
     /// xorshift64* — plenty for penalty noise.
@@ -407,19 +416,19 @@ impl JitState {
             penalty: [HotPenalty::default(); PENALTY_SLOTS],
             penaltyslot: 0,
             prng: Prng::new(),
-            arch: {
-                let over = std::env::var("LUAJIT_RS_JIT_ARCH").unwrap_or_default();
-                if over.eq_ignore_ascii_case("arm64") || over.eq_ignore_ascii_case("aarch64") {
-                    self::asm::Arch::Arm64
-                } else if over.eq_ignore_ascii_case("x64") || over.eq_ignore_ascii_case("x86_64") {
-                    self::asm::Arch::X64
-                } else {
-                    self::asm::HOST_ARCH
-                }
-            },
+            arch: asm::HOST_ARCH,
+            #[cfg(not(target_arch = "wasm32"))]
             no_asm: std::env::var("LUAJIT_RS_NOASM").is_ok(),
+            #[cfg(target_arch = "wasm32")]
+            no_asm: true,
+            #[cfg(not(target_arch = "wasm32"))]
             trace_dump: std::env::var("LUAJIT_RS_TRDUMP").is_ok(),
+            #[cfg(target_arch = "wasm32")]
+            trace_dump: false,
+            #[cfg(not(target_arch = "wasm32"))]
             trace_dump2: std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2"),
+            #[cfg(target_arch = "wasm32")]
+            trace_dump2: false,
         };
         js.init_hotcount();
         js
