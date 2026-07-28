@@ -321,19 +321,23 @@ pub fn lua_gettop(l: &LuaState) -> usize {
 }
 
 pub fn lua_settop(l: &mut LuaState, idx: i32) {
-    let abs = lua_absindex(l, idx);
-    if abs < l.base {
+    let new_top = if idx > 0 {
+        l.base + idx as usize
+    } else if idx == 0 {
+        l.base
+    } else {
+        l.top.wrapping_add_signed(idx as isize + 1)
+    };
+    if new_top < l.base {
         return;
     }
-    if abs > l.top {
-        l.stack_ensure(abs);
-        l.top = abs;
-    } else {
-        for i in abs..l.top {
+    if new_top > l.top {
+        l.stack_ensure(new_top);
+        for i in l.top..new_top {
             l.stack[i] = LuaValue::NIL;
         }
-        l.top = abs;
     }
+    l.top = new_top;
 }
 
 pub fn lua_pop(l: &mut LuaState, n: i32) {

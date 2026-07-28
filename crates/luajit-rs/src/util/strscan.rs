@@ -3,8 +3,8 @@ use std::num::Wrapping;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumSuffix {
     None,
-    LL,
-    ULL,
+    Ll,
+    Ull,
     Imag,
 }
 
@@ -169,16 +169,16 @@ fn split_suffix(s: &[u8]) -> (&[u8], NumSuffix) {
             && (last3[1] == b'L' || last3[1] == b'l')
             && (last3[2] == b'L' || last3[2] == b'l')
         {
-            return (&s[..len - 3], NumSuffix::ULL);
+            return (&s[..len - 3], NumSuffix::Ull);
         }
     }
     if len >= 2 {
         let last2 = &s[len - 2..];
         if (last2[0] == b'L' || last2[0] == b'l') && (last2[1] == b'L' || last2[1] == b'l') {
             if len >= 3 && (s[len - 3] == b'U' || s[len - 3] == b'u') {
-                return (&s[..len - 3], NumSuffix::ULL);
+                return (&s[..len - 3], NumSuffix::Ull);
             }
-            return (&s[..len - 2], NumSuffix::LL);
+            return (&s[..len - 2], NumSuffix::Ll);
         }
     }
     (s, NumSuffix::None)

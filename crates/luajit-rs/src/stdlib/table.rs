@@ -1,12 +1,13 @@
 //! Table library: `table.concat`, `table.insert`, `table.move`,
 //! `table.pack`, `table.remove`, `table.sort`, `table.unpack`.
 
+use crate::api::lua_gettop;
 use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push};
+use super::{LibTarget, arg, err_bad_arg, push};
 use crate::lual_reg;
 
 use super::sort::introsort;
@@ -60,7 +61,7 @@ pub fn tab_insert(l: &mut LuaState) -> LuaResult<i32> {
         Some(t) => t,
         None => return Err(err_bad_arg(l, 1, "table.insert", "table", "")),
     };
-    let n = nargs(l);
+    let n = lua_gettop(l);
     if n == 2 {
         let pos = (t.as_ref().len() as i32) + 1;
         t.as_mut().set_int(pos, arg(l, 1));
@@ -107,7 +108,7 @@ fn tab_move(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn tab_pack(l: &mut LuaState) -> LuaResult<i32> {
-    let n = nargs(l);
+    let n = lua_gettop(l);
     let t = l
         .heap()
         .alloc_table(crate::table::LuaTable::new(n as u32 + 1, 1));

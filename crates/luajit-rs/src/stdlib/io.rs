@@ -7,13 +7,14 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Mutex;
 
+use crate::api::lua_gettop;
 use crate::err::{LuaError, LuaResult};
 use crate::func::{CClosure, GcFunc};
 use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv, tostring_bytes};
+use super::{LibTarget, arg, err_bad_arg, push, pushv, tostring_bytes};
 use crate::lual_reg;
 
 enum Entry {
@@ -248,7 +249,7 @@ fn read_format(l: &mut LuaState, r: &mut dyn BufRead, fmt: LuaValue) -> Result<L
 }
 
 fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i32> {
-    let n = nargs(l);
+    let n = lua_gettop(l);
     let mut fmts: Vec<LuaValue> = (first_fmt..n.max(first_fmt)).map(|i| arg(l, i)).collect();
     if fmts.is_empty() {
         fmts.push(LuaValue::NIL); // Default: one line.
@@ -287,7 +288,7 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
 // -- Writing -----------------------------------------------------------------
 
 fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32> {
-    let n = nargs(l);
+    let n = lua_gettop(l);
     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n.saturating_sub(first));
     for i in first..n {
         let v = arg(l, i);
@@ -426,7 +427,7 @@ fn handle_lines(l: &mut LuaState) -> LuaResult<i32> {
 
 fn io_open(l: &mut LuaState) -> LuaResult<i32> {
     let path = String::from_utf8_lossy(str_arg(l, 0, "io.open")?).into_owned();
-    let mode = if nargs(l) >= 2 {
+    let mode = if lua_gettop(l) >= 2 {
         String::from_utf8_lossy(str_arg(l, 1, "io.open")?).into_owned()
     } else {
         "r".to_string()
@@ -462,7 +463,7 @@ fn io_write(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn io_lines(l: &mut LuaState) -> LuaResult<i32> {
-    if nargs(l) == 0 {
+    if lua_gettop(l) == 0 {
         return Err(l.runtime_error(b"io.lines() without a filename is not supported"));
     }
     let path = String::from_utf8_lossy(str_arg(l, 0, "io.lines")?).into_owned();
@@ -478,7 +479,7 @@ fn io_lines(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn io_close(l: &mut LuaState) -> LuaResult<i32> {
-    if nargs(l) >= 1 {
+    if lua_gettop(l) >= 1 {
         return handle_close(l);
     }
     push(l, LuaValue::TRUE);

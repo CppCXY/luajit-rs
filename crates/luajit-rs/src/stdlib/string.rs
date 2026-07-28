@@ -3,11 +3,12 @@
 //! `string.len`, `string.lower`, `string.match`, `string.rep`,
 //! `string.reverse`, `string.sub`, `string.upper`.
 
+use crate::api::lua_gettop;
 use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push, tostring_bytes};
+use super::{LibTarget, arg, err_bad_arg, push, tostring_bytes};
 use crate::lual_reg;
 use crate::stdlib::pattern::{CaptureValue, find, gsub};
 
@@ -318,7 +319,7 @@ pub fn str_byte(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn str_char(l: &mut LuaState) -> LuaResult<i32> {
-    let n = nargs(l);
+    let n = lua_gettop(l);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let c = arg(l, i).as_number().unwrap_or(0.0) as u32;
@@ -352,7 +353,7 @@ fn str_format(l: &mut LuaState) -> LuaResult<i32> {
         Some(sid) => l.str_static(sid).to_vec(),
         None => return Err(err_bad_arg(l, 1, "string.format", "string", "")),
     };
-    let n = nargs(l);
+    let n = lua_gettop(l);
     enum Owned {
         Num(f64),
         Str(Vec<u8>),

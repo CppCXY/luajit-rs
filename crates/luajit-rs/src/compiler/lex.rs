@@ -317,13 +317,13 @@ impl<'a> LexState<'a> {
                     && (s[body_len - 2] == b'L' || s[body_len - 2] == b'l')
                     && (s[body_len - 1] == b'L' || s[body_len - 1] == b'l')
                 {
-                    suffix = crate::strscan::NumSuffix::ULL;
+                    suffix = crate::strscan::NumSuffix::Ull;
                     body_len -= 3;
                 } else if body_len >= 2
                     && (s[body_len - 2] == b'L' || s[body_len - 2] == b'l')
                     && (s[body_len - 1] == b'L' || s[body_len - 1] == b'l')
                 {
-                    suffix = crate::strscan::NumSuffix::LL;
+                    suffix = crate::strscan::NumSuffix::Ll;
                     body_len -= 2;
                 }
                 let n = crate::strscan::scan_bin_to_u64(&s[..body_len]);
@@ -332,7 +332,7 @@ impl<'a> LexState<'a> {
                         if suffix != crate::strscan::NumSuffix::None {
                             self.tokval.is_cdata = true;
                             self.tokval.cdata_bits = u;
-                            self.tokval.cdata_is_ull = suffix == crate::strscan::NumSuffix::ULL;
+                            self.tokval.cdata_is_ull = suffix == crate::strscan::NumSuffix::Ull;
                         }
                         return u as f64;
                     }
@@ -356,7 +356,7 @@ impl<'a> LexState<'a> {
                 if r.suffix != crate::strscan::NumSuffix::None {
                     self.tokval.is_cdata = true;
                     self.tokval.cdata_bits = r.u;
-                    self.tokval.cdata_is_ull = r.suffix == crate::strscan::NumSuffix::ULL;
+                    self.tokval.cdata_is_ull = r.suffix == crate::strscan::NumSuffix::Ull;
                     self.tokval.cdata_is_imag = r.suffix == crate::strscan::NumSuffix::Imag;
                 }
                 r.n

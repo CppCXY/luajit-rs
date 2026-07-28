@@ -3,11 +3,12 @@
 //! trick, round-to-nearest-even, low 32 mantissa bits) — unlike the
 //! Lua 5.3-style operators, which use a saturating truncation.
 
+use crate::api::lua_gettop;
 use crate::err::{LuaError, LuaResult};
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push};
+use super::{LibTarget, arg, err_bad_arg, push};
 use crate::lual_reg;
 
 /// `lj_num2bit`: wrapping num -> int32. The bias add rounds to nearest
@@ -47,7 +48,7 @@ pub fn bnot(l: &mut LuaState) -> LuaResult<i32> {
 macro_rules! bit_fold {
     ($name:ident, $lua:literal, $op:tt) => {
         pub fn $name(l: &mut LuaState) -> LuaResult<i32> {
-            let n = nargs(l);
+            let n = lua_gettop(l);
             let mut acc = bitarg(l, 0, $lua)?;
             for i in 1..n {
                 #[allow(clippy::assign_op_pattern)]
@@ -87,7 +88,7 @@ pub fn bswap(l: &mut LuaState) -> LuaResult<i32> {
 
 fn tohex(l: &mut LuaState) -> LuaResult<i32> {
     let x = bitarg(l, 0, "bit.tohex")? as u32;
-    let n = if nargs(l) >= 2 {
+    let n = if lua_gettop(l) >= 2 {
         bitarg(l, 1, "bit.tohex")?
     } else {
         8

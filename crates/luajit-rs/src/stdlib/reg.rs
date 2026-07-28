@@ -1,4 +1,7 @@
-use crate::api as a;
+use crate::api::{
+    lua_gettop, lua_newtable, lua_pop, lua_pushcfunction, lua_pushraw, lua_setfield, lua_setglobal,
+    lua_settop,
+};
 use crate::func::CFunction;
 use crate::gc::GcPtr;
 use crate::state::LuaState;
@@ -19,7 +22,6 @@ pub struct LibBuilder<'a> {
     entries: Vec<(&'a [u8], CFunction)>,
     constants: Vec<(&'a [u8], LuaValue)>,
 }
-
 impl<'a> LibBuilder<'a> {
     pub fn new(l: &'a mut LuaState, name: &'a [u8], target: LibTarget) -> Self {
         LibBuilder {
@@ -30,21 +32,16 @@ impl<'a> LibBuilder<'a> {
             constants: Vec::new(),
         }
     }
-
     pub fn func(mut self, fname: &'a [u8], f: CFunction) -> Self {
         self.entries.push((fname, f));
         self
     }
-
     pub fn value(mut self, key: &'a [u8], val: LuaValue) -> Self {
         self.constants.push((key, val));
         self
     }
-
     pub fn build(self) -> GcPtr<LuaTable> {
         if matches!(self.target, LibTarget::BaseLib) {
-            // Registration during init — use direct heap API to avoid
-            // stack-index dependency on base/top being 0.
             let g = self.l.global();
             let env = g.globals;
             for &(field, f) in &self.entries {
@@ -61,36 +58,25 @@ impl<'a> LibBuilder<'a> {
             }
             return env;
         }
-
-        // Use api/ for table creation and population
-        let top_before = a::lua_gettop(self.l);
-        a::lua_newtable(self.l);
-        // Stack: [ ...newtable ]
-        let tidx = a::lua_gettop(self.l) as i32;
-
+        let top_before = lua_gettop(self.l);
+        lua_newtable(self.l);
+        let tidx = lua_gettop(self.l) as i32;
         for &(field, f) in &self.entries {
-            a::lua_pushcfunction(self.l, f);
-            // Stack: [ ...newtable, func ]
-            a::lua_setfield(self.l, tidx, std::str::from_utf8(field).unwrap_or(""));
-            // Stack: [ ...newtable ]
+            lua_pushcfunction(self.l, f);
+            lua_setfield(self.l, tidx, std::str::from_utf8(field).unwrap_or(""));
         }
         for &(key, val) in &self.constants {
-            a::lua_pushraw(self.l, val);
-            // Stack: [ ...newtable, val ]
-            a::lua_setfield(self.l, tidx, std::str::from_utf8(key).unwrap_or(""));
-            // Stack: [ ...newtable ]
+            lua_pushraw(self.l, val);
+            lua_setfield(self.l, tidx, std::str::from_utf8(key).unwrap_or(""));
         }
-
         let table = self.l.stack[tidx as usize - 1]
             .as_table()
             .expect("no table");
-
         match self.target {
             LibTarget::Global => {
-                a::lua_setglobal(self.l, std::str::from_utf8(self.name).unwrap_or(""));
+                lua_setglobal(self.l, std::str::from_utf8(self.name).unwrap_or(""));
             }
             LibTarget::Preload => {
-                // Keep internal API for complex closure construction
                 let g = self.l.global();
                 let env = g.globals;
                 let pack_sid = g.heap.intern(b"package");
@@ -125,18 +111,14 @@ impl<'a> LibBuilder<'a> {
                 pre_tab
                     .as_mut()
                     .set(g.heap.str_value(name_sid), LuaValue::func(loader));
-                a::lua_pop(self.l, 1);
+                lua_pop(self.l, 1);
             }
             LibTarget::BaseLib => unreachable!(),
         }
-
-        // Restore stack to what it was before — table is now set as global,
-        // and the stack copy is no longer needed
-        a::lua_settop(self.l, top_before as i32);
+        lua_settop(self.l, top_before as i32);
         table
     }
 }
-
 #[macro_export]
 macro_rules! lual_reg {
     ($l:expr, $name:expr, $target:expr) => {
