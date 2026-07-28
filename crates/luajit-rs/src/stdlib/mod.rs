@@ -21,8 +21,10 @@ pub mod reg;
 pub mod sort;
 pub mod string;
 pub mod table;
+mod time;
 
 pub use reg::LibTarget;
+pub(crate) use time::{PlatformInstant, unix_nanos, unix_secs};
 
 use crate::err::LuaResult;
 use crate::ffi;

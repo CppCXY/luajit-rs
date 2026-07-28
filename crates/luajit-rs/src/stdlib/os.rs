@@ -10,12 +10,8 @@ use super::{LibTarget, arg, err_bad_arg, push};
 use crate::lual_reg;
 
 fn os_clock(l: &mut LuaState) -> LuaResult<i32> {
-    use std::time::UNIX_EPOCH;
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    push(l, LuaValue::number(now - l.global().boot_time));
+    let elapsed = l.global().boot_time.elapsed_secs_f64();
+    push(l, LuaValue::number(elapsed));
     Ok(1)
 }
 
@@ -203,13 +199,7 @@ fn os_getenv(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn os_time(l: &mut LuaState) -> LuaResult<i32> {
-    use std::time::UNIX_EPOCH;
-    let secs = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    push(l, LuaValue::number(secs as f64));
-    Ok(1)
+    todo!()
 }
 
 pub fn open(l: &mut LuaState) {

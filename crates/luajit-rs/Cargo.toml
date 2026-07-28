@@ -11,3 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 ahash.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys.workspace = true
