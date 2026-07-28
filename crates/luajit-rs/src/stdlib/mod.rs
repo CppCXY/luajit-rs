@@ -237,5 +237,5 @@ pub fn open_libs(l: &mut LuaState) {
     io::open(l);
     package::open(l);
     debug::open(l);
-    ffi::lib::open(l);
+    ffi::open(l);
 }

@@ -111,6 +111,7 @@ impl GcHeader {
 }
 
 // ── Low-address allocator ───────────────────────────────────────────────
+#[cfg(not(target_arch = "wasm32"))]
 mod lowmem {
     use std::alloc::Layout;
     use std::ptr::NonNull;
@@ -268,6 +269,20 @@ mod lowmem {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod lowmem {
+    use std::alloc::Layout;
+    use std::ptr::NonNull;
+    pub fn alloc(layout: Layout) -> (NonNull<u8>, bool) {
+        let p = unsafe { std::alloc::alloc(layout) };
+        assert!(!p.is_null(), "alloc failed");
+        unsafe { (NonNull::new_unchecked(p), false) }
+    }
+    pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout, _mapped: bool) {
+        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout); }
+    }
+}
+
 fn alloc_block<T>(
     v: T,
     kind: GcObjectKind,
@@ -288,7 +303,7 @@ fn alloc_block<T>(
 }
 fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
     let addr = data.as_ptr() as usize;
-    if !(0x1000..(1usize << 47)).contains(&addr) {
+    if !(0x1000..(1u64 << 47) as usize).contains(&addr) {
         eprintln!("DEALLOC-BAD-PTR: {:p}", data.as_ptr());
         std::process::abort();
     }
@@ -306,7 +321,7 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
 }
 fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
     let addr = ptr.as_ptr() as usize;
-    if !(0x1000..(1usize << 47)).contains(&addr) {
+    if !(0x1000..(1u64 << 47) as usize).contains(&addr) {
         static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> =
             std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
         let p = DUMMY.load(std::sync::atomic::Ordering::Relaxed);
@@ -386,7 +401,7 @@ impl<T> Pool<T> {
         while i < self.objects.len() {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
-            if addr <= 0x1000 || addr >= (1usize << 47) {
+            if addr <= 0x1000 || addr >= (1u64 << 47) as usize {
                 eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
@@ -416,7 +431,7 @@ impl<T> Pool<T> {
         while i < self.objects.len() {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
-            if addr <= 0x1000 || addr >= (1usize << 47) {
+            if addr <= 0x1000 || addr >= (1u64 << 47) as usize {
                 eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
@@ -891,9 +906,12 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                     }
                 }
                 if let Some(rec) = &gs.jit.rec {
-                    m.mark_proto(rec.cur.startpt);
-                    for v in rec.cur.ir.kgc_values() {
-                        m.mark_value(v);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        m.mark_proto(rec.cur.startpt);
+                        for v in rec.cur.ir.kgc_values() {
+                            m.mark_value(v);
+                        }
                     }
                 }
             }
@@ -1022,9 +1040,12 @@ pub fn full_gc(g: &mut GlobalState) {
         }
     }
     if let Some(rec) = &g.jit.rec {
-        m.mark_proto(rec.cur.startpt);
-        for v in rec.cur.ir.kgc_values() {
-            m.mark_value(v);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            m.mark_proto(rec.cur.startpt);
+            for v in rec.cur.ir.kgc_values() {
+                m.mark_value(v);
+            }
         }
     }
     m.propagate();
