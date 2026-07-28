@@ -56,7 +56,7 @@ fn civil_to_timestamp(y: i64, mo: i64, d: i64, h: i64, m: i64, s: i64) -> i64 {
     let mp = if month <= 2 { month + 9 } else { month - 3 };
     let doy = (153 * mp as u64 + 2) / 5 + d as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = (era * 146097) as i64 + doe as i64 - 719468;
+    let days = (era * 146097) + doe as i64 - 719468;
     days * 86400 + h * 3600 + m * 60 + s
 }
 
@@ -132,7 +132,7 @@ fn civil_to_days(y: i64, m: i64, d: i64) -> i64 {
     let mp = if month <= 2 { month + 9 } else { month - 3 };
     let doy = (153 * mp as u64 + 2) / 5 + d as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146097) as i64 + doe as i64 - 719468
+    (era * 146097) + doe as i64 - 719468
 }
 
 #[allow(clippy::too_many_arguments)]
