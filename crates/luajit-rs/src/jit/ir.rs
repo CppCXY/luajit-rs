@@ -14,6 +14,7 @@
 //!   makes them take two IR slots, which is purely a C memory-layout
 //!   trick (`ir[1].tv`).
 
+
 use super::TraceError;
 
 // -- IR opcodes (lj_ir.h IRDEF) --------------------------------------------

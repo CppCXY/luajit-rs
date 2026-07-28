@@ -27,18 +27,21 @@
 //!   bytecode to the non-counting I* variants, which removes the check
 //!   from the hot path for good.
 
-pub mod asm;
-pub mod exec;
-pub mod ir;
-pub mod mcode;
-pub mod opt_dce;
-pub mod opt_fold;
-pub mod opt_ivar;
-pub mod opt_loop;
-pub mod opt_mem;
-pub mod opt_narrow;
-pub mod record;
-pub mod trace;
+mod asm;
+mod exec;
+mod ir;
+mod mcode;
+mod opt_dce;
+mod opt_fold;
+mod opt_ivar;
+mod opt_loop;
+mod opt_mem;
+mod opt_narrow;
+mod record;
+mod trace;
+
+pub use exec::trace_exec;
+pub use trace::{rec_abort_error, rec_ins, trace_hot};
 
 use crate::bc::BCIns;
 use crate::gc::GcPtr;
