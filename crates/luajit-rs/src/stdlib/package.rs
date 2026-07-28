@@ -219,11 +219,12 @@ fn resolve_path(l: &mut LuaState, envname: &str, def: &[u8]) -> Vec<u8> {
     }
     {
         let pat: &[u8] = &[LUA_EXECDIR];
+        #[cfg(not(target_arch = "wasm32"))]
         if let Ok(exe) = std::env::current_exe()
             && let Some(parent) = exe.parent()
         {
             let dir = parent.to_string_lossy().into_owned().into_bytes();
-            s = gsub(&s, pat, &dir);
+            s = gsub(&s, &pat, &dir);
         }
     }
     let sid = l.heap().intern(&s);

@@ -319,11 +319,16 @@ pub struct Prng(u64);
 
 impl Prng {
     fn new() -> Prng {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15);
-        Prng(seed | 1)
+        #[cfg(target_arch = "wasm32")]
+        { return Prng(0x9E37_79B9_7F4A_7C15); }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15);
+            Prng(seed | 1)
+        }
     }
 
     /// xorshift64* — plenty for penalty noise.
@@ -412,9 +417,18 @@ impl JitState {
             penaltyslot: 0,
             prng: Prng::new(),
             arch: asm::HOST_ARCH,
+            #[cfg(not(target_arch = "wasm32"))]
             no_asm: std::env::var("LUAJIT_RS_NOASM").is_ok(),
+            #[cfg(target_arch = "wasm32")]
+            no_asm: true,
+            #[cfg(not(target_arch = "wasm32"))]
             trace_dump: std::env::var("LUAJIT_RS_TRDUMP").is_ok(),
+            #[cfg(target_arch = "wasm32")]
+            trace_dump: false,
+            #[cfg(not(target_arch = "wasm32"))]
             trace_dump2: std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2"),
+            #[cfg(target_arch = "wasm32")]
+            trace_dump2: false,
         };
         js.init_hotcount();
         js

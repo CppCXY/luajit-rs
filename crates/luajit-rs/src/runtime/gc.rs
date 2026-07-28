@@ -1,6 +1,10 @@
 use std::cell::Cell;
 use std::ptr::NonNull;
 
+/// Maximum address for a valid GC pointer. On 64-bit hosts this is
+/// 2^47 (for NaN-boxing), on 32-bit/wasm32 it's the full address space.
+const ADDR_MAX: u64 = if cfg!(target_pointer_width = "64") { 1u64 << 47 } else { u32::MAX as u64 };
+
 // ── Re-export generational GC types ────────────────────────────────────
 pub use super::gc_gen::header::{Age, GcObjectKind};
 
@@ -303,7 +307,7 @@ fn alloc_block<T>(
 }
 fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
     let addr = data.as_ptr() as usize;
-    if !(0x1000..(1u64 << 47) as usize).contains(&addr) {
+    if !(0x1000..ADDR_MAX as usize).contains(&addr) {
         eprintln!("DEALLOC-BAD-PTR: {:p}", data.as_ptr());
         std::process::abort();
     }
@@ -321,7 +325,7 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
 }
 fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
     let addr = ptr.as_ptr() as usize;
-    if !(0x1000..(1u64 << 47) as usize).contains(&addr) {
+    if !(0x1000..ADDR_MAX as usize).contains(&addr) {
         static DUMMY: std::sync::atomic::AtomicPtr<GcHeader> =
             std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
         let p = DUMMY.load(std::sync::atomic::Ordering::Relaxed);
@@ -401,7 +405,7 @@ impl<T> Pool<T> {
         while i < self.objects.len() {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
-            if addr <= 0x1000 || addr >= (1u64 << 47) as usize {
+            if addr <= 0x1000 || addr >= ADDR_MAX as usize {
                 eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
@@ -431,7 +435,7 @@ impl<T> Pool<T> {
         while i < self.objects.len() {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
-            if addr <= 0x1000 || addr >= (1u64 << 47) as usize {
+            if addr <= 0x1000 || addr >= ADDR_MAX as usize {
                 eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
