@@ -280,9 +280,9 @@ pub fn open(l: &mut LuaState) {
         .func(b"tointeger", math_tointeger)
         .func(b"type", math_type)
         .func(b"ult", math_ult)
-        .constant(b"pi", LuaValue::number(std::f64::consts::PI))
-        .constant(b"huge", LuaValue::number(f64::MAX))
-        .constant(b"maxinteger", LuaValue::number(i64::MAX as f64))
-        .constant(b"mininteger", LuaValue::number(i64::MIN as f64))
+        .value(b"pi", LuaValue::number(std::f64::consts::PI))
+        .value(b"huge", LuaValue::number(f64::MAX))
+        .value(b"maxinteger", LuaValue::number(i64::MAX as f64))
+        .value(b"mininteger", LuaValue::number(i64::MIN as f64))
         .build();
 }

@@ -62,9 +62,9 @@ pub fn open(l: &mut LuaState) {
         .func(b"off", jit_off)
         .func(b"flush", jit_flush)
         .func(b"status", jit_status)
-        .constant(b"version", version_val)
-        .constant(b"version_num", LuaValue::number(20100.0))
-        .constant(b"arch", arch_val)
-        .constant(b"os", os_val)
+        .value(b"version", version_val)
+        .value(b"version_num", LuaValue::number(20100.0))
+        .value(b"arch", arch_val)
+        .value(b"os", os_val)
         .build();
 }

@@ -1,47 +1,23 @@
-//! Library registration builder.
-//!
-//! ```ignore
-//! // Named library as a global table:
-//! lual_reg!(l, b"string", LibTarget::Global)
-//!     .func(b"byte", str_byte)
-//!     .build();
-//!
-//! // Base library (register directly into _G, no sub-table):
-//! lual_reg!(l, b"", LibTarget::BaseLib)
-//!     .func(b"print", lib_print)
-//!     .build();
-//!
-//! // With constants:
-//! lual_reg!(l, b"math", LibTarget::Global)
-//!     .func(b"abs", math_abs)
-//!     .constant(b"pi", LuaValue::number(std::f64::consts::PI))
-//!     .build();
-//! ```
-
-use crate::func::{CClosure, CFunction, GcFunc};
+use crate::api as a;
+use crate::func::CFunction;
+use crate::gc::GcPtr;
 use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 
-/// Where the library table should be exposed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LibTarget {
-    /// Register directly on `_G` (for base library).
     BaseLib,
-    /// Register as a global variable (LuaJIT's `luaL_openlibs`).
     Global,
-    /// Insert into `package.preload[name]`.
     Preload,
 }
 
-/// Builder for a named library table.  Created by [`lual_reg!`].
 pub struct LibBuilder<'a> {
     l: &'a mut LuaState,
     name: &'a [u8],
     target: LibTarget,
     entries: Vec<(&'a [u8], CFunction)>,
     constants: Vec<(&'a [u8], LuaValue)>,
-    env: Option<crate::gc::GcPtr<LuaTable>>,
 }
 
 impl<'a> LibBuilder<'a> {
@@ -52,123 +28,115 @@ impl<'a> LibBuilder<'a> {
             target,
             entries: Vec::new(),
             constants: Vec::new(),
-            env: None,
         }
     }
 
-    /// Override the environment table (defaults to `_G`).
-    pub fn env(mut self, t: crate::gc::GcPtr<LuaTable>) -> Self {
-        self.env = Some(t);
-        self
-    }
-
-    /// Register one C function.
     pub fn func(mut self, fname: &'a [u8], f: CFunction) -> Self {
         self.entries.push((fname, f));
         self
     }
 
-    /// Set a static constant on the library table (only meaningful for
-    /// `Global`/`Preload`; ignored for `BaseLib`).
-    pub fn constant(mut self, key: &'a [u8], value: LuaValue) -> Self {
-        self.constants.push((key, value));
+    pub fn value(mut self, key: &'a [u8], val: LuaValue) -> Self {
+        self.constants.push((key, val));
         self
     }
 
-    /// Build the library table and expose it according to `target`.
-    pub fn build(self) -> crate::gc::GcPtr<LuaTable> {
-        let env = self.env.unwrap_or(self.l.global().globals);
-        let globals = env; // for BaseLib, register directly into globals
-
+    pub fn build(self) -> GcPtr<LuaTable> {
         if matches!(self.target, LibTarget::BaseLib) {
+            // Registration during init — use direct heap API to avoid
+            // stack-index dependency on base/top being 0.
+            let g = self.l.global();
+            let env = g.globals;
             for &(field, f) in &self.entries {
-                let sid = self.l.heap().intern(field);
-                let fref = self.l.heap().alloc_func(GcFunc::C(CClosure {
-                    f,
-                    env,
-                    upvals: Vec::new(),
-                }));
-                globals
-                    .as_mut()
-                    .set(self.l.heap().str_value(sid), LuaValue::func(fref));
+                let sid = g.heap.intern(field);
+                let fref = g
+                    .heap
+                    .alloc_func(crate::func::GcFunc::C(crate::func::CClosure {
+                        f,
+                        env,
+                        upvals: Vec::new(),
+                    }));
+                env.as_mut()
+                    .set(g.heap.str_value(sid), LuaValue::func(fref));
             }
-            return globals;
+            return env;
         }
 
-        let t = self.l.heap().alloc_table(LuaTable::new(
-            0,
-            ((self.entries.len() + self.constants.len()) as u32)
-                .next_power_of_two()
-                .trailing_zeros(),
-        ));
+        // Use api/ for table creation and population
+        let top_before = a::lua_gettop(self.l);
+        a::lua_newtable(self.l);
+        // Stack: [ ...newtable ]
+        let tidx = a::lua_gettop(self.l) as i32;
+
         for &(field, f) in &self.entries {
-            let sid = self.l.heap().intern(field);
-            let fref = self.l.heap().alloc_func(GcFunc::C(CClosure {
-                f,
-                env,
-                upvals: Vec::new(),
-            }));
-            t.as_mut()
-                .set(self.l.heap().str_value(sid), LuaValue::func(fref));
+            a::lua_pushcfunction(self.l, f);
+            // Stack: [ ...newtable, func ]
+            a::lua_setfield(self.l, tidx, std::str::from_utf8(field).unwrap_or(""));
+            // Stack: [ ...newtable ]
         }
         for &(key, val) in &self.constants {
-            let sid = self.l.heap().intern(key);
-            t.as_mut().set(self.l.heap().str_value(sid), val);
+            a::lua_pushraw(self.l, val);
+            // Stack: [ ...newtable, val ]
+            a::lua_setfield(self.l, tidx, std::str::from_utf8(key).unwrap_or(""));
+            // Stack: [ ...newtable ]
         }
+
+        let table = self.l.stack[tidx as usize - 1]
+            .as_table()
+            .expect("no table");
+
         match self.target {
-            LibTarget::Global | LibTarget::BaseLib => {
-                let name_sid = self.l.heap().intern(self.name);
-                self.l
-                    .global()
-                    .globals
-                    .as_mut()
-                    .set(self.l.heap().str_value(name_sid), LuaValue::table(t));
+            LibTarget::Global => {
+                a::lua_setglobal(self.l, std::str::from_utf8(self.name).unwrap_or(""));
             }
             LibTarget::Preload => {
+                // Keep internal API for complex closure construction
                 let g = self.l.global();
-                let pack_sid = self.l.heap().intern(b"package");
+                let env = g.globals;
+                let pack_sid = g.heap.intern(b"package");
                 let pack = g.heap.str_value(pack_sid);
-                let pack_tab = match g.globals.as_ref().get(pack).as_table() {
-                    Some(pt) => pt,
-                    None => {
-                        let pt = g.heap.alloc_table(LuaTable::new(0, 2));
-                        g.globals.as_mut().set(pack, LuaValue::table(pt));
-                        pt
-                    }
-                };
-                let pre_sid = self.l.heap().intern(b"preload");
+                let pack_tab = env.as_ref().get(pack).as_table().unwrap_or_else(|| {
+                    let pt = g.heap.alloc_table(LuaTable::new(0, 2));
+                    env.as_mut().set(pack, LuaValue::table(pt));
+                    pt
+                });
+                let pre_sid = g.heap.intern(b"preload");
                 let pre = g.heap.str_value(pre_sid);
-                let pre_tab = match pack_tab.as_ref().get(pre).as_table() {
-                    Some(pt) => pt,
-                    None => {
-                        let pt = g.heap.alloc_table(LuaTable::new(0, 2));
-                        pack_tab.as_mut().set(pre, LuaValue::table(pt));
-                        pt
-                    }
-                };
+                let pre_tab = pack_tab.as_ref().get(pre).as_table().unwrap_or_else(|| {
+                    let pt = g.heap.alloc_table(LuaTable::new(0, 2));
+                    pack_tab.as_mut().set(pre, LuaValue::table(pt));
+                    pt
+                });
                 let name_sid = g.heap.intern(self.name);
-                let loader = g.heap.alloc_func(GcFunc::C(CClosure {
-                    f: |l: &mut LuaState| {
-                        let tab = match l.stack[l.base - 1].as_table() {
-                            Some(t) => t,
-                            None => return Ok(0),
-                        };
-                        l.stack[l.base] = LuaValue::table(tab);
-                        Ok(1)
-                    },
-                    env,
-                    upvals: Vec::new(),
-                }));
+                let loader = g
+                    .heap
+                    .alloc_func(crate::func::GcFunc::C(crate::func::CClosure {
+                        f: |l: &mut LuaState| {
+                            let tab = match l.stack[l.base - 1].as_table() {
+                                Some(t) => t,
+                                None => return Ok(0),
+                            };
+                            l.stack[l.base] = LuaValue::table(tab);
+                            Ok(1)
+                        },
+                        env,
+                        upvals: Vec::new(),
+                    }));
                 pre_tab
                     .as_mut()
                     .set(g.heap.str_value(name_sid), LuaValue::func(loader));
+                a::lua_pop(self.l, 1);
             }
+            LibTarget::BaseLib => unreachable!(),
         }
-        t
+
+        // Restore stack to what it was before — table is now set as global,
+        // and the stack copy is no longer needed
+        a::lua_settop(self.l, top_before as i32);
+        table
     }
 }
 
-/// Convenience macro for the builder pattern.
 #[macro_export]
 macro_rules! lual_reg {
     ($l:expr, $name:expr, $target:expr) => {
