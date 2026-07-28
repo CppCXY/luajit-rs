@@ -316,11 +316,28 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
         .unwrap();
     let layout = layout.pad_to_align();
     let ap = unsafe { (data.as_ptr() as *mut u8).sub(data_offset) };
+    // Check that ap is 16-byte aligned (required by glibc fastbin).
+    if (ap as usize) & 0xF != 0 {
+        eprintln!(
+            "DEALLOC-MISALIGNED: ap={:p} data={:p} offset={} T={}",
+            ap,
+            data.as_ptr(),
+            data_offset,
+            std::any::type_name::<T>()
+        );
+        std::process::abort();
+    }
+    let kind = unsafe { (*(ap as *const GcHeader)).kind };
     debug_assert!(
-        unsafe { (*(ap as *const GcHeader)).kind <= 7 },
-        "dealloc_block: corrupt kind T={}",
+        kind <= 7,
+        "dealloc_block: corrupt kind={} T={}",
+        kind,
         std::any::type_name::<T>()
     );
+    if kind > 7 {
+        eprintln!("DEALLOC-CORRUPT: kind={} T={}", kind, std::any::type_name::<T>());
+        std::process::abort();
+    }
     unsafe { lowmem::dealloc(NonNull::new_unchecked(ap), layout, mapped) };
 }
 #[inline]
@@ -343,6 +360,14 @@ fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
         .unwrap();
     unsafe {
         let p = (ptr.as_ptr() as *const u8).sub(data_offset) as *const GcHeader;
+        // Quick alignment check: must be at least 4-byte aligned
+        if (p as usize) & 0x3 != 0 {
+            eprintln!(
+                "GCHEADER-MISALIGNED: p={:p} ptr={:p} off={} T={}",
+                p, ptr.as_ptr(), data_offset, std::any::type_name::<T>()
+            );
+            std::process::abort();
+        }
         let h = &*p;
         debug_assert!(
             h.kind <= 7,
