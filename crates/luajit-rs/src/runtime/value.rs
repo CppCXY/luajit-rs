@@ -163,14 +163,17 @@ impl LuaValue {
         ((self.0 as i64) >> 47) as u32
     }
 
+    #[inline]
     pub fn is_nil(self) -> bool {
         self.itype() == LJ_TNIL
     }
 
+    #[inline]
     pub fn is_false(self) -> bool {
         self.itype() == LJ_TFALSE
     }
 
+    #[inline]
     pub fn is_true(self) -> bool {
         self.itype() == LJ_TTRUE
     }
@@ -180,18 +183,22 @@ impl LuaValue {
     }
 
     /// `tvisnumber`: itype <= LJ_TISNUM.
+    #[inline]
     pub fn is_number(self) -> bool {
         self.itype() <= LJ_TISNUM
     }
 
+    #[inline]
     pub fn is_string(self) -> bool {
         self.itype() == LJ_TSTR
     }
 
+    #[inline]
     pub fn is_table(self) -> bool {
         self.itype() == LJ_TTAB
     }
 
+    #[inline]
     pub fn is_func(self) -> bool {
         self.itype() == LJ_TFUNC
     }
@@ -238,6 +245,7 @@ impl LuaValue {
         self.itype() < LJ_TISTRUECOND
     }
 
+    #[inline]
     pub fn as_number(self) -> Option<f64> {
         if self.is_number() {
             Some(f64::from_bits(self.0))
@@ -255,10 +263,12 @@ impl LuaValue {
     }
 
     /// The interned id of a string value (loaded from the object).
+    #[inline]
     pub fn as_string_id(self) -> Option<StrId> {
         self.as_string().map(|p| p.as_ref().sid())
     }
 
+    #[inline]
     pub fn as_table(self) -> Option<GcPtr<crate::table::LuaTable>> {
         if self.is_table() {
             GcPtr::from_addr(self.gc_addr())
@@ -267,6 +277,7 @@ impl LuaValue {
         }
     }
 
+    #[inline]
     pub fn as_func(self) -> Option<GcPtr<crate::func::GcFunc>> {
         if self.is_func() {
             GcPtr::from_addr(self.gc_addr())
@@ -303,6 +314,7 @@ impl LuaValue {
     /// strings hash by their interned `sid` (`hashstr`), numbers by
     /// `hashrot` over their bit halves (`hashnum`), booleans map to 0/1
     /// (`hashmask(boolV)`), other GC objects by their payload (`hashgcref`).
+    #[inline]
     pub fn hash_key(self) -> u32 {
         if self.is_string() {
             self.as_string().unwrap().as_ref().sid()

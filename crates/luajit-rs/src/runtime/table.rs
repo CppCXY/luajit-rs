@@ -127,6 +127,7 @@ impl LuaTable {
     /// Access a node by index, falling back to the static EMPTY node
     /// when the table has no hash part. This avoids allocating a Vec
     /// holding a copy of the EMPTY node.
+    #[inline]
     fn node_slot(&self, idx: u32) -> &Node {
         if self.hmask > 0 {
             &self.node[idx as usize]
@@ -134,6 +135,7 @@ impl LuaTable {
             Self::empty_node()
         }
     }
+    #[inline]
     fn node_slot_mut(&mut self, idx: u32) -> &mut Node {
         debug_assert!(self.hmask > 0, "cannot mutate the shared EMPTY node");
         &mut self.node[idx as usize]
@@ -212,6 +214,7 @@ impl LuaTable {
     }
 
     /// The main hash-slot index for `key` (`hashkey` + `hashmask`).
+    #[inline]
     fn hash_slot(&self, key: LuaValue) -> u32 {
         key.hash_key() & self.hmask
     }
@@ -228,6 +231,7 @@ impl LuaTable {
 
     // -- Getters ---------------------------------------------------------
 
+    #[inline]
     pub fn get(&self, key: LuaValue) -> LuaValue {
         if let Some(i) = LuaTable::array_key(key)
             && i < self.asize

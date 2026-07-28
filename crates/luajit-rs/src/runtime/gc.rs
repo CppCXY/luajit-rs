@@ -323,6 +323,7 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
     );
     unsafe { lowmem::dealloc(NonNull::new_unchecked(ap), layout, mapped) };
 }
+#[inline]
 fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
     let addr = ptr.as_ptr() as usize;
     if !(0x1000..ADDR_MAX as usize).contains(&addr) {
@@ -500,10 +501,12 @@ impl<T> GcPtr<T> {
     }
 
     #[allow(clippy::should_implement_trait)]
+    #[inline]
     pub fn as_ref<'a>(self) -> &'a T {
         unsafe { &*self.0.as_ptr() }
     }
 
+    #[inline]
     pub fn as_mut<'a>(self) -> &'a mut T {
         unsafe { &mut *self.0.as_ptr() }
     }
@@ -863,6 +866,7 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
 /// Unlike `barrier_fwd`, this only accesses the table's GC header — always
 /// a valid GC object pointer — so it is safe to call at every store site
 /// including from the VM interpreter.
+#[inline]
 pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
     let h = gc_header(t.0);
     if h.is_black() {
