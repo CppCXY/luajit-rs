@@ -548,7 +548,11 @@ fn lib_getlocal(l: &mut LuaState) -> LuaResult<i32> {
             }
             let idx = slot + local - 1;
             let name = str_val(l, "");
-            let val = if idx < l.stack.len() { l.stack[idx] } else { LuaValue::NIL };
+            let val = if idx < l.stack.len() {
+                l.stack[idx]
+            } else {
+                LuaValue::NIL
+            };
             pushv(l, &[name, val]);
             Ok(2)
         }

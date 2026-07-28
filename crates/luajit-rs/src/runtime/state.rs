@@ -211,7 +211,7 @@ pub struct GlobalState {
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
     /// for cheap differencing at every `os.clock` call.
-    pub boot_time: PlatformInstant,
+    pub(crate) boot_time: PlatformInstant,
     /// The main thread. Set once the owning [`Lua`] is pinned. The interpreter
     /// entry points use this when no explicit thread is supplied.
     main: Option<StateRef>,
