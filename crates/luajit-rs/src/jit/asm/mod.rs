@@ -9,6 +9,7 @@
 use super::{GCtrace, TraceError, mcode::McodeArea};
 
 mod arm64;
+mod riscv64;
 mod x64;
 
 /// Target architecture for native code generation.
@@ -17,7 +18,7 @@ pub enum Arch {
     Unknown,
     X64,
     Arm64,
-    RISCV64,
+    Riscv64,
     Wasm32,
 }
 
@@ -28,7 +29,7 @@ pub const HOST_ARCH: Arch =  if cfg!(target_arch = "x86_64") {
 } else if cfg!(target_arch = "aarch64") {
     Arch::Arm64
 } else if cfg!(target_arch = "riscv64") {
-    Arch::RISCV64
+    Arch::Riscv64
 } else if cfg!(target_arch = "wasm32") {
     Arch::Wasm32
 } else {
@@ -45,6 +46,7 @@ pub fn assemble(
     match arch {
         Arch::X64 => x64::assemble(tr, link),
         Arch::Arm64 => arm64::assemble(tr, link),
+        Arch::Riscv64 => riscv64::assemble(tr, link),
         _ => Err(TraceError::NYIBC),
     }
 }
@@ -61,6 +63,7 @@ pub fn patch_exit(
     match arch {
         Arch::X64 => x64::patch_exit(area, stub_tails, exitno, target),
         Arch::Arm64 => arm64::patch_exit(area, stub_tails, exitno, target),
+        Arch::Riscv64 => riscv64::patch_exit(area, stub_tails, exitno, target),
         _ => {}
     }
 }

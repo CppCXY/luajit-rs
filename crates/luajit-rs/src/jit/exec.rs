@@ -265,18 +265,26 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
     let mut phivals: Vec<u64> = Vec::with_capacity(phis.len());
 
     let mut start = REF_FIRST;
+    // Pre-compute the covering snapshot for each IR ref so the inner
+    // loop avoids the O(snaps) while-chain on every instruction.
+    let snap_for_ref: Vec<usize> = {
+        let mut map = vec![0usize; nins as usize];
+        let mut si = 0usize;
+        for r in REF_FIRST..nins {
+            while si + 1 < tr.snap.len() && tr.snap[si + 1].iref <= r {
+                si += 1;
+            }
+            map[(r - REF_BIAS) as usize] = si;
+        }
+        map
+    };
     'trace: loop {
-        // Snapshot cursor: the guard at ref R exits through the last
-        // snapshot with iref <= R.
-        let mut snapidx = 0usize;
         let mut r = start;
         while r < nins {
-            while snapidx + 1 < tr.snap.len() && tr.snap[snapidx + 1].iref <= r {
-                snapidx += 1;
-            }
             let ins = *ir.ir(r);
+            let ri = (r - REF_BIAS) as usize;
+            let snapidx = snap_for_ref[ri];
             let op = ins.op();
-            let val = |env: &[u64], op: IRRef| -> u64 { read_ref(ir, env, op) };
             match op {
                 IROp::NOP | IROp::BASE | IROp::LOOP | IROp::PHI => {}
                 IROp::SLOAD => {
@@ -287,7 +295,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     if ins.is_guard() && !typecheck(v, ins.t()) {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
-                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                    env[ri] = v.to_bits();
                 }
                 IROp::ULOAD => {
                     // op1 = KINT64 constant holding the closed cell address.
@@ -296,12 +304,12 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     if ins.is_guard() && !typecheck(v, ins.t()) {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
-                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                    env[ri] = v.to_bits();
                 }
                 IROp::FLOAD => {
                     // Guarded `metatable == nil` check (IRFL_TAB_META).
                     debug_assert!(ins.is_guard());
-                    let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
+                    let tv = LuaValue::from_bits(read_ref(ir, env, ins.op1 as IRRef));
                     let mt = tv
                         .as_table()
                         .expect("FLOAD on a non-table")
@@ -313,20 +321,20 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 }
                 IROp::HLOAD => {
                     let v = LuaValue::from_bits(jit_tget(
-                        val(env, ins.op1 as IRRef),
-                        val(env, ins.op2 as IRRef),
+                        read_ref(ir, env, ins.op1 as IRRef),
+                        read_ref(ir, env, ins.op2 as IRRef),
                     ));
                     if ins.is_guard() && !typecheck(v, ins.t()) {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
-                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                    env[ri] = v.to_bits();
                 }
                 IROp::ALOAD => {
                     // Inlined array-part load: guard the key is an exact
                     // int inside the array, then read through aptr.
-                    let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
+                    let tv = LuaValue::from_bits(read_ref(ir, env, ins.op1 as IRRef));
                     let t = tv.as_table().expect("ALOAD on a non-table");
-                    let kn = f64::from_bits(val(env, ins.op2 as IRRef));
+                    let kn = f64::from_bits(read_ref(ir, env, ins.op2 as IRRef));
                     let ki = kn as i32;
                     if ki as f64 != kn || ki < 0 || (ki as u32) >= t.as_ref().asize {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
@@ -335,19 +343,19 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     if !typecheck(v, ins.t()) {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
-                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                    env[ri] = v.to_bits();
                 }
                 IROp::ASTORE => {
                     let carg = *ir.ir(ins.op2 as IRRef);
                     debug_assert_eq!(carg.op(), IROp::CARG);
-                    let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
+                    let tv = LuaValue::from_bits(read_ref(ir, env, ins.op1 as IRRef));
                     let t = tv.as_table().expect("ASTORE on a non-table");
-                    let kn = f64::from_bits(val(env, carg.op1 as IRRef));
+                    let kn = f64::from_bits(read_ref(ir, env, carg.op1 as IRRef));
                     let ki = kn as i32;
                     if ki as f64 != kn || ki <= 0 || (ki as u32) >= t.as_ref().asize {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
-                    let v = LuaValue::from_bits(val(env, carg.op2 as IRRef));
+                    let v = LuaValue::from_bits(read_ref(ir, env, carg.op2 as IRRef));
                     unsafe { *t.as_ref().aptr.add(ki as usize) = v };
                 }
                 IROp::GCSTEP => {
@@ -364,22 +372,22 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let carg = *ir.ir(ins.op2 as IRRef);
                     debug_assert_eq!(carg.op(), IROp::CARG);
                     jit_tset(
-                        val(env, ins.op1 as IRRef),
-                        val(env, carg.op1 as IRRef),
-                        val(env, carg.op2 as IRRef),
+                        read_ref(ir, env, ins.op1 as IRRef),
+                        read_ref(ir, env, carg.op1 as IRRef),
+                        read_ref(ir, env, carg.op2 as IRRef),
                     );
                 }
                 IROp::TNEW => {
-                    env[(r - REF_BIAS) as usize] = jit_tnew();
+                    env[ri] = jit_tnew();
                 }
                 IROp::TDUP => {
-                    env[(r - REF_BIAS) as usize] = jit_tdup(val(env, ins.op1 as IRRef));
+                    env[ri] = jit_tdup(read_ref(ir, env, ins.op1 as IRRef));
                 }
                 IROp::CALLL => {
                     let idx = ins.op2 as u32;
                     let bits = match super::record::ircall_arity(idx) {
                         1 => {
-                            let x = val(env, ins.op1 as IRRef);
+                            let x = read_ref(ir, env, ins.op1 as IRRef);
                             match idx {
                                 super::record::IRCALL_STR_LEN => jit_str_len(x),
                                 super::record::IRCALL_STR_CHAR => jit_str_char(x),
@@ -390,7 +398,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         2 => {
                             let carg = *ir.ir(ins.op1 as IRRef);
                             debug_assert_eq!(carg.op(), IROp::CARG);
-                            let (x, y) = (val(env, carg.op1 as IRRef), val(env, carg.op2 as IRRef));
+                            let (x, y) = (read_ref(ir, env, carg.op1 as IRRef), read_ref(ir, env, carg.op2 as IRRef));
                             match idx {
                                 super::record::IRCALL_TAB_NEXTK => jit_tnextk(x, y),
                                 super::record::IRCALL_FMOD => jit_fmod(x, y),
@@ -408,9 +416,9 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                             let cargi = *ir.ir(cargj.op1 as IRRef);
                             debug_assert_eq!(cargi.op(), IROp::CARG);
                             let (x, y, z) = (
-                                val(env, cargi.op1 as IRRef),
-                                val(env, cargi.op2 as IRRef),
-                                val(env, cargj.op2 as IRRef),
+                                read_ref(ir, env, cargi.op1 as IRRef),
+                                read_ref(ir, env, cargi.op2 as IRRef),
+                                read_ref(ir, env, cargj.op2 as IRRef),
                             );
                             match idx {
                                 super::record::IRCALL_STR_SUB => jit_str_sub(x, y, z),
@@ -423,18 +431,18 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     if ins.is_guard() && !typecheck(v, ins.t()) {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
-                    env[(r - REF_BIAS) as usize] = v.to_bits();
+                    env[ri] = v.to_bits();
                 }
                 IROp::TOBIT => {
                     // Wrapping num -> int32 (num2bit); the recorder's
                     // range guards keep this inside the exact window.
-                    let x = f64::from_bits(val(env, ins.op1 as IRRef));
+                    let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef));
                     let z = crate::stdlib::bit::num2bit(x) as f64;
-                    env[(r - REF_BIAS) as usize] = z.to_bits();
+                    env[ri] = z.to_bits();
                 }
                 IROp::BSWAP => {
-                    let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
-                    env[(r - REF_BIAS) as usize] = ((x.swap_bytes()) as f64).to_bits();
+                    let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef)) as i32;
+                    env[ri] = ((x.swap_bytes()) as f64).to_bits();
                 }
                 IROp::BAND
                 | IROp::BOR
@@ -447,18 +455,18 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 | IROp::BNOT => {
                     // Fused num -> int32 -> op -> num, mirroring the
                     // interpreter's coercions (operands are range-guarded).
-                    let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
+                    let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef)) as i32;
                     let z: f64 = match op {
                         IROp::BNOT => (!x) as f64,
                         IROp::BAND => {
-                            (x & f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64
+                            (x & f64::from_bits(read_ref(ir, env, ins.op2 as IRRef)) as i32) as f64
                         }
-                        IROp::BOR => (x | f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64,
+                        IROp::BOR => (x | f64::from_bits(read_ref(ir, env, ins.op2 as IRRef)) as i32) as f64,
                         IROp::BXOR => {
-                            (x ^ f64::from_bits(val(env, ins.op2 as IRRef)) as i32) as f64
+                            (x ^ f64::from_bits(read_ref(ir, env, ins.op2 as IRRef)) as i32) as f64
                         }
                         _ => {
-                            let sh = (f64::from_bits(val(env, ins.op2 as IRRef)) as u32) & 31;
+                            let sh = (f64::from_bits(read_ref(ir, env, ins.op2 as IRRef)) as u32) & 31;
                             match op {
                                 IROp::BSHL => (x << sh) as f64,
                                 IROp::BSHR => ((x as u32) >> sh) as f64,
@@ -468,7 +476,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                             }
                         }
                     };
-                    env[(r - REF_BIAS) as usize] = z.to_bits();
+                    env[ri] = z.to_bits();
                 }
                 IROp::ADD
                 | IROp::SUB
@@ -479,27 +487,27 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 | IROp::MAX
                 | IROp::MOD => {
                     if irt_isint(ins.t()) {
-                        let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
-                        let y = f64::from_bits(val(env, ins.op2 as IRRef)) as i32;
+                        let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef)) as i32;
+                        let y = f64::from_bits(read_ref(ir, env, ins.op2 as IRRef)) as i32;
                         let z = super::opt_fold::kfold_intop(x, y, op);
-                        env[(r - REF_BIAS) as usize] = (z as f64).to_bits();
+                        env[ri] = (z as f64).to_bits();
                     } else {
-                        let x = f64::from_bits(val(env, ins.op1 as IRRef));
-                        let y = f64::from_bits(val(env, ins.op2 as IRRef));
+                        let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef));
+                        let y = f64::from_bits(read_ref(ir, env, ins.op2 as IRRef));
                         let z = super::opt_fold::fold_numarith(x, y, op);
-                        env[(r - REF_BIAS) as usize] = z.to_bits();
+                        env[ri] = z.to_bits();
                     }
                 }
                 IROp::NEG => {
-                    let x = f64::from_bits(val(env, ins.op1 as IRRef));
-                    env[(r - REF_BIAS) as usize] = (-x).to_bits();
+                    let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef));
+                    env[ri] = (-x).to_bits();
                 }
                 IROp::ABS => {
-                    let x = f64::from_bits(val(env, ins.op1 as IRRef));
-                    env[(r - REF_BIAS) as usize] = x.abs().to_bits();
+                    let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef));
+                    env[ri] = x.abs().to_bits();
                 }
                 IROp::FPMATH => {
-                    let x = f64::from_bits(val(env, ins.op1 as IRRef));
+                    let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef));
                     let z = match ins.op2 as u32 {
                         super::record::IRFPM_FLOOR => x.floor(),
                         super::record::IRFPM_CEIL => x.ceil(),
@@ -507,7 +515,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         super::record::IRFPM_SQRT => x.sqrt(),
                         _ => unreachable!("bad FPMATH literal"),
                     };
-                    env[(r - REF_BIAS) as usize] = z.to_bits();
+                    env[ri] = z.to_bits();
                 }
                 IROp::LT
                 | IROp::GE
@@ -518,12 +526,12 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 | IROp::ULE
                 | IROp::UGT => {
                     let cond = if irt_isnum(ins.t()) {
-                        let x = f64::from_bits(val(env, ins.op1 as IRRef));
-                        let y = f64::from_bits(val(env, ins.op2 as IRRef));
+                        let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef));
+                        let y = f64::from_bits(read_ref(ir, env, ins.op2 as IRRef));
                         super::opt_fold::fold_numcmp(x, y, op)
                     } else if irt_isint(ins.t()) {
-                        let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
-                        let y = f64::from_bits(val(env, ins.op2 as IRRef)) as i32;
+                        let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef)) as i32;
+                        let y = f64::from_bits(read_ref(ir, env, ins.op2 as IRRef)) as i32;
                         match op {
                             IROp::LT => x < y,
                             IROp::GE => x >= y,
@@ -544,13 +552,13 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 }
                 IROp::EQ | IROp::NE => {
                     let cond = if irt_isnum(ins.t()) {
-                        let x = f64::from_bits(val(env, ins.op1 as IRRef));
-                        let y = f64::from_bits(val(env, ins.op2 as IRRef));
+                        let x = f64::from_bits(read_ref(ir, env, ins.op1 as IRRef));
+                        let y = f64::from_bits(read_ref(ir, env, ins.op2 as IRRef));
                         if op == IROp::EQ { x == y } else { x != y }
                     } else {
                         // GC objects: reference identity on the value bits.
-                        let x = val(env, ins.op1 as IRRef);
-                        let y = val(env, ins.op2 as IRRef);
+                        let x = read_ref(ir, env, ins.op1 as IRRef);
+                        let y = read_ref(ir, env, ins.op2 as IRRef);
                         if op == IROp::EQ { x == y } else { x != y }
                     };
                     debug_assert!(ins.is_guard());
@@ -560,7 +568,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 }
                 IROp::CONV => {
                     // op2 encodes target type; for now only NUM↔INT.
-                    let src = val(env, ins.op1 as IRRef);
+                    let src = read_ref(ir, env, ins.op1 as IRRef);
                     let tgt = ins.op2 as u8;
                     let z = if irt_isnum(tgt) {
                         // INT → NUM: value already stored as f64 bits.
@@ -578,7 +586,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         let x = f64::from_bits(src);
                         (x as i32 as f64).to_bits()
                     };
-                    env[(r - REF_BIAS) as usize] = z;
+                    env[ri] = z;
                 }
                 _ => unreachable!("unexpected IR op {:?} in phase-3 trace", op),
             }
@@ -725,6 +733,7 @@ fn exit_snapshot(
 }
 
 /// Runtime type check against a (guarded) IR type — the SLOAD typecheck.
+#[inline]
 fn typecheck(v: LuaValue, t: u8) -> bool {
     match irt_type(t) {
         IRT_NUM => v.is_number(),
