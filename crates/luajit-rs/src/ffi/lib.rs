@@ -10,9 +10,10 @@ use crate::err::LuaResult;
 use crate::ffi::clib;
 use crate::ffi::parser::parse;
 use crate::ffi::{
-    CT, CTState, CType, CTypeID, ct_info, ctype_align, ctype_cid, ctype_isnum, ctype_isptr,
+    CT, CTState, CType, CTypeID, ct_info, ctype_align, ctype_cid, ctype_isnum, ctype_ispointer,
 };
 use crate::func::{CClosure, CFunction, GcFunc};
+use crate::gc::GcPtr;
 use crate::meta::MM;
 use crate::runtime::cdata::CData;
 use crate::state::{GlobalState, LuaState};
@@ -87,52 +88,51 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
         .map_err(|_| l.runtime_error(b"ffi: invalid UTF-8 in type name"))?;
     let name = raw_str.trim().to_string();
 
-    // First try the full name including pointer/array suffixes.
-    if let Some(id) = quick_type_id(&name) {
-        return Ok(id);
-    }
-    if let Some(&id) = l.global().cts.as_ref().and_then(|c| c.names.get(&name)) {
-        return Ok(id);
-    }
-
-    // If the string starts with a struct/union/enum keyword, don't strip anything
-    // — pass the full declaration to the parser.
-    let is_complex_decl = name.trim_start().starts_with("struct")
-        || name.trim_start().starts_with("union")
-        || name.trim_start().starts_with("enum");
-
-    // Strip `[...]` suffix (VLA or fixed-size array).
-    let base = if is_complex_decl {
-        name.clone()
+    // Extract array suffix `[N]` or `[?]` if present.
+    let (base_name, array_count) = if let Some(bracket) = name.find('[') {
+        let close = name.rfind(']').unwrap_or(name.len());
+        let base = name[..bracket].trim().to_string();
+        let inside = name[bracket + 1..close].trim();
+        let count: usize = inside.parse().unwrap_or(0);
+        (base, if count > 0 { count } else { 1 })
     } else {
-        name.find('[')
-            .map(|i| name[..i].trim().to_string())
-            .unwrap_or_else(|| name.clone())
+        (name.clone(), 1)
     };
 
+    // First try the full base name including pointer suffixes.
+    if let Some(id) = quick_type_id(&base_name) {
+        return wrap_array(l, id, array_count);
+    }
+    if let Some(&id) = l.global().cts.as_ref().and_then(|c| c.names.get(&base_name)) {
+        return wrap_array(l, id, array_count);
+    }
+
+    // Strip `[...]` suffix from base_name (already done above).
     // Strip `*` suffix for pointer to custom types.
-    let (base, is_ptr) = if let Some(s) = base.strip_suffix('*') {
+    let (base, is_ptr) = if let Some(s) = base_name.strip_suffix('*') {
         (s.trim().to_string(), true)
-    } else if let Some(s) = base.strip_suffix(" *") {
+    } else if let Some(s) = base_name.strip_suffix(" *") {
         (s.trim().to_string(), true)
     } else {
-        (base, false)
+        (base_name.clone(), false)
     };
 
     if let Some(id) = quick_type_id(&base) {
-        return Ok(if is_ptr {
+        let id = if is_ptr {
             make_ptr_type(cts_of(l), id)
         } else {
             id
-        });
+        };
+        return wrap_array(l, id, array_count);
     }
 
     if let Some(&id) = l.global().cts.as_ref().and_then(|c| c.names.get(&base)) {
-        return Ok(if is_ptr {
+        let id = if is_ptr {
             make_ptr_type(cts_of(l), id)
         } else {
             id
-        });
+        };
+        return wrap_array(l, id, array_count);
     }
 
     let cts = cts_of(l);
@@ -140,11 +140,33 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
     if let Err(e) = parse(cts, &base) {
         return Err(l.runtime_error(format!("ffi: cannot parse '{}': {}", base, e).as_bytes()));
     }
-    if cts.top > prev_top {
-        Ok(cts.top - 1)
+    let id = if cts.top > prev_top {
+        cts.top - 1
     } else {
-        Err(err_bad_arg(l, 1, "ffi", "C type", ""))
+        return Err(err_bad_arg(l, 1, "ffi", "C type", ""));
+    };
+    wrap_array(l, id, array_count)
+}
+
+/// If `count > 1`, create or reuse an array `CType` wrapping the base type.
+fn wrap_array(l: &mut LuaState, base_id: u32, count: usize) -> LuaResult<u32> {
+    if count <= 1 {
+        return Ok(base_id);
     }
+    let cts = cts_of(l);
+    let base_sz = cts.raw(base_id).size;
+    let total_sz = base_sz.saturating_mul(count as u32);
+    // Search existing array types for a match.
+    let info = ct_info(CT::Array, 0) | base_id;
+    for i in 0..cts.top as usize {
+        if cts.tab[i].info == info && cts.tab[i].size == total_sz {
+            return Ok(i as u32);
+        }
+    }
+    let id = cts.top;
+    cts.tab.push(CType { info, size: total_sz, sib: 0, next: 0, name: 0 });
+    cts.top = id + 1;
+    Ok(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -175,14 +197,48 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
     if nargs(l) > 1 {
         let v2 = arg(l, 1);
         if let Some(tab) = v2.as_table() {
-            // Initializer table: copy array elements into the struct.
-            let n = tab.as_ref().len();
-            for i in 0..n {
-                let v = tab.as_ref().get_int(i as i32 + 1);
-                let off = i as usize * 4;
-                if off + 4 <= cd.data.len() {
-                    let val = v.as_number().unwrap_or(0.0) as i32;
-                    cd.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
+            // Initializer table: copy array/struct elements.
+            let n = tab.as_ref().len() as usize;
+            if n == 0 {
+            } else {
+                let first = tab.as_ref().get_int(1);
+                if first.is_number() {
+                    // Flat array of scalars: write 4-byte ints.
+                    for i in 0..n {
+                        let v = tab.as_ref().get_int(i as i32 + 1);
+                        let off = i as usize * 4;
+                        if off + 4 <= cd.data.len() {
+                            let val = v.as_number().unwrap_or(0.0) as i32;
+                            cd.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                        }
+                    }
+                } else if first.as_table().is_some() {
+                    // Array of structs/tables: recursively fill each element.
+                    let cts = cts_of(l);
+                    let raw_ct = cts.raw(id);
+                    let elem_id = if ctype_ispointer(raw_ct.info) {
+                        ctype_cid(raw_ct.info)
+                    } else {
+                        id
+                    };
+                    let elem_sz = cts.raw(elem_id).size as usize;
+                    if elem_sz > 0 {
+                        for i in 0..n {
+                            let sub = tab.as_ref().get_int(i as i32 + 1);
+                            if let Some(st) = sub.as_table() {
+                                let sub_n = st.as_ref().len() as usize;
+                                for j in 0..sub_n {
+                                    let fv = st.as_ref().get_int(j as i32 + 1);
+                                    let off = i as usize * elem_sz + j * 4;
+                                    if off + 4 <= cd.data.len() {
+                                        let val = fv.as_number().unwrap_or(0.0) as i32;
+                                        cd.data[off..off + 4]
+                                            .copy_from_slice(&val.to_le_bytes());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         } else if let Some(count) = v2.as_number() {
@@ -392,6 +448,39 @@ fn read_field_from_slice(data: &[u8], offset: u32, sz: usize) -> f64 {
     }
 }
 
+fn array_element(
+    l: &mut LuaState,
+    cd: GcPtr<CData>,
+    idx: i32,
+) -> LuaResult<i32> {
+    let ctypeid = cd.as_ref().ctypeid;
+    let cts = l.global().cts.as_ref().unwrap();
+    let raw_ct = cts.raw(ctypeid);
+    let elem_typeid = if ctype_ispointer(raw_ct.info) {
+        ctype_cid(raw_ct.info)
+    } else {
+        ctypeid
+    };
+    let elem_sz = cts.raw(elem_typeid).size as usize;
+    if idx < 0 || elem_sz == 0 {
+        push(l, LuaValue::NIL);
+        return Ok(1);
+    }
+    let data_len = cd.as_ref().data.len();
+    let count = data_len / elem_sz;
+    if idx as usize >= count {
+        push(l, LuaValue::NIL);
+        return Ok(1);
+    }
+    let offset = idx as usize * elem_sz;
+    let data = &cd.as_ref().data;
+    let elem_bytes = data[offset..offset + elem_sz].to_vec();
+    let sub = CData { ctypeid: elem_typeid, data: elem_bytes.into_boxed_slice() };
+    let p = l.global().heap.cdatas.alloc(sub);
+    push(l, LuaValue::cdata(p));
+    Ok(1)
+}
+
 fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
     let cd = match arg(l, 0).as_cdata() {
         Some(c) => c,
@@ -403,6 +492,11 @@ fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
     }
     let cts = l.global().cts.as_ref().unwrap();
 
+    // Numeric key → array element access
+    if let Some(idx) = key.as_number() {
+        return array_element(l, cd, idx as i32);
+    }
+
     let name = match key.as_string_id() {
         Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
         _ => {
@@ -412,7 +506,7 @@ fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let raw_ct = cts.raw(cd.as_ref().ctypeid);
-    let (target_id, is_ptr) = if ctype_isptr(raw_ct.info) {
+    let (target_id, is_ptr) = if ctype_ispointer(raw_ct.info) {
         (ctype_cid(raw_ct.info), true)
     } else {
         (cd.as_ref().ctypeid, false)
@@ -468,7 +562,7 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let raw_ct = cts.raw(cd.as_ref().ctypeid);
-    let (target_id, is_ptr) = if ctype_isptr(raw_ct.info) {
+    let (target_id, is_ptr) = if ctype_ispointer(raw_ct.info) {
         (ctype_cid(raw_ct.info), true)
     } else {
         (cd.as_ref().ctypeid, false)

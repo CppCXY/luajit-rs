@@ -160,6 +160,28 @@ fn cdata_is_ull(v: LuaValue) -> bool {
     }
 }
 
+fn try_cdata_binop(l: &mut LuaState, xv: LuaValue, yv: LuaValue, op: impl Fn(u64, u64) -> u64) -> Option<LuaValue> {
+    let x_cd = cdata_u64(xv);
+    let y_cd = cdata_u64(yv);
+    match (x_cd, y_cd) {
+        (Some(x), Some(y)) => {
+            let is_ull = cdata_is_ull(xv) || cdata_is_ull(yv);
+            Some(make_cdata_result(l, op(x, y), is_ull))
+        }
+        (Some(x), None) if yv.is_number() => {
+            let is_ull = cdata_is_ull(xv);
+            let y = (yv.num() as i64) as u64;
+            Some(make_cdata_result(l, op(x, y), is_ull))
+        }
+        (None, Some(y)) if xv.is_number() => {
+            let is_ull = cdata_is_ull(yv);
+            let x = (xv.num() as i64) as u64;
+            Some(make_cdata_result(l, op(x, y), is_ull))
+        }
+        _ => None,
+    }
+}
+
 fn execute_inner(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
     let mut nargs = nargs;
     let f = l.stack[func_slot];
@@ -498,6 +520,7 @@ impl Interp {
             self.set_at(fs + 2 + i, v);
         }
         let n = self.call_c_inline(f, fs, args.len())?;
+        self.sp = self.l().stack.as_mut_ptr();
         Ok(if n > 0 { self.at(fs) } else { LuaValue::NIL })
     }
 
@@ -636,71 +659,6 @@ impl Interp {
                 #[allow(unused_assignments)]
                 {
                     ip = unsafe { self.bcp.add(self.pc) };
-                }
-            }};
-        }
-        // Numeric binary op fast path; slow path calls meta_arith for
-        // string coercion and metamethods (lj_meta_arith).
-        macro_rules! arith {
-            ($a:expr, $xv:expr, $yv:expr, $mm:expr, $x:ident, $y:ident, $body:expr) => {{
-                let xv = $xv;
-                let yv = $yv;
-                if xv.is_number() && yv.is_number() {
-                    let $x = xv.num();
-                    let $y = yv.num();
-                    setreg!($a, LuaValue::number_raw($body));
-                } else {
-                    sync!();
-                    match self.meta_arith($mm, xv, yv, $a)? {
-                        Some(r) => setreg!($a, r),
-                        None => {
-                            resync!();
-                            continue;
-                        }
-                    }
-                }
-            }};
-        }
-        // reg `op` constant (VN form): check the register, constant is
-        // always numeric.
-        macro_rules! arith_vn {
-            ($a:expr, $ins:expr, $mm:expr, $x:ident, $y:ident, $body:expr) => {{
-                let xv = reg!(bc_b($ins));
-                if xv.is_number() {
-                    let $x = xv.num();
-                    let $y = unsafe { *self.knp.add(bc_c($ins) as usize) };
-                    setreg!($a, LuaValue::number_raw($body));
-                } else {
-                    sync!();
-                    match self.meta_arith($mm, xv, kslot!(bc_c($ins)), $a)? {
-                        Some(r) => setreg!($a, r),
-                        None => {
-                            resync!();
-                            continue;
-                        }
-                    }
-                }
-            }};
-        }
-        // constant `op` reg (NV form): swap — constant is first argument
-        // but LL semantics require it to be the *second* for ADD/NV (A=B+C
-        // where B is reg, C is const). The macro body must do `y + x` etc.
-        macro_rules! arith_nv {
-            ($a:expr, $ins:expr, $mm:expr, $x:ident, $y:ident, $body:expr) => {{
-                let $x = kslot!(bc_c($ins));
-                let yv = reg!(bc_b($ins));
-                if yv.is_number() {
-                    let $y = yv.num();
-                    setreg!($a, LuaValue::number_raw($body));
-                } else {
-                    sync!();
-                    match self.meta_arith($mm, $x, yv, $a)? {
-                        Some(r) => setreg!($a, r),
-                        None => {
-                            resync!();
-                            continue;
-                        }
-                    }
                 }
             }};
         }
@@ -1014,9 +972,9 @@ impl Interp {
                     let yv = reg!(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
                         setreg!(a, LuaValue::number_raw(xv.num() + yv.num()));
-                    } else if let (Some(xb), Some(yb)) = (cdata_u64(xv), cdata_u64(yv)) {
-                        let is_ull = cdata_is_ull(xv) || cdata_is_ull(yv);
-                        let r = make_cdata_result(self.l(), xb.wrapping_add(yb), is_ull);
+                    } else if let Some(r) =
+                        try_cdata_binop(self.l(), xv, yv, |x, y| x.wrapping_add(y))
+                    {
                         setreg!(a, r);
                     } else {
                         sync!();
@@ -1034,9 +992,9 @@ impl Interp {
                     let yv = reg!(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
                         setreg!(a, LuaValue::number_raw(xv.num() - yv.num()));
-                    } else if let (Some(xb), Some(yb)) = (cdata_u64(xv), cdata_u64(yv)) {
-                        let is_ull = cdata_is_ull(xv) || cdata_is_ull(yv);
-                        let r = make_cdata_result(self.l(), xb.wrapping_sub(yb), is_ull);
+                    } else if let Some(r) =
+                        try_cdata_binop(self.l(), xv, yv, |x, y| x.wrapping_sub(y))
+                    {
                         setreg!(a, r);
                     } else {
                         sync!();
@@ -1054,9 +1012,9 @@ impl Interp {
                     let yv = reg!(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
                         setreg!(a, LuaValue::number_raw(xv.num() * yv.num()));
-                    } else if let (Some(xb), Some(yb)) = (cdata_u64(xv), cdata_u64(yv)) {
-                        let is_ull = cdata_is_ull(xv) || cdata_is_ull(yv);
-                        let r = make_cdata_result(self.l(), xb.wrapping_mul(yb), is_ull);
+                    } else if let Some(r) =
+                        try_cdata_binop(self.l(), xv, yv, |x, y| x.wrapping_mul(y))
+                    {
                         setreg!(a, r);
                     } else {
                         sync!();
@@ -1069,43 +1027,252 @@ impl Interp {
                         }
                     }
                 }
-                BCOp::DIVVV => arith!(a, reg!(bc_b(ins)), reg!(bc_c(ins)), MM::Div, x, y, x / y),
-                BCOp::MODVV => {
-                    arith!(
-                        a,
-                        reg!(bc_b(ins)),
-                        reg!(bc_c(ins)),
-                        MM::Mod,
-                        x,
-                        y,
-                        x - (x / y).floor() * y
-                    )
+                BCOp::DIVVV => {
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    if xv.is_number() && yv.is_number() {
+                        setreg!(a, LuaValue::number_raw(xv.num() / yv.num()));
+                    } else if let Some(r) =
+                        try_cdata_binop(self.l(), xv, yv, |x, y| x / y)
+                    {
+                        setreg!(a, r);
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Div, xv, yv, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
+                    }
                 }
-                BCOp::ADDVN => arith_vn!(a, ins, MM::Add, x, y, x + y),
-                BCOp::SUBVN => arith_vn!(a, ins, MM::Sub, x, y, x - y),
-                BCOp::MULVN => arith_vn!(a, ins, MM::Mul, x, y, x * y),
-                BCOp::DIVVN => arith_vn!(a, ins, MM::Div, x, y, x / y),
-                BCOp::MODVN => arith_vn!(a, ins, MM::Mod, x, y, x - (x / y).floor() * y),
-                BCOp::ADDNV => arith_nv!(a, ins, MM::Add, kv, y, kv.num() + y),
-                BCOp::SUBNV => arith_nv!(a, ins, MM::Sub, kv, y, kv.num() - y),
-                BCOp::MULNV => arith_nv!(a, ins, MM::Mul, kv, y, kv.num() * y),
-                BCOp::DIVNV => arith_nv!(a, ins, MM::Div, kv, y, kv.num() / y),
+                BCOp::MODVV => {
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    if xv.is_number() && yv.is_number() {
+                        let x = xv.num();
+                        let y = yv.num();
+                        setreg!(a, LuaValue::number_raw(x - (x / y).floor() * y));
+                    } else if let Some(r) =
+                        try_cdata_binop(self.l(), xv, yv, |x, y| x % y)
+                    {
+                        setreg!(a, r);
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Mod, xv, yv, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
+                    }
+                }
+                BCOp::ADDVN => {
+                    let xv = reg!(bc_b(ins));
+                    if xv.is_number() {
+                        let x = xv.num();
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
+                        setreg!(a, LuaValue::number_raw(x + y));
+                    } else if let Some(x_cd) = cdata_u64(xv) {
+                        let is_ull = cdata_is_ull(xv);
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
+                        setreg!(a, make_cdata_result(self.l(), x_cd.wrapping_add(y), is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Add, xv, kslot!(bc_c(ins)), a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
+                BCOp::SUBVN => {
+                    let xv = reg!(bc_b(ins));
+                    if xv.is_number() {
+                        let x = xv.num();
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
+                        setreg!(a, LuaValue::number_raw(x - y));
+                    } else if let Some(x_cd) = cdata_u64(xv) {
+                        let is_ull = cdata_is_ull(xv);
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
+                        setreg!(a, make_cdata_result(self.l(), x_cd.wrapping_sub(y), is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Sub, xv, kslot!(bc_c(ins)), a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
+                BCOp::MULVN => {
+                    let xv = reg!(bc_b(ins));
+                    if xv.is_number() {
+                        let x = xv.num();
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
+                        setreg!(a, LuaValue::number_raw(x * y));
+                    } else if let Some(x_cd) = cdata_u64(xv) {
+                        let is_ull = cdata_is_ull(xv);
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
+                        setreg!(a, make_cdata_result(self.l(), x_cd.wrapping_mul(y), is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Mul, xv, kslot!(bc_c(ins)), a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
+                BCOp::DIVVN => {
+                    let xv = reg!(bc_b(ins));
+                    if xv.is_number() {
+                        let x = xv.num();
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
+                        setreg!(a, LuaValue::number_raw(x / y));
+                    } else if let Some(x_cd) = cdata_u64(xv) {
+                        let is_ull = cdata_is_ull(xv);
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
+                        let r = if y == 0 { 0 } else { x_cd / y };
+                        setreg!(a, make_cdata_result(self.l(), r, is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Div, xv, kslot!(bc_c(ins)), a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
+                BCOp::MODVN => {
+                    let xv = reg!(bc_b(ins));
+                    if xv.is_number() {
+                        let x = xv.num();
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
+                        setreg!(a, LuaValue::number_raw(x - (x / y).floor() * y));
+                    } else if let Some(x_cd) = cdata_u64(xv) {
+                        let is_ull = cdata_is_ull(xv);
+                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
+                        let r = if y == 0 { 0 } else { x_cd % y };
+                        setreg!(a, make_cdata_result(self.l(), r, is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Mod, xv, kslot!(bc_c(ins)), a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
+                BCOp::ADDNV => {
+                    let kv = kslot!(bc_c(ins));
+                    let yv = reg!(bc_b(ins));
+                    if yv.is_number() {
+                        let y = yv.num();
+                        setreg!(a, LuaValue::number_raw(kv.num() + y));
+                    } else if let Some(y_cd) = cdata_u64(yv) {
+                        let is_ull = cdata_is_ull(yv);
+                        let x = kv.num() as i64 as u64;
+                        setreg!(a, make_cdata_result(self.l(), x.wrapping_add(y_cd), is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Add, kv, yv, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
+                BCOp::SUBNV => {
+                    let kv = kslot!(bc_c(ins));
+                    let yv = reg!(bc_b(ins));
+                    if yv.is_number() {
+                        let y = yv.num();
+                        setreg!(a, LuaValue::number_raw(kv.num() - y));
+                    } else if let Some(y_cd) = cdata_u64(yv) {
+                        let is_ull = cdata_is_ull(yv);
+                        let x = kv.num() as i64 as u64;
+                        setreg!(a, make_cdata_result(self.l(), x.wrapping_sub(y_cd), is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Sub, kv, yv, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
+                BCOp::MULNV => {
+                    let kv = kslot!(bc_c(ins));
+                    let yv = reg!(bc_b(ins));
+                    if yv.is_number() {
+                        let y = yv.num();
+                        setreg!(a, LuaValue::number_raw(kv.num() * y));
+                    } else if let Some(y_cd) = cdata_u64(yv) {
+                        let is_ull = cdata_is_ull(yv);
+                        let x = kv.num() as i64 as u64;
+                        setreg!(a, make_cdata_result(self.l(), x.wrapping_mul(y_cd), is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Mul, kv, yv, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
+                BCOp::DIVNV => {
+                    let kv = kslot!(bc_c(ins));
+                    let yv = reg!(bc_b(ins));
+                    if yv.is_number() {
+                        let y = yv.num();
+                        setreg!(a, LuaValue::number_raw(kv.num() / y));
+                    } else if let Some(y_cd) = cdata_u64(yv) {
+                        let is_ull = cdata_is_ull(yv);
+                        let x = kv.num() as i64 as u64;
+                        let r = if y_cd == 0 { 0 } else { x / y_cd };
+                        setreg!(a, make_cdata_result(self.l(), r, is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Div, kv, yv, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
+                }
                 BCOp::MODNV => {
-                    arith_nv!(a, ins, MM::Mod, kv, y, {
+                    let kv = kslot!(bc_c(ins));
+                    let yv = reg!(bc_b(ins));
+                    if yv.is_number() {
+                        let y = yv.num();
                         let x = kv.num();
-                        x - (x / y).floor() * y
-                    })
+                        setreg!(a, LuaValue::number_raw(x - (x / y).floor() * y));
+                    } else if let Some(y_cd) = cdata_u64(yv) {
+                        let is_ull = cdata_is_ull(yv);
+                        let x = kv.num() as i64 as u64;
+                        let r = if y_cd == 0 { 0 } else { x % y_cd };
+                        setreg!(a, make_cdata_result(self.l(), r, is_ull));
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Mod, kv, yv, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => { resync!(); continue; }
+                        }
+                    }
                 }
                 BCOp::POW => {
-                    arith!(
-                        a,
-                        reg!(bc_b(ins)),
-                        reg!(bc_c(ins)),
-                        MM::Pow,
-                        x,
-                        y,
-                        vm_pow(x, y)
-                    )
+                    let xv = reg!(bc_b(ins));
+                    let yv = reg!(bc_c(ins));
+                    if xv.is_number() && yv.is_number() {
+                        setreg!(a, LuaValue::number_raw(vm_pow(xv.num(), yv.num())));
+                    } else if let Some(r) =
+                        try_cdata_binop(self.l(), xv, yv, |x, y| (x as f64).powf(y as f64) as u64)
+                    {
+                        setreg!(a, r);
+                    } else {
+                        sync!();
+                        match self.meta_arith(MM::Pow, xv, yv, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
+                    }
                 }
                 BCOp::CAT => {
                     sync!();
