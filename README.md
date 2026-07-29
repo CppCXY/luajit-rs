@@ -42,50 +42,6 @@ cargo build --release
 cargo test --workspace                       # 125 unit tests
 ```
 
-### Using the C API
-
-```rust
-use luajit_rs::api::Lua;
-use luajit_rs::func::CFunction;
-use luajit_rs::err::LuaResult;
-use luajit_rs::state::LuaState;
-
-let mut lua = Lua::new();
-
-// Execute Lua code
-lua.load(b"return 1 + 2", "test").unwrap();
-lua.pcall(0, 1).unwrap();
-assert_eq!(lua.to_number(-1), Some(3.0));
-
-// Push and read values
-lua.push_string(b"hello");
-lua.set_global("greeting");
-lua.get_global("greeting");
-assert_eq!(&lua.to_string(-1), b"hello");
-
-// Register a C function
-fn double(l: &mut LuaState) -> LuaResult<i32> {
-    let x = luajit_rs::stdlib::arg(l, 0).as_number().unwrap_or(0.0);
-    luajit_rs::stdlib::push(l, luajit_rs::value::LuaValue::number(x * 2.0));
-    Ok(1)
-}
-lua.register("double", double);
-
-// Tables
-lua.new_table();
-lua.push_number(42.0);
-lua.set_field(-2, "answer");
-lua.get_field(-1, "answer");
-assert_eq!(lua.to_number(-1), Some(42.0));
-
-// Userdata
-let ptr = lua.new_userdata(64);
-unsafe { std::ptr::write(ptr as *mut f64, 3.14); }
-let data = lua.check_userdata(-1);
-assert!(!data.is_null());
-assert_eq!(unsafe { *(data as *const f64) }, 3.14);
-```
-
 ### LuaJIT test suite
 
 ```sh

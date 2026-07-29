@@ -1,0 +1,26 @@
+{
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'luajit-interpreter'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=luajit-interpreter",
+                    "--package=luajit-interpreter",
+                    "--target=x86_64-pc-windows-gnu",
+                ],
+                "filter": {
+                    "name": "luajit-interpreter",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "run",
+                "test.lua"
+            ],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
