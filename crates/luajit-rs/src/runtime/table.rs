@@ -618,6 +618,8 @@ impl LuaTable {
         let newcap = self.array.capacity() * std::mem::size_of::<LuaValue>()
             + self.node_len() * std::mem::size_of::<Node>();
         if newcap > oldcap && !self.table_extra.is_null() {
+            // Only update if the pointer still references a live GcHeap
+            // field (it may be stale if the table outlived its allocator).
             unsafe {
                 *self.table_extra += newcap - oldcap;
             }
