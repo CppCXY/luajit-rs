@@ -10,7 +10,8 @@ use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 use crate::{
-    lua_getfield, lua_getglobal, lua_gettop, lua_isnil, lua_newtable, lua_pop, lua_pushcfunction, lua_pushstring, lua_pushvalue, lua_rawseti, lua_register, lua_setfield, lua_setglobal,
+    lua_getfield, lua_getglobal, lua_gettop, lua_isnil, lua_newtable, lua_pop, lua_pushcfunction,
+    lua_pushstring, lua_pushvalue, lua_rawseti, lua_register, lua_setfield, lua_setglobal,
 };
 
 use super::{arg, err_bad_arg, push};
@@ -144,12 +145,12 @@ fn call_func(
 // ── path helpers ────────────────────────────────────────────────────────────
 
 fn gsub(s: &[u8], pat: &[u8], repl: &[u8]) -> Vec<u8> {
-    if pat.is_empty() {
+    if pat.is_empty() || pat.len() > s.len() {
         return s.to_vec();
     }
     let mut out = Vec::with_capacity(s.len() + repl.len());
     let mut i = 0;
-    while i <= s.len().saturating_sub(pat.len()) {
+    while i + pat.len() <= s.len() {
         if s[i..i + pat.len()] == pat[..] {
             out.extend_from_slice(repl);
             i += pat.len();
@@ -228,9 +229,9 @@ fn resolve_path(l: &mut LuaState, envname: &str, def: &[u8]) -> Vec<u8> {
         let pat: &[u8] = &[AUXMARK];
         s = gsub(&s, pat, def);
     }
+    #[cfg(not(target_arch = "wasm32"))]
     {
         let pat: &[u8] = &[LUA_EXECDIR];
-        #[cfg(not(target_arch = "wasm32"))]
         if let Ok(exe) = std::env::current_exe()
             && let Some(parent) = exe.parent()
         {
