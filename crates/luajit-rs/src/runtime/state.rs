@@ -40,6 +40,7 @@ pub struct GcHeap {
     pub debt: usize,
     pub gc_state: crate::gc::GcState,
     pub gc_gray: Vec<crate::gc::Gray>,
+    pub gc_grayagain: Vec<crate::gc::Gray>,
     pub gc_sweep_pool: u8,
     pub gc_step_size: usize,
     /// Tri-color white bit (0 or 1), flips each GC cycle.
@@ -63,6 +64,7 @@ impl Default for GcHeap {
             debt: 0,
             gc_state: crate::gc::GcState::Pause,
             gc_gray: Vec::new(),
+            gc_grayagain: Vec::new(),
             gc_sweep_pool: 0,
             gc_step_size: crate::gc::GC_STEP_SIZE,
             current_white: 0,
@@ -218,31 +220,6 @@ pub struct GlobalState {
 }
 
 impl GlobalState {
-    fn new() -> GlobalState {
-        let boot = PlatformInstant::now();
-        let mut heap = GcHeap::default();
-        let globals = heap.alloc_table(LuaTable::new(0, 1));
-        let registry = heap.alloc_table(LuaTable::new(0, 1));
-        // lj_meta_init: intern the metamethod names once.
-        let mut mmname = [LuaValue::NIL; meta::MM_MAX];
-        for (i, name) in meta::MM_NAMES.iter().enumerate() {
-            let sid = heap.intern(name);
-            mmname[i] = heap.str_value(sid);
-        }
-        GlobalState {
-            heap,
-            globals,
-            registry,
-            basemt: [None; ITYPE_COUNT],
-            mmname,
-            cur_l: None,
-            jit: JitState::new(),
-            cts: None,
-            boot_time: boot,
-            main: None,
-        }
-    }
-
     pub fn basemt_of(&self, itype: u32) -> Option<GcPtr<LuaTable>> {
         self.basemt[(!itype) as usize & (ITYPE_COUNT - 1)]
     }

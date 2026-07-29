@@ -589,6 +589,7 @@ pub(crate) const GC_THRESHOLD_MIN: usize = 64 * 1024;
 pub enum GcState {
     Pause,
     Propagate,
+    Atomic,
     Sweep,
 }
 pub const GC_STEP_SIZE: usize = 4096;
@@ -839,6 +840,11 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
     if heap.gc_state == GcState::Pause {
         return;
     }
+    let gray = if heap.gc_state == GcState::Propagate {
+        &mut heap.gc_gray
+    } else {
+        &mut heap.gc_grayagain
+    };
     match val.itype() {
         LJ_TSTR => {
             if let Some(p) = val.as_string() {
@@ -850,7 +856,7 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
                 && !p.is_marked()
             {
                 p.set_marked();
-                heap.gc_gray.push(Gray::Tab(p));
+                gray.push(Gray::Tab(p));
             }
         }
         LJ_TFUNC => {
@@ -858,7 +864,7 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
                 && !p.is_marked()
             {
                 p.set_marked();
-                heap.gc_gray.push(Gray::Func(p));
+                gray.push(Gray::Func(p));
             }
         }
         LJ_TTHREAD => {
@@ -866,7 +872,7 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
                 && !p.is_marked()
             {
                 p.set_marked();
-                heap.gc_gray.push(Gray::Thread(p));
+                gray.push(Gray::Thread(p));
             }
         }
         LJ_TUDATA => {
@@ -893,10 +899,18 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
 /// including from the VM interpreter.
 #[inline]
 pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
+    if heap.gc_state == GcState::Pause {
+        return;
+    }
     let h = gc_header(t.0);
     if h.is_black() {
         h.make_gray();
-        heap.gc_gray.push(Gray::Tab(t));
+        let gray = if heap.gc_state == GcState::Propagate {
+            &mut heap.gc_gray
+        } else {
+            &mut heap.gc_grayagain
+        };
+        gray.push(Gray::Tab(t));
     }
 }
 
@@ -948,6 +962,9 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                     }
                 }
             }
+            // Extend with any existing gray objects (from sweep-phase barriers).
+            m.gray.extend(std::mem::take(&mut heap.gc_gray));
+            m.gray.extend(std::mem::take(&mut heap.gc_grayagain));
             heap.gc_gray = m.gray;
         }
         GcState::Propagate => {
@@ -955,11 +972,33 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                 gray: std::mem::take(&mut heap.gc_gray),
                 strings: &heap.strings,
             };
-            if m.propagate_step(step / 64) {
-                heap.gc_state = GcState::Sweep;
-                heap.gc_sweep_pool = 0;
+            let done = m.propagate_step(step / 64);
+            // Merge barrier outputs (pushed to gc_gray during propagation).
+            m.gray.extend(std::mem::take(&mut heap.gc_gray));
+            if done && m.gray.is_empty() {
+                heap.gc_state = GcState::Atomic;
             }
             heap.gc_gray = m.gray;
+        }
+        GcState::Atomic => {
+            // Process ALL gray objects completely. Loops because barriers
+            // during propagation push to gc_grayagain in Atomic state.
+            loop {
+                let mut gray = std::mem::take(&mut heap.gc_grayagain);
+                gray.extend(std::mem::take(&mut heap.gc_gray));
+                if gray.is_empty() {
+                    break;
+                }
+                let mut m = Marker {
+                    gray,
+                    strings: &heap.strings,
+                };
+                m.propagate();
+            }
+            heap.gc_gray.clear();
+            heap.gc_grayagain.clear();
+            heap.gc_state = GcState::Sweep;
+            heap.gc_sweep_pool = 0;
         }
         GcState::Sweep => {
             // Sweep one pool per step for fairness.
@@ -1135,6 +1174,7 @@ pub fn full_gc(g: &mut GlobalState) {
     g.heap.debt = 0;
     g.heap.gc_state = GcState::Pause;
     g.heap.gc_gray.clear();
+    g.heap.gc_grayagain.clear();
 }
 
 pub(crate) fn account_func(f: &GcFunc) -> usize {
