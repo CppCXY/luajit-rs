@@ -446,7 +446,10 @@ impl JitState {
 
     #[inline(always)]
     pub fn is_on(&self) -> bool {
-        self.flags & JIT_F_ON != 0
+        #[cfg(target_arch = "wasm32")]
+        { return false; }
+        #[cfg(not(target_arch = "wasm32"))]
+        { self.flags & JIT_F_ON != 0 }
     }
 
     /// `jit.on()` / `jit.off()`. Re-arms the hot counters on enable, like

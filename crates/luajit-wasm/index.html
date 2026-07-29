@@ -112,6 +112,10 @@ let lua = null;
 async function boot() {
   await init();
   lua = new LuaWasm();
+
+  // Redirect print() to output panel
+  lua.on_print((line) => append(line, "output-print"));
+
   runBtn.textContent = "Run \u25B6";
   runBtn.disabled = false;
   loader.classList.add("hidden");

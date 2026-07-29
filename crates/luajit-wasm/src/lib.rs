@@ -1,24 +1,19 @@
-//! Lua engine for WebAssembly.
-//!
-//! ```js
-//! import { LuaWasm } from "./luajit_wasm.js";
-//! const lua = new LuaWasm();
-//! console.log(lua.do_string("return 1 + 2"));     // "3"
-//! lua.do_string("function greet(n) return 'hi '..n end");
-//! console.log(lua.call("greet", ["world"]));       // "hi world"
-//! ```
-
 use luajit_rs::{
     Lua, LuaState, lua_error_message, lua_gc, lua_getglobal, lua_gettop, lua_isfunction,
-    lua_newtable, lua_pcall, lua_peek, lua_pop, lua_pushboolean, lua_pushnil, lua_pushnumber,
-    lua_pushstring, lua_rawseti, lua_setglobal, lua_settable, lual_loadstring, lual_openlibs,
+    lua_isnil, lua_newtable, lua_pcall, lua_peek, lua_pop, lua_pushboolean, lua_pushcfunction,
+    lua_pushnil, lua_pushnumber, lua_pushstring, lua_rawseti, lua_setglobal, lua_settable,
+    lua_settop, lual_loadstring, lual_openlibs,
 };
 use std::cell::RefCell;
+use std::ptr;
 use wasm_bindgen::prelude::*;
+
+static mut BRIDGE_CB: *const RefCell<Option<js_sys::Function>> = ptr::null();
 
 #[wasm_bindgen]
 pub struct LuaWasm {
     inner: RefCell<Lua>,
+    print_cb: RefCell<Option<js_sys::Function>>,
 }
 
 impl Default for LuaWasm {
@@ -35,45 +30,66 @@ impl LuaWasm {
         lual_openlibs(lua.main());
         LuaWasm {
             inner: RefCell::new(lua),
+            print_cb: RefCell::new(None),
         }
     }
 
-    /// Execute a Lua chunk; returns the first result as a Lua literal.
+    pub fn on_print(&self, cb: JsValue) {
+        let mut lua = self.inner.borrow_mut();
+        let l = lua.main();
+        if cb.is_null() || cb.is_undefined() {
+            *self.print_cb.borrow_mut() = None;
+            lua_getglobal(l, "__orig_print");
+            if !lua_isnil(l, -1) {
+                lua_setglobal(l, "print");
+            } else {
+                lua_pop(l, 1);
+            }
+            return;
+        }
+        let func = cb.unchecked_into::<js_sys::Function>();
+        lua_getglobal(l, "print");
+        if !lua_isnil(l, -1) && lua_isfunction(l, -1) {
+            lua_setglobal(l, "__orig_print");
+        } else {
+            lua_pop(l, 1);
+        }
+        *self.print_cb.borrow_mut() = Some(func);
+        unsafe { BRIDGE_CB = &self.print_cb; }
+        lua_pushcfunction(l, print_bridge);
+        lua_setglobal(l, "print");
+    }
+
     pub fn do_string(&self, src: &str) -> Result<String, JsValue> {
         let mut lua = self.inner.borrow_mut();
         let l = lua.main();
+        lua_settop(l, 0);
         lual_loadstring(l, src.as_bytes()).map_err(|_| js_error(l))?;
         lua_pcall(l, 0, -1, 0).map_err(|_| js_error(l))?;
         let n = lua_gettop(l);
-        Ok(if n == 0 {
-            String::new()
-        } else {
-            value_to_literal(l, 1)
-        })
+        let result = Ok(if n == 0 { String::new() } else { value_to_literal(l, 1) });
+        lua_settop(l, 0);
+        result
     }
 
-    /// Call a global Lua function. `args` is a JS array of values.
     pub fn call(&self, name: &str, args: js_sys::Array) -> Result<String, JsValue> {
         let mut lua = self.inner.borrow_mut();
         let l = lua.main();
-
+        lua_settop(l, 0);
         lua_getglobal(l, name);
         if !lua_isfunction(l, -1) {
             lua_pop(l, 1);
+            lua_settop(l, 0);
             return Err(JsValue::from_str(&format!("'{}' is not a function", name)));
         }
-
         let nargs = push_js_array(l, &args);
         lua_pcall(l, nargs, 1, 0).map_err(|_| js_error(l))?;
         let n = lua_gettop(l);
-        Ok(if n == 0 {
-            String::new()
-        } else {
-            value_to_literal(l, 1)
-        })
+        let result = Ok(if n == 0 { String::new() } else { value_to_literal(l, 1) });
+        lua_settop(l, 0);
+        result
     }
 
-    /// Set a global to a JS value.
     pub fn set_global(&self, name: &str, val: JsValue) -> Result<(), JsValue> {
         let mut lua = self.inner.borrow_mut();
         let l = lua.main();
@@ -82,7 +98,6 @@ impl LuaWasm {
         Ok(())
     }
 
-    /// Get a global as a Lua literal.
     pub fn get_global(&self, name: &str) -> Result<String, JsValue> {
         let mut lua = self.inner.borrow_mut();
         let l = lua.main();
@@ -92,20 +107,32 @@ impl LuaWasm {
         Ok(result)
     }
 
-    /// Run a full GC cycle.
     pub fn gc_collect(&self) {
         let mut lua = self.inner.borrow_mut();
         lua_gc(lua.main(), 2, 0);
     }
 
-    /// Memory used in KB.
     pub fn gc_count(&self) -> f64 {
         let mut lua = self.inner.borrow_mut();
         lua_gc(lua.main(), 5, 0) as f64
     }
 }
 
-// ── helpers ────────────────────────────────────────────────────────────
+fn print_bridge(l: &mut LuaState) -> luajit_rs::LuaResult<i32> {
+    let n = lua_gettop(l);
+    let mut parts = Vec::new();
+    for i in 1..=n as i32 {
+        parts.push(value_to_literal(l, i));
+    }
+    let line = parts.join("\t");
+    let cb_ptr = unsafe { BRIDGE_CB };
+    if !cb_ptr.is_null() {
+        if let Some(ref cb) = *unsafe { &*cb_ptr }.borrow() {
+            let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&line));
+        }
+    }
+    Ok(0)
+}
 
 fn value_to_literal(l: &LuaState, idx: i32) -> String {
     let v = lua_peek(l, idx);
@@ -120,8 +147,7 @@ fn value_to_literal(l: &LuaState, idx: i32) -> String {
             format!("{}", n)
         }
     } else if let Some(s) = v.as_string() {
-        let text = std::str::from_utf8(s.as_ref().as_bytes()).unwrap_or("");
-        format!("\"{}\"", text.escape_debug())
+        std::str::from_utf8(s.as_ref().as_bytes()).unwrap_or("").to_string()
     } else {
         "null".to_string()
     }
