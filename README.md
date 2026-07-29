@@ -89,8 +89,8 @@ assert_eq!(unsafe { *(data as *const f64) }, 3.14);
 ### LuaJIT test suite
 
 ```sh
-cd crates/luajit-rs/tests/luajit2_test
-../../../target/release/luajit-rs test.lua   # 424 tests (x86-64: all pass)
+cd tests/luajit2_test
+../../target/release/luajit-rs test.lua   # 424 tests
 ```
 
 ## Platform support
@@ -99,8 +99,10 @@ cd crates/luajit-rs/tests/luajit2_test
 |---------------------|:-----------:|:-----------------:|-------|
 | Windows x64         | ✓           | ✓                 | Fully working |
 | Linux x64           | ✓           | ✓                 | Fully working |
+| Linux ARM64         | ✓           | ✓                 | Fully working |
 | macOS x64           | ✓           | ✓                 | Fully working |
-| ARM64 (macOS/Linux) | ✓           | ✓                 | Fully working |
+| macOS ARM64         | ✓           | ✓                 | Fully working |
+
 
 ## Debugging & tuning
 
