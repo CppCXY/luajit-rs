@@ -618,8 +618,31 @@ impl Default for Lua {
 
 impl Lua {
     pub fn new() -> Lua {
+        // Allocate GlobalState on the heap, then initialise it via a raw
+        // pointer so that all alloc_table calls reference the heap-resident
+        // GcHeap field from the start (no stack→heap migration).
+        let boot = PlatformInstant::now();
+        let g = Box::into_raw(Box::new(GlobalState {
+            heap: GcHeap::default(),
+            globals: GcPtr::new(NonNull::dangling()),
+            registry: GcPtr::new(NonNull::dangling()),
+            basemt: [None; ITYPE_COUNT],
+            mmname: [LuaValue::NIL; meta::MM_MAX],
+            cur_l: None,
+            jit: JitState::new(),
+            cts: None,
+            boot_time: boot,
+            main: None,
+        }));
+        let gs = unsafe { &mut *g };
+        gs.globals = gs.heap.alloc_table(LuaTable::new(0, 1));
+        gs.registry = gs.heap.alloc_table(LuaTable::new(0, 1));
+        for (i, name) in meta::MM_NAMES.iter().enumerate() {
+            let sid = gs.heap.intern(name);
+            gs.mmname[i] = gs.heap.str_value(sid);
+        }
         let mut lua = Lua {
-            g: Box::new(GlobalState::new()),
+            g: unsafe { Box::from_raw(g) },
         };
         let gref = GlobalRef(NonNull::from(&*lua.g));
         let main_ref = lua.g.heap.alloc_thread(LuaState::new(gref, true));

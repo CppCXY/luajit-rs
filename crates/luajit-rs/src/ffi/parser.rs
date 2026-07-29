@@ -437,13 +437,15 @@ impl<'a> Parser<'a> {
                 next: 0,
                 name: 0,
             });
-            self.cts.top += 1;
+            self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
+                format!("too many C types (overflow)")
+            })?;
             return Ok(id);
         }
         self.next(); // {
 
         let first_field_id = self.cts.top;
-        let mut total_size: u32 = 0;
+        let mut total_size: u64 = 0;
         let mut max_align: u32 = 1;
         let mut field_infos: Vec<(String, u32, u32)> = Vec::new(); // (name, type_id, offset)
         let mut guard: usize = 0;
@@ -501,28 +503,31 @@ impl<'a> Parser<'a> {
             // Extract field info before any mutable ops on cts
             let field_size = {
                 let ct = self.cts.get(fdecl.type_id);
-                (ct.size, 1u32 << ctype_align(ct.info))
+                (ct.size as u64, 1u32 << ctype_align(ct.info))
             };
             max_align = max_align.max(field_size.1);
-            total_size = (total_size + field_size.1 - 1) & !(field_size.1 - 1);
+            let align = field_size.1 as u64;
+            total_size = (total_size + align - 1) & !(align - 1);
 
             let finfo = ct_info(CT::Field, 0) | fdecl.type_id;
             self.cts.tab.push(CType {
                 info: finfo,
-                size: total_size,
+                size: total_size as u32,
                 sib: 0,
                 next: 0,
                 name: 0,
             });
             if !field_name.is_empty() {
-                field_infos.push((field_name, fdecl.type_id, total_size));
+                field_infos.push((field_name, fdecl.type_id, total_size as u32));
             }
-            self.cts.top += 1;
+            self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
+                format!("too many C types (overflow)")
+            })?;
             total_size += field_size.0;
         }
         self.expect(Token::RBrace)?;
 
-        total_size = (total_size + max_align - 1) & !(max_align - 1);
+        total_size = (total_size + max_align as u64 - 1) & !(max_align as u64 - 1);
 
         // Link field siblings
         let num_fields = self.cts.top - first_field_id;
@@ -542,12 +547,14 @@ impl<'a> Parser<'a> {
             | (max_align.trailing_zeros() << ctinfo::SHIFT_ALIGN);
         self.cts.tab.push(CType {
             info: sinfo,
-            size: total_size,
+            size: total_size as u32,
             sib: 0,
             next: 0,
             name: 0,
         });
-        self.cts.top += 1;
+        self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
+            format!("too many C types (overflow)")
+        })?;
         let struct_id = self.cts.top - 1;
         // Register field names
         for (name, type_id, offset) in field_infos {
@@ -607,7 +614,9 @@ impl<'a> Parser<'a> {
             next: 0,
             name: 0,
         });
-        self.cts.top += 1;
+        self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
+            format!("too many C types (overflow)")
+        })?;
         self.cts.names.insert(name, id);
         // Skip declarator suffix
         self.skip_until_semicolon();

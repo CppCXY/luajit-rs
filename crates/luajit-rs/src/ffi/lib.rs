@@ -64,7 +64,7 @@ fn make_ptr_type(cts: &mut CTState, pointee_id: u32) -> u32 {
         next: 0,
         name: 0,
     });
-    cts.top += 1;
+    cts.top = cts.top.checked_add(1).unwrap_or(u32::MAX);
     ptr_id
 }
 
