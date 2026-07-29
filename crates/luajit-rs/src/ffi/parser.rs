@@ -471,16 +471,45 @@ impl<'a> Parser<'a> {
                 String::new()
             };
 
-            // Skip array declarator brackets (after field name)
+            // Parse array declarator brackets (e.g. f[2][3]).
+            let mut array_multiplier: u32 = 1;
             while self.tok == Token::LBracket {
                 self.next(); // eat [
+                let mut array_num: u32 = 1;
+                if self.tok == Token::Integer {
+                    if let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>() {
+                        array_num = n.max(1);
+                    }
+                    self.next();
+                }
                 while self.tok != Token::RBracket && self.tok != Token::Eof {
                     self.next();
                 }
                 if self.tok == Token::RBracket {
                     self.next(); // eat ]
                 }
+                array_multiplier = array_multiplier.saturating_mul(array_num);
             }
+
+            let field_type_id = if array_multiplier > 1 {
+                let elem_ct = self.cts.get(fdecl.type_id);
+                let total_sz = elem_ct.size.saturating_mul(array_multiplier);
+                let info = ct_info(CT::Array, 0) | fdecl.type_id;
+                // Search for existing array type.
+                let existing = (0..self.cts.top as usize).find(|&i| {
+                    self.cts.tab[i].info == info && self.cts.tab[i].size == total_sz
+                });
+                if let Some(id) = existing {
+                    id as u32
+                } else {
+                    let id = self.cts.top;
+                    self.cts.tab.push(CType { info, size: total_sz, sib: 0, next: 0, name: 0 });
+                    self.cts.top = id + 1;
+                    id
+                }
+            } else {
+                fdecl.type_id
+            };
 
             // Bitfield
             if self.tok == Token::Colon {
@@ -502,28 +531,39 @@ impl<'a> Parser<'a> {
 
             // Extract field info before any mutable ops on cts
             let field_size = {
-                let ct = self.cts.get(fdecl.type_id);
+                let ct = self.cts.get(field_type_id);
                 (ct.size as u64, 1u32 << ctype_align(ct.info))
             };
             max_align = max_align.max(field_size.1);
             let align = field_size.1 as u64;
-            total_size = (total_size + align - 1) & !(align - 1);
+            let field_offset = if is_union { 0u64 } else {
+                (total_size + align - 1) & !(align - 1)
+            };
+            total_size = if is_union {
+                total_size.max(field_offset + field_size.0)
+            } else {
+                (field_offset + align - 1) & !(align - 1)
+            };
 
-            let finfo = ct_info(CT::Field, 0) | fdecl.type_id;
+            let finfo = ct_info(CT::Field, 0) | field_type_id;
             self.cts.tab.push(CType {
                 info: finfo,
-                size: total_size as u32,
+                size: field_offset as u32,
                 sib: 0,
                 next: 0,
                 name: 0,
             });
             if !field_name.is_empty() {
-                field_infos.push((field_name, fdecl.type_id, total_size as u32));
+                field_infos.push((field_name, field_type_id, field_offset as u32));
             }
             self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
                 format!("too many C types (overflow)")
             })?;
-            total_size += field_size.0;
+            total_size = if is_union {
+                total_size.max(field_offset + field_size.0)
+            } else {
+                (field_offset + field_size.0 + align - 1) & !(align - 1)
+            };
         }
         self.expect(Token::RBrace)?;
 

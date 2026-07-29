@@ -88,8 +88,13 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
         .map_err(|_| l.runtime_error(b"ffi: invalid UTF-8 in type name"))?;
     let name = raw_str.trim().to_string();
 
-    // Extract array suffix `[N]` or `[?]` if present.
-    let (base_name, array_count) = if let Some(bracket) = name.find('[') {
+    let is_complex_decl = name.trim_start().starts_with("struct")
+        || name.trim_start().starts_with("union")
+        || name.trim_start().starts_with("enum");
+
+    let (base_name, array_count) = if is_complex_decl {
+        (name.clone(), 1)
+    } else if let Some(bracket) = name.rfind('[') {
         let close = name.rfind(']').unwrap_or(name.len());
         let base = name[..bracket].trim().to_string();
         let inside = name[bracket + 1..close].trim();
