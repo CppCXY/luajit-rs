@@ -1,4 +1,4 @@
-use crate::gc::GcPtr;
+use crate::gc::{self, GcPtr};
 use crate::value::LuaValue;
 
 /// Max. array part size (`LJ_MAX_ASIZE`) and max. array key bits.
@@ -288,7 +288,7 @@ impl LuaTable {
     #[inline]
     pub fn set_str(&mut self, key: LuaValue, val: LuaValue) {
         debug_assert!(key.is_string());
-        self.nomm = 0; // Clear metamethod cache (BC_TSETS does the same).
+        self.nomm = 0;
         if !self.has_hpart() {
             self.set(key, val);
             return;
@@ -298,6 +298,7 @@ impl LuaTable {
             let node = self.node_slot_mut(n);
             if node.key == key {
                 node.val = val;
+                self.barrier();
                 return;
             }
             let next = node.next;
@@ -317,14 +318,13 @@ impl LuaTable {
         if k > 0 && (k as u32) < self.asize {
             debug_assert!(std::ptr::eq(self.aptr, self.array.as_ptr() as *mut _));
             self.array[k as usize] = v;
+            self.barrier();
             return;
         }
-        // Grow the array to cover key `k` when it's beyond the current
-        // boundary. Avoids the expensive hash/rehash path for sequential
-        // integer keys on fresh tables (e.g. {1,2,3,4,5}).
         if k > 0 && (k as u32) < LJ_MAX_ASIZE {
             self.reasize(k as u32);
             self.array[k as usize] = v;
+            self.barrier();
             return;
         }
         self.set(LuaValue::number(k as f64), v);
@@ -475,13 +475,14 @@ impl LuaTable {
     pub fn set(&mut self, key: LuaValue, val: LuaValue) {
         debug_assert!(!key.is_nil());
         if key.is_string() {
-            self.nomm = 0; // Invalidate negative metamethod cache.
+            self.nomm = 0;
         }
         loop {
             if let Some(i) = LuaTable::array_key(key)
                 && i < self.asize
             {
                 self.array[i as usize] = val;
+                self.barrier();
                 return;
             }
             if self.has_hpart() {
@@ -489,6 +490,7 @@ impl LuaTable {
                 loop {
                     if self.node_slot(n).key == key {
                         self.node_slot_mut(n).val = val;
+                        self.barrier();
                         return;
                     }
                     let next = self.node_slot(n).next;
@@ -501,9 +503,10 @@ impl LuaTable {
             match self.try_new_key(key) {
                 Some(slot) => {
                     self.node_slot_mut(slot).val = val;
+                    self.barrier();
                     return;
                 }
-                None => continue, // Table was rehashed: retry insertion.
+                None => continue,
             }
         }
     }
@@ -714,6 +717,20 @@ impl LuaTable {
         let na = LuaTable::best_asize(&bins, &mut asize);
         total -= na;
         self.resize(asize, hsize2hbits(total));
+    }
+
+    #[inline]
+    fn barrier(&self) {
+        if self.heap.is_null() {
+            return;
+        }
+        let heap = unsafe { &mut *(self.heap as *mut crate::state::GcHeap) };
+        if heap.gc_state == gc::GcState::Pause {
+            return;
+        }
+        let this = GcPtr::from_addr(self as *const Self as u64)
+            .expect("table barrier: invalid self pointer");
+        gc::barrier_back(heap, this);
     }
 
     /// Grow the array part to cover integer keys up to `nasize`, per

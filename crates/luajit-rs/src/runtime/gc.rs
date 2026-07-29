@@ -65,9 +65,9 @@ impl GcHeader {
     pub fn change_white(&self) {
         let b = self.rb();
         if b & BIT_WHITE0 != 0 {
-            self.wb((b & !BIT_WHITE0) | BIT_WHITE1);
+            self.wb((b & !COLOR_MASK) | BIT_WHITE1);
         } else {
-            self.wb((b & !BIT_WHITE1) | BIT_WHITE0);
+            self.wb((b & !COLOR_MASK) | BIT_WHITE0);
         }
     }
     pub fn nw2black(&self) {
@@ -918,54 +918,11 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
     let step = heap.gc_step_size.max(size);
     match heap.gc_state {
         GcState::Pause => {
-            let live = heap.total + heap.strings.bytes() + heap.table_extra;
-            if live + step < heap.threshold {
-                return;
+            if heap.total + heap.strings.bytes() + heap.table_extra + step >= heap.threshold {
+                heap.threshold = heap.total + heap.strings.bytes() + heap.table_extra
+                    + ((heap.total + heap.strings.bytes()) * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
             }
-            // Start new cycle: all existing objects are currently unmarked.
-            // Roots will be marked by gc_start_cycle.
-            heap.gc_state = GcState::Propagate;
-            let mut m = Marker {
-                gray: Vec::with_capacity(64),
-                strings: &heap.strings,
-            };
-            let g = unsafe { &*(heap as *const GcHeap as *const GlobalState) };
-            // SAFETY: GlobalState contains GcHeap as its first (unnamed) field before globals.
-            // This works because heap is inside a GlobalState and we only read root fields.
-            unsafe {
-                let gs = &*(g as *const GlobalState);
-                m.mark_table(gs.globals);
-                m.mark_table(gs.registry);
-                for mt in gs.basemt.iter().flatten() {
-                    m.mark_table(*mt);
-                }
-                for &v in gs.mmname.iter() {
-                    m.mark_value(v);
-                }
-                m.mark_thread(gs.main());
-                if let Some(cur) = gs.cur_l {
-                    m.mark_thread(cur);
-                }
-                for t in gs.jit.trace.iter().flatten() {
-                    m.mark_proto(t.startpt);
-                    for v in t.ir.kgc_values() {
-                        m.mark_value(v);
-                    }
-                }
-                if let Some(rec) = &gs.jit.rec {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        m.mark_proto(rec.cur.startpt);
-                        for v in rec.cur.ir.kgc_values() {
-                            m.mark_value(v);
-                        }
-                    }
-                }
-            }
-            // Extend with any existing gray objects (from sweep-phase barriers).
-            m.gray.extend(std::mem::take(&mut heap.gc_gray));
-            m.gray.extend(std::mem::take(&mut heap.gc_grayagain));
-            heap.gc_gray = m.gray;
+            return;
         }
         GcState::Propagate => {
             let mut m = Marker {
@@ -1001,7 +958,22 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
             heap.gc_sweep_pool = 0;
         }
         GcState::Sweep => {
-            // Sweep one pool per step for fairness.
+            loop {
+                if heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() {
+                    break;
+                }
+                let mut gray = std::mem::take(&mut heap.gc_grayagain);
+                gray.extend(std::mem::take(&mut heap.gc_gray));
+                let mut m = Marker {
+                    gray,
+                    strings: &heap.strings,
+                };
+                m.propagate();
+                if m.gray.is_empty() && heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() {
+                    break;
+                }
+                heap.gc_gray = m.gray;
+            }
             let done = match heap.gc_sweep_pool {
                 0 => {
                     heap.strings.sweep(heap.current_white);
