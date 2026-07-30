@@ -671,7 +671,7 @@ mod tests {
     use crate::state::Lua;
     use crate::stdlib::open_libs;
     use crate::value::LuaValue;
-    use crate::vm;
+    use crate::vm::{self, call};
 
     fn load_proto(lua: &mut Lua, src: &str) -> (LuaValue, GcPtr<Proto>) {
         let f = crate::state::load(lua.main(), src.as_bytes().to_vec(), "=test").unwrap();
@@ -747,7 +747,7 @@ mod tests {
             "local s = 0 for i = 1, 200 do s = s + i end return s",
         );
         let forl_pc = find_op(pt, BCOp::FORL).unwrap();
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(20100.0));
 
         let g = lua.global();
@@ -813,7 +813,7 @@ mod tests {
                if i % 2 == 0 then s = s + 2 else s = s + 1 end \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(150000.0));
     }
 
@@ -833,7 +833,7 @@ mod tests {
                s = s + x \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         // 249 iterations of +1, then 51 iterations of +'2' (coerced).
         assert_eq!(r[0].as_number(), Some(249.0 + 51.0 * 2.0));
     }
@@ -847,7 +847,7 @@ mod tests {
             "local s, i = 0, 0 while i < 500 do i = i + 1 s = s + 2 end return s",
         );
         let loop_pc = find_op(pt, BCOp::LOOP).unwrap();
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(1000.0));
         let g = lua.global();
         // LOOP patched to JLOOP and executed through the trace.
@@ -876,7 +876,7 @@ mod tests {
                if i % 2 == 0 then s = s + 2 else s = s + 1 end \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(150000.0));
 
         let g = lua.global();
@@ -916,7 +916,7 @@ mod tests {
                if i % 2 == 0 then ts(i) s = s + 2 else s = s + 1 end \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(150000.0));
         let g = lua.global();
         if let Some(forl_pc) = find_op(pt, BCOp::JFORL) {
@@ -951,7 +951,7 @@ mod tests {
                if m == 0 then a = a + 1 elseif m == 1 then b = b + 1 else c = c + 1 end \
              end return a * 1000000 + b * 1000 + c",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         // 200000 = 3*66666+2: m cycles 1,2,0,... -> a=66666, b=66667, c=66667.
         assert_eq!(
             r[0].as_number(),
@@ -974,7 +974,7 @@ mod tests {
                for j = 1, 1000 do n = n + 1 end \
              end return n",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(1000000.0));
     }
 
@@ -991,7 +991,7 @@ mod tests {
              for i = 1, 100001 do a, b = b, a s = s + a end \
              return a * 1000 + b * 100 + s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         // Odd iteration count: a,b end up swapped; s alternates +2.5/+1.5.
         let s = 50000.0 * (1.5 + 2.5) + 2.5;
         assert_eq!(r[0].as_number(), Some(2.5 * 1000.0 + 1.5 * 100.0 + s));
@@ -1007,13 +1007,13 @@ mod tests {
             &mut lua,
             "local s = 0 for i = 1, 300 do s = s + i end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(45150.0));
         assert!(find_op(pt, BCOp::JFORL).is_some());
         for t in lua.global().jit.trace.iter_mut().flatten() {
             t.mcode = None;
         }
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(45150.0), "portable tier diverged");
     }
 
@@ -1028,7 +1028,7 @@ mod tests {
             "local ts = tostring local s = 0 \
              for i = 1, 2000000 do ts(i) s = s + 1 end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(2000000.0));
         // The loop should either be blacklisted (IFORL stays) or
         // successfully JIT-compiled (IFORL replaced by hotcount hook).
@@ -1060,7 +1060,7 @@ mod tests {
             "local function g(x) return x + 1 end \
              local s = 0 for i = 1, 2000000 do s = g(s) end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(2000000.0));
         let forl_pc = find_op(pt, BCOp::JFORL).expect("loop not compiled");
         let g = lua.global();
@@ -1099,7 +1099,7 @@ mod tests {
              local s = 0 \
              for i = 1, 200000 do s = f(s, i) end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(150000.0 + 50000.0 * 2.0));
     }
 
@@ -1119,7 +1119,7 @@ mod tests {
                s = s + (b - a) \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(100000.0));
     }
 
@@ -1136,7 +1136,7 @@ mod tests {
              local s = 0 \
              for i = 1, 30000 do s = s + r(8) end return s",
         );
-        let res = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let res = call(lua.main(), f, &[]).unwrap();
         assert_eq!(res[0].as_number(), Some(240000.0));
         assert_eq!(lua.global().jit.state, TraceState::Idle);
     }
@@ -1158,7 +1158,7 @@ mod tests {
              local s = 0 \
              for i = 1, 200000 do s = f(s, i) end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(300000.0));
         let g = lua.global();
         let forl_pc = find_op(pt, BCOp::JFORL).expect("root not compiled");
@@ -1191,7 +1191,7 @@ mod tests {
              local s = 0 \
              for i = 1, 200000 do s = wrap(s) end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200000.0));
         assert!(
             find_op(pt, BCOp::JFORL).is_some(),
@@ -1218,7 +1218,7 @@ mod tests {
              local s = 0 \
              for i = 1, 200000 do s = g(s) end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(1400000.0));
     }
 
@@ -1236,7 +1236,7 @@ mod tests {
              local s = 0 \
              for i = 1, 200000 do t = i s = s + get() end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200000.0 * 200001.0 / 2.0));
     }
 
@@ -1254,7 +1254,7 @@ mod tests {
              for i = 1, 100000 do s = s + t[i] end \
              return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(100000.0 * 100001.0));
         assert!(
             find_op(pt, BCOp::JFORL).is_some(),
@@ -1276,7 +1276,7 @@ mod tests {
                gcnt = gcnt + 2 \
              end return t.x * 1000000 + gcnt",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200000.0 * 1000000.0 + 400000.0));
     }
 
@@ -1299,7 +1299,7 @@ mod tests {
                s = s + (u.k or 0) \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         // +1 per iteration, plus __index result 5 for i in 50000..=60000.
         assert_eq!(r[0].as_number(), Some(60000.0 + 10001.0 * 5.0));
     }
@@ -1318,7 +1318,7 @@ mod tests {
                s = s + fl(i / 2) + sq(i) - ab(-i) \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         let mut want = 0.0f64;
         for i in 1..=200000 {
             // Mirror the bytecode's association order exactly.
@@ -1348,7 +1348,7 @@ mod tests {
              local acc = 0 \
              for i = 1, 200 do acc = acc + 1 / fl(z * -1) end return acc",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(f64::INFINITY));
     }
 
@@ -1367,7 +1367,7 @@ mod tests {
                for k, v in ipairs(t) do s = s + v - k end \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         // Each inner pass: sum of 2k over k=1..2000.
         assert_eq!(r[0].as_number(), Some(200.0 * (2000.0 * 2001.0)));
         assert!(
@@ -1403,7 +1403,7 @@ mod tests {
                end \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(120.0 * (1999.0 + 100.0)));
     }
 
@@ -1426,7 +1426,7 @@ mod tests {
                for k, v in iter, t, 0 do s = s + v end \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(200.0 * (1000.0 * 1001.0 / 2.0)));
         assert!(
             find_op(pt, BCOp::JITERL).is_some(),
@@ -1452,7 +1452,7 @@ mod tests {
                for k, v in pairs(t) do s = s + v end \
              end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(
             r[0].as_number(),
             Some(300.0 * (500.0 * 501.0 / 2.0 + 3000.0))
@@ -1483,7 +1483,7 @@ mod tests {
                h = h & 2147483647 \
              end return h + ~h",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         // Mirror the interpreter's fused semantics in Rust.
         let mut h: i32 = 0;
         for i in 1..=200000i64 {
@@ -1514,7 +1514,7 @@ mod tests {
              for i = 1, 300000 do t[i] = i s = s + 1 end \
              return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(300000.0));
         let g = lua.global();
         // A full GC ran mid-loop: the threshold was re-derived from the
@@ -1560,7 +1560,7 @@ mod tests {
             &mut lua,
             r#"local function f(a, b) return a .. b end return f("hello", "world")"#,
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert!(r[0].is_string());
         assert_eq!(r[0].as_string().unwrap().as_ref().as_bytes(), b"helloworld");
     }
@@ -1573,7 +1573,7 @@ mod tests {
             &mut lua,
             "local s = '' for i = 1, 100 do s = s .. i end return s",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert!(r[0].is_string());
         let expected: String = (1..=100).map(|n| n.to_string()).collect();
         assert_eq!(
@@ -1590,7 +1590,7 @@ mod tests {
             &mut lua,
             "local x = 0; local function set(v) x = v end; set(42); return x",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(42.0));
     }
 
@@ -1602,7 +1602,7 @@ mod tests {
             &mut lua,
             "local function f(...) local a,b = ...; return a + b end; return f(3, 4)",
         );
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(7.0));
     }
 
@@ -1617,7 +1617,7 @@ mod tests {
             "local s = 0 for i = 1, 200 do s = s + i end return s",
         );
         let forl_pc = find_op(pt, BCOp::FORL).unwrap();
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(20100.0));
 
         let g = lua.global();
@@ -1682,7 +1682,7 @@ mod tests {
 
     fn jit_run(lua: &mut Lua, src: &str) -> LuaValue {
         let (f, _pt) = load_proto(lua, src);
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         r[0]
     }
 
@@ -1835,7 +1835,7 @@ mod tests {
         let mut lua = Lua::new();
         open_libs(lua.main());
         let (f, pt) = load_proto(&mut lua, "local s=0 for i=1,300 do s=s+i end return s");
-        let r = crate::vm::call(lua.main(), f, &[]).unwrap();
+        let r = call(lua.main(), f, &[]).unwrap();
         assert_eq!(r[0].as_number(), Some(45150.0));
         let g = lua.global();
         // Check if trace was assembled on native-arch targets.

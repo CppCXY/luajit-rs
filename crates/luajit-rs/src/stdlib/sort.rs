@@ -8,6 +8,8 @@
 //! `2*floor(log2(n))` recursion levels.
 
 use crate::err::LuaResult;
+use crate::runtime::func::GcFunc;
+use crate::runtime::gc::GcPtr;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
@@ -115,7 +117,7 @@ fn insertion_sort(
 fn heapsort(
     l: &mut LuaState,
     items: &mut [(i32, LuaValue)],
-    comp: crate::gc::GcPtr<crate::func::GcFunc>,
+    comp: GcPtr<GcFunc>,
     lo: usize,
     hi: usize,
 ) -> LuaResult<()> {

@@ -1,17 +1,23 @@
 use std::ptr::NonNull;
 
+use crate::compiler::lex::CompileError;
+use crate::compiler::parse::Parser;
 use crate::ffi::CTState;
 use crate::func::{CClosure, CFunction, GcFunc, LuaClosure};
 use crate::gc::{GcObjectKind, GcPtr, Pool};
 use crate::jit::JitState;
-use crate::meta;
 use crate::proto::KGc;
 use crate::proto::Proto;
+use crate::runtime::cdata::CData;
+use crate::runtime::func::Upval;
+use crate::runtime::gc::{self, GcState, Gray};
+use crate::runtime::userdata::GcUserData;
 use crate::stdlib::PlatformInstant;
 use crate::string::{Interner, StrId};
 use crate::table::LuaTable;
 use crate::value::{GcRef, LJ_TFUNC, LJ_TTAB, LuaValue};
 use crate::vm::FRAME_TYPE_MASK;
+use crate::{LuaError, meta};
 
 /// The GC heap: stable-address object pools.
 ///
@@ -30,17 +36,17 @@ pub struct GcHeap {
     pub protos: Pool<Proto>,
     pub tables: Pool<LuaTable>,
     pub funcs: Pool<GcFunc>,
-    pub upvals: Pool<crate::func::Upval>,
-    pub cdatas: Pool<crate::runtime::cdata::CData>,
-    pub userdatas: Pool<crate::runtime::userdata::GcUserData>,
+    pub upvals: Pool<Upval>,
+    pub cdatas: Pool<CData>,
+    pub userdatas: Pool<GcUserData>,
     pub threads: Pool<LuaState>,
     pub total: usize,
     pub threshold: usize,
     pub table_extra: usize,
     pub debt: usize,
-    pub gc_state: crate::gc::GcState,
-    pub gc_gray: Vec<crate::gc::Gray>,
-    pub gc_grayagain: Vec<crate::gc::Gray>,
+    pub gc_state: GcState,
+    pub gc_gray: Vec<Gray>,
+    pub gc_grayagain: Vec<Gray>,
     pub gc_sweep_pool: u8,
     pub gc_step_size: usize,
     /// Tri-color white bit (0 or 1), flips each GC cycle.
@@ -59,14 +65,14 @@ impl Default for GcHeap {
             userdatas: Pool::new(GcObjectKind::UserData),
             threads: Pool::new(GcObjectKind::Thread),
             total: 0,
-            threshold: crate::gc::GC_THRESHOLD_MIN,
+            threshold: gc::GC_THRESHOLD_MIN,
             table_extra: 0,
             debt: 0,
-            gc_state: crate::gc::GcState::Pause,
+            gc_state: gc::GcState::Pause,
             gc_gray: Vec::new(),
             gc_grayagain: Vec::new(),
             gc_sweep_pool: 0,
-            gc_step_size: crate::gc::GC_STEP_SIZE,
+            gc_step_size: gc::GC_STEP_SIZE,
             current_white: 0,
         }
     }
@@ -84,7 +90,7 @@ impl GcHeap {
             // allocates rapidly (e.g. a table-append loop) doesn't trigger
             // the GCSTEP guard again after a constant 16 KiB margin, which
             // would be consumed immediately by the next few allocations.
-            self.threshold = live + ((live * crate::gc::GC_PAUSE) / 100).max(16384);
+            self.threshold = live + ((live * gc::GC_PAUSE) / 100).max(16384);
         }
     }
 
@@ -94,7 +100,7 @@ impl GcHeap {
         let size = t.gc_size();
         self.total += size;
         self.account_alloc(size);
-        crate::gc::gc_step(self, size);
+        gc::gc_step(self, size);
         self.tables.alloc(t)
     }
 
@@ -118,14 +124,14 @@ impl GcHeap {
     }
 
     pub fn alloc_func(&mut self, f: GcFunc) -> GcPtr<GcFunc> {
-        let size = crate::gc::account_func(&f);
+        let size = gc::account_func(&f);
         self.total += size;
         self.account_alloc(size);
         self.funcs.alloc(f)
     }
 
-    pub fn alloc_upval(&mut self, uv: crate::func::Upval) -> GcPtr<crate::func::Upval> {
-        let size = crate::gc::account_upval();
+    pub fn alloc_upval(&mut self, uv: Upval) -> GcPtr<Upval> {
+        let size = gc::account_upval();
         self.total += size;
         self.account_alloc(size);
         let p = self.upvals.alloc(uv);
@@ -134,27 +140,21 @@ impl GcHeap {
     }
 
     pub fn alloc_thread(&mut self, th: LuaState) -> GcPtr<LuaState> {
-        let size = crate::gc::account_thread(&th);
+        let size = gc::account_thread(&th);
         self.total += size;
         self.account_alloc(size);
         self.threads.alloc(th)
     }
 
-    pub fn alloc_cdata(
-        &mut self,
-        cd: crate::runtime::cdata::CData,
-    ) -> GcPtr<crate::runtime::cdata::CData> {
-        let size = std::mem::size_of::<crate::runtime::cdata::CData>() + cd.data.len();
+    pub fn alloc_cdata(&mut self, cd: CData) -> GcPtr<CData> {
+        let size = std::mem::size_of::<CData>() + cd.data.len();
         self.total += size;
         self.account_alloc(size);
         self.cdatas.alloc(cd)
     }
 
-    pub fn alloc_userdata(
-        &mut self,
-        ud: crate::runtime::userdata::GcUserData,
-    ) -> GcPtr<crate::runtime::userdata::GcUserData> {
-        let size = std::mem::size_of::<crate::runtime::userdata::GcUserData>();
+    pub fn alloc_userdata(&mut self, ud: GcUserData) -> GcPtr<GcUserData> {
+        let size = std::mem::size_of::<GcUserData>();
         self.total += size;
         self.account_alloc(size);
         self.userdatas.alloc(ud)
@@ -340,7 +340,7 @@ pub struct LuaState {
     pub top: usize,
     /// Open upvalues pointing into this thread's stack, kept sorted by slot
     /// (descending), mirroring LuaJIT's `L->openupval` list.
-    pub openuv: Vec<GcPtr<crate::func::Upval>>,
+    pub openuv: Vec<GcPtr<Upval>>,
     /// The pending error object (`LuaError::Runtime`).
     pub errval: LuaValue,
     /// The number of yielded values (`LuaError::Yield`).
@@ -455,7 +455,7 @@ impl LuaState {
     pub fn upvalue(&self, i: usize) -> LuaValue {
         let f = self.stack[self.base - 2];
         match f.as_func().map(|p| p.as_ref()) {
-            Some(crate::func::GcFunc::C(cc)) => cc.upvals.get(i).copied().unwrap_or(LuaValue::NIL),
+            Some(GcFunc::C(cc)) => cc.upvals.get(i).copied().unwrap_or(LuaValue::NIL),
             _ => LuaValue::NIL,
         }
     }
@@ -465,7 +465,7 @@ impl LuaState {
     pub fn set_upvalue(&mut self, i: usize, v: LuaValue) {
         let f = self.stack[self.base - 2];
         if let Some(gf) = f.as_func()
-            && let crate::func::GcFunc::C(cc) = gf.as_mut()
+            && let GcFunc::C(cc) = gf.as_mut()
             && i < cc.upvals.len()
         {
             cc.upvals[i] = v;
@@ -500,7 +500,7 @@ impl LuaState {
     }
 
     /// Raise a runtime error carrying a string message with source location.
-    pub fn runtime_error(&mut self, msg: impl AsRef<[u8]>) -> crate::err::LuaError {
+    pub fn runtime_error(&mut self, msg: impl AsRef<[u8]>) -> LuaError {
         let mut full = msg.as_ref().to_vec();
 
         let mut slot = self.base;
@@ -512,7 +512,7 @@ impl LuaState {
             let link_bits = self.stack[slot - 1].to_bits();
             if let Some(fv) = func.as_func() {
                 match fv.as_ref() {
-                    crate::func::GcFunc::Lua(cl) => {
+                    GcFunc::Lua(cl) => {
                         let pt = cl.proto.as_ref();
                         let pc = self
                             .debug_pc
@@ -542,7 +542,7 @@ impl LuaState {
                         full = format!("{}:{}: {}", src, line, msg_str).into_bytes();
                         break;
                     }
-                    crate::func::GcFunc::C(_) => {
+                    GcFunc::C(_) => {
                         // Walk to caller via frame link.
                         // FRAME_LUA=0 means the link encodes the caller's base.
                         let ft = link_bits & FRAME_TYPE_MASK;
@@ -561,7 +561,7 @@ impl LuaState {
 
         let sid = self.heap().intern(&full);
         self.errval = self.heap().str_value(sid);
-        crate::err::LuaError::Runtime
+        LuaError::Runtime
     }
 
     /// Register a builtin function as a global under `name`.
@@ -652,7 +652,7 @@ pub fn new_thread(l: &LuaState) -> StateRef {
 
 pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue, String> {
     let g = l.global();
-    let mut parser = crate::parse::Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
+    let mut parser = Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
     // Suppress panic output for compile errors (caught by catch_unwind).
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -661,7 +661,7 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
     let mut proto = match result {
         Ok(p) => p,
         Err(e) => {
-            let msg = if let Some(ce) = e.downcast_ref::<crate::lex::CompileError>() {
+            let msg = if let Some(ce) = e.downcast_ref::<CompileError>() {
                 ce.0.clone()
             } else if let Some(s) = e.downcast_ref::<String>() {
                 s.clone()
@@ -732,7 +732,9 @@ const _: () = assert!(std::mem::size_of::<GcRef>() == 8);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::LuaResult;
+
+use super::*;
 
     #[test]
     fn load_produces_top_level_closure() {
@@ -806,7 +808,7 @@ mod tests {
 
     #[test]
     fn register_and_lookup_global() {
-        fn dummy(_l: &mut LuaState) -> crate::err::LuaResult<i32> {
+        fn dummy(_l: &mut LuaState) -> LuaResult<i32> {
             Ok(0)
         }
         let mut lua = Lua::new();

@@ -861,7 +861,7 @@ fn str_bytes(bits: u64) -> &'static [u8] {
 /// The heap bound by `trace_exec` (for allocating helpers).
 /// Prefer `jit_heap_from_env` for portable-executor callers that have
 /// the env buffer; this fallback reads the thread-local (machine-code path).
-fn jit_heap() -> &'static mut crate::state::GcHeap {
+fn jit_heap() -> &'static mut GcHeap {
     unsafe {
         JIT_HEAP
             .with(|c| c.get())

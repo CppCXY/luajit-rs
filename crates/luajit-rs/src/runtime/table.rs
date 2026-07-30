@@ -1,4 +1,5 @@
 use crate::gc::{self, GcPtr};
+use crate::runtime::state::GcHeap;
 use crate::value::LuaValue;
 
 /// Max. array part size (`LJ_MAX_ASIZE`) and max. array key bits.
@@ -76,7 +77,7 @@ pub struct LuaTable {
     pub(crate) table_extra: *mut usize,
     /// Back-pointer to the owning GcHeap, for the write barrier during
     /// incremental GC. Set by `alloc_table`.
-    pub(crate) heap: *const crate::state::GcHeap,
+    pub(crate) heap: *const GcHeap,
 }
 
 impl Default for LuaTable {
@@ -724,7 +725,7 @@ impl LuaTable {
         if self.heap.is_null() {
             return;
         }
-        let heap = unsafe { &mut *(self.heap as *mut crate::state::GcHeap) };
+        let heap = unsafe { &mut *(self.heap as *mut GcHeap) };
         if heap.gc_state == gc::GcState::Pause {
             return;
         }
