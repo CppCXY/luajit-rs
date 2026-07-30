@@ -86,17 +86,17 @@ pub fn lual_loadfile(l: &mut LuaState, path: &str) -> LuaResult<()> {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-    let src = match std::fs::read(path) {
-        Ok(s) => s,
-        Err(e) => {
-            lua_pushstring(l, format!("cannot open {path}: {e}").as_bytes());
-            return Err(LuaError::Runtime);
+        let src = match std::fs::read(path) {
+            Ok(s) => s,
+            Err(e) => {
+                lua_pushstring(l, format!("cannot open {path}: {e}").as_bytes());
+                return Err(LuaError::Runtime);
+            }
+        };
+        match lual_loadstring(l, &src) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e),
         }
-    };
-    match lual_loadstring(l, &src) {
-        Ok(()) => Ok(()),
-        Err(e) => Err(e),
-    }
     }
 }
 

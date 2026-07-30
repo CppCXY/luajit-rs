@@ -28,6 +28,8 @@
 //! tail: once a side trace is compiled, `patch_exit` retargets them
 //! straight into it (lj_asm_patchexit).
 
+use crate::jit::{exec, record};
+
 use super::super::ir::*;
 use super::super::mcode::McodeArea;
 use super::super::record::{IRFPM_CEIL, IRFPM_FLOOR, IRFPM_SQRT, IRFPM_TRUNC, IRSLOAD_PARENT};
@@ -245,9 +247,7 @@ impl<'a> Asm<'a> {
                 IROp::CALLL => {
                     // Arity >= 2 arguments are marked by the CARG arm;
                     // single-argument calls take op1 directly.
-                    if super::super::record::ircall_arity(ins.op2 as u32) == 1
-                        && ins.op1 as IRRef >= REF_BIAS
-                    {
+                    if record::ircall_arity(ins.op2 as u32) == 1 && ins.op1 as IRRef >= REF_BIAS {
                         a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
                     }
                 }
@@ -452,15 +452,12 @@ impl<'a> Asm<'a> {
                 IROp::HSTORE => self.asm_hstore(&ins),
                 IROp::CALLL => self.asm_calll(&ins)?,
                 IROp::TNEW => {
-                    self.helper_call(
-                        super::super::exec::jit_tnew as *const () as usize as u64,
-                        &[],
-                    );
+                    self.helper_call(exec::jit_tnew as *const () as usize as u64, &[]);
                     self.ff_result(&ins)?;
                 }
                 IROp::TDUP => {
                     self.helper_call(
-                        super::super::exec::jit_tdup as *const () as usize as u64,
+                        exec::jit_tdup as *const () as usize as u64,
                         &[ins.op1 as IRRef],
                     );
                     self.ff_result(&ins)?;
@@ -540,7 +537,7 @@ impl<'a> Asm<'a> {
             // rax = prospective frame top: max framesize (255) + margin.
             self.mov_rr64(RAX, RBASE);
             self.add_r64_imm32(RAX, delta + (255 + 8) * 8);
-            self.mov_r64_imm64(RCX, super::super::exec::stack_end_cell_addr());
+            self.mov_r64_imm64(RCX, exec::stack_end_cell_addr());
             self.cmp_r64_mem(RAX, RCX, 0);
             self.guard(CC_A);
             if delta != 0 {
@@ -563,7 +560,7 @@ impl<'a> Asm<'a> {
             if delta != 0 {
                 self.mov_rr64(RAX, RBASE);
                 self.add_r64_imm32(RAX, delta + (255 + 8) * 8);
-                self.mov_r64_imm64(RCX, super::super::exec::stack_end_cell_addr());
+                self.mov_r64_imm64(RCX, exec::stack_end_cell_addr());
                 self.cmp_r64_mem(RAX, RCX, 0);
                 self.guard(CC_A);
                 self.add_r64_imm32(RBASE, delta);
@@ -583,7 +580,7 @@ impl<'a> Asm<'a> {
         // back to the executor, restore the callee-saved xmm (Win64),
         // return eax.
         let epilogue = self.code.len();
-        self.mov_r64_imm64(RCX, super::super::exec::exit_base_cell_addr());
+        self.mov_r64_imm64(RCX, exec::exit_base_cell_addr());
         self.mov_mem_r64(RCX, 0, RBASE);
         #[cfg(windows)]
         {
@@ -737,7 +734,7 @@ impl<'a> Asm<'a> {
     /// ULOAD: load a closed upvalue cell through its constant address
     /// (op1 = KINT64), with the same typecheck shapes as SLOAD.
     fn asm_uload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let addr = exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
         let t = ins.t();
         let i = Self::iidx(self.cur);
         self.mov_r64_imm64(RAX, addr);
@@ -792,7 +789,7 @@ impl<'a> Asm<'a> {
     /// HLOAD: raw table get through the shared helper, with the SLOAD
     /// typecheck shapes applied to the returned value bits in rax.
     fn asm_hload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let addr = super::super::exec::jit_tget as *const () as usize as u64;
+        let addr = exec::jit_tget as *const () as usize as u64;
         self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
         self.ff_result(ins)
     }
@@ -803,18 +800,18 @@ impl<'a> Asm<'a> {
         use super::super::record as rec;
         let idx = ins.op2 as u32;
         let addr = match idx {
-            rec::IRCALL_TAB_NEXTK => super::super::exec::jit_tnextk as *const () as u64,
-            rec::IRCALL_FMOD => super::super::exec::jit_fmod as *const () as u64,
-            rec::IRCALL_STR_LEN => super::super::exec::jit_str_len as *const () as u64,
-            rec::IRCALL_STR_CMP => super::super::exec::jit_str_cmp as *const () as u64,
-            rec::IRCALL_STR_BYTE => super::super::exec::jit_str_byte as *const () as u64,
-            rec::IRCALL_STR_SUB => super::super::exec::jit_str_sub as *const () as u64,
-            rec::IRCALL_VARG => super::super::exec::jit_varg as *const () as u64,
-            rec::IRCALL_STR_CHAR => super::super::exec::jit_str_char as *const () as u64,
-            rec::IRCALL_TAB_LEN => super::super::exec::jit_alen as *const () as u64,
-            rec::IRCALL_TAB_CONCAT => super::super::exec::jit_tconcat as *const () as u64,
-            rec::IRCALL_CAT => super::super::exec::jit_cat as *const () as u64,
-            rec::IRCALL_USET => super::super::exec::jit_uset as *const () as u64,
+            rec::IRCALL_TAB_NEXTK => exec::jit_tnextk as *const () as u64,
+            rec::IRCALL_FMOD => exec::jit_fmod as *const () as u64,
+            rec::IRCALL_STR_LEN => exec::jit_str_len as *const () as u64,
+            rec::IRCALL_STR_CMP => exec::jit_str_cmp as *const () as u64,
+            rec::IRCALL_STR_BYTE => exec::jit_str_byte as *const () as u64,
+            rec::IRCALL_STR_SUB => exec::jit_str_sub as *const () as u64,
+            rec::IRCALL_VARG => exec::jit_varg as *const () as u64,
+            rec::IRCALL_STR_CHAR => exec::jit_str_char as *const () as u64,
+            rec::IRCALL_TAB_LEN => exec::jit_alen as *const () as u64,
+            rec::IRCALL_TAB_CONCAT => exec::jit_tconcat as *const () as u64,
+            rec::IRCALL_CAT => exec::jit_cat as *const () as u64,
+            rec::IRCALL_USET => exec::jit_uset as *const () as u64,
             _ => unreachable!("bad IRCALL index"),
         };
         match rec::ircall_arity(idx) {
@@ -936,7 +933,7 @@ impl<'a> Asm<'a> {
     /// POW: the interpreter's vm_pow via a helper call (raw bits in and
     /// out; the result is always a number, no guard).
     fn asm_pow(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let addr = super::super::exec::jit_pow as *const () as usize as u64;
+        let addr = exec::jit_pow as *const () as usize as u64;
         self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
         let i = Self::iidx(self.cur);
         if self.last_use[i] != 0 || self.needs_env[i] {
@@ -952,7 +949,7 @@ impl<'a> Asm<'a> {
     fn asm_hstore(&mut self, ins: &IRIns) {
         let carg = *self.tr.ir.ir(ins.op2 as IRRef);
         debug_assert_eq!(carg.op(), IROp::CARG);
-        let addr = super::super::exec::jit_tset as *const () as usize as u64;
+        let addr = exec::jit_tset as *const () as usize as u64;
         self.helper_call(
             addr,
             &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef],
@@ -1056,8 +1053,8 @@ impl<'a> Asm<'a> {
     /// minus the string bytes (strings never grow on-trace):
     /// `heap.total + heap.table_extra >= heap.threshold`.
     fn asm_gcstep(&mut self, ins: &IRIns) {
-        let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
-        let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
+        let total_addr = exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let thres_addr = exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
         // table_extra is right after threshold in GcHeap (repr(C)).
         let extra_addr = thres_addr + std::mem::size_of::<usize>() as u64;
         self.mov_r64_imm64(RAX, total_addr);
@@ -1258,7 +1255,7 @@ impl<'a> Asm<'a> {
                     self.mov_mem_r64(RBASE, disp, RAX);
                 }
             } else {
-                self.mov_r64_imm64(RAX, super::super::exec::const_bits(&self.tr.ir, rref));
+                self.mov_r64_imm64(RAX, exec::const_bits(&self.tr.ir, rref));
                 self.mov_mem_r64(RBASE, disp, RAX);
             }
         }
@@ -1356,7 +1353,7 @@ impl<'a> Asm<'a> {
                         self.mov_mem_r64(RENV, Self::env_disp(p.phi), RAX);
                     }
                 } else {
-                    self.mov_r64_imm64(RAX, super::super::exec::const_bits(&self.tr.ir, p.rref));
+                    self.mov_r64_imm64(RAX, exec::const_bits(&self.tr.ir, p.rref));
                     self.mov_mem_r64(RENV, Self::env_disp(p.phi), RAX);
                 }
             }
@@ -1392,7 +1389,7 @@ impl<'a> Asm<'a> {
                     self.movsd_load(rg, RENV, Self::env_disp(x));
                 }
                 Owner::Konst(k) => {
-                    self.mov_r64_imm64(RAX, super::super::exec::const_bits(&self.tr.ir, k));
+                    self.mov_r64_imm64(RAX, exec::const_bits(&self.tr.ir, k));
                     self.movq_xmm_gpr(rg, RAX);
                 }
                 Owner::None => unreachable!(),
@@ -1421,7 +1418,7 @@ impl<'a> Asm<'a> {
                     self.movsd_load(rg, RENV, Self::env_disp(p.rref));
                 }
             } else {
-                self.mov_r64_imm64(RAX, super::super::exec::const_bits(&self.tr.ir, p.rref));
+                self.mov_r64_imm64(RAX, exec::const_bits(&self.tr.ir, p.rref));
                 self.movq_xmm_gpr(rg, RAX);
             }
             if self.needs_env[Self::iidx(p.lref)] {
@@ -1438,7 +1435,7 @@ impl<'a> Asm<'a> {
                 self.mov_mem_r64(RENV, Self::env_disp(p.lref), RAX);
             }
         } else {
-            self.mov_r64_imm64(RAX, super::super::exec::const_bits(&self.tr.ir, p.rref));
+            self.mov_r64_imm64(RAX, exec::const_bits(&self.tr.ir, p.rref));
             self.mov_mem_r64(RENV, Self::env_disp(p.lref), RAX);
         }
     }
@@ -1550,7 +1547,7 @@ impl<'a> Asm<'a> {
             self.owner[rg as usize] = Owner::Ins(r);
             self.loc[i] = Some(rg);
         } else {
-            self.mov_r64_imm64(RAX, super::super::exec::const_bits(&self.tr.ir, r));
+            self.mov_r64_imm64(RAX, exec::const_bits(&self.tr.ir, r));
             self.movq_xmm_gpr(rg, RAX);
             self.owner[rg as usize] = Owner::Konst(r);
         }
@@ -1593,7 +1590,7 @@ impl<'a> Asm<'a> {
             debug_assert!(self.env_valid[Self::iidx(r)]);
             self.mov_r64_mem(gpr, RENV, Self::env_disp(r));
         } else {
-            self.mov_r64_imm64(gpr, super::super::exec::const_bits(&self.tr.ir, r));
+            self.mov_r64_imm64(gpr, exec::const_bits(&self.tr.ir, r));
         }
     }
 

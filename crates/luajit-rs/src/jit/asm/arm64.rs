@@ -5,6 +5,8 @@
     clippy::type_complexity,
     clippy::needless_range_loop
 )]
+use crate::jit::{exec, record};
+
 /// AArch64 trace assembler: translates SSA IR into ARM64 native code.
 ///
 /// Register conventions:
@@ -570,9 +572,7 @@ impl<'a> Asm<'a> {
                     }
                 }
                 IROp::CALLL => {
-                    if super::super::record::ircall_arity(ins.op2 as u32) == 1
-                        && ins.op1 as IRRef >= REF_BIAS
-                    {
+                    if record::ircall_arity(ins.op2 as u32) == 1 && ins.op1 as IRRef >= REF_BIAS {
                         a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
                     }
                 }
@@ -786,8 +786,7 @@ impl<'a> Asm<'a> {
             self.owner[rg as usize] = Owner::Ins(r);
             self.loc[Self::iidx(r)] = Some(rg);
         } else {
-            self.code
-                .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, r));
+            self.code.mov64(RSCRATCH, exec::const_bits(&self.tr.ir, r));
             self.code.fmov_fp(rg, RSCRATCH);
             self.owner[rg as usize] = Owner::Konst(r);
         }
@@ -811,8 +810,7 @@ impl<'a> Asm<'a> {
         } else if r >= REF_BIAS {
             self.code.ldr(rd, RENV, Self::env_ofs(r));
         } else {
-            self.code
-                .mov64(rd, super::super::exec::const_bits(&self.tr.ir, r));
+            self.code.mov64(rd, exec::const_bits(&self.tr.ir, r));
         }
     }
     fn def(&mut self, d: u8) {
@@ -970,7 +968,7 @@ impl<'a> Asm<'a> {
 
     // ULOAD: upvalue load
     fn asm_uload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let addr = exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
         let t = ins.t();
         let i = Self::iidx(self.cur);
         self.code.mov64(RSCRATCH, addr);
@@ -1137,7 +1135,7 @@ impl<'a> Asm<'a> {
 
     // HLOAD: table get via helper
     fn asm_hload(&mut self, ins: &IRIns) -> Result<(), TraceError> {
-        let addr = super::super::exec::jit_tget as *const () as usize as u64;
+        let addr = exec::jit_tget as *const () as usize as u64;
         self.helper_call(addr, &[ins.op1 as IRRef, ins.op2 as IRRef]);
         self.ff_result(ins)
     }
@@ -1146,7 +1144,7 @@ impl<'a> Asm<'a> {
     fn asm_hstore(&mut self, ins: &IRIns) {
         let carg = *self.tr.ir.ir(ins.op2 as IRRef);
         debug_assert_eq!(carg.op(), IROp::CARG);
-        let addr = super::super::exec::jit_tset as *const () as usize as u64;
+        let addr = exec::jit_tset as *const () as usize as u64;
         self.helper_call(
             addr,
             &[ins.op1 as IRRef, carg.op1 as IRRef, carg.op2 as IRRef],
@@ -1158,18 +1156,18 @@ impl<'a> Asm<'a> {
         use super::super::record as rec;
         let idx = ins.op2 as u32;
         let addr = match idx {
-            rec::IRCALL_TAB_NEXTK => super::super::exec::jit_tnextk as *const () as u64,
-            rec::IRCALL_FMOD => super::super::exec::jit_fmod as *const () as u64,
-            rec::IRCALL_STR_LEN => super::super::exec::jit_str_len as *const () as u64,
-            rec::IRCALL_STR_CMP => super::super::exec::jit_str_cmp as *const () as u64,
-            rec::IRCALL_STR_BYTE => super::super::exec::jit_str_byte as *const () as u64,
-            rec::IRCALL_STR_SUB => super::super::exec::jit_str_sub as *const () as u64,
-            rec::IRCALL_VARG => super::super::exec::jit_varg as *const () as u64,
-            rec::IRCALL_STR_CHAR => super::super::exec::jit_str_char as *const () as u64,
-            rec::IRCALL_TAB_LEN => super::super::exec::jit_alen as *const () as u64,
-            rec::IRCALL_TAB_CONCAT => super::super::exec::jit_tconcat as *const () as u64,
-            rec::IRCALL_CAT => super::super::exec::jit_cat as *const () as u64,
-            rec::IRCALL_USET => super::super::exec::jit_uset as *const () as u64,
+            rec::IRCALL_TAB_NEXTK => exec::jit_tnextk as *const () as u64,
+            rec::IRCALL_FMOD => exec::jit_fmod as *const () as u64,
+            rec::IRCALL_STR_LEN => exec::jit_str_len as *const () as u64,
+            rec::IRCALL_STR_CMP => exec::jit_str_cmp as *const () as u64,
+            rec::IRCALL_STR_BYTE => exec::jit_str_byte as *const () as u64,
+            rec::IRCALL_STR_SUB => exec::jit_str_sub as *const () as u64,
+            rec::IRCALL_VARG => exec::jit_varg as *const () as u64,
+            rec::IRCALL_STR_CHAR => exec::jit_str_char as *const () as u64,
+            rec::IRCALL_TAB_LEN => exec::jit_alen as *const () as u64,
+            rec::IRCALL_TAB_CONCAT => exec::jit_tconcat as *const () as u64,
+            rec::IRCALL_CAT => exec::jit_cat as *const () as u64,
+            rec::IRCALL_USET => exec::jit_uset as *const () as u64,
             _ => return Err(TraceError::NYIIR),
         };
         match rec::ircall_arity(idx) {
@@ -1229,7 +1227,7 @@ impl<'a> Asm<'a> {
         // side-trace → restore → re-entry infinite loop.
         if self.loop_pos.is_some() {
             self.helper_call(
-                super::super::exec::jit_tget as *const () as usize as u64,
+                exec::jit_tget as *const () as usize as u64,
                 &[ins.op1 as IRRef, ins.op2 as IRRef],
             );
             self.ff_result(ins)
@@ -1274,7 +1272,7 @@ impl<'a> Asm<'a> {
         // the interpreter every time the table needs to grow.  Call jit_tset
         // directly instead, keeping the trace alive across resize boundaries.
         if self.loop_pos.is_some() {
-            let addr = super::super::exec::jit_tset as *const () as usize as u64;
+            let addr = exec::jit_tset as *const () as usize as u64;
             self.helper_call(addr, &[ins.op1 as IRRef, keyref, carg.op2 as IRRef]);
             // ASTORE has no return value; skip ff_result typecheck.
             if self.needs_env[Self::iidx(self.cur)] {
@@ -1313,8 +1311,8 @@ impl<'a> Asm<'a> {
 
     // GCSTEP: GC debt check — exit to interpreter when collection is due.
     fn asm_gcstep(&mut self, ins: &IRIns) {
-        let total_addr = super::super::exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
-        let thres_addr = super::super::exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
+        let total_addr = exec::const_bits(&self.tr.ir, ins.op1 as IRRef);
+        let thres_addr = exec::const_bits(&self.tr.ir, ins.op2 as IRRef);
         // table_extra sits right after threshold in GcHeap (repr(C)).
         let extra_addr = thres_addr + std::mem::size_of::<usize>() as u64;
         self.code.mov64(RSCRATCH, total_addr);
@@ -1577,7 +1575,7 @@ impl<'a> Asm<'a> {
                 }
             } else {
                 self.code
-                    .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, rref));
+                    .mov64(RSCRATCH, exec::const_bits(&self.tr.ir, rref));
                 self.code.str_safe(RSCRATCH, RBASE, disp);
             }
         }
@@ -1676,15 +1674,12 @@ impl<'a> Asm<'a> {
                 IROp::HSTORE => self.asm_hstore(&ins),
                 IROp::CALLL => self.asm_calll(&ins)?,
                 IROp::TNEW => {
-                    self.helper_call(
-                        super::super::exec::jit_tnew as *const () as usize as u64,
-                        &[],
-                    );
+                    self.helper_call(exec::jit_tnew as *const () as usize as u64, &[]);
                     self.ff_result(&ins)?;
                 }
                 IROp::TDUP => {
                     self.helper_call(
-                        super::super::exec::jit_tdup as *const () as usize as u64,
+                        exec::jit_tdup as *const () as usize as u64,
                         &[ins.op1 as IRRef],
                     );
                     self.ff_result(&ins)?;
@@ -1694,7 +1689,7 @@ impl<'a> Asm<'a> {
                 IROp::GCSTEP => self.asm_gcstep(&ins),
                 IROp::POW => {
                     self.helper_call(
-                        super::super::exec::jit_pow as *const () as usize as u64,
+                        exec::jit_pow as *const () as usize as u64,
                         &[ins.op1 as IRRef, ins.op2 as IRRef],
                     );
                     self.ff_result(&ins)?;
@@ -1896,10 +1891,8 @@ impl<'a> Asm<'a> {
                         self.env_valid[i] = true;
                     } else {
                         // Constant: materialize and store.
-                        self.code.mov64(
-                            RSCRATCH,
-                            super::super::exec::const_bits(&self.tr.ir, p.rref),
-                        );
+                        self.code
+                            .mov64(RSCRATCH, exec::const_bits(&self.tr.ir, p.rref));
                         self.code.str(RSCRATCH, RENV, Self::env_ofs(p.lref));
                         self.env_valid[Self::iidx(p.lref)] = true;
                     }
@@ -1926,8 +1919,7 @@ impl<'a> Asm<'a> {
                             self.code.ldr_d(rg, RENV, Self::env_ofs(x));
                         }
                         Owner::Konst(k) => {
-                            self.code
-                                .mov64(RSCRATCH, super::super::exec::const_bits(&self.tr.ir, k));
+                            self.code.mov64(RSCRATCH, exec::const_bits(&self.tr.ir, k));
                             self.code.fmov_fp(rg, RSCRATCH);
                         }
                         Owner::None => unreachable!(),
@@ -1949,8 +1941,7 @@ impl<'a> Asm<'a> {
             let room = (255 + 8) * 8;
             self.code.mov64(RSCRATCH, (delta + room) as u64);
             self.code.add_rr(RSCRATCH, RSCRATCH, RBASE);
-            self.code
-                .mov64(RSCRATCH2, super::super::exec::stack_end_cell_addr());
+            self.code.mov64(RSCRATCH2, exec::stack_end_cell_addr());
             self.code.ldr(RSCRATCH3, RSCRATCH2, 0);
             self.code.cmp_rr(RSCRATCH, RSCRATCH3);
             self.guard(cond::HI);
@@ -1971,8 +1962,7 @@ impl<'a> Asm<'a> {
                 let room = (255 + 8) * 8;
                 self.code.mov64(RSCRATCH, (delta + room) as u64);
                 self.code.add_rr(RSCRATCH, RSCRATCH, RBASE);
-                self.code
-                    .mov64(RSCRATCH2, super::super::exec::stack_end_cell_addr());
+                self.code.mov64(RSCRATCH2, exec::stack_end_cell_addr());
                 self.code.ldr(RSCRATCH3, RSCRATCH2, 0);
                 self.code.cmp_rr(RSCRATCH, RSCRATCH3);
                 self.guard(cond::HI);
@@ -1995,8 +1985,7 @@ impl<'a> Asm<'a> {
         // ── epilogue ──
         let epilogue = self.code.len();
         // Store BASE to exit_base cell
-        self.code
-            .mov64(RSCRATCH, super::super::exec::exit_base_cell_addr());
+        self.code.mov64(RSCRATCH, exec::exit_base_cell_addr());
         self.code.str(RBASE, RSCRATCH, 0);
         // Restore callee-saved regs
         for i in 0..SAVED_GPR_PAIRS {

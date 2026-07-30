@@ -437,9 +437,11 @@ impl<'a> Parser<'a> {
                 next: 0,
                 name: 0,
             });
-            self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
-                format!("too many C types (overflow)")
-            })?;
+            self.cts.top = self
+                .cts
+                .top
+                .checked_add(1)
+                .ok_or_else(|| "too many C types (overflow)".to_string())?;
             return Ok(id);
         }
         self.next(); // {
@@ -496,14 +498,19 @@ impl<'a> Parser<'a> {
                 let total_sz = elem_ct.size.saturating_mul(array_multiplier);
                 let info = ct_info(CT::Array, 0) | fdecl.type_id;
                 // Search for existing array type.
-                let existing = (0..self.cts.top as usize).find(|&i| {
-                    self.cts.tab[i].info == info && self.cts.tab[i].size == total_sz
-                });
+                let existing = (0..self.cts.top as usize)
+                    .find(|&i| self.cts.tab[i].info == info && self.cts.tab[i].size == total_sz);
                 if let Some(id) = existing {
                     id as u32
                 } else {
                     let id = self.cts.top;
-                    self.cts.tab.push(CType { info, size: total_sz, sib: 0, next: 0, name: 0 });
+                    self.cts.tab.push(CType {
+                        info,
+                        size: total_sz,
+                        sib: 0,
+                        next: 0,
+                        name: 0,
+                    });
                     self.cts.top = id + 1;
                     id
                 }
@@ -536,7 +543,9 @@ impl<'a> Parser<'a> {
             };
             max_align = max_align.max(field_size.1);
             let align = field_size.1 as u64;
-            let field_offset = if is_union { 0u64 } else {
+            let field_offset = if is_union {
+                0u64
+            } else {
                 (total_size + align - 1) & !(align - 1)
             };
             total_size = if is_union {
@@ -556,9 +565,11 @@ impl<'a> Parser<'a> {
             if !field_name.is_empty() {
                 field_infos.push((field_name, field_type_id, field_offset as u32));
             }
-            self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
-                format!("too many C types (overflow)")
-            })?;
+            self.cts.top = self
+                .cts
+                .top
+                .checked_add(1)
+                .ok_or_else(|| "too many C types (overflow)".to_string())?;
             total_size = if is_union {
                 total_size.max(field_offset + field_size.0)
             } else {
@@ -592,9 +603,11 @@ impl<'a> Parser<'a> {
             next: 0,
             name: 0,
         });
-        self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
-            format!("too many C types (overflow)")
-        })?;
+        self.cts.top = self
+            .cts
+            .top
+            .checked_add(1)
+            .ok_or_else(|| "too many C types (overflow)".to_string())?;
         let struct_id = self.cts.top - 1;
         // Register field names
         for (name, type_id, offset) in field_infos {
@@ -654,9 +667,11 @@ impl<'a> Parser<'a> {
             next: 0,
             name: 0,
         });
-        self.cts.top = self.cts.top.checked_add(1).ok_or_else(|| {
-            format!("too many C types (overflow)")
-        })?;
+        self.cts.top = self
+            .cts
+            .top
+            .checked_add(1)
+            .ok_or_else(|| "too many C types (overflow)".to_string())?;
         self.cts.names.insert(name, id);
         // Skip declarator suffix
         self.skip_until_semicolon();

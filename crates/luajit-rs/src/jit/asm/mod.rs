@@ -22,8 +22,8 @@ pub enum Arch {
 }
 
 /// The native arch for the current compilation target.
-/// 
-pub const HOST_ARCH: Arch =  if cfg!(target_arch = "x86_64") {
+///
+pub const HOST_ARCH: Arch = if cfg!(target_arch = "x86_64") {
     Arch::X64
 } else if cfg!(target_arch = "aarch64") {
     Arch::Arm64

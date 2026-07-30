@@ -65,7 +65,7 @@ fn make_ptr_type(cts: &mut CTState, pointee_id: u32) -> u32 {
         next: 0,
         name: 0,
     });
-    cts.top = cts.top.checked_add(1).unwrap_or(u32::MAX);
+    cts.top = cts.top.saturating_add(1);
     ptr_id
 }
 
@@ -108,7 +108,12 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
     if let Some(id) = quick_type_id(&base_name) {
         return wrap_array(l, id, array_count);
     }
-    if let Some(&id) = l.global().cts.as_ref().and_then(|c| c.names.get(&base_name)) {
+    if let Some(&id) = l
+        .global()
+        .cts
+        .as_ref()
+        .and_then(|c| c.names.get(&base_name))
+    {
         return wrap_array(l, id, array_count);
     }
 
@@ -169,7 +174,13 @@ fn wrap_array(l: &mut LuaState, base_id: u32, count: usize) -> LuaResult<u32> {
         }
     }
     let id = cts.top;
-    cts.tab.push(CType { info, size: total_sz, sib: 0, next: 0, name: 0 });
+    cts.tab.push(CType {
+        info,
+        size: total_sz,
+        sib: 0,
+        next: 0,
+        name: 0,
+    });
     cts.top = id + 1;
     Ok(id)
 }
@@ -211,7 +222,7 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
                     // Flat array of scalars: write 4-byte ints.
                     for i in 0..n {
                         let v = tab.as_ref().get_int(i as i32 + 1);
-                        let off = i as usize * 4;
+                        let off = i * 4;
                         if off + 4 <= cd.data.len() {
                             let val = v.as_number().unwrap_or(0.0) as i32;
                             cd.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
@@ -234,11 +245,10 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
                                 let sub_n = st.as_ref().len() as usize;
                                 for j in 0..sub_n {
                                     let fv = st.as_ref().get_int(j as i32 + 1);
-                                    let off = i as usize * elem_sz + j * 4;
+                                    let off = i * elem_sz + j * 4;
                                     if off + 4 <= cd.data.len() {
                                         let val = fv.as_number().unwrap_or(0.0) as i32;
-                                        cd.data[off..off + 4]
-                                            .copy_from_slice(&val.to_le_bytes());
+                                        cd.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
                                     }
                                 }
                             }
@@ -453,11 +463,7 @@ fn read_field_from_slice(data: &[u8], offset: u32, sz: usize) -> f64 {
     }
 }
 
-fn array_element(
-    l: &mut LuaState,
-    cd: GcPtr<CData>,
-    idx: i32,
-) -> LuaResult<i32> {
+fn array_element(l: &mut LuaState, cd: GcPtr<CData>, idx: i32) -> LuaResult<i32> {
     let ctypeid = cd.as_ref().ctypeid;
     let cts = l.global().cts.as_ref().unwrap();
     let raw_ct = cts.raw(ctypeid);
@@ -480,7 +486,10 @@ fn array_element(
     let offset = idx as usize * elem_sz;
     let data = &cd.as_ref().data;
     let elem_bytes = data[offset..offset + elem_sz].to_vec();
-    let sub = CData { ctypeid: elem_typeid, data: elem_bytes.into_boxed_slice() };
+    let sub = CData {
+        ctypeid: elem_typeid,
+        data: elem_bytes.into_boxed_slice(),
+    };
     let p = l.global().heap.cdatas.alloc(sub);
     push(l, LuaValue::cdata(p));
     Ok(1)

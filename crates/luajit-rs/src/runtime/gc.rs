@@ -3,7 +3,11 @@ use std::ptr::NonNull;
 
 /// Maximum address for a valid GC pointer. On 64-bit hosts this is
 /// 2^47 (for NaN-boxing), on 32-bit/wasm32 it's the full address space.
-const ADDR_MAX: u64 = if cfg!(target_pointer_width = "64") { 1u64 << 47 } else { u32::MAX as u64 };
+const ADDR_MAX: u64 = if cfg!(target_pointer_width = "64") {
+    1u64 << 47
+} else {
+    u32::MAX as u64
+};
 
 // ── Re-export generational GC types ────────────────────────────────────
 pub use super::gc_gen::header::{Age, GcObjectKind};
@@ -283,7 +287,9 @@ mod lowmem {
         unsafe { (NonNull::new_unchecked(p), false) }
     }
     pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout, _mapped: bool) {
-        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout); }
+        unsafe {
+            std::alloc::dealloc(ptr.as_ptr(), layout);
+        }
     }
 }
 
@@ -335,7 +341,11 @@ fn dealloc_block<T>(data: NonNull<T>, mapped: bool) {
         std::any::type_name::<T>()
     );
     if kind > 7 {
-        eprintln!("DEALLOC-CORRUPT: kind={} T={}", kind, std::any::type_name::<T>());
+        eprintln!(
+            "DEALLOC-CORRUPT: kind={} T={}",
+            kind,
+            std::any::type_name::<T>()
+        );
         std::process::abort();
     }
     unsafe { lowmem::dealloc(NonNull::new_unchecked(ap), layout, mapped) };
@@ -364,7 +374,10 @@ fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
         if (p as usize) & 0x3 != 0 {
             eprintln!(
                 "GCHEADER-MISALIGNED: p={:p} ptr={:p} off={} T={}",
-                p, ptr.as_ptr(), data_offset, std::any::type_name::<T>()
+                p,
+                ptr.as_ptr(),
+                data_offset,
+                std::any::type_name::<T>()
             );
             std::process::abort();
         }
@@ -919,10 +932,11 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
     match heap.gc_state {
         GcState::Pause => {
             if heap.total + heap.strings.bytes() + heap.table_extra + step >= heap.threshold {
-                heap.threshold = heap.total + heap.strings.bytes() + heap.table_extra
+                heap.threshold = heap.total
+                    + heap.strings.bytes()
+                    + heap.table_extra
                     + ((heap.total + heap.strings.bytes()) * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
             }
-            return;
         }
         GcState::Propagate => {
             let mut m = Marker {

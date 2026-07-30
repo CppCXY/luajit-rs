@@ -38,6 +38,7 @@ mod opt_ivar;
 mod opt_loop;
 mod opt_mem;
 mod opt_narrow;
+mod opt_sink;
 mod record;
 mod trace;
 
@@ -320,7 +321,9 @@ pub struct Prng(u64);
 impl Prng {
     fn new() -> Prng {
         #[cfg(target_arch = "wasm32")]
-        { return Prng(0x9E37_79B9_7F4A_7C15); }
+        {
+            return Prng(0x9E37_79B9_7F4A_7C15);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             let seed = std::time::SystemTime::now()
@@ -447,9 +450,13 @@ impl JitState {
     #[inline(always)]
     pub fn is_on(&self) -> bool {
         #[cfg(target_arch = "wasm32")]
-        { return false; }
+        {
+            return false;
+        }
         #[cfg(not(target_arch = "wasm32"))]
-        { self.flags & JIT_F_ON != 0 }
+        {
+            self.flags & JIT_F_ON != 0
+        }
     }
 
     /// `jit.on()` / `jit.off()`. Re-arms the hot counters on enable, like

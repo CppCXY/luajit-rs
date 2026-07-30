@@ -14,7 +14,6 @@
 //!   makes them take two IR slots, which is purely a C memory-layout
 //!   trick (`ir[1].tv`).
 
-
 use super::TraceError;
 
 // -- IR opcodes (lj_ir.h IRDEF) --------------------------------------------
@@ -767,7 +766,9 @@ impl IrBuf {
     pub fn emitir(&mut self, ot: u16, a: IRRef, b: IRRef) -> Result<TRef, TraceError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            super::opt_fold::opt_fold(self, IRIns::new(ot, a, b))
+            use crate::jit::opt_fold;
+
+            opt_fold::opt_fold(self, IRIns::new(ot, a, b))
         }
         #[cfg(target_arch = "wasm32")]
         {

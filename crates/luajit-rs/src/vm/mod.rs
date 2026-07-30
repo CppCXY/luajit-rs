@@ -160,7 +160,12 @@ fn cdata_is_ull(v: LuaValue) -> bool {
     }
 }
 
-fn try_cdata_binop(l: &mut LuaState, xv: LuaValue, yv: LuaValue, op: impl Fn(u64, u64) -> u64) -> Option<LuaValue> {
+fn try_cdata_binop(
+    l: &mut LuaState,
+    xv: LuaValue,
+    yv: LuaValue,
+    op: impl Fn(u64, u64) -> u64,
+) -> Option<LuaValue> {
     let x_cd = cdata_u64(xv);
     let y_cd = cdata_u64(yv);
     match (x_cd, y_cd) {
@@ -361,7 +366,13 @@ impl Interp {
 
     /// Core of `enter_lua` without the `stack_ensure` — the caller has
     /// already ensured enough space (possibly combining with mmcall data).
-    fn enter_lua_sans_ensure(&mut self, gf: GcPtr<GcFunc>, func_slot: usize, nargs: usize, link: u64) {
+    fn enter_lua_sans_ensure(
+        &mut self,
+        gf: GcPtr<GcFunc>,
+        func_slot: usize,
+        nargs: usize,
+        link: u64,
+    ) {
         let cl = match gf.as_ref() {
             GcFunc::Lua(c) => c,
             _ => unreachable!(),
@@ -1032,9 +1043,7 @@ impl Interp {
                     let yv = reg!(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
                         setreg!(a, LuaValue::number_raw(xv.num() / yv.num()));
-                    } else if let Some(r) =
-                        try_cdata_binop(self.l(), xv, yv, |x, y| x / y)
-                    {
+                    } else if let Some(r) = try_cdata_binop(self.l(), xv, yv, |x, y| x / y) {
                         setreg!(a, r);
                     } else {
                         sync!();
@@ -1054,9 +1063,7 @@ impl Interp {
                         let x = xv.num();
                         let y = yv.num();
                         setreg!(a, LuaValue::number_raw(x - (x / y).floor() * y));
-                    } else if let Some(r) =
-                        try_cdata_binop(self.l(), xv, yv, |x, y| x % y)
-                    {
+                    } else if let Some(r) = try_cdata_binop(self.l(), xv, yv, |x, y| x % y) {
                         setreg!(a, r);
                     } else {
                         sync!();
@@ -1083,7 +1090,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Add, xv, kslot!(bc_c(ins)), a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1101,7 +1111,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Sub, xv, kslot!(bc_c(ins)), a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1119,7 +1132,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Mul, xv, kslot!(bc_c(ins)), a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1132,13 +1148,16 @@ impl Interp {
                     } else if let Some(x_cd) = cdata_u64(xv) {
                         let is_ull = cdata_is_ull(xv);
                         let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
-                        let r = if y == 0 { 0 } else { x_cd / y };
+                        let r = x_cd.checked_div(y).unwrap_or(0);
                         setreg!(a, make_cdata_result(self.l(), r, is_ull));
                     } else {
                         sync!();
                         match self.meta_arith(MM::Div, xv, kslot!(bc_c(ins)), a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1157,7 +1176,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Mod, xv, kslot!(bc_c(ins)), a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1175,7 +1197,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Add, kv, yv, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1193,7 +1218,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Sub, kv, yv, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1211,7 +1239,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Mul, kv, yv, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1224,13 +1255,16 @@ impl Interp {
                     } else if let Some(y_cd) = cdata_u64(yv) {
                         let is_ull = cdata_is_ull(yv);
                         let x = kv.num() as i64 as u64;
-                        let r = if y_cd == 0 { 0 } else { x / y_cd };
+                        let r = x.checked_div(y_cd).unwrap_or(0);
                         setreg!(a, make_cdata_result(self.l(), r, is_ull));
                     } else {
                         sync!();
                         match self.meta_arith(MM::Div, kv, yv, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1250,7 +1284,10 @@ impl Interp {
                         sync!();
                         match self.meta_arith(MM::Mod, kv, yv, a)? {
                             Some(r) => setreg!(a, r),
-                            None => { resync!(); continue; }
+                            None => {
+                                resync!();
+                                continue;
+                            }
                         }
                     }
                 }

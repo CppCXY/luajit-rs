@@ -1,8 +1,8 @@
 use luajit_rs::{
-    Lua, LuaState, lua_error_message, lua_gc, lua_getglobal, lua_gettop, lua_isfunction,
-    lua_isnil, lua_newtable, lua_pcall, lua_peek, lua_pop, lua_pushboolean, lua_pushcfunction,
-    lua_pushnil, lua_pushnumber, lua_pushstring, lua_rawseti, lua_setglobal, lua_settable,
-    lua_settop, lual_loadstring, lual_openlibs,
+    Lua, LuaState, lua_error_message, lua_gc, lua_getglobal, lua_gettop, lua_isfunction, lua_isnil,
+    lua_newtable, lua_pcall, lua_peek, lua_pop, lua_pushboolean, lua_pushcfunction, lua_pushnil,
+    lua_pushnumber, lua_pushstring, lua_rawseti, lua_setglobal, lua_settable, lua_settop,
+    lual_loadstring, lual_openlibs,
 };
 use std::cell::RefCell;
 use std::ptr;
@@ -55,7 +55,9 @@ impl LuaWasm {
             lua_pop(l, 1);
         }
         *self.print_cb.borrow_mut() = Some(func);
-        unsafe { BRIDGE_CB = &self.print_cb; }
+        unsafe {
+            BRIDGE_CB = &self.print_cb;
+        }
         lua_pushcfunction(l, print_bridge);
         lua_setglobal(l, "print");
     }
@@ -67,7 +69,11 @@ impl LuaWasm {
         lual_loadstring(l, src.as_bytes()).map_err(|_| js_error(l))?;
         lua_pcall(l, 0, -1, 0).map_err(|_| js_error(l))?;
         let n = lua_gettop(l);
-        let result = Ok(if n == 0 { String::new() } else { value_to_literal(l, 1) });
+        let result = Ok(if n == 0 {
+            String::new()
+        } else {
+            value_to_literal(l, 1)
+        });
         lua_settop(l, 0);
         result
     }
@@ -85,7 +91,11 @@ impl LuaWasm {
         let nargs = push_js_array(l, &args);
         lua_pcall(l, nargs, 1, 0).map_err(|_| js_error(l))?;
         let n = lua_gettop(l);
-        let result = Ok(if n == 0 { String::new() } else { value_to_literal(l, 1) });
+        let result = Ok(if n == 0 {
+            String::new()
+        } else {
+            value_to_literal(l, 1)
+        });
         lua_settop(l, 0);
         result
     }
@@ -126,10 +136,10 @@ fn print_bridge(l: &mut LuaState) -> luajit_rs::LuaResult<i32> {
     }
     let line = parts.join("\t");
     let cb_ptr = unsafe { BRIDGE_CB };
-    if !cb_ptr.is_null() {
-        if let Some(ref cb) = *unsafe { &*cb_ptr }.borrow() {
-            let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&line));
-        }
+    if !cb_ptr.is_null()
+        && let Some(ref cb) = *unsafe { &*cb_ptr }.borrow()
+    {
+        let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&line));
     }
     Ok(0)
 }
@@ -147,7 +157,9 @@ fn value_to_literal(l: &LuaState, idx: i32) -> String {
             format!("{}", n)
         }
     } else if let Some(s) = v.as_string() {
-        std::str::from_utf8(s.as_ref().as_bytes()).unwrap_or("").to_string()
+        std::str::from_utf8(s.as_ref().as_bytes())
+            .unwrap_or("")
+            .to_string()
     } else {
         "null".to_string()
     }

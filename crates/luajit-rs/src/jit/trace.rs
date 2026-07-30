@@ -12,8 +12,11 @@
 
 use crate::bc::{self, BCOp, bc_isret, bc_j, bc_op, setbc_d, setbc_op};
 use crate::gc::GcPtr;
-use crate::jit::ir::IrBuf;
-use crate::jit::{GCtrace, record};
+use crate::jit::ir::{self, IrBuf};
+use crate::jit::{
+    GCtrace, SNAP_NORESTORE, asm, opt_dce, opt_ivar, opt_loop, opt_narrow, opt_sink, record,
+    snap_ref, snap_slot,
+};
 use crate::proto::{PROTO_ILOOP, PROTO_NOJIT, Proto};
 use crate::state::{GlobalState, LuaState};
 
@@ -311,11 +314,12 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
                 && lnk == rec.cur.traceno
                 && rec.framedepth + rec.retdepth == 0
             {
-                super::opt_dce::opt_dce(&mut rec.cur);
-                super::opt_narrow::opt_narrow(&mut rec.cur.ir);
-                match super::opt_loop::opt_loop(&mut rec) {
+                opt_dce::opt_dce(&mut rec.cur);
+                opt_sink::opt_sink(&mut rec.cur);
+                opt_narrow::opt_narrow(&mut rec.cur.ir);
+                match opt_loop::opt_loop(&mut rec) {
                     Ok(true) => {
-                        super::opt_ivar::opt_ivar(&mut rec.cur.ir);
+                        opt_ivar::opt_ivar(&mut rec.cur.ir);
                     }
                     Ok(false) => {
                         // Fixable failure (TYPEINS/GFAIL), already undone:
@@ -347,7 +351,7 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             if minstitch > 0
                 && rec.parent == 0
                 && matches!(e, TraceError::NYIBC | TraceError::NYIFFU)
-                && rec.cur.ir.nins() - super::ir::REF_FIRST >= minstitch
+                && rec.cur.ir.nins() - ir::REF_FIRST >= minstitch
             {
                 // The snapshot describes the state right before the NYI
                 // bytecode; the interpreter resumes there, executes it
@@ -425,9 +429,10 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             None
         };
         let arch = js.arch;
-        super::opt_narrow::opt_narrow(&mut trace.ir);
+        opt_narrow::opt_narrow(&mut trace.ir);
+        opt_sink::opt_sink(&mut trace);
         if !js.no_asm
-            && let Ok((mc, inner, tails)) = super::asm::assemble(&trace, link_target, arch)
+            && let Ok((mc, inner, tails)) = asm::assemble(&trace, link_target, arch)
         {
             if js.trace_dump {
                 eprintln!(
@@ -472,7 +477,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
             trace
                 .snap
                 .iter()
-                .map(|s| (s.iref - super::ir::REF_BIAS, s.pc, s.baseslot, s.nslots))
+                .map(|s| (s.iref - ir::REF_BIAS, s.pc, s.baseslot, s.nslots))
                 .collect::<Vec<_>>(),
         );
         if js.trace_dump2 {
@@ -495,13 +500,9 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                     .map(|&sn| {
                         format!(
                             "{}={}{}",
-                            super::snap_slot(sn),
-                            super::snap_ref(sn) as i32 - REF_BIAS as i32,
-                            if sn & super::SNAP_NORESTORE != 0 {
-                                "!"
-                            } else {
-                                ""
-                            }
+                            snap_slot(sn),
+                            snap_ref(sn) as i32 - REF_BIAS as i32,
+                            if sn & SNAP_NORESTORE != 0 { "!" } else { "" }
                         )
                     })
                     .collect();
@@ -517,9 +518,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
     }
     // Machine-code chains switch traces without resizing env in Rust:
     // keep the high-water mark over all stored traces.
-    js.env_need = js
-        .env_need
-        .max((trace.ir.nins() - super::ir::REF_BIAS) as usize);
+    js.env_need = js.env_need.max((trace.ir.nins() - ir::REF_BIAS) as usize);
 
     // Patch the bytecode of the starting instruction in a root trace.
     let pt = trace.startpt;
@@ -557,7 +556,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                     let pt_ = js.trace[parent as usize].as_mut().unwrap();
                     let tails = std::mem::take(&mut pt_.stub_tails);
                     if let Some(area) = &mut pt_.mcode {
-                        super::asm::patch_exit(area, &tails, exitno as u32, target, js.arch);
+                        asm::patch_exit(area, &tails, exitno as u32, target, js.arch);
                     }
                     pt_.stub_tails = tails;
                 }
@@ -892,7 +891,7 @@ mod tests {
             .enumerate()
             .find_map(|(i, s)| (s.sidetrace != 0).then_some((i, s.sidetrace)))
             .expect("no exit linked to a side trace");
-        assert_eq!(root.snap[exitno].count, super::super::SNAPCOUNT_DONE);
+        assert_eq!(root.snap[exitno].count, SNAPCOUNT_DONE);
         let st = g.jit.trace[side as usize].as_deref().unwrap();
         assert_eq!(st.root, rootno, "side trace not rooted");
         assert_eq!(st.linktype, TraceLink::Root);
@@ -927,7 +926,7 @@ mod tests {
             assert!(
                 root.snap
                     .iter()
-                    .any(|s| s.count == super::super::SNAPCOUNT_DONE && s.sidetrace == 0),
+                    .any(|s| s.count == SNAPCOUNT_DONE && s.sidetrace == 0),
                 "hopeless exit was not blacklisted"
             );
         }

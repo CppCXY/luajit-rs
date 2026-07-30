@@ -13,6 +13,8 @@
 
 use crate::bc::*;
 use crate::gc::GcPtr;
+use crate::jit::exec::{self, jit_str_byte, jit_tget, jit_tnextk};
+use crate::jit::{bc_addr, opt_fold};
 use crate::proto::Proto;
 use crate::state::LuaState;
 use crate::value::LuaValue;
@@ -757,7 +759,7 @@ impl Record {
 
     /// `innerloopleft`: did this inner loop repeatedly fail to loop back?
     fn innerloopleft(js: &JitState, pt: GcPtr<Proto>, pc: usize) -> bool {
-        let key = super::bc_addr(pt, pc);
+        let key = bc_addr(pt, pc);
         for i in 0..PENALTY_SLOTS {
             if js.penalty[i].pc == key {
                 return matches!(
@@ -1024,7 +1026,7 @@ impl Record {
         }
         self.set_base(a, kf);
         // The frame link the interpreter stores: the return ins address.
-        let lk = self.cur.ir.kint64(super::bc_addr(self.pt, pc + 1) as u64);
+        let lk = self.cur.ir.kint64(bc_addr(self.pt, pc + 1) as u64);
         self.set_base(a + 1, lk | TREF_FRAME);
         // Load the arguments in the caller's context (already-populated
         // trefs — e.g. the copied ITERC triple — are returned as-is).
@@ -1387,7 +1389,7 @@ impl Record {
         let Some(t) = tabv.as_table() else {
             return Err(TraceError::NYIBC);
         };
-        let v = LuaValue::from_bits(super::exec::jit_tget(tabv.to_bits(), keyv.to_bits()));
+        let v = LuaValue::from_bits(jit_tget(tabv.to_bits(), keyv.to_bits()));
         if v.is_nil() {
             if t.as_ref().metatable.is_some() {
                 return Err(TraceError::NYIBC); // __index metamethod NYI.
@@ -1605,8 +1607,7 @@ impl Record {
                 };
                 let tabv = argv[0];
                 let keyv = if nargs >= 2 { argv[1] } else { LuaValue::NIL };
-                let nkv =
-                    LuaValue::from_bits(super::exec::jit_tnextk(tabv.to_bits(), keyv.to_bits()));
+                let nkv = LuaValue::from_bits(jit_tnextk(tabv.to_bits(), keyv.to_bits()));
                 let t_nk = Self::value_irt(nkv);
                 let carg = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CARG, IRT_NIL),
@@ -1776,8 +1777,7 @@ impl Record {
                 } else {
                     LuaValue::number(1.0)
                 };
-                let outv =
-                    LuaValue::from_bits(super::exec::jit_str_byte(argv[0].to_bits(), iv.to_bits()));
+                let outv = LuaValue::from_bits(jit_str_byte(argv[0].to_bits(), iv.to_bits()));
                 let t_out = Self::value_irt(outv);
                 let carg = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CARG, IRT_NIL),
@@ -2274,7 +2274,7 @@ impl Record {
                             IRCALL_STR_CMP,
                         ));
                         y = self.cur.ir.knum(0.0);
-                        xn = f64::from_bits(super::exec::jit_str_cmp(rav.to_bits(), rcv.to_bits()));
+                        xn = f64::from_bits(exec::jit_str_cmp(rav.to_bits(), rcv.to_bits()));
                         yn = 0.0;
                     } else {
                         return Err(TraceError::NYIBC); // Mixed/metamethods NYI.
@@ -2285,7 +2285,7 @@ impl Record {
                         // ISGE/ISGT are unordered (NaN behavior).
                         irop = IROp::from_u8(irop as u8 ^ 4);
                     }
-                    if !super::opt_fold::fold_numcmp(xn, yn, irop) {
+                    if !opt_fold::fold_numcmp(xn, yn, irop) {
                         irop = IROp::from_u8(irop as u8 ^ 5);
                     }
                     self.cur

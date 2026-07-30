@@ -7,6 +7,7 @@
 
 use crate::err::{LuaError, LuaResult};
 use crate::state::LuaState;
+use crate::stdlib::nargs;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 use crate::{
@@ -236,7 +237,7 @@ fn resolve_path(l: &mut LuaState, envname: &str, def: &[u8]) -> Vec<u8> {
             && let Some(parent) = exe.parent()
         {
             let dir = parent.to_string_lossy().into_owned().into_bytes();
-            s = gsub(&s, &pat, &dir);
+            s = gsub(&s, pat, &dir);
         }
     }
     let sid = l.heap().intern(&s);
@@ -327,7 +328,7 @@ fn lib_module(l: &mut LuaState) -> LuaResult<i32> {
         None => return Err(err_bad_arg(l, 1, "module", "string", "")),
     };
     let name = l.str_static(name_sid).to_vec();
-    let nargs = super::nargs(l);
+    let nargs = nargs(l);
 
     let tab = pushmodule(l, &name);
 

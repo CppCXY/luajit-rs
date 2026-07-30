@@ -20,6 +20,8 @@
 //! materialize the final snapshot into the Lua stack and restart from
 //! the top. A failing guard exits through its covering snapshot.
 
+use crate::jit::{ir, opt_fold, record};
+use crate::runtime::state::GcHeap;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
@@ -58,17 +60,18 @@ pub struct ExitResult {
 /// side trace recording was started (jit.state == Record).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult {
-    // Bind the heap for allocating helpers (string interning): traces
-    // are executed strictly single-threaded per VM.
-    JIT_HEAP.with(|c| c.set(l.heap() as *mut crate::state::GcHeap));
+    // Bind heap pointer for allocating helpers into exec_env[0]
+    // so the portable executor can pass it explicitly (avoids TLS
+    // conflicts when two Lua VMs run interleaved on the same thread).
+    // Machine-code helpers still read JIT_HEAP via thread_local below.
     let g = l.global();
+    let heap_ptr = l.heap() as *mut crate::state::GcHeap;
     let mut env = std::mem::take(&mut g.jit.exec_env);
     if env.len() < g.jit.env_need {
-        // Machine-code chains switch traces without returning to Rust:
-        // size the buffer for the largest stored trace up front. Stale
-        // contents are harmless (defs precede uses).
         env.resize(g.jit.env_need, 0u64);
     }
+    env[0] = heap_ptr as u64;
+    JIT_HEAP.with(|c| c.set(heap_ptr));
     let hotexit = g.jit.param(JitParam::HotExit) as u8;
     let mut current = traceno;
     // Current frame base: recursive traces (Uprec/Tailrec) and Root
@@ -217,7 +220,9 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
         if snap.count != SNAPCOUNT_DONE {
             snap.count += 1;
             if snap.count >= hotexit {
-                super::trace::trace_hot_side(l, cbase, current, exitno);
+                use crate::jit::trace;
+
+                trace::trace_hot_side(l, cbase, current, exitno);
             }
         }
         break ExitResult {
@@ -377,13 +382,13 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 }
                 IROp::CALLL => {
                     let idx = ins.op2 as u32;
-                    let bits = match super::record::ircall_arity(idx) {
+                    let bits = match record::ircall_arity(idx) {
                         1 => {
                             let x = val(env, ins.op1 as IRRef);
                             match idx {
-                                super::record::IRCALL_STR_LEN => jit_str_len(x),
-                                super::record::IRCALL_STR_CHAR => jit_str_char(x),
-                                super::record::IRCALL_TAB_LEN => jit_alen(x),
+                                record::IRCALL_STR_LEN => jit_str_len(x),
+                                record::IRCALL_STR_CHAR => jit_str_char(x),
+                                record::IRCALL_TAB_LEN => jit_alen(x),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -392,13 +397,13 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                             debug_assert_eq!(carg.op(), IROp::CARG);
                             let (x, y) = (val(env, carg.op1 as IRRef), val(env, carg.op2 as IRRef));
                             match idx {
-                                super::record::IRCALL_TAB_NEXTK => jit_tnextk(x, y),
-                                super::record::IRCALL_FMOD => jit_fmod(x, y),
-                                super::record::IRCALL_STR_CMP => jit_str_cmp(x, y),
-                                super::record::IRCALL_STR_BYTE => jit_str_byte(x, y),
-                                super::record::IRCALL_TAB_CONCAT => jit_tconcat(x, y),
-                                super::record::IRCALL_CAT => jit_cat(x, y),
-                                super::record::IRCALL_USET => jit_uset(x, y),
+                                record::IRCALL_TAB_NEXTK => jit_tnextk(x, y),
+                                record::IRCALL_FMOD => jit_fmod(x, y),
+                                record::IRCALL_STR_CMP => jit_str_cmp(x, y),
+                                record::IRCALL_STR_BYTE => jit_str_byte(x, y),
+                                record::IRCALL_TAB_CONCAT => jit_tconcat(x, y),
+                                record::IRCALL_CAT => jit_cat(x, y),
+                                record::IRCALL_USET => jit_uset(x, y),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -413,8 +418,8 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                                 val(env, cargj.op2 as IRRef),
                             );
                             match idx {
-                                super::record::IRCALL_STR_SUB => jit_str_sub(x, y, z),
-                                super::record::IRCALL_VARG => jit_varg(x, y, z),
+                                record::IRCALL_STR_SUB => jit_str_sub(x, y, z),
+                                record::IRCALL_VARG => jit_varg(x, y, z),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -481,12 +486,12 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     if irt_isint(ins.t()) {
                         let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
                         let y = f64::from_bits(val(env, ins.op2 as IRRef)) as i32;
-                        let z = super::opt_fold::kfold_intop(x, y, op);
+                        let z = opt_fold::kfold_intop(x, y, op);
                         env[(r - REF_BIAS) as usize] = (z as f64).to_bits();
                     } else {
                         let x = f64::from_bits(val(env, ins.op1 as IRRef));
                         let y = f64::from_bits(val(env, ins.op2 as IRRef));
-                        let z = super::opt_fold::fold_numarith(x, y, op);
+                        let z = opt_fold::fold_numarith(x, y, op);
                         env[(r - REF_BIAS) as usize] = z.to_bits();
                     }
                 }
@@ -501,10 +506,10 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 IROp::FPMATH => {
                     let x = f64::from_bits(val(env, ins.op1 as IRRef));
                     let z = match ins.op2 as u32 {
-                        super::record::IRFPM_FLOOR => x.floor(),
-                        super::record::IRFPM_CEIL => x.ceil(),
-                        super::record::IRFPM_TRUNC => x.trunc(),
-                        super::record::IRFPM_SQRT => x.sqrt(),
+                        record::IRFPM_FLOOR => x.floor(),
+                        record::IRFPM_CEIL => x.ceil(),
+                        record::IRFPM_TRUNC => x.trunc(),
+                        record::IRFPM_SQRT => x.sqrt(),
                         _ => unreachable!("bad FPMATH literal"),
                     };
                     env[(r - REF_BIAS) as usize] = z.to_bits();
@@ -520,7 +525,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let cond = if irt_isnum(ins.t()) {
                         let x = f64::from_bits(val(env, ins.op1 as IRRef));
                         let y = f64::from_bits(val(env, ins.op2 as IRRef));
-                        super::opt_fold::fold_numcmp(x, y, op)
+                        opt_fold::fold_numcmp(x, y, op)
                     } else if irt_isint(ins.t()) {
                         let x = f64::from_bits(val(env, ins.op1 as IRRef)) as i32;
                         let y = f64::from_bits(val(env, ins.op2 as IRRef)) as i32;
@@ -568,7 +573,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     } else if irt_isint(tgt) && ins.is_guard() {
                         // NUM → INT (guarded): verify exact int32.
                         let x = f64::from_bits(src);
-                        if super::ir::num_isint(x) {
+                        if ir::num_isint(x) {
                             (x as i32 as f64).to_bits()
                         } else {
                             return exit_snapshot(l, base, cbase, tr, env, snapidx);
@@ -822,7 +827,7 @@ pub extern "C" fn jit_fmod(a_bits: u64, b_bits: u64) -> u64 {
 
 thread_local! {
     /// Heap of the VM currently executing a trace (set by `trace_exec`).
-    static JIT_HEAP: std::cell::Cell<*mut crate::state::GcHeap> =
+    static JIT_HEAP: std::cell::Cell<*mut GcHeap> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
     /// One-past-the-end address of the current Lua stack buffer, for
     /// the machine-code recursive tails' headroom check.
@@ -854,12 +859,14 @@ fn str_bytes(bits: u64) -> &'static [u8] {
 }
 
 /// The heap bound by `trace_exec` (for allocating helpers).
+/// Prefer `jit_heap_from_env` for portable-executor callers that have
+/// the env buffer; this fallback reads the thread-local (machine-code path).
 fn jit_heap() -> &'static mut crate::state::GcHeap {
     unsafe {
         JIT_HEAP
             .with(|c| c.get())
             .as_mut()
-            .expect("allocating helper outside trace_exec")
+            .expect("JIT_HEAP not set")
     }
 }
 
@@ -1071,5 +1078,11 @@ pub extern "C" fn jit_varg(base_ptr: u64, frame_link: u64, packed: u64) -> u64 {
 
 #[cfg(target_arch = "wasm32")]
 pub fn trace_exec(_l: &mut crate::state::LuaState, _base: usize, _traceno: u32) -> ExitResult {
-    ExitResult { pc: 0, exitno: 0, baseslot: 2, gcexit: false, shift: 0 }
+    ExitResult {
+        pc: 0,
+        exitno: 0,
+        baseslot: 2,
+        gcexit: false,
+        shift: 0,
+    }
 }
