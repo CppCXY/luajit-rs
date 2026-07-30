@@ -58,6 +58,7 @@ fn str_find(l: &mut LuaState) -> LuaResult<i32> {
         Ok(Some((start, end, caps))) => {
             let caps_vec: Vec<CaptureValue> = caps.iter().cloned().collect();
             let n = caps_vec.len();
+            l.stack_ensure(l.base + 2 + n);
             l.stack[l.base] = LuaValue::number((start + 1) as f64);
             l.stack[l.base + 1] = LuaValue::number(end as f64);
             push_captures(l, &caps_vec, s, l.base + 2);
@@ -191,6 +192,7 @@ fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
     if repl_arg.is_func() {
         let (result, count) = gsub_fn(l, &s, &pat, repl_arg, max)?;
         let sid = l.heap().intern(&result);
+        l.stack_ensure(l.base + 2);
         l.stack[l.base] = l.heap().str_value(sid);
         l.stack[l.base + 1] = LuaValue::number(count as f64);
         l.top = l.base + 2;
@@ -203,6 +205,7 @@ fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
         match gsub(&s, &pat, &repl, max) {
             Ok((result, count)) => {
                 let sid = l.heap().intern(&result);
+                l.stack_ensure(l.base + 2);
                 l.stack[l.base] = l.heap().str_value(sid);
                 l.stack[l.base + 1] = LuaValue::number(count as f64);
                 l.top = l.base + 2;
@@ -311,6 +314,7 @@ pub fn str_byte(l: &mut LuaState) -> LuaResult<i32> {
         Ok(1)
     } else {
         let hi = hi.min(len - 1);
+        l.stack_ensure(l.base + (hi - lo) as usize + 1);
         for k in lo..=hi {
             l.stack[l.base + (k - lo) as usize] = LuaValue::number(s[k as usize] as f64);
         }

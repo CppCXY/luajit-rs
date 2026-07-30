@@ -445,7 +445,6 @@ impl<T> Pool<T> {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
             if addr <= 0x1000 || addr >= ADDR_MAX as usize {
-                eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
                 continue;
@@ -475,7 +474,6 @@ impl<T> Pool<T> {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
             if addr <= 0x1000 || addr >= ADDR_MAX as usize {
-                eprintln!("SWEEP-CORRUPT-PTR at index {}: 0x{:x}", i, addr);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
                 continue;
@@ -587,9 +585,11 @@ impl<T> std::fmt::Debug for GcPtr<T> {
     }
 }
 
+use crate::compiler::lex::Interner;
 // ── Collector ───────────────────────────────────────────────────────────
 use crate::func::{GcFunc, Upval};
 use crate::proto::{KGc, Proto};
+use crate::runtime::userdata::GcUserData;
 use crate::state::{GcHeap, GlobalState, LuaState};
 use crate::table::LuaTable;
 use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LJ_TUDATA, LuaValue};
@@ -612,12 +612,12 @@ pub enum Gray {
     Func(GcPtr<GcFunc>),
     Proto(GcPtr<Proto>),
     Thread(GcPtr<LuaState>),
-    UserData(GcPtr<crate::runtime::userdata::GcUserData>),
+    UserData(GcPtr<GcUserData>),
 }
 
 struct Marker<'g> {
     gray: Vec<Gray>,
-    strings: &'g crate::string::Interner,
+    strings: &'g Interner,
 }
 impl<'g> Marker<'g> {
     fn mark_value(&mut self, v: LuaValue) {

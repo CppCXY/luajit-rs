@@ -60,7 +60,7 @@ pub fn pushv(l: &mut LuaState, vs: &[LuaValue]) {
 #[inline]
 pub fn arg(l: &LuaState, i: usize) -> LuaValue {
     let slot = l.base + i;
-    if slot < l.top {
+    if slot < l.top && slot < l.stack.len() {
         l.stack[slot]
     } else {
         LuaValue::NIL

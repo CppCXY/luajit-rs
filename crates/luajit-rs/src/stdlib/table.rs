@@ -180,6 +180,7 @@ fn tab_unpack(l: &mut LuaState) -> LuaResult<i32> {
     let i = arg(l, 1).as_number().unwrap_or(1.0) as i32;
     let j = arg(l, 2).as_number().unwrap_or(t.as_ref().len() as f64) as i32;
     let mut cnt = 0;
+    l.stack_ensure(l.base + (j - i + 1) as usize);
     for k in i..=j {
         let v = t.as_ref().get_int(k);
         l.stack[l.base + cnt] = v;

@@ -218,6 +218,8 @@ fn call_c(
     want: i32,
 ) -> LuaResult<usize> {
     let args_base = func_slot + 2;
+    // Ensure the stack can hold the args and results before touching it.
+    l.stack_ensure(args_base + nargs + 8);
     let saved_base = l.base;
     let saved_top = l.top;
     // Set a frame link so error walkers can find the caller.
@@ -238,6 +240,7 @@ fn call_c(
             return Err(e);
         }
     };
+    l.stack_ensure((func_slot + n + 8).max(args_base + nargs + 8));
     for i in 0..n {
         l.stack[func_slot + i] = l.stack[args_base + i];
     }
@@ -2092,6 +2095,13 @@ impl Interp {
                             let numparams = self.proto().numparams as usize;
                             let nvarg = (delta - 2).saturating_sub(numparams);
                             let dst = a as usize;
+                            let need = cur_base!() + dst + nvarg + 8;
+                            if need > self.l().stack.len() {
+                                sync!();
+                                self.l().stack_ensure(need);
+                                self.sp = self.l().stack.as_mut_ptr();
+                                resync!();
+                            }
                             let src = unsafe { bp.sub(delta).add(numparams) };
                             if bc_b(ins) == 0 {
                                 for i in 0..nvarg {
@@ -2502,7 +2512,11 @@ impl Interp {
         nargs: usize,
     ) -> LuaResult<usize> {
         let args_base = func_slot + 2;
+        // self.l() returns &mut LuaState, but we hold it as a raw pointer
+        // so we can update self.sp mid-function if stack_ensure reallocs.
+        let lp = self as *mut Interp;
         let l = self.l();
+        l.stack_ensure(args_base + nargs + 8);
         let saved_base = l.base;
         let saved_top = l.top;
         // Set a frame link so error walkers can find the caller's Lua frame.
@@ -2524,6 +2538,12 @@ impl Interp {
                 return Err(e);
             }
         };
+        // C function may return more results than nargs; ensure room and
+        // refresh sp in case any internal stack_ensure reallocated the Vec.
+        l.stack_ensure((func_slot + n + 8).max(args_base + nargs + 8));
+        unsafe {
+            (*lp).sp = l.stack.as_mut_ptr();
+        }
         for i in 0..n {
             l.stack[func_slot + i] = l.stack[args_base + i];
         }

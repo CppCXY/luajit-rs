@@ -78,6 +78,7 @@ pub(crate) fn do_resume(
             want,
         } => {
             co.suspend = Suspend::Start;
+            co.stack_ensure(slot + 2 + nargs);
             for i in 0..nargs {
                 co.stack[slot + 2 + i] = l.stack[args_at + i];
             }
@@ -85,6 +86,7 @@ pub(crate) fn do_resume(
         }
         Suspend::Return { base, slot } => {
             co.suspend = Suspend::Start;
+            co.stack_ensure(slot + 2 + nargs);
             for i in 0..nargs {
                 co.stack[slot + 2 + i] = l.stack[args_at + i];
             }
@@ -142,6 +144,7 @@ fn lib_resume(l: &mut LuaState) -> LuaResult<i32> {
         // Status validation errors surface as `false, msg` from resume.
         Err(LuaError::Runtime) => {
             let msg = l.errval;
+            l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = msg;
             l.top = l.base + 2;
@@ -153,6 +156,7 @@ fn lib_resume(l: &mut LuaState) -> LuaResult<i32> {
     match outcome {
         Outcome::Done(n) => {
             // true, results...
+            l.stack_ensure(l.base + 1 + n);
             for i in (0..n).rev() {
                 l.stack[l.base + 1 + i] = co.stack[i];
             }
@@ -161,6 +165,7 @@ fn lib_resume(l: &mut LuaState) -> LuaResult<i32> {
             Ok((1 + n) as i32)
         }
         Outcome::Yielded(slot, n) => {
+            l.stack_ensure(l.base + 1 + n);
             for i in 0..n {
                 l.stack[l.base + 1 + i] = co.stack[slot + i];
             }
@@ -169,6 +174,7 @@ fn lib_resume(l: &mut LuaState) -> LuaResult<i32> {
             Ok((1 + n) as i32)
         }
         Outcome::Failed => {
+            l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = co.errval;
             l.top = l.base + 2;
@@ -258,6 +264,7 @@ fn wrap_call(l: &mut LuaState) -> LuaResult<i32> {
     let co = co_ref.get();
     match outcome {
         Outcome::Done(n) => {
+            l.stack_ensure(l.base + n);
             for i in 0..n {
                 l.stack[l.base + i] = co.stack[i];
             }
@@ -265,6 +272,7 @@ fn wrap_call(l: &mut LuaState) -> LuaResult<i32> {
             Ok(n as i32)
         }
         Outcome::Yielded(slot, n) => {
+            l.stack_ensure(l.base + n);
             for i in 0..n {
                 l.stack[l.base + i] = co.stack[slot + i];
             }

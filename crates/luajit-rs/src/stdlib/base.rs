@@ -87,6 +87,7 @@ fn lib_select(l: &mut LuaState) -> LuaResult<i32> {
         _ => return Err(err_bad_arg(l, 1, "select", "number or '#'", "")),
     };
     let mut cnt = 0;
+    l.stack_ensure(l.base + n.saturating_sub(k));
     for i in k..n {
         l.stack[l.base + cnt] = arg(l, i);
         cnt += 1;
@@ -257,6 +258,7 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
     let n = nargs(l).saturating_sub(1);
     // Move `n` trailing args into call position right after `f`.
     // Reverse order: dest overlaps src (dest = src + 1).
+    l.stack_ensure(l.base + 2 + n);
     for i in (0..n).rev() {
         l.stack[l.base + 2 + i] = arg(l, i + 1);
     }
@@ -264,6 +266,7 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
     match crate::vm::execute(l, l.base, n, -1) {
         Ok(nret) => {
             // Shift results down so the true/false header can go first.
+            l.stack_ensure(l.base + nret + 1);
             for i in (0..nret).rev() {
                 l.stack[l.base + i + 1] = l.stack[l.base + i];
             }
@@ -272,6 +275,7 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
         }
         Err(LuaError::Runtime) => {
             l.base = saved_base;
+            l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
             Ok(2)
@@ -284,11 +288,13 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
     let _msgh = arg(l, 1); // error handler (NYI: not invoked on error)
     let n = nargs(l).saturating_sub(2);
+    l.stack_ensure(l.base + 2 + n);
     for i in 0..n {
         l.stack[l.base + 2 + i] = arg(l, i + 2);
     }
     match crate::vm::execute(l, l.base, n, -1) {
         Ok(nret) => {
+            l.stack_ensure(l.base + nret + 1);
             for i in (0..nret).rev() {
                 l.stack[l.base + i + 1] = l.stack[l.base + i];
             }
@@ -296,6 +302,7 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
             Ok(nret as i32 + 1)
         }
         Err(LuaError::Runtime) => {
+            l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
             Ok(2)
@@ -396,6 +403,7 @@ fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
             let r = match call_reader(l, src) {
                 Ok(chunk) => chunk,
                 Err(e) => {
+                    l.stack_ensure(l.base + 2);
                     l.stack[l.base] = LuaValue::NIL;
                     l.stack[l.base + 1] = l.global().heap.str_value(
                         l.global().heap.intern(
@@ -421,6 +429,7 @@ fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
                 Ok(1)
             }
             Err(msg) => {
+                l.stack_ensure(l.base + 2);
                 l.stack[l.base] = LuaValue::NIL;
                 l.stack[l.base + 1] = l
                     .global()
@@ -457,6 +466,7 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
             Ok(1)
         }
         Err(msg) => {
+            l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::NIL;
             l.stack[l.base + 1] = l
                 .global()

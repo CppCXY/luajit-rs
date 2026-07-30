@@ -373,7 +373,7 @@ impl LuaState {
     /// resize so closures stay correct.
     pub fn new(g: GlobalRef, is_main: bool) -> LuaState {
         let max_stack = if is_main { STACK_MAX } else { CO_STACK_MAX };
-        let initial_len = if is_main { 1024 } else { 64 };
+        let initial_len = if is_main { 256 } else { 8 };
         LuaState {
             g,
             is_main,
@@ -408,7 +408,7 @@ impl LuaState {
     /// stores, string concatenation) eventually trigger collection.
     #[inline]
     pub fn stack_ensure(&mut self, need: usize) {
-        if need > self.stack.len() {
+        if need >= self.stack.len() {
             let new_len = (self.stack.len() * 2).max(need + 16).min(self._max_stack);
             assert!(new_len <= self._max_stack, "stack overflow");
             let old_ptr = self.stack.as_mut_ptr();
