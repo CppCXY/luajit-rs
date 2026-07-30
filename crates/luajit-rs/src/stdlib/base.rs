@@ -199,6 +199,10 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             push(l, LuaValue::number(0.0));
             Ok(1)
         }
+        b"stop" | b"restart" | b"setpause" | b"setstepmul" => {
+            // GC parameters — no-op for now.
+            Ok(0)
+        }
         b"count" => {
             let heap = &l.global().heap;
             let bytes = heap.total + heap.strings.bytes();
@@ -207,6 +211,13 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
         }
         _ => Err(err_bad_arg(l, 1, "collectgarbage", "option string", "")),
     }
+}
+
+fn lib_gcinfo(l: &mut LuaState) -> LuaResult<i32> {
+    let heap = &l.global().heap;
+    let bytes = heap.total + heap.strings.bytes();
+    push(l, LuaValue::number(bytes as f64 / 1024.0));
+    Ok(1)
 }
 
 pub fn lib_rawget(l: &mut LuaState) -> LuaResult<i32> {
@@ -478,6 +489,46 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
+fn lib_loadfile(l: &mut LuaState) -> LuaResult<i32> {
+    let filename = match arg(l, 0).as_string() {
+        Some(s) => s.as_ref().as_bytes().to_vec(),
+        None => return Err(err_bad_arg(l, 1, "loadfile", "string", "")),
+    };
+    let chunkname = std::str::from_utf8(&filename)
+        .unwrap_or("=(loadfile)")
+        .to_string();
+    let path = String::from_utf8_lossy(&filename);
+    match std::fs::read(path.as_ref()) {
+        Ok(code) => match crate::state::load(l, code, &chunkname) {
+            Ok(v) => {
+                push(l, v);
+                Ok(1)
+            }
+            Err(msg) => {
+                l.stack_ensure(l.base + 2);
+                l.stack[l.base] = LuaValue::NIL;
+                l.stack[l.base + 1] = l
+                    .global()
+                    .heap
+                    .str_value(l.global().heap.intern(msg.as_bytes()));
+                l.top = l.base + 2;
+                Ok(2)
+            }
+        },
+        Err(e) => {
+            l.stack_ensure(l.base + 2);
+            l.stack[l.base] = LuaValue::NIL;
+            let msg = format!("cannot open {}: {}", path, e);
+            l.stack[l.base + 1] = l
+                .global()
+                .heap
+                .str_value(l.global().heap.intern(msg.as_bytes()));
+            l.top = l.base + 2;
+            Ok(2)
+        }
+    }
+}
+
 pub fn open(l: &mut LuaState) {
     lual_reg!(l, b"", LibTarget::BaseLib)
         .func(b"print", lib_print)
@@ -492,6 +543,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"setmetatable", lib_setmetatable)
         .func(b"assert", lib_assert)
         .func(b"collectgarbage", lib_collectgarbage)
+        .func(b"gcinfo", lib_gcinfo)
         .func(b"rawget", lib_rawget)
         .func(b"rawset", lib_rawset)
         .func(b"rawequal", lib_rawequal)
@@ -501,6 +553,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"getmetatable", lib_getmetatable)
         .func(b"loadstring", lib_loadstring)
         .func(b"load", lib_load)
+        .func(b"loadfile", lib_loadfile)
         .build();
 
     let gsid = l.heap().intern(b"_G");

@@ -19,7 +19,8 @@ use luajit_rs::internal::state::{Lua, load};
 use luajit_rs::internal::table::LuaTable;
 use luajit_rs::{
     LuaError, LuaState, LuaValue, internal, lua_error_message, lua_getglobal, lua_gettop,
-    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring, lual_openlibs,
+    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring,
+    lual_openlibs,
 };
 
 const LUA_PROMPT: &str = "> ";
@@ -96,14 +97,20 @@ fn collectargs(argv: &[String]) -> Result<Args, String> {
 fn create_arg_table(l: &mut LuaState, args: &[String], argn: usize) {
     let g = l.global();
     let script_idx = argn.min(args.len().saturating_sub(1));
-    let total = args.len() - script_idx;
     let t = g.heap.alloc_table(LuaTable::new(0, 1));
-    if script_idx < args.len() {
-        let name = args[script_idx].as_str();
-        let sid = g.heap.intern(name.as_bytes());
+    // Standard Lua 5.1: arg[-1] = interpreter path, arg[0] = script name
+    if !args.is_empty() {
+        let path = args[0].replace('\\', "/");
+        let sid = g.heap.intern(path.as_bytes());
         let v = g.heap.str_value(sid);
         t.as_mut().set(LuaValue::number(-1.0), v);
+    }
+    if script_idx < args.len() {
+        let name = args[script_idx].replace('\\', "/");
+        let sid = g.heap.intern(name.as_bytes());
+        let v = g.heap.str_value(sid);
         t.as_mut().set(LuaValue::number(0.0), v);
+        let total = args.len() - script_idx;
         for i in 1..total {
             let s = args[script_idx + i].as_str();
             let sid2 = g.heap.intern(s.as_bytes());
@@ -209,6 +216,30 @@ fn dotty(ll: &mut LuaState) -> i32 {
     0
 }
 
+fn try_loadfile(lua: &mut Lua, name: &str) -> bool {
+    let ll = lua.main();
+    let src = match std::fs::read(name) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let _ = lua_settop(ll, 0);
+    if lual_loadstring(ll, &src).is_err() {
+        eprintln!("luajit-rs: compile error in {name}");
+        return false;
+    }
+    match lua_pcall(ll, 0, 0, 0) {
+        Ok(()) => true,
+        Err(LuaError::Runtime) => {
+            eprintln!("luajit-rs: {}", error_msg(ll));
+            false
+        }
+        Err(LuaError::Yield) => {
+            eprintln!("luajit-rs: attempt to yield");
+            false
+        }
+    }
+}
+
 fn dofile(lua: &mut Lua, name: &str) -> i32 {
     let ll = lua.main();
     let src = match std::fs::read(name) {
@@ -218,8 +249,9 @@ fn dofile(lua: &mut Lua, name: &str) -> i32 {
             return 1;
         }
     };
+    let _ = lua_settop(ll, 0);
     if lual_loadstring(ll, &src).is_err() {
-        eprintln!("luajit-rs: compile error in {name}");
+        eprintln!("luajit-rs: compile error in {name}: {}", String::from_utf8_lossy(&src));
         return 1;
     }
     match lua_pcall(ll, 0, 0, 0) {
@@ -237,6 +269,7 @@ fn dofile(lua: &mut Lua, name: &str) -> i32 {
 
 fn dostring(lua: &mut Lua, s: &str, name: &str) -> i32 {
     let ll = lua.main();
+    let _ = lua_settop(ll, 0);
     if lual_loadstring(ll, s.as_bytes()).is_err() {
         eprintln!("luajit-rs: compile error in {name}");
         return 1;
@@ -275,25 +308,14 @@ fn run_args(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
             }
             Some('l') => {
                 let name = if a.len() > 2 {
-                    &a[2..]
+                    a[2..].to_string()
                 } else {
                     i += 1;
-                    argv[i].as_str()
+                    argv[i].clone()
                 };
-                let ll = lua.main();
-                lua_getglobal(ll, "require");
-                lua_pushstring(ll, name.as_bytes());
-                match lua_pcall(ll, 1, 0, 0) {
-                    Ok(()) => {}
-                    Err(LuaError::Runtime) => {
-                        eprintln!("luajit-rs: {}", error_msg(ll));
-                        return 1;
-                    }
-                    Err(LuaError::Yield) => {
-                        eprintln!("luajit-rs: attempt to yield");
-                        return 1;
-                    }
-                }
+                // Try loading as file; library names like "string"/"io"
+                // are already loaded by lual_openlibs, so skip if file not found.
+                let _ = try_loadfile(lua, &name);
             }
             Some('j') => {
                 let cmd = if a.len() > 2 {
@@ -436,7 +458,7 @@ fn main() {
         }
         let ll = lua.main();
         dotty(ll);
-    } else if (flags.argn as usize) >= args.len() && !flags.exec && !flags.version {
+    } else if (flags.argn as usize) >= args.len() && !flags.exec && !flags.version && flags.argn == 1 {
         if stdin_is_tty() {
             println!("{VERSION}");
             let ll = lua.main();

@@ -264,9 +264,18 @@ fn os_execute(l: &mut LuaState) -> LuaResult<i32> {
             None => return Err(err_bad_arg(l, 1, "os.execute", "string", "")),
         };
         let status = if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .args(["/C", &cmd_str])
-                .status()
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static BAT_ID: AtomicU64 = AtomicU64::new(0);
+            let n = BAT_ID.fetch_add(1, Ordering::Relaxed);
+            let tmp = std::env::temp_dir().join(format!("lua_{}.bat", n));
+            let bat_content = format!("@echo off\r\n{}\r\n", cmd_str);
+            let _ = std::fs::write(&tmp, &bat_content);
+            let r = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg(&tmp)
+                .status();
+            let _ = std::fs::remove_file(&tmp);
+            r
         } else {
             std::process::Command::new("sh")
                 .arg("-c")
@@ -274,9 +283,11 @@ fn os_execute(l: &mut LuaState) -> LuaResult<i32> {
                 .status()
         };
         match status {
-            Ok(s) if s.success() => push(l, LuaValue::boolean(true)),
-            Ok(_) => push(l, LuaValue::NIL),
-            Err(_) => push(l, LuaValue::NIL),
+            Ok(s) => {
+                let code = s.code().unwrap_or(0) as f64;
+                push(l, LuaValue::number(code));
+            }
+            Err(_) => push(l, LuaValue::number(1.0)),
         }
         Ok(1)
     }
@@ -371,8 +382,17 @@ fn os_setlocale(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn os_tmpname(l: &mut LuaState) -> LuaResult<i32> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let ts = time::unix_secs();
-    let name = format!("/tmp/lua_{}", ts);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = std::env::temp_dir();
+    let name = tmp
+        .join(format!("lua_{}_{:04}", ts, id % 10000))
+        .to_string_lossy()
+        .into_owned();
+    // Use forward slashes for Lua compatibility.
+    let name = name.replace('\\', "/");
     let sid = l.heap().intern(name.as_bytes());
     push(l, l.heap().str_value(sid));
     Ok(1)

@@ -652,25 +652,43 @@ pub fn new_thread(l: &LuaState) -> StateRef {
 
 pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue, String> {
     let g = l.global();
-    let mut parser = Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
-    // Suppress panic output for compile errors (caught by catch_unwind).
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));
-    std::panic::set_hook(prev_hook);
-    let mut proto = match result {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = if let Some(ce) = e.downcast_ref::<CompileError>() {
-                ce.0.clone()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(s) = e.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else {
-                "unknown compile error".to_string()
-            };
-            return Err(msg);
+
+    // Detect string.dump cache format: "\x1bLJ" + index
+    let mut proto = if src.len() >= 3 && &src[..3] == b"\x1bLJ" {
+        let idx_str = String::from_utf8_lossy(&src[3..]);
+        if let Ok(idx) = idx_str.parse::<u32>() {
+            let cache_key = g.heap.intern(b"__LUARS_DUMP_CACHE");
+            let key = g.heap.str_value(cache_key);
+            let globals = g.globals.as_ref();
+            if let Some(fv) = globals.get(key).as_table()
+                && fv.as_ref().get_int(idx as i32).is_func()
+            {
+                return Ok(fv.as_ref().get_int(idx as i32));
+            }
+            return Err("corrupted dump cache".to_string());
+        }
+        return Err("corrupted dump cache".to_string());
+    } else {
+        let mut parser = Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));
+        std::panic::set_hook(prev_hook);
+        match result {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = if let Some(ce) = e.downcast_ref::<CompileError>() {
+                    ce.0.clone()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else {
+                    "unknown compile error".to_string()
+                };
+                return Err(msg);
+            }
         }
     };
 

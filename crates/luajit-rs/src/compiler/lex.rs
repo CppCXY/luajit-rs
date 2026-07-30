@@ -212,6 +212,15 @@ impl<'a> LexState<'a> {
             ls.pos += 2;
             ls.next_char();
         }
+        // Skip shebang line (#!...) at the beginning of the file.
+        if ls.c == b'#' as i32 {
+            while !ls.is_eol() && ls.c != LEX_EOF {
+                ls.next_char();
+            }
+            if ls.c != LEX_EOF {
+                ls.newline();
+            }
+        }
         ls
     }
 

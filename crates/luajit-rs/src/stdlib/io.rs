@@ -4,7 +4,7 @@
 //! registry (files are OS resources shared across VMs).
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::sync::Mutex;
 
 use crate::api::lua_gettop;
@@ -17,12 +17,18 @@ use crate::value::LuaValue;
 use super::{LibTarget, arg, err_bad_arg, push, pushv, tostring_bytes};
 use crate::lual_reg;
 
+#[allow(dead_code)]
 enum Entry {
     Read(BufReader<File>),
-    Write(File),
+    Write(BufWriter<File>),
+    Stdin,
+    Stdout,
+    Stderr,
 }
 
 static FILES: Mutex<Vec<Option<Entry>>> = Mutex::new(Vec::new());
+static DEFAULT_INPUT: Mutex<Option<usize>> = Mutex::new(None);
+static DEFAULT_OUTPUT: Mutex<Option<usize>> = Mutex::new(None);
 
 fn registry_put(e: Entry) -> usize {
     let mut files = FILES.lock().unwrap();
@@ -256,25 +262,55 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
     }
     let mut out = Vec::with_capacity(fmts.len());
     match fd {
-        None => {
-            let stdin = std::io::stdin();
-            let mut lock = stdin.lock();
-            for f in fmts {
-                out.push(read_format(l, &mut lock, f)?);
+        None => match *DEFAULT_INPUT.lock().unwrap() {
+            Some(id) => {
+                let mut files = FILES.lock().unwrap();
+                match files.get_mut(id).and_then(|e| e.as_mut()) {
+                    Some(Entry::Read(r)) => {
+                        for f in fmts {
+                            out.push(read_format(l, r, f)?);
+                        }
+                    }
+                    Some(Entry::Stdin) => {
+                        drop(files);
+                        let stdin = std::io::stdin();
+                        let mut lock = stdin.lock();
+                        for f in fmts {
+                            out.push(read_format(l, &mut lock, f)?);
+                        }
+                    }
+                    Some(Entry::Write(_) | Entry::Stdout | Entry::Stderr) => {
+                        return Err(l.runtime_error(b"file not opened for reading"));
+                    }
+                    None => return Err(l.runtime_error(b"attempt to use a closed file")),
+                }
             }
-        }
+            None => {
+                let stdin = std::io::stdin();
+                let mut lock = stdin.lock();
+                for f in fmts {
+                    out.push(read_format(l, &mut lock, f)?);
+                }
+            }
+        },
         Some(id) => {
             let mut files = FILES.lock().unwrap();
             let entry = files.get_mut(id).and_then(|e| e.as_mut());
             match entry {
                 Some(Entry::Read(r)) => {
-                    // The registry lock is process-wide; nothing inside
-                    // read_format touches FILES again.
                     for f in fmts {
                         out.push(read_format(l, r, f)?);
                     }
                 }
-                Some(Entry::Write(_)) => {
+                Some(Entry::Stdin) => {
+                    drop(files);
+                    let stdin = std::io::stdin();
+                    let mut lock = stdin.lock();
+                    for f in fmts {
+                        out.push(read_format(l, &mut lock, f)?);
+                    }
+                }
+                Some(Entry::Write(_) | Entry::Stdout | Entry::Stderr) => {
                     return Err(l.runtime_error(b"file not opened for reading"));
                 }
                 None => return Err(l.runtime_error(b"attempt to use a closed file")),
@@ -298,18 +334,46 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
         chunks.push(tostring_bytes(l, v));
     }
     let result: std::io::Result<()> = match fd {
-        None => {
-            let mut so = std::io::stdout();
-            chunks
-                .iter()
-                .try_for_each(|c| so.write_all(c))
-                .and_then(|_| so.flush())
-        }
+        None => match *DEFAULT_OUTPUT.lock().unwrap() {
+            Some(id) => {
+                let mut files = FILES.lock().unwrap();
+                match files.get_mut(id).and_then(|e| e.as_mut()) {
+                    Some(Entry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
+                    Some(Entry::Stdout) | Some(Entry::Stderr) => {
+                        drop(files);
+                        let mut so = std::io::stdout();
+                        chunks
+                            .iter()
+                            .try_for_each(|c| so.write_all(c))
+                            .and_then(|_| so.flush())
+                    }
+                    Some(Entry::Read(_) | Entry::Stdin) => {
+                        return Err(l.runtime_error(b"file not opened for writing"));
+                    }
+                    None => return Err(l.runtime_error(b"attempt to use a closed file")),
+                }
+            }
+            None => {
+                let mut so = std::io::stdout();
+                chunks
+                    .iter()
+                    .try_for_each(|c| so.write_all(c))
+                    .and_then(|_| so.flush())
+            }
+        },
         Some(id) => {
             let mut files = FILES.lock().unwrap();
             match files.get_mut(id).and_then(|e| e.as_mut()) {
                 Some(Entry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
-                Some(Entry::Read(_)) => {
+                Some(Entry::Stdout) | Some(Entry::Stderr) => {
+                    drop(files);
+                    let mut so = std::io::stdout();
+                    chunks
+                        .iter()
+                        .try_for_each(|c| so.write_all(c))
+                        .and_then(|_| so.flush())
+                }
+                Some(Entry::Read(_) | Entry::Stdin) => {
                     return Err(l.runtime_error(b"file not opened for writing"));
                 }
                 None => return Err(l.runtime_error(b"attempt to use a closed file")),
@@ -435,12 +499,12 @@ fn io_open(l: &mut LuaState) -> LuaResult<i32> {
     let m = mode.trim_end_matches('b');
     let entry = match m {
         "r" => File::open(&path).map(|f| Entry::Read(BufReader::new(f))),
-        "w" => File::create(&path).map(Entry::Write),
+        "w" => File::create(&path).map(|f| Entry::Write(BufWriter::new(f))),
         "a" => std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(&path)
-            .map(Entry::Write),
+            .map(|f| Entry::Write(BufWriter::new(f))),
         _ => return ret_fail(l, &format!("invalid mode '{}'", mode)),
     };
     match entry {
@@ -482,7 +546,172 @@ fn io_close(l: &mut LuaState) -> LuaResult<i32> {
     if lua_gettop(l) >= 1 {
         return handle_close(l);
     }
+    // Close default output: drop the file handle (BufWriter flushes on drop).
+    let out_id = *DEFAULT_OUTPUT.lock().unwrap();
+    if let Some(id) = out_id {
+        FILES.lock().unwrap()[id] = None;
+        *DEFAULT_OUTPUT.lock().unwrap() = None;
+    }
     push(l, LuaValue::TRUE);
+    Ok(1)
+}
+
+fn io_flush(l: &mut LuaState) -> LuaResult<i32> {
+    let out = *DEFAULT_OUTPUT.lock().unwrap();
+    match out {
+        Some(id) => {
+            let mut files = FILES.lock().unwrap();
+            match files.get_mut(id).and_then(|e| e.as_mut()) {
+                Some(Entry::Write(f)) => match f.flush() {
+                    Ok(()) => { push(l, LuaValue::TRUE); Ok(1) }
+                    Err(e) => ret_fail(l, &e.to_string()),
+                },
+                Some(Entry::Stdout | Entry::Stderr) => {
+                    drop(files);
+                    match std::io::stdout().flush() {
+                        Ok(()) => { push(l, LuaValue::TRUE); Ok(1) }
+                        Err(e) => ret_fail(l, &e.to_string()),
+                    }
+                }
+                _ => Err(l.runtime_error(b"default output not writable")),
+            }
+        }
+        None => {
+            match std::io::stdout().flush() {
+                Ok(()) => { push(l, LuaValue::TRUE); Ok(1) }
+                Err(e) => ret_fail(l, &e.to_string()),
+            }
+        }
+    }
+}
+
+fn io_input(l: &mut LuaState) -> LuaResult<i32> {
+    if lua_gettop(l) == 0 {
+        let in_id = *DEFAULT_INPUT.lock().unwrap();
+        match in_id {
+            Some(id) => {
+                let h = new_handle(l, id);
+                push(l, h);
+                Ok(1)
+            }
+            None => {
+                let id = registry_put(Entry::Stdin);
+                *DEFAULT_INPUT.lock().unwrap() = Some(id);
+                let h = new_handle(l, id);
+                push(l, h);
+                Ok(1)
+            }
+        }
+    } else {
+        let v = arg(l, 0);
+        let id = if let Some(fd) = handle_fd(l, 0) {
+            let files = FILES.lock().unwrap();
+            if files.get(fd).and_then(|e| e.as_ref()).is_none() {
+                return Err(l.runtime_error(b"attempt to use a closed file"));
+            }
+            fd
+        } else if let Some(s) = v.as_string() {
+            let path = String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned();
+            match File::open(&path) {
+                Ok(f) => registry_put(Entry::Read(BufReader::new(f))),
+                Err(e) => return ret_fail(l, &format!("{}: {}", path, e)),
+            }
+        } else {
+            return Err(err_bad_arg(l, 1, "input", "string or file", ""));
+        };
+        let old = *DEFAULT_INPUT.lock().unwrap();
+        *DEFAULT_INPUT.lock().unwrap() = Some(id);
+        match old {
+            Some(old_id) => {
+                let h = new_handle(l, old_id);
+                push(l, h);
+                Ok(1)
+            }
+            None => {
+                let h = new_handle(l, id);
+                push(l, h);
+                Ok(1)
+            }
+        }
+    }
+}
+
+fn io_output(l: &mut LuaState) -> LuaResult<i32> {
+    if lua_gettop(l) == 0 {
+        let out_id = *DEFAULT_OUTPUT.lock().unwrap();
+        match out_id {
+            Some(id) => {
+                let h = new_handle(l, id);
+                push(l, h);
+                Ok(1)
+            }
+            None => {
+                let id = registry_put(Entry::Stdout);
+                *DEFAULT_OUTPUT.lock().unwrap() = Some(id);
+                let h = new_handle(l, id);
+                push(l, h);
+                Ok(1)
+            }
+        }
+    } else {
+        let v = arg(l, 0);
+        let id = if let Some(fd) = handle_fd(l, 0) {
+            let files = FILES.lock().unwrap();
+            if files.get(fd).and_then(|e| e.as_ref()).is_none() {
+                return Err(l.runtime_error(b"attempt to use a closed file"));
+            }
+            fd
+        } else if let Some(s) = v.as_string() {
+            let path = String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned();
+            match File::create(&path) {
+                Ok(f) => registry_put(Entry::Write(BufWriter::new(f))),
+                Err(e) => return ret_fail(l, &format!("{}: {}", path, e)),
+            }
+        } else {
+            return Err(err_bad_arg(l, 1, "output", "string or file", ""));
+        };
+        let old = *DEFAULT_OUTPUT.lock().unwrap();
+        *DEFAULT_OUTPUT.lock().unwrap() = Some(id);
+        match old {
+            Some(old_id) => {
+                let h = new_handle(l, old_id);
+                push(l, h);
+                Ok(1)
+            }
+            None => {
+                let h = new_handle(l, id);
+                push(l, h);
+                Ok(1)
+            }
+        }
+    }
+}
+
+fn io_type(l: &mut LuaState) -> LuaResult<i32> {
+    if lua_gettop(l) == 0 {
+        push(l, LuaValue::NIL);
+        return Ok(1);
+    }
+    let v = arg(l, 0);
+    if v.as_table().is_some() {
+        let sid = l.heap().intern(b"__fd");
+        let k = l.heap().str_value(sid);
+        if v.as_table().unwrap().as_ref().get_str(k).as_number().is_some() {
+            let files = FILES.lock().unwrap();
+            let fd = v.as_table().unwrap().as_ref().get_str(k).as_number().unwrap() as usize;
+            if let Some(entry) = files.get(fd).and_then(|e| e.as_ref()) {
+                match entry {
+                    Entry::Read(_) | Entry::Write(_) | Entry::Stdin | Entry::Stdout | Entry::Stderr => {
+                        let sid = l.heap().intern(b"file"); push(l, l.heap().str_value(sid)); return Ok(1)
+                    }
+                }
+            }
+            let sid = l.heap().intern(b"closed file");
+            push(l, l.heap().str_value(sid));
+            return Ok(1);
+        }
+    }
+    push(l, LuaValue::NIL);
     Ok(1)
 }
 
@@ -493,5 +722,9 @@ pub fn open(l: &mut LuaState) {
         .func(b"write", io_write)
         .func(b"lines", io_lines)
         .func(b"close", io_close)
+        .func(b"flush", io_flush)
+        .func(b"input", io_input)
+        .func(b"output", io_output)
+        .func(b"type", io_type)
         .build();
 }

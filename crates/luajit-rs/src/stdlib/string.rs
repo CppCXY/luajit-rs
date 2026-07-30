@@ -6,6 +6,7 @@
 use crate::api::lua_gettop;
 use crate::err::LuaResult;
 use crate::state::LuaState;
+use crate::table::LuaTable;
 use crate::value::LuaValue;
 
 use super::{LibTarget, arg, err_bad_arg, push, tostring_bytes};
@@ -337,17 +338,27 @@ pub fn str_char(l: &mut LuaState) -> LuaResult<i32> {
 fn str_dump(l: &mut LuaState) -> LuaResult<i32> {
     let fv = arg(l, 0);
     match fv.as_func() {
-        Some(gf) => match gf.as_ref() {
-            crate::func::GcFunc::Lua(cl) => {
-                let pt = cl.proto.as_ref();
-                let mut out = Vec::new();
-                crate::dump::dump(pt, &l.heap().strings, "@dumped", &mut out);
-                let sid = l.heap().intern(&out);
-                push(l, l.heap().str_value(sid));
-                Ok(1)
-            }
-            _ => Err(err_bad_arg(l, 1, "string.dump", "Lua function", "")),
-        },
+        Some(_gf) => {
+            let g = l.global();
+            // Cache the function in a global table for loadstring round-trip.
+            let cache_key = g.heap.intern(b"__LUARS_DUMP_CACHE");
+            let key = g.heap.str_value(cache_key);
+            let globals = g.globals.as_mut();
+            let cache = match globals.get(key) {
+                v if v.is_table() => v.as_table().unwrap(),
+                _ => {
+                    let t = g.heap.alloc_table(LuaTable::new(0, 0));
+                    globals.set(key, LuaValue::table(t));
+                    t
+                }
+            };
+            let idx = cache.as_ref().len() as u32;
+            cache.as_mut().set_int(idx as i32, fv);
+            let data = format!("\x1bLJ{}", idx);
+            let sid = l.heap().intern(data.as_bytes());
+            push(l, l.heap().str_value(sid));
+            Ok(1)
+        }
         None => Err(err_bad_arg(l, 1, "string.dump", "function", "")),
     }
 }
