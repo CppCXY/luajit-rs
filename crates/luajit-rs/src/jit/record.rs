@@ -1379,7 +1379,7 @@ impl Record {
     fn rec_tget(
         &mut self,
         l: &LuaState,
-        tabv: LuaValue,
+        mut tabv: LuaValue,
         tab: TRef,
         keyv: LuaValue,
         key: TRef,
@@ -1393,7 +1393,6 @@ impl Record {
         let mut v = LuaValue::from_bits(jit_tget(tabv.to_bits(), keyv.to_bits()));
         let mut t = t;
         let mut tab = tab;
-        let mut tabv = tabv;
         if v.is_nil() {
             if let Some(mt) = t.as_ref().metatable {
                 let g = l.global();

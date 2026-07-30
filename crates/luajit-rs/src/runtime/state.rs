@@ -373,7 +373,7 @@ impl LuaState {
     /// resize so closures stay correct.
     pub fn new(g: GlobalRef, is_main: bool) -> LuaState {
         let max_stack = if is_main { STACK_MAX } else { CO_STACK_MAX };
-        let initial_len = 1024;
+        let initial_len = if is_main { 1024 } else { 64 };
         LuaState {
             g,
             is_main,
@@ -734,7 +734,7 @@ const _: () = assert!(std::mem::size_of::<GcRef>() == 8);
 mod tests {
     use crate::LuaResult;
 
-use super::*;
+    use super::*;
 
     #[test]
     fn load_produces_top_level_closure() {
