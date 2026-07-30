@@ -2723,11 +2723,14 @@ impl Record {
                 ));
             }
 
-            // FNEW creates new closures with unstable identities inside
-            // hot loops. Even though CNEW IR exists, the closure escapes
-            // via CALL and cannot be sunk. Keep blacklisted until closure
-            // inlining is implemented.
-            BCOp::FNEW => return Err(TraceError::BLACKL),
+            BCOp::FNEW => {
+                let proto = match &pt.as_ref().kgc[bc_d(ins) as usize] {
+                    crate::proto::KGc::ProtoRef(c) => *c,
+                    _ => return Err(TraceError::NYIBC),
+                };
+                result = self.cur.ir.kint64(proto.addr());
+                self.rec_gcstep(l);
+            }
 
             // Everything else is NYI in Phase 2: calls, returns, tables,
             // upvalues, iterators, varargs, concat, bit ops, lengths.
