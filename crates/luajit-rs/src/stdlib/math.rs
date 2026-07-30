@@ -16,16 +16,33 @@ macro_rules! math1 {
         /// (pub: the JIT's fast-function recorder identifies builtins by
         /// their function pointer.)
         pub fn $name(l: &mut LuaState) -> LuaResult<i32> {
-            let x = match arg(l, 0).as_number() {
+            let v = arg(l, 0);
+            let x = match v.as_number() {
                 Some(n) => n,
                 None => {
-                    return Err(err_bad_arg(
-                        l,
-                        1,
-                        concat!("math.", stringify!($name)),
-                        "number",
-                        "",
-                    ))
+                    // Lua-style string-to-number coercion.
+                    if let Some(sid) = v.as_string_id() {
+                        match crate::strscan::scan_number(l.str_static(sid)) {
+                            Some(n) => n,
+                            None => {
+                                return Err(err_bad_arg(
+                                    l,
+                                    1,
+                                    concat!("math.", stringify!($name)),
+                                    "number",
+                                    "",
+                                ))
+                            }
+                        }
+                    } else {
+                        return Err(err_bad_arg(
+                            l,
+                            1,
+                            concat!("math.", stringify!($name)),
+                            "number",
+                            "",
+                        ))
+                    }
                 }
             };
             push(l, LuaValue::number($fn(x)));

@@ -282,7 +282,14 @@ pub fn lua_typename(_l: &LuaState, tp: LuaType) -> &'static str {
 }
 
 pub fn lua_tonumber(l: &LuaState, idx: i32) -> f64 {
-    lua_index(l, idx).as_number().unwrap_or(0.0)
+    let v = lua_index(l, idx);
+    if let Some(n) = v.as_number() {
+        n
+    } else if let Some(sid) = v.as_string_id() {
+        crate::strscan::scan_number(l.str_static(sid)).unwrap_or(0.0)
+    } else {
+        0.0
+    }
 }
 
 pub fn lua_tointeger(l: &LuaState, idx: i32) -> i64 {

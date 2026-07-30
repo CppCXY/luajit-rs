@@ -308,14 +308,23 @@ fn run_args(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
             }
             Some('l') => {
                 let name = if a.len() > 2 {
-                    a[2..].to_string()
+                    &a[2..]
                 } else {
                     i += 1;
-                    argv[i].clone()
+                    argv[i].as_str()
                 };
-                // Try loading as file; library names like "string"/"io"
-                // are already loaded by lual_openlibs, so skip if file not found.
-                let _ = try_loadfile(lua, &name);
+                // Exactly as LuaJIT's dolibrary():
+                //   lua_getglobal(L, "require");
+                //   lua_pushstring(L, name);
+                //   return report(L, docall(L, 1, 1));
+                let ll = lua.main();
+                let _ = lua_settop(ll, 0);
+                lua_getglobal(ll, "require");
+                lua_pushstring(ll, name.as_bytes());
+                if lua_pcall(ll, 1, 0, 0) != Ok(()) {
+                    eprintln!("luajit-rs: {}", error_msg(ll));
+                    return 1;
+                }
             }
             Some('j') => {
                 let cmd = if a.len() > 2 {

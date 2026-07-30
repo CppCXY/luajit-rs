@@ -383,7 +383,48 @@ fn loader_lua(l: &mut LuaState) -> LuaResult<i32> {
         None => return Err(err_bad_arg(l, 1, "loader_lua", "string", "")),
     };
     let name = l.str_static(name_sid);
+    let name_str = String::from_utf8_lossy(name).into_owned();
     let pkg = package_table(l);
+
+    // If the module name looks like an absolute/relative path (contains
+    // directory separator), try it directly with and without .lua extension.
+    // This matches the Lua 5.1 loader's behavior for file paths.
+    if name_str.contains('/') || name_str.contains('\\') {
+        let mut tried = Vec::new();
+        for try_name in [name_str.as_str(), &format!("{}.lua", name_str)] {
+            if std::path::Path::new(try_name).is_file() {
+                match std::fs::read(try_name) {
+                    Ok(src) => {
+                        let chunkname = format!("@{}", try_name);
+                        match crate::state::load(l, src, &chunkname) {
+                            Ok(f) => {
+                                push(l, f);
+                                return Ok(1);
+                            }
+                            Err(e) => {
+                                return Err(l.runtime_error(
+                                    format!("error loading '{}': {}", try_name, e).as_bytes(),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(l.runtime_error(
+                            format!("cannot read '{}': {}", try_name, e).as_bytes(),
+                        ));
+                    }
+                }
+            }
+            tried.push(format!("\n\tno file '{}'", try_name));
+        }
+        push(
+            l,
+            l.heap()
+                .str_value(l.heap().intern(tried.concat().as_bytes())),
+        );
+        return Ok(1);
+    }
+
     let path_k = str_key(l, b"path");
     let path_v = pkg.as_ref().get_str(path_k);
     let path = match path_v.as_string_id() {

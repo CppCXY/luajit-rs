@@ -1,10 +1,13 @@
 //! Base library: `print`, `type`, `tostring`, `tonumber`, `select`,
 //! `pairs`, `ipairs`, `next`, `assert`, `setmetatable`, `collectgarbage`,
-//! `error`, `pcall`, `xpcall`, `rawequal`, `rawget`, `rawset`, `getmetatable`.
+//! `error`, `pcall`, `xpcall`, `rawequal`, `rawget`, `rawset`, `getmetatable`,
+//! `newproxy`.
 
 use crate::err::{LuaError, LuaResult};
 use crate::runtime::meta::MM;
+use crate::runtime::userdata::GcUserData;
 use crate::state::LuaState;
+use crate::table::LuaTable;
 use crate::value::{LJ_TNIL, LuaValue};
 
 use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv, tostring_meta};
@@ -529,6 +532,34 @@ fn lib_loadfile(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
+fn lib_newproxy(l: &mut LuaState) -> LuaResult<i32> {
+    let arg = arg(l, 0);
+    let data: Box<[u8]> = vec![0u8; 1].into_boxed_slice();
+    let mt = if arg.is_truthy() && !arg.is_bool() {
+        // newproxy(proxy) — share metatable of existing proxy
+        if let Some(ud) = arg.as_userdata() {
+            ud.as_ref().metatable
+        } else {
+            None
+        }
+    } else if arg.is_true() {
+        // newproxy(true) — create empty metatable
+        let t = l.global().heap.alloc_table(LuaTable::new(0, 0));
+        Some(t)
+    } else {
+        // newproxy() or newproxy(false) — no metatable
+        None
+    };
+    let ud = if let Some(m) = mt {
+        GcUserData::with_metatable(data, m)
+    } else {
+        GcUserData::new(data)
+    };
+    let ptr = l.global().heap.alloc_userdata(ud);
+    push(l, LuaValue::userdata(ptr));
+    Ok(1)
+}
+
 pub fn open(l: &mut LuaState) {
     lual_reg!(l, b"", LibTarget::BaseLib)
         .func(b"print", lib_print)
@@ -554,6 +585,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"loadstring", lib_loadstring)
         .func(b"load", lib_load)
         .func(b"loadfile", lib_loadfile)
+        .func(b"newproxy", lib_newproxy)
         .build();
 
     let gsid = l.heap().intern(b"_G");

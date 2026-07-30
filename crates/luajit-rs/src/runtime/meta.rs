@@ -73,6 +73,9 @@ pub const MM_NAMES: [&[u8]; MM_MAX] = [
 pub fn metatable_of(g: &GlobalState, o: LuaValue) -> Option<GcPtr<LuaTable>> {
     if let Some(t) = o.as_table() {
         t.as_ref().metatable
+    } else if let Some(ud) = o.as_userdata() {
+        // Per-instance metatable takes precedence over base metatable.
+        ud.as_ref().metatable.or_else(|| g.basemt_of(o.itype()))
     } else {
         g.basemt_of(o.itype())
     }

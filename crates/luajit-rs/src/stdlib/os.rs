@@ -388,7 +388,7 @@ fn os_tmpname(l: &mut LuaState) -> LuaResult<i32> {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir();
     let name = tmp
-        .join(format!("lua_{}_{:04}", ts, id % 10000))
+        .join(format!("lua_{}_{:04}.lua", ts, id % 10000))
         .to_string_lossy()
         .into_owned();
     // Use forward slashes for Lua compatibility.
