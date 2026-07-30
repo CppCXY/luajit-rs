@@ -380,6 +380,12 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                 IROp::TDUP => {
                     env[(r - REF_BIAS) as usize] = jit_tdup(val(env, ins.op1 as IRRef));
                 }
+                IROp::CNEW => {
+                    env[(r - REF_BIAS) as usize] = jit_cnew(
+                        val(env, ins.op1 as IRRef),
+                        val(env, ins.op2 as IRRef),
+                    );
+                }
                 IROp::CALLL => {
                     let idx = ins.op2 as u32;
                     let bits = match record::ircall_arity(idx) {
@@ -953,6 +959,24 @@ pub extern "C" fn jit_tdup(templ_addr: u64) -> u64 {
     let templ = unsafe { &*(templ_addr as usize as *const crate::table::LuaTable) };
     let t = jit_heap().alloc_table_jit(templ.dup());
     LuaValue::table(t).to_bits()
+}
+
+/// BC_FNEW: allocate a new Lua closure.
+pub extern "C" fn jit_cnew(proto_ptr: u64, env_bits: u64) -> u64 {
+    let proto = unsafe { crate::gc::GcPtr::<crate::proto::Proto>::from_addr(proto_ptr) }
+        .expect("jit_cnew: bad proto pointer");
+    let env = crate::gc::GcPtr::<crate::table::LuaTable>::from_addr(
+        env_bits & crate::value::LJ_GCVMASK,
+    )
+    .unwrap_or_else(|| {
+        let heap = jit_heap();
+        unsafe { &*(heap as *const crate::state::GcHeap as *const crate::state::GlobalState) }
+            .globals
+    });
+    let cl = jit_heap().alloc_func(crate::func::GcFunc::Lua(
+        crate::func::LuaClosure { proto, env, upvals: Vec::new() },
+    ));
+    LuaValue::func(cl).to_bits()
 }
 
 /// `#t` / table.insert boundary: the raw table length (no metamethods,

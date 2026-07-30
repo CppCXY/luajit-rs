@@ -251,7 +251,7 @@ impl<'a> Asm<'a> {
                         a.needs_env[Self::iidx(ins.op1 as IRRef)] = true;
                     }
                 }
-                IROp::TNEW | IROp::TDUP => {} // Literal / constant operands.
+                IROp::TNEW | IROp::TDUP | IROp::CNEW => {} // Literal / constant operands.
                 IROp::ALOAD => {
                     // Table via env/GPR, key via xmm.
                     if ins.op1 as IRRef >= REF_BIAS {
@@ -459,6 +459,13 @@ impl<'a> Asm<'a> {
                     self.helper_call(
                         exec::jit_tdup as *const () as usize as u64,
                         &[ins.op1 as IRRef],
+                    );
+                    self.ff_result(&ins)?;
+                }
+                IROp::CNEW => {
+                    self.helper_call(
+                        exec::jit_cnew as *const () as usize as u64,
+                        &[ins.op1 as IRRef, ins.op2 as IRRef],
                     );
                     self.ff_result(&ins)?;
                 }

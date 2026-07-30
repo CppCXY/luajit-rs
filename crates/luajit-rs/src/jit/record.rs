@@ -1378,6 +1378,7 @@ impl Record {
     /// paths abort with NYIBC.
     fn rec_tget(
         &mut self,
+        l: &LuaState,
         tabv: LuaValue,
         tab: TRef,
         keyv: LuaValue,
@@ -1389,12 +1390,26 @@ impl Record {
         let Some(t) = tabv.as_table() else {
             return Err(TraceError::NYIBC);
         };
-        let v = LuaValue::from_bits(jit_tget(tabv.to_bits(), keyv.to_bits()));
+        let mut v = LuaValue::from_bits(jit_tget(tabv.to_bits(), keyv.to_bits()));
+        let mut t = t;
+        let mut tab = tab;
+        let mut tabv = tabv;
         if v.is_nil() {
-            if t.as_ref().metatable.is_some() {
-                return Err(TraceError::NYIBC); // __index metamethod NYI.
+            if let Some(mt) = t.as_ref().metatable {
+                let g = l.global();
+                let idx_key = g.mmname[crate::meta::MM::Index as usize];
+                let idx_val = mt.as_ref().get_str(idx_key);
+                if let Some(delegated) = idx_val.as_table() {
+                    tabv = LuaValue::table(delegated);
+                    t = delegated;
+                    tab = self.cur.ir.kgc(tabv.to_bits(), IRT_TAB);
+                    v = LuaValue::from_bits(jit_tget(tabv.to_bits(), keyv.to_bits()));
+                } else {
+                    return Err(TraceError::NYIBC);
+                }
+            } else {
+                self.meta_guard(tab);
             }
-            self.meta_guard(tab);
         }
         let ty = Self::value_irt(v);
         // Array fast path (get_int's inline case): integer key inside
@@ -1581,7 +1596,7 @@ impl Record {
                     .ir
                     .emitir(irtn(IROp::ADD), tref_ref(ctrl), tref_ref(one))?;
                 let iv = argv[1].as_number().ok_or(TraceError::NYIBC)? + 1.0;
-                let v = self.rec_tget(argv[0], tab, LuaValue::number(iv), k)?;
+                let v = self.rec_tget(l, argv[0], tab, LuaValue::number(iv), k)?;
                 if tref_isnil(v) {
                     res[0] = TREF_NIL;
                     nres = 1;
@@ -1626,7 +1641,7 @@ impl Record {
                     res[0] = TREF_NIL;
                     nres = 1;
                 } else {
-                    let v = self.rec_tget(tabv, tab, nkv, nk)?;
+                    let v = self.rec_tget(l, tabv, tab, nkv, nk)?;
                     res[0] = nk;
                     res[1] = v;
                     nres = 2;
@@ -2060,7 +2075,7 @@ impl Record {
                 let keyv = argv[1];
                 let tab = self.base_ref(a + 2);
                 let key = self.base_ref(a + 3);
-                res[0] = self.rec_tget(tabv, tab, keyv, key)?;
+                res[0] = self.rec_tget(l, tabv, tab, keyv, key)?;
                 nres = 1;
             }
             Recff::RawSet => {
@@ -2636,7 +2651,7 @@ impl Record {
                 } else {
                     (rc, rcv)
                 };
-                result = self.rec_tget(tabv, rb, keyv, key)?;
+                result = self.rec_tget(l, tabv, rb, keyv, key)?;
             }
             BCOp::TSETV | BCOp::TSETS | BCOp::TSETB => {
                 let tabv = self.slot_val(l, base, bc_b(ins));
@@ -2663,7 +2678,7 @@ impl Record {
                 let tabv = LuaValue::table(env);
                 let tab = self.cur.ir.kgc(tabv.to_bits(), IRT_TAB);
                 if op == BCOp::GGET {
-                    result = self.rec_tget(tabv, tab, rcv, rc)?;
+                    result = self.rec_tget(l, tabv, tab, rcv, rc)?;
                 } else {
                     let val = self.getslot(l, base, bc_a(ins));
                     self.rec_tset(l, tabv, tab, rcv, rc, val)?;
@@ -2709,8 +2724,9 @@ impl Record {
             }
 
             // FNEW creates new closures with unstable identities inside
-            // hot loops, making compiled traces with closure identity guards
-            // useless. Immediately blacklist the parent trace.
+            // hot loops. Even though CNEW IR exists, the closure escapes
+            // via CALL and cannot be sunk. Keep blacklisted until closure
+            // inlining is implemented.
             BCOp::FNEW => return Err(TraceError::BLACKL),
 
             // Everything else is NYI in Phase 2: calls, returns, tables,

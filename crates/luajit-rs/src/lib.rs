@@ -7,7 +7,7 @@ mod stdlib;
 mod util;
 mod vm;
 
-use compiler::{bc, dump, lex, parse};
+use compiler::{bc, dump, lex};
 use runtime::{func, gc, meta, proto, state, string, table, value};
 use util::{strfmt, strscan};
 use vm::err;
