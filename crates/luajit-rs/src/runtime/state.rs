@@ -79,17 +79,14 @@ impl Default for GcHeap {
 }
 
 impl GcHeap {
-    /// Track an allocation and advance the GC threshold if necessary.
-    /// Mirrors LuaJIT's `lj_gc_step` debt tracking: when the total crosses
-    /// the threshold, we bump it forward instead of collecting immediately.
+    /// Track an allocation and accumulate GC debt.
     fn account_alloc(&mut self, size: usize) {
         let live = self.total + self.strings.bytes() + self.table_extra;
         if live >= self.threshold {
             self.debt += size;
-            // Bump the threshold proportionally so that a JIT trace that
-            // allocates rapidly (e.g. a table-append loop) doesn't trigger
-            // the GCSTEP guard again after a constant 16 KiB margin, which
-            // would be consumed immediately by the next few allocations.
+            // Advance threshold proportionally (LuaJIT's GC_PAUSE: 200%).
+            // This avoids re-triggering the GCSTEP guard on every allocation
+            // while ensuring the next collection triggers at ~2x memory.
             self.threshold = live + ((live * gc::GC_PAUSE) / 100).max(16384);
         }
     }
@@ -99,8 +96,8 @@ impl GcHeap {
         t.heap = self as *const GcHeap;
         let size = t.gc_size();
         self.total += size;
+        gc::gc_step(self, size);  // GC first — may start a cycle
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.tables.alloc(t)
     }
 
@@ -118,8 +115,10 @@ impl GcHeap {
     }
 
     pub fn alloc_proto(&mut self, p: Proto) -> GcPtr<Proto> {
-        self.total += p.gc_size();
-        self.account_alloc(p.gc_size());
+        let sz = p.gc_size();
+        self.total += sz;
+        self.account_alloc(sz);
+        gc::gc_step(self, sz);
         self.protos.alloc(p)
     }
 
@@ -127,6 +126,7 @@ impl GcHeap {
         let size = gc::account_func(&f);
         self.total += size;
         self.account_alloc(size);
+        gc::gc_step(self, size);
         self.funcs.alloc(f)
     }
 
@@ -134,6 +134,7 @@ impl GcHeap {
         let size = gc::account_upval();
         self.total += size;
         self.account_alloc(size);
+        gc::gc_step(self, size);
         let p = self.upvals.alloc(uv);
         p.as_mut().init_closed();
         p
@@ -143,6 +144,7 @@ impl GcHeap {
         let size = gc::account_thread(&th);
         self.total += size;
         self.account_alloc(size);
+        gc::gc_step(self, size);
         self.threads.alloc(th)
     }
 
@@ -150,6 +152,7 @@ impl GcHeap {
         let size = std::mem::size_of::<CData>() + cd.data.len();
         self.total += size;
         self.account_alloc(size);
+        gc::gc_step(self, size);
         self.cdatas.alloc(cd)
     }
 
@@ -157,6 +160,7 @@ impl GcHeap {
         let size = std::mem::size_of::<GcUserData>();
         self.total += size;
         self.account_alloc(size);
+        gc::gc_step(self, size);
         self.userdatas.alloc(ud)
     }
 
@@ -165,7 +169,9 @@ impl GcHeap {
         let sid = self.strings.intern(s);
         let new_bytes = self.strings.bytes();
         if new_bytes > prev_bytes {
-            self.account_alloc(new_bytes - prev_bytes);
+            let sz = new_bytes - prev_bytes;
+            self.account_alloc(sz);
+            gc::gc_step(self, sz);
         }
         sid
     }

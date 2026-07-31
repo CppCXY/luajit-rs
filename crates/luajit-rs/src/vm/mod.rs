@@ -1395,7 +1395,8 @@ impl Interp {
                 // -- Tables --
                 BCOp::TNEW => {
                     // Inline: only sync when GC is due (cold path).
-                    if self.l().global().heap.should_collect() {
+                    let g = self.l().global();
+                    if g.heap.should_collect() || g.heap.debt > 4096 {
                         sync!();
                         self.gc_check();
                     }
@@ -2362,7 +2363,8 @@ impl Interp {
     /// frame's full extent first, since returns may have lowered it.
     #[inline]
     fn gc_check(&mut self) {
-        if self.l().global().heap.should_collect() {
+        let g = self.l().global();
+        if g.heap.should_collect() || g.heap.debt > 4096 {
             self.gc_collect();
         }
     }

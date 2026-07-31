@@ -299,6 +299,10 @@ fn alloc_block<T>(
     alloc_size: u32,
     current_white: u8,
 ) -> (NonNull<T>, bool) {
+    // New objects inherit the current generation's white bit.
+    // During the next sweep, `is_dead` checks the *opposite* bit,
+    // so new objects survive their first sweep.  Current white
+    // is flipped at cycle START, not END.
     let (layout, data_offset) = std::alloc::Layout::new::<GcHeader>()
         .extend(std::alloc::Layout::new::<T>())
         .unwrap();
@@ -927,16 +931,21 @@ pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
     }
 }
 
-pub fn gc_step(heap: &mut GcHeap, size: usize) {
+/// Run one incremental GC step. Returns `true` when the cycle is complete
+/// (state is Pause).
+pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
     let step = heap.gc_step_size.max(size);
     match heap.gc_state {
         GcState::Pause => {
-            if heap.total + heap.strings.bytes() + heap.table_extra + step >= heap.threshold {
-                heap.threshold = heap.total
-                    + heap.strings.bytes()
-                    + heap.table_extra
-                    + ((heap.total + heap.strings.bytes()) * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
+            let live = heap.total + heap.strings.bytes() + heap.table_extra;
+            if live >= heap.threshold {
+                heap.debt += step;
+                // Advance threshold by a moderate fixed amount.  Debt
+                // will trip gc_check / C-call boundaries into calling
+                // full_gc() (which starts a proper cycle).
+                heap.threshold = live + 65536;
             }
+            true
         }
         GcState::Propagate => {
             let mut m = Marker {
@@ -944,121 +953,98 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) {
                 strings: &heap.strings,
             };
             let done = m.propagate_step(step / 64);
-            // Merge barrier outputs (pushed to gc_gray during propagation).
             m.gray.extend(std::mem::take(&mut heap.gc_gray));
             if done && m.gray.is_empty() {
                 heap.gc_state = GcState::Atomic;
             }
             heap.gc_gray = m.gray;
+            false
         }
         GcState::Atomic => {
-            // Process ALL gray objects completely. Loops because barriers
-            // during propagation push to gc_grayagain in Atomic state.
             loop {
                 let mut gray = std::mem::take(&mut heap.gc_grayagain);
                 gray.extend(std::mem::take(&mut heap.gc_gray));
-                if gray.is_empty() {
-                    break;
-                }
-                let mut m = Marker {
-                    gray,
-                    strings: &heap.strings,
-                };
+                if gray.is_empty() { break; }
+                let mut m = Marker { gray, strings: &heap.strings };
                 m.propagate();
             }
             heap.gc_gray.clear();
             heap.gc_grayagain.clear();
             heap.gc_state = GcState::Sweep;
             heap.gc_sweep_pool = 0;
+            false
         }
         GcState::Sweep => {
             loop {
-                if heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() {
-                    break;
-                }
+                if heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() { break; }
                 let mut gray = std::mem::take(&mut heap.gc_grayagain);
                 gray.extend(std::mem::take(&mut heap.gc_gray));
-                let mut m = Marker {
-                    gray,
-                    strings: &heap.strings,
-                };
+                let mut m = Marker { gray, strings: &heap.strings };
                 m.propagate();
                 if m.gray.is_empty() && heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() {
                     break;
                 }
                 heap.gc_gray = m.gray;
             }
-            let done = match heap.gc_sweep_pool {
-                0 => {
-                    heap.strings.sweep(heap.current_white);
-                    1
-                }
-                1 => {
-                    heap.tables.sweep_tricolor(heap.current_white, |_| {});
-                    2
-                }
-                2 => {
-                    heap.funcs.sweep_tricolor(heap.current_white, |_| {});
-                    3
-                }
-                3 => {
-                    heap.threads.sweep_tricolor(heap.current_white, |th| {
-                        for &uv in &th.openuv {
-                            uv.as_mut().close();
-                        }
-                    });
-                    4
-                }
-                4 => {
-                    heap.upvals.sweep_tricolor(heap.current_white, |_| {});
-                    5
-                }
-                5 => {
-                    heap.protos.sweep_tricolor(heap.current_white, |_| {});
-                    6
-                }
-                6 => {
-                    heap.userdatas.sweep_tricolor(heap.current_white, |_| {});
-                    7
-                }
-                _ => 7,
-            };
-            heap.gc_sweep_pool = done;
-            if done >= 7 {
-                heap.current_white ^= 1;
-                let cw = heap.current_white;
-                heap.strings.update_current_white(cw);
-                heap.tables.update_current_white(cw);
-                heap.funcs.update_current_white(cw);
-                heap.protos.update_current_white(cw);
-                heap.upvals.update_current_white(cw);
-                heap.threads.update_current_white(cw);
-                heap.cdatas.update_current_white(cw);
-                heap.userdatas.update_current_white(cw);
+            let done = sweep_one_pool(heap);
+            if done {
                 heap.gc_state = GcState::Pause;
-                let mut total = 0usize;
-                for t in heap.tables.iter() {
-                    total += t.gc_size();
-                }
-                for f in heap.funcs.iter() {
-                    total += size_func(f);
-                }
-                total += heap.upvals.len() * size_upval();
-                for p in heap.protos.iter() {
-                    total += p.gc_size();
-                }
-                for th in heap.threads.iter() {
-                    total += size_thread(th);
-                }
+                let total = total_live(heap);
                 heap.total = total;
                 heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
                     .max(GC_THRESHOLD_MIN)
                     .max(heap.threshold / 2);
                 heap.table_extra = 0;
                 heap.debt = 0;
+                true
+            } else {
+                false
             }
         }
     }
+}
+
+fn sweep_one_pool(heap: &mut GcHeap) -> bool {
+    let done = match heap.gc_sweep_pool {
+        0 => { heap.strings.sweep(heap.current_white); 1 }
+        1 => { heap.tables.sweep_tricolor(heap.current_white, |_| {}); 2 }
+        2 => { heap.funcs.sweep_tricolor(heap.current_white, |_| {}); 3 }
+        3 => { heap.threads.sweep_tricolor(heap.current_white, |th| {
+            for &uv in &th.openuv { uv.as_mut().close(); }
+        }); 4 }
+        4 => { heap.upvals.sweep_tricolor(heap.current_white, |_| {}); 5 }
+        5 => { heap.protos.sweep_tricolor(heap.current_white, |_| {}); 6 }
+        6 => { heap.userdatas.sweep_tricolor(heap.current_white, |_| {}); 7 }
+        _ => {
+            heap.gc_state = GcState::Pause;
+            let mut total = total_live(heap);
+            heap.total = total;
+            heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
+                .max(GC_THRESHOLD_MIN)
+                .max(heap.threshold / 2);
+            heap.table_extra = 0;
+            heap.debt = 0;
+            return true;
+        }
+    };
+    heap.gc_sweep_pool = done;
+    false
+}
+
+fn total_live(heap: &GcHeap) -> usize {
+    let mut total = 0usize;
+    for t in heap.tables.iter() { total += t.gc_size(); }
+    for f in heap.funcs.iter() { total += size_func(f); }
+    total += heap.upvals.len() * size_upval();
+    for p in heap.protos.iter() { total += p.gc_size(); }
+    for th in heap.threads.iter() { total += size_thread(th); }
+    for cd in heap.cdatas.iter() {
+        total += std::mem::size_of::<crate::runtime::cdata::CData>() + cd.data.len();
+    }
+    total += heap.userdatas.len()
+        * (std::mem::size_of::<crate::runtime::userdata::GcUserData>()
+            + std::mem::size_of::<Box<dyn std::any::Any>>());
+    total
 }
 
 fn size_thread(th: &LuaState) -> usize {
@@ -1069,11 +1055,35 @@ pub(crate) fn account_thread(th: &LuaState) -> usize {
 }
 
 pub fn full_gc(g: &mut GlobalState) {
-    // Finish any in-progress cycle.
-    while g.heap.gc_state != GcState::Pause {
-        gc_step(&mut g.heap, usize::MAX);
-    }
-    // Start and run a complete cycle.
+    // Drain any in-progress cycle.
+    while !gc_step(&mut g.heap, usize::MAX) {}
+    // Start a fresh cycle.
+    start_gc_cycle(g);
+    // Run it to completion.
+    while !gc_step(&mut g.heap, usize::MAX) {}
+    debug_assert!(g.globals.is_marked(), "globals not marked after full_gc");
+    debug_assert!(g.registry.is_marked(), "registry not marked after full_gc");
+    debug_assert!(g.main().is_marked(), "main thread not marked after full_gc");
+    g.heap.gc_gray.clear();
+    g.heap.gc_grayagain.clear();
+}
+
+/// Start a new GC cycle from Pause state. Marks roots and transitions to
+/// Propagate. Caller should then drive the cycle with gc_step().
+pub fn start_gc_cycle(g: &mut GlobalState) {
+    debug_assert!(g.heap.gc_state == GcState::Pause);
+    // Flip current_white at cycle START so that sweep below finds
+    // objects allocated with the *previous* white (which is now "dead").
+    g.heap.current_white ^= 1;
+    let cw = g.heap.current_white;
+    g.heap.strings.update_current_white(cw);
+    g.heap.tables.update_current_white(cw);
+    g.heap.funcs.update_current_white(cw);
+    g.heap.protos.update_current_white(cw);
+    g.heap.upvals.update_current_white(cw);
+    g.heap.threads.update_current_white(cw);
+    g.heap.cdatas.update_current_white(cw);
+    g.heap.userdatas.update_current_white(cw);
     g.heap.gc_state = GcState::Propagate;
     let mut m = Marker {
         gray: Vec::with_capacity(64),
@@ -1106,61 +1116,7 @@ pub fn full_gc(g: &mut GlobalState) {
             }
         }
     }
-    m.propagate();
-    debug_assert!(g.globals.is_marked(), "globals not marked after propagate");
-    debug_assert!(
-        g.registry.is_marked(),
-        "registry not marked after propagate"
-    );
-    debug_assert!(
-        g.main().is_marked(),
-        "main thread not marked after propagate"
-    );
-    let cw = g.heap.current_white;
-    g.heap.strings.sweep(cw);
-    g.heap.tables.sweep_tricolor(cw, |_| {});
-    g.heap.funcs.sweep_tricolor(cw, |_| {});
-    g.heap.threads.sweep_tricolor(cw, |th| {
-        for &uv in &th.openuv {
-            uv.as_mut().close();
-        }
-    });
-    g.heap.upvals.sweep_tricolor(cw, |_| {});
-    g.heap.protos.sweep_tricolor(cw, |_| {});
-    g.heap.userdatas.sweep_tricolor(cw, |_| {});
-    g.heap.current_white ^= 1;
-    let ncw = g.heap.current_white;
-    g.heap.strings.update_current_white(ncw);
-    g.heap.tables.update_current_white(ncw);
-    g.heap.funcs.update_current_white(ncw);
-    g.heap.protos.update_current_white(ncw);
-    g.heap.upvals.update_current_white(ncw);
-    g.heap.threads.update_current_white(ncw);
-    g.heap.cdatas.update_current_white(ncw);
-    g.heap.userdatas.update_current_white(ncw);
-    let mut total = 0usize;
-    for t in g.heap.tables.iter() {
-        total += t.gc_size();
-    }
-    for f in g.heap.funcs.iter() {
-        total += size_func(f);
-    }
-    total += g.heap.upvals.len() * size_upval();
-    for p in g.heap.protos.iter() {
-        total += p.gc_size();
-    }
-    for th in g.heap.threads.iter() {
-        total += size_thread(th);
-    }
-    g.heap.total = total;
-    g.heap.threshold = ((total + g.heap.strings.bytes()) * GC_PAUSE / 100)
-        .max(GC_THRESHOLD_MIN)
-        .max(g.heap.threshold / 2);
-    g.heap.table_extra = 0;
-    g.heap.debt = 0;
-    g.heap.gc_state = GcState::Pause;
-    g.heap.gc_gray.clear();
-    g.heap.gc_grayagain.clear();
+    g.heap.gc_gray = m.gray;
 }
 
 pub(crate) fn account_func(f: &GcFunc) -> usize {

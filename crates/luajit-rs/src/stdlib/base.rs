@@ -197,9 +197,21 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
         None => b"collect".to_vec(),
     };
     match opt.as_slice() {
-        b"collect" | b"step" | b"full" => {
+        b"collect" | b"full" => {
             crate::gc::full_gc(l.global());
             push(l, LuaValue::number(0.0));
+            Ok(1)
+        }
+        b"step" => {
+            let size = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+            let g = l.global();
+            let limit = if size == 0 { 1 } else { size * 1024 };
+            // Start a cycle if idle, then run one step.
+            if g.heap.gc_state == crate::runtime::gc::GcState::Pause {
+                crate::gc::start_gc_cycle(g);
+            }
+            let done = crate::gc::gc_step(&mut g.heap, limit);
+            push(l, LuaValue::boolean(done));
             Ok(1)
         }
         b"stop" | b"restart" | b"setpause" | b"setstepmul" => {
