@@ -753,10 +753,13 @@ impl<'g> Marker<'g> {
         }
     }
     fn mark_thread(&mut self, th: GcPtr<LuaState>) {
-        if !th.is_marked() {
-            th.set_marked();
-            self.gray.push(Gray::Thread(th));
-        }
+        // Always mark the (main) thread and re-enqueue it: a stale
+        // `marked` flag from an earlier cycle must never skip the stack
+        // walk, or residual slots would go unmarked and be freed out from
+        // under the stack (the interpreter's `frame_top` protects them
+        // from the atomic clear).
+        th.set_marked();
+        self.gray.push(Gray::Thread(th));
     }
     fn mark_table(&mut self, t: GcPtr<LuaTable>) {
         if !t.is_marked() {
