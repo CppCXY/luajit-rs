@@ -15,7 +15,7 @@ use crate::{
     lua_pushstring, lua_pushvalue, lua_rawseti, lua_register, lua_setfield, lua_setglobal,
 };
 
-use super::{arg, err_bad_arg, push};
+use super::{err_bad_arg_type, arg, err_bad_arg, push};
 
 // ── constants ───────────────────────────────────────────────────────────────
 
@@ -249,12 +249,12 @@ fn resolve_path(l: &mut LuaState, envname: &str, def: &[u8]) -> Vec<u8> {
 fn lib_searchpath(l: &mut LuaState) -> LuaResult<i32> {
     let name_sid = match arg(l, 0).as_string_id() {
         Some(sid) => sid,
-        None => return Err(err_bad_arg(l, 1, "searchpath", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "searchpath", "string", arg(l, 1-1))),
     };
     let name = l.str_static(name_sid);
     let path_sid = match arg(l, 1).as_string_id() {
         Some(sid) => sid,
-        None => return Err(err_bad_arg(l, 2, "searchpath", "string", "")),
+        None => return Err(err_bad_arg_type(l, 2, "searchpath", "string", arg(l, 2-1))),
     };
     let path = l.str_static(path_sid);
     let sep = match arg(l, 2).as_string_id() {
@@ -305,7 +305,7 @@ fn lib_loadlib(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_seeall(l: &mut LuaState) -> LuaResult<i32> {
     let tab = match arg(l, 0).as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg(l, 1, "seeall", "table", "")),
+        None => return Err(err_bad_arg_type(l, 1, "seeall", "table", arg(l, 1-1))),
     };
     let mt = match tab.as_ref().metatable {
         Some(m) => m,
@@ -325,7 +325,7 @@ fn lib_seeall(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_module(l: &mut LuaState) -> LuaResult<i32> {
     let name_sid = match arg(l, 0).as_string_id() {
         Some(sid) => sid,
-        None => return Err(err_bad_arg(l, 1, "module", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "module", "string", arg(l, 1-1))),
     };
     let name = l.str_static(name_sid).to_vec();
     let nargs = nargs(l);
@@ -380,7 +380,7 @@ fn loader_preload(l: &mut LuaState) -> LuaResult<i32> {
 fn loader_lua(l: &mut LuaState) -> LuaResult<i32> {
     let name_sid = match arg(l, 0).as_string_id() {
         Some(sid) => sid,
-        None => return Err(err_bad_arg(l, 1, "loader_lua", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "loader_lua", "string", arg(l, 1-1))),
     };
     let name = l.str_static(name_sid);
     let name_str = String::from_utf8_lossy(name).into_owned();
@@ -502,7 +502,7 @@ fn loader_croot(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
     let name_v = arg(l, 0);
     let Some(name_sid) = name_v.as_string_id() else {
-        return Err(err_bad_arg(l, 1, "require", "string", ""));
+        return Err(err_bad_arg_type(l, 1, "require", "string", arg(l, 1-1)));
     };
     let name = l.str_static(name_sid).to_vec();
 

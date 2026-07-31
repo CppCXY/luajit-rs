@@ -19,7 +19,28 @@ pub fn opt_sink(t: &mut GCtrace) {
     for r in REF_FIRST..nins {
         let op = t.ir.ir(r).op();
         if (op == IROp::TDUP || op == IROp::CNEW) && !t.ir.ir(r).is_marked() {
-            allocs.push(r);
+            // Only sink when every use is a pure field read (or the GC
+            // guard): a TDUP used as a *value* (stored into a table, or
+            // passed along) escapes and must keep allocating a fresh
+            // object every iteration.
+            let mut escaped = false;
+            for r2 in REF_FIRST..nins {
+                let ins2 = t.ir.ir(r2);
+                if (ins2.op1 == r as u16 || ins2.op2 == r as u16)
+                    && ins2.op() != IROp::ALOAD
+                    && ins2.op() != IROp::HLOAD
+                    && ins2.op() != IROp::ALEN
+                    && ins2.op() != IROp::GCSTEP
+                    && ins2.op() != IROp::TDUP
+                    && ins2.op() != IROp::CNEW
+                {
+                    escaped = true;
+                    break;
+                }
+            }
+            if !escaped {
+                allocs.push(r);
+            }
         }
     }
     for r in REF_FIRST..nins {

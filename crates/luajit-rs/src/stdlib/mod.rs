@@ -218,6 +218,43 @@ pub fn err_bad_arg(l: &mut LuaState, n: u32, func: &str, expected: &str, got: &s
     l.runtime_error(msg.as_bytes())
 }
 
+/// Type name for `luaL_typename`-style messages; a nil argument is
+/// spelled "no value" (LuaJIT's fast-function convention).
+pub fn type_name(v: LuaValue) -> &'static str {
+    if v.is_nil() {
+        "no value"
+    } else if v.is_number() {
+        "number"
+    } else if v.is_string() {
+        "string"
+    } else if v == LuaValue::FALSE || v == LuaValue::TRUE {
+        "boolean"
+    } else if v.is_table() {
+        "table"
+    } else if v.is_func() {
+        "function"
+    } else if v.is_thread() {
+        "thread"
+    } else if v.is_userdata() {
+        "userdata"
+    } else if v.is_cdata() {
+        "cdata"
+    } else {
+        "userdata"
+    }
+}
+
+/// `err_bad_arg` with the offending value's type filled in.
+pub fn err_bad_arg_type(
+    l: &mut LuaState,
+    n: u32,
+    func: &str,
+    expected: &str,
+    got: LuaValue,
+) -> LuaError {
+    err_bad_arg(l, n, func, expected, type_name(got))
+}
+
 /// Install every standard library.
 pub fn open_libs(l: &mut LuaState) {
     base::open(l);

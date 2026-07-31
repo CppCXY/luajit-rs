@@ -8,7 +8,7 @@ use crate::state::LuaState;
 use crate::value::LuaValue;
 use crate::{err::LuaResult, stdlib::time};
 
-use super::{LibTarget, arg, err_bad_arg, push};
+use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, push};
 use crate::lual_reg;
 
 fn os_clock(l: &mut LuaState) -> LuaResult<i32> {
@@ -261,7 +261,7 @@ fn os_execute(l: &mut LuaState) -> LuaResult<i32> {
         }
         let cmd_str = match cmd.as_string_id() {
             Some(sid) => String::from_utf8_lossy(l.str_static(sid)),
-            None => return Err(err_bad_arg(l, 1, "os.execute", "string", "")),
+            None => return Err(err_bad_arg_type(l, 1, "os.execute", "string", arg(l, 1-1))),
         };
         let status = if cfg!(windows) {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -303,7 +303,7 @@ fn os_getenv(l: &mut LuaState) -> LuaResult<i32> {
     {
         let name = match arg(l, 0).as_string_id() {
             Some(sid) => l.str_static(sid),
-            None => return Err(err_bad_arg(l, 1, "os.getenv", "string", "")),
+            None => return Err(err_bad_arg_type(l, 1, "os.getenv", "string", arg(l, 1-1))),
         };
         let name_str = std::str::from_utf8(name).unwrap_or("");
         match std::env::var(name_str) {
@@ -326,7 +326,7 @@ fn os_remove(l: &mut LuaState) -> LuaResult<i32> {
     {
         let name = match arg(l, 0).as_string_id() {
             Some(sid) => String::from_utf8_lossy(l.str_static(sid)),
-            None => return Err(err_bad_arg(l, 1, "os.remove", "string", "")),
+            None => return Err(err_bad_arg_type(l, 1, "os.remove", "string", arg(l, 1-1))),
         };
         match std::fs::remove_file(name.as_ref()) {
             Ok(()) => push(l, LuaValue::boolean(true)),
@@ -351,11 +351,11 @@ fn os_rename(l: &mut LuaState) -> LuaResult<i32> {
     {
         let old = match arg(l, 0).as_string_id() {
             Some(sid) => String::from_utf8_lossy(l.str_static(sid)),
-            None => return Err(err_bad_arg(l, 1, "os.rename", "string", "")),
+            None => return Err(err_bad_arg_type(l, 1, "os.rename", "string", arg(l, 1-1))),
         };
         let new = match arg(l, 1).as_string_id() {
             Some(sid) => String::from_utf8_lossy(l.str_static(sid)),
-            None => return Err(err_bad_arg(l, 2, "os.rename", "string", "")),
+            None => return Err(err_bad_arg_type(l, 2, "os.rename", "string", arg(l, 2-1))),
         };
         match std::fs::rename(old.as_ref(), new.as_ref()) {
             Ok(()) => push(l, LuaValue::boolean(true)),

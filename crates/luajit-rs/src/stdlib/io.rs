@@ -14,7 +14,7 @@ use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, push, pushv, tostring_bytes};
+use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, push, pushv, tostring_bytes};
 use crate::lual_reg;
 
 #[allow(dead_code)]
@@ -406,7 +406,7 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
 fn handle_read(l: &mut LuaState) -> LuaResult<i32> {
     match handle_fd(l, 0) {
         Some(fd) => do_read(l, Some(fd), 1),
-        None => Err(err_bad_arg(l, 1, "read", "file", "")),
+        None => Err(err_bad_arg_type(l, 1, "read", "file", arg(l, 1-1))),
     }
 }
 
@@ -414,7 +414,7 @@ fn handle_read(l: &mut LuaState) -> LuaResult<i32> {
 fn handle_write(l: &mut LuaState) -> LuaResult<i32> {
     match handle_fd(l, 0) {
         Some(fd) => do_write(l, Some(fd), 1),
-        None => Err(err_bad_arg(l, 1, "write", "file", "")),
+        None => Err(err_bad_arg_type(l, 1, "write", "file", arg(l, 1-1))),
     }
 }
 
@@ -427,7 +427,7 @@ fn handle_close(l: &mut LuaState) -> LuaResult<i32> {
             push(l, LuaValue::TRUE);
             Ok(1)
         }
-        None => Err(err_bad_arg(l, 1, "close", "file", "")),
+        None => Err(err_bad_arg_type(l, 1, "close", "file", arg(l, 1-1))),
     }
 }
 
@@ -491,7 +491,7 @@ fn handle_lines(l: &mut LuaState) -> LuaResult<i32> {
             push(l, it);
             Ok(1)
         }
-        None => Err(err_bad_arg(l, 1, "lines", "file", "")),
+        None => Err(err_bad_arg_type(l, 1, "lines", "file", arg(l, 1-1))),
     }
 }
 
@@ -632,7 +632,7 @@ fn io_input(l: &mut LuaState) -> LuaResult<i32> {
                 Err(e) => return ret_fail(l, &format!("{}: {}", path, e)),
             }
         } else {
-            return Err(err_bad_arg(l, 1, "input", "string or file", ""));
+            return Err(err_bad_arg_type(l, 1, "input", "string or file", arg(l, 1-1)));
         };
         let old = *DEFAULT_INPUT.lock().unwrap();
         *DEFAULT_INPUT.lock().unwrap() = Some(id);
@@ -683,7 +683,7 @@ fn io_output(l: &mut LuaState) -> LuaResult<i32> {
                 Err(e) => return ret_fail(l, &format!("{}: {}", path, e)),
             }
         } else {
-            return Err(err_bad_arg(l, 1, "output", "string or file", ""));
+            return Err(err_bad_arg_type(l, 1, "output", "string or file", arg(l, 1-1)));
         };
         let old = *DEFAULT_OUTPUT.lock().unwrap();
         *DEFAULT_OUTPUT.lock().unwrap() = Some(id);

@@ -294,7 +294,8 @@ impl Interp {
         Ok(Some(false))
     }
 
-    /// `lj_meta_len`: `__len` metamethod (via execute recursion).
+    /// `lj_meta_len`: `__len` metamethod (via execute recursion). Passes
+    /// the object twice (LuaJIT 2.1 5.2-compat semantics).
     pub(super) fn meta_len(&mut self, o: LuaValue) -> LuaResult<LuaValue> {
         let mo = meta_lookup(self.l().global(), o, MM::Len);
         if mo.is_nil() {
@@ -306,7 +307,8 @@ impl Interp {
         let st = self.l().top;
         self.set_at(fs, mo);
         self.set_at(fs + 2, o);
-        execute(self.l(), fs, 1, 1)?;
+        self.set_at(fs + 3, o);
+        execute(self.l(), fs, 2, 1)?;
         let r = self.at(fs);
         self.l().top = st;
         Ok(r)

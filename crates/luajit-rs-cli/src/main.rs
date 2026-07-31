@@ -215,7 +215,7 @@ fn dotty(ll: &mut LuaState) -> i32 {
     0
 }
 
-fn dofile(lua: &mut Lua, name: &str) -> i32 {
+fn dofile(lua: &mut Lua, name: &str, script_args: &[String]) -> i32 {
     let ll = lua.main();
     let src = match std::fs::read(name) {
         Ok(s) => s,
@@ -232,7 +232,10 @@ fn dofile(lua: &mut Lua, name: &str) -> i32 {
         );
         return 1;
     }
-    match lua_pcall(ll, 0, 0, 0) {
+    for a in script_args {
+        lua_pushstring(ll, a.as_bytes());
+    }
+    match lua_pcall(ll, script_args.len() as i32, 0, 0) {
         Ok(()) => 0,
         Err(LuaError::Runtime) => {
             eprintln!("luajit-rs: {}", error_msg(ll));
@@ -389,7 +392,7 @@ fn handle_script(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
         }
         return dostring(lua, &String::from_utf8_lossy(&src), "=stdin");
     }
-    dofile(lua, name)
+    dofile(lua, name, &argv[argn + 1..])
 }
 
 fn main() {
@@ -416,7 +419,7 @@ fn main() {
         && let Ok(init) = std::env::var("LUA_INIT")
     {
         if let Some(rest) = init.strip_prefix('@') {
-            let _ = dofile(&mut lua, rest);
+            let _ = dofile(&mut lua, rest, &[]);
         } else {
             let _ = dostring(&mut lua, &init, "=");
         }

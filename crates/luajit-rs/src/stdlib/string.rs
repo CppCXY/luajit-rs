@@ -9,7 +9,7 @@ use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, push, tostring_bytes};
+use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, push, tostring_bytes};
 use crate::lual_reg;
 use crate::stdlib::pattern::{CaptureValue, find, gsub};
 
@@ -32,11 +32,11 @@ fn push_captures(l: &mut LuaState, captures: &[CaptureValue], text: &[u8], base:
 fn str_find(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 1, "string.find", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "string.find", "string", arg(l, 1-1))),
     };
     let pat = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 2, "string.find", "string", "")),
+        None => return Err(err_bad_arg_type(l, 2, "string.find", "string", arg(l, 2-1))),
     };
     let init = arg(l, 2).as_number().map_or(1, |n| n.max(1.0) as usize);
     let plain = arg(l, 3).is_truthy();
@@ -78,11 +78,11 @@ fn str_find(l: &mut LuaState) -> LuaResult<i32> {
 fn str_match(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 1, "string.match", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "string.match", "string", arg(l, 1-1))),
     };
     let pat = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 2, "string.match", "string", "")),
+        None => return Err(err_bad_arg_type(l, 2, "string.match", "string", arg(l, 2-1))),
     };
     let init = arg(l, 2).as_number().map_or(1, |n| n.max(1.0) as usize);
 
@@ -113,11 +113,11 @@ fn str_match(l: &mut LuaState) -> LuaResult<i32> {
 fn str_gmatch(l: &mut LuaState) -> LuaResult<i32> {
     let text = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg(l, 1, "string.gmatch", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "string.gmatch", "string", arg(l, 1-1))),
     };
     let pat = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg(l, 2, "string.gmatch", "string", "")),
+        None => return Err(err_bad_arg_type(l, 2, "string.gmatch", "string", arg(l, 2-1))),
     };
     let text_sid = l.heap().intern(&text);
     let pat_sid = l.heap().intern(&pat);
@@ -181,11 +181,11 @@ fn gmatch_iter(l: &mut LuaState) -> LuaResult<i32> {
 fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg(l, 1, "string.gsub", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "string.gsub", "string", arg(l, 1-1))),
     };
     let pat = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg(l, 2, "string.gsub", "string", "")),
+        None => return Err(err_bad_arg_type(l, 2, "string.gsub", "string", arg(l, 2-1))),
     };
     let repl_arg = arg(l, 2);
     let max = arg(l, 3).as_number().map(|n| n as usize);
@@ -201,7 +201,7 @@ fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
     } else {
         let repl = match repl_arg.as_string_id() {
             Some(sid) => l.str_static(sid).to_vec(),
-            None => return Err(err_bad_arg(l, 3, "string.gsub", "string or function", "")),
+            None => return Err(err_bad_arg_type(l, 3, "string.gsub", "string or function", arg(l, 3-1))),
         };
         match gsub(&s, &pat, &repl, max) {
             Ok((result, count)) => {
@@ -300,7 +300,7 @@ fn call_lua_fn(
 pub fn str_byte(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 1, "string.byte", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "string.byte", "string", arg(l, 1-1))),
     };
     let i = arg(l, 1).as_number().unwrap_or(1.0) as i64;
     let j = arg(l, 2).as_number().map_or(i, |n| n as i64);
@@ -327,8 +327,22 @@ pub fn str_char(l: &mut LuaState) -> LuaResult<i32> {
     let n = lua_gettop(l);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let c = arg(l, i).as_number().unwrap_or(0.0) as u32;
-        out.push((c & 0xff) as u8);
+        let c = match num_arg_coerce(l, i) {
+            Some(c) => c,
+            None => {
+                return Err(err_bad_arg_type(
+                    l,
+                    i as u32 + 1,
+                    "char",
+                    "number",
+                    arg(l, i),
+                ))
+            }
+        };
+        if c < 0.0 || c > 255.0 || c.fract() != 0.0 {
+            return Err(l.runtime_error(b"out of range"));
+        }
+        out.push(c as u8);
     }
     let sid = l.heap().intern(&out);
     push(l, l.heap().str_value(sid));
@@ -359,14 +373,14 @@ fn str_dump(l: &mut LuaState) -> LuaResult<i32> {
             push(l, l.heap().str_value(sid));
             Ok(1)
         }
-        None => Err(err_bad_arg(l, 1, "string.dump", "function", "")),
+        None => Err(err_bad_arg_type(l, 1, "string.dump", "function", arg(l, 1-1))),
     }
 }
 
 fn str_format(l: &mut LuaState) -> LuaResult<i32> {
     let fmt = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg(l, 1, "string.format", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "string.format", "string", arg(l, 1-1))),
     };
     let n = lua_gettop(l);
     enum Owned {
@@ -402,19 +416,23 @@ fn str_format(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn str_len(l: &mut LuaState) -> LuaResult<i32> {
-    match arg(l, 0).as_string_id() {
-        Some(sid) => {
-            push(l, LuaValue::number(l.str_static(sid).len() as f64));
-            Ok(1)
-        }
-        None => Err(err_bad_arg(l, 1, "string.len", "string", "")),
-    }
+    let v = arg(l, 0);
+    let len = if let Some(sid) = v.as_string_id() {
+        l.str_static(sid).len()
+    } else if v.is_number() {
+        // Lua 5.1: numbers are coerced to strings (luaL_checklstring).
+        crate::stdlib::tostring_bytes(l, v).len()
+    } else {
+        return Err(err_bad_arg_type(l, 1, "len", "string", arg(l, 1-1)));
+    };
+    push(l, LuaValue::number(len as f64));
+    Ok(1)
 }
 
 fn map_bytes(l: &mut LuaState, f: fn(u8) -> u8) -> LuaResult<i32> {
-    let s = match arg(l, 0).as_string_id() {
-        Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 1, "string case", "string", "")),
+    let s = match str_arg_coerce(l, 0, "string") {
+        Some(s) => s,
+        None => return Err(err_bad_arg_type(l, 1, "string", "string", arg(l, 0))),
     };
     let out: Vec<u8> = s.iter().map(|&b| f(b)).collect();
     let sid = l.heap().intern(&out);
@@ -432,7 +450,7 @@ fn str_upper(l: &mut LuaState) -> LuaResult<i32> {
 fn str_rep(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 1, "string.rep", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "string.rep", "string", arg(l, 1-1))),
     };
     let n = arg(l, 1).as_number().unwrap_or(0.0) as i64;
     let sep = match arg(l, 2).as_string_id() {
@@ -452,24 +470,57 @@ fn str_rep(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
+/// Lua 5.1 string coercion: numbers are converted with tostring.
+fn str_arg_coerce(l: &mut LuaState, i: usize, _name: &str) -> Option<Vec<u8>> {
+    let v = arg(l, i);
+    if let Some(sid) = v.as_string_id() {
+        Some(l.str_static(sid).to_vec())
+    } else if v.is_number() {
+        Some(crate::stdlib::tostring_bytes(l, v))
+    } else {
+        None
+    }
+}
+
+/// Numeric coercion for string-library indices (Lua 5.1's luaL_optint
+/// accepts numeric strings).
+fn num_arg_coerce(l: &mut LuaState, i: usize) -> Option<f64> {
+    let v = arg(l, i);
+    if let Some(n) = v.as_number() {
+        return Some(n);
+    }
+    if let Some(sid) = v.as_string_id() {
+        return crate::strscan::scan_number(l.str_static(sid));
+    }
+    None
+}
+
 fn str_reverse(l: &mut LuaState) -> LuaResult<i32> {
-    let s = match arg(l, 0).as_string_id() {
-        Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 1, "string.reverse", "string", "")),
+    let bytes = match arg(l, 0).as_string_id() {
+        Some(sid) => l.str_static(sid).to_vec(),
+        None => {
+            let v = arg(l, 0);
+            if v.is_number() {
+                // Lua 5.1: numbers are coerced to strings.
+                crate::stdlib::tostring_bytes(l, v)
+            } else {
+                return Err(err_bad_arg_type(l, 1, "reverse", "string", arg(l, 1-1)));
+            }
+        }
     };
-    let rev: Vec<u8> = s.iter().copied().rev().collect();
+    let rev: Vec<u8> = bytes.iter().copied().rev().collect();
     let sid = l.heap().intern(&rev);
     push(l, l.heap().str_value(sid));
     Ok(1)
 }
 
 pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
-    let s = match arg(l, 0).as_string_id() {
-        Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg(l, 1, "string.sub", "string", "")),
+    let s = match str_arg_coerce(l, 0, "sub") {
+        Some(s) => s,
+        None => return Err(err_bad_arg_type(l, 1, "sub", "string", arg(l, 0))),
     };
-    let i = arg(l, 1).as_number().unwrap_or(1.0) as i64;
-    let j = arg(l, 2).as_number().map(|n| n as i64);
+    let i = num_arg_coerce(l, 1).unwrap_or(1.0) as i64;
+    let j = num_arg_coerce(l, 2).map(|n| n as i64);
     let len = s.len() as i64;
     let a = if i < 0 {
         (len + i).max(0) as usize

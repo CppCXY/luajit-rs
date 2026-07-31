@@ -8,7 +8,7 @@ use crate::err::{LuaError, LuaResult};
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, push};
+use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, push};
 use crate::lual_reg;
 
 /// `lj_num2bit`: wrapping num -> int32. The bias add rounds to nearest
@@ -98,6 +98,11 @@ fn tohex(l: &mut LuaState) -> LuaResult<i32> {
     } else {
         (n as usize, false)
     };
+    if digits == 0 {
+        // tohex(x, 0) is the empty string.
+        push(l, l.heap().str_value(l.heap().intern(b"")));
+        return Ok(1);
+    }
     let digits = digits.clamp(1, 8);
     let s = if upper {
         format!(

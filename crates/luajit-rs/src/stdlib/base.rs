@@ -10,7 +10,7 @@ use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::{LJ_TNIL, LuaValue};
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv, tostring_meta};
+use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, nargs, push, pushv, tostring_meta};
 use crate::lual_reg;
 
 fn lib_print(l: &mut LuaState) -> LuaResult<i32> {
@@ -87,7 +87,7 @@ fn lib_select(l: &mut LuaState) -> LuaResult<i32> {
     }
     let k = match first.as_number() {
         Some(k) if k >= 1.0 => k as usize,
-        _ => return Err(err_bad_arg(l, 1, "select", "number or '#'", "")),
+        _ => return Err(err_bad_arg_type(l, 1, "select", "number or '#'", arg(l, 1-1))),
     };
     let mut cnt = 0;
     l.stack_ensure(l.base + n.saturating_sub(k));
@@ -105,8 +105,12 @@ pub fn lib_next(l: &mut LuaState) -> LuaResult<i32> {
     let k = arg(l, 1);
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg(l, 1, "next", "table", "")),
+        None => return Err(err_bad_arg_type(l, 1, "next", "table", arg(l, 1-1))),
     };
+    // Lua 5.1: a non-nil key must actually be in the table.
+    if !k.is_nil() && tab.as_ref().get(k).is_nil() {
+        return Err(l.runtime_error(b"invalid key to 'next'"));
+    }
     match tab.as_ref().next(k) {
         Some((nk, nv)) => {
             pushv(l, &[nk, nv]);
@@ -135,7 +139,7 @@ pub fn lib_ipairs_iter(l: &mut LuaState) -> LuaResult<i32> {
     let i = arg(l, 1).as_number().unwrap_or(0.0) + 1.0;
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg(l, 1, "ipairs", "table", "")),
+        None => return Err(err_bad_arg_type(l, 1, "ipairs", "table", arg(l, 1-1))),
     };
     let v = tab.as_ref().get_int(i as i32);
     if v.is_nil() {
@@ -161,10 +165,10 @@ fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
     let mt = arg(l, 1);
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg(l, 1, "setmetatable", "table", "")),
+        None => return Err(err_bad_arg_type(l, 1, "setmetatable", "table", arg(l, 1-1))),
     };
     if !mt.is_table() && !mt.is_nil() {
-        return Err(err_bad_arg(l, 2, "setmetatable", "nil or table", ""));
+        return Err(err_bad_arg_type(l, 2, "setmetatable", "nil or table", arg(l, 2-1)));
     }
     // Protected metatable check (lj_meta_lookup(o, MM_metatable)).
     if !crate::meta::meta_lookup(l.global(), t, MM::Metatable).is_nil() {
@@ -183,7 +187,9 @@ fn lib_assert(l: &mut LuaState) -> LuaResult<i32> {
     } else {
         let msg = arg(l, 1);
         if msg.is_nil() {
-            Err(l.runtime_error(b"assertion failed!"))
+            // LuaJIT: no location prefix for the bare message.
+            l.errval = l.heap().str_value(l.heap().intern(b"assertion failed!"));
+            Err(LuaError::Runtime)
         } else {
             l.errval = msg;
             Err(LuaError::Runtime)
@@ -272,7 +278,7 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             push(l, LuaValue::number(bytes as f64 / 1024.0));
             Ok(1)
         }
-        _ => Err(err_bad_arg(l, 1, "collectgarbage", "option string", "")),
+        _ => Err(err_bad_arg_type(l, 1, "collectgarbage", "option string", arg(l, 1-1))),
     }
 }
 
@@ -288,7 +294,7 @@ pub fn lib_rawget(l: &mut LuaState) -> LuaResult<i32> {
     let k = arg(l, 1);
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg(l, 1, "rawget", "table", "")),
+        None => return Err(err_bad_arg_type(l, 1, "rawget", "table", arg(l, 1-1))),
     };
     push(l, tab.as_ref().get(k));
     Ok(1)
@@ -300,7 +306,7 @@ pub fn lib_rawset(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 2);
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg(l, 1, "rawset", "table", "")),
+        None => return Err(err_bad_arg_type(l, 1, "rawset", "table", arg(l, 1-1))),
     };
     tab.as_mut().set(k, v);
     push(l, t);
@@ -316,14 +322,32 @@ fn lib_rawequal(l: &mut LuaState) -> LuaResult<i32> {
 
 fn lib_error(l: &mut LuaState) -> LuaResult<i32> {
     let msg = arg(l, 0);
-    let _level = arg(l, 1).as_number().unwrap_or(1.0) as i32;
-    if let Some(sid) = msg.as_string_id() {
-        let bytes = l.heap().strings.get(sid).to_vec();
-        Err(l.runtime_error(&bytes))
-    } else {
+    let level = arg(l, 1).as_number().unwrap_or(1.0) as i32;
+    if level == 0 {
+        // level 0: the message is used verbatim (no position added).
         l.errval = if msg.is_nil() { LuaValue::NIL } else { msg };
-        Err(LuaError::Runtime)
+        return Err(LuaError::Runtime);
     }
+    // The position prefix is added only when the direct caller is a Lua
+    // function (LuaJIT's lj_ff_error: a C caller such as pcall/xpcall has
+    // no location to report).
+    let link = l.stack[l.base - 1].to_bits();
+    let caller_is_lua = (link & 3) == 0
+        && {
+            let sb = (link >> 3) as usize;
+            sb >= 2
+                && l.stack[sb - 2].as_func().map_or(false, |f| {
+                    matches!(f.as_ref(), crate::func::GcFunc::Lua(_))
+                })
+        };
+    if caller_is_lua
+        && let Some(sid) = msg.as_string_id()
+    {
+        let bytes = l.heap().strings.get(sid).to_vec();
+        return Err(l.runtime_error(&bytes));
+    }
+    l.errval = if msg.is_nil() { LuaValue::NIL } else { msg };
+    Err(LuaError::Runtime)
 }
 
 /// `pcall(f [, arg...])` — protected call. The callee may be any value:
@@ -409,6 +433,57 @@ fn lib_getmetatable(l: &mut LuaState) -> LuaResult<i32> {
         }
         None => push(l, LuaValue::NIL),
     }
+    Ok(1)
+}
+
+/// `setfenv(f, table)` — set the environment of a function (Lua 5.1).
+fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
+    let o = arg(l, 0);
+    let tab = match arg(l, 1).as_table() {
+        Some(t) => t,
+        None => return Err(err_bad_arg_type(l, 2, "setfenv", "table", arg(l, 2-1))),
+    };
+    if let Some(f) = o.as_func() {
+        match f.as_mut() {
+            crate::func::GcFunc::Lua(c) => c.env = tab,
+            crate::func::GcFunc::C(c) => c.env = tab,
+        }
+        push(l, o);
+    } else if o.is_number() {
+        return Err(l.runtime_error(b"setfenv: numeric level not supported"));
+    } else {
+        return Err(err_bad_arg_type(l, 1, "setfenv", "function or number", arg(l, 1-1)));
+    }
+    Ok(1)
+}
+
+/// `getfenv(f)` — the environment of a function (Lua 5.1).
+fn lib_getfenv(l: &mut LuaState) -> LuaResult<i32> {    let o = arg(l, 0);
+    let env = match o.as_func() {
+        Some(f) => match f.as_ref() {
+            crate::func::GcFunc::Lua(c) => c.env,
+            crate::func::GcFunc::C(c) => c.env,
+        },
+        _ => l.global().globals,
+    };
+    push(l, LuaValue::table(env));
+    Ok(1)
+}
+
+/// `rawlen(v)` — raw length without metamethods (Lua 5.2).
+fn lib_rawlen(l: &mut LuaState) -> LuaResult<i32> {
+    let v = arg(l, 0);
+    let n = if let Some(t) = v.as_table() {
+        t.as_ref().len() as f64
+    } else if let Some(sid) = v.as_string_id() {
+        l.str_static(sid).len() as f64
+    } else if let Some(ud) = v.as_userdata() {
+        // Lua 5.2: userdata length is the size of its memory block.
+        std::mem::size_of::<GcUserData>() as f64
+    } else {
+        return Err(err_bad_arg_type(l, 1, "rawlen", "table or string", v));
+    };
+    push(l, LuaValue::number(n));
     Ok(1)
 }
 
@@ -524,7 +599,7 @@ fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
             }
         }
     } else {
-        Err(err_bad_arg(l, 1, "load", "string or function", ""))
+        Err(err_bad_arg_type(l, 1, "load", "string or function", arg(l, 1-1)))
     }
 }
 
@@ -532,7 +607,7 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
     let code = match v.as_string() {
         Some(s) => s.as_ref().as_bytes().to_vec(),
-        None => return Err(err_bad_arg(l, 1, "loadstring", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "loadstring", "string", arg(l, 1-1))),
     };
     let chunkname = if nargs(l) >= 2 {
         let nv = arg(l, 1);
@@ -565,7 +640,7 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_loadfile(l: &mut LuaState) -> LuaResult<i32> {
     let filename = match arg(l, 0).as_string() {
         Some(s) => s.as_ref().as_bytes().to_vec(),
-        None => return Err(err_bad_arg(l, 1, "loadfile", "string", "")),
+        None => return Err(err_bad_arg_type(l, 1, "loadfile", "string", arg(l, 1-1))),
     };
     let chunkname = std::str::from_utf8(&filename)
         .unwrap_or("=(loadfile)")
@@ -652,6 +727,9 @@ pub fn open(l: &mut LuaState) {
         .func(b"pcall", lib_pcall)
         .func(b"xpcall", lib_xpcall)
         .func(b"getmetatable", lib_getmetatable)
+        .func(b"rawlen", lib_rawlen)
+        .func(b"setfenv", lib_setfenv)
+        .func(b"getfenv", lib_getfenv)
         .func(b"loadstring", lib_loadstring)
         .func(b"load", lib_load)
         .func(b"loadfile", lib_loadfile)

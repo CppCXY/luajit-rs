@@ -1860,6 +1860,20 @@ impl Record {
                 if !tref_isnum(c) {
                     return Err(TraceError::NYIBC);
                 }
+                // Out-of-range exits to the interpreter, which raises
+                // "out of range" (string.char(300) is an error).
+                let k0 = self.cur.ir.knum(0.0);
+                let k255 = self.cur.ir.knum(255.0);
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::UGE, IRT_GUARD | IRT_INT),
+                    tref_ref(c),
+                    tref_ref(k0),
+                ));
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::ULE, IRT_GUARD | IRT_INT),
+                    tref_ref(c),
+                    tref_ref(k255),
+                ));
                 res[0] = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CALLL, IRT_STR),
                     tref_ref(c),
@@ -1904,31 +1918,10 @@ impl Record {
                         tref_ref(carg),
                     ));
                 } else if nargs == 3 {
-                    // Positional form: table.insert(t, pos, v).
-                    let posv = argv[1];
-                    let posn = posv.as_number().ok_or(TraceError::NYIBC)?;
-                    let pi = posn as i32;
-                    if pi as f64 != posn || pi < 1 {
-                        return Err(TraceError::NYIBC);
-                    }
-                    if (pi as u32) >= t.as_ref().asize {
-                        return Err(TraceError::NYIBC);
-                    }
-                    let key = self.base_ref(a + 3);
-                    if !tref_isnum(key) {
-                        return Err(TraceError::NYIBC);
-                    }
-                    let val = self.base_ref(a + 4);
-                    let carg = self.cur.ir.emit_ins(IRIns::new(
-                        irt(IROp::CARG, IRT_NIL),
-                        tref_ref(key),
-                        tref_ref(val),
-                    ));
-                    self.cur.ir.emit_ins(IRIns::new(
-                        irt(IROp::ASTORE, IRT_NIL),
-                        tref_ref(tab),
-                        tref_ref(carg),
-                    ));
+                    // Positional insert shifts [pos..#t] up by one: a loop
+                    // the trace can't express faithfully. Keep it in the
+                    // interpreter (whose tab_insert does the shift).
+                    return Err(TraceError::NYIBC);
                 } else {
                     return Err(TraceError::NYIBC);
                 }

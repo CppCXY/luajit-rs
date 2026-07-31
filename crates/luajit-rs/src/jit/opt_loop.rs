@@ -189,9 +189,19 @@ fn loop_unroll(rec: &mut Record) -> Result<(), TraceError> {
         // loop iterations for the same object. Without this, the
         // loop body duplicates the metatable-nil guard, bloating
         // machine code and hurting QEMU throughput.
+        //
+        // Allocations (TDUP/TNEW/CNEW) are *not* invariant: they must
+        // run on every iteration (each `{...}`/`function() end`/newproxy
+        // creates a fresh object), and hoisting them leaves the loop
+        // body reading a dead env slot (the hoisted allocation sits in
+        // the pre-roll, outliving the iteration that used it).
         let mode = IR_MODE[ir.op() as usize];
         let is_load = irm_kind(mode) == IRM_L && ir.op() == IROp::FLOAD;
-        if (irm_kind(mode) == IRM_N || is_load) && op1 == ir.op1 as IRRef && op2 == ir.op2 as IRRef
+        let is_alloc = matches!(ir.op(), IROp::TDUP | IROp::TNEW | IROp::CNEW);
+        if (irm_kind(mode) == IRM_N || is_load)
+            && !is_alloc
+            && op1 == ir.op1 as IRRef
+            && op2 == ir.op2 as IRRef
         {
             subst[iidx(ins)] = ins as IRRef1; // Regular invariant ins.
             ins += 1;

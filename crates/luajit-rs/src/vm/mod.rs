@@ -1020,7 +1020,14 @@ impl Interp {
                     if let Some(sid) = v.as_string_id() {
                         let n = self.l().heap().strings.get(sid).len();
                         setreg!(a, LuaValue::number(n as f64));
-                    } else if let Some(t) = v.as_table() {
+                    } else if let Some(t) = v.as_table()
+                        && !crate::meta::meta_fast(
+                            self.l().global(),
+                            t.as_ref().metatable,
+                            MM::Len,
+                        )
+                        .is_some()
+                    {
                         setreg!(a, LuaValue::number(t.as_ref().len() as f64));
                     } else {
                         sync!();
@@ -1968,8 +1975,16 @@ impl Interp {
                     let idx = reg!(a + FORL_IDX);
                     let stop = reg!(a + FORL_STOP);
                     let step = reg!(a + FORL_STEP);
-                    if idx.is_number() && stop.is_number() && step.is_number() {
-                        let (i, s, st) = (idx.num(), stop.num(), step.num());
+                    if let (Some(i), Some(s), Some(st)) = (
+                        for_number(self.l(), idx),
+                        for_number(self.l(), stop),
+                        for_number(self.l(), step),
+                    ) {
+                        // LuaJIT coerces strings to numbers and writes the
+                        // converted values back for the loop comparisons.
+                        setreg!(a + FORL_IDX, LuaValue::number(i));
+                        setreg!(a + FORL_STOP, LuaValue::number(s));
+                        setreg!(a + FORL_STEP, LuaValue::number(st));
                         setreg!(a + FORL_EXT, LuaValue::number_raw(i));
                         let enter = if st >= 0.0 { i <= s } else { i >= s };
                         if !enter {
@@ -1988,8 +2003,14 @@ impl Interp {
                     let idx = reg!(a + FORL_IDX);
                     let stop = reg!(a + FORL_STOP);
                     let step = reg!(a + FORL_STEP);
-                    if idx.is_number() && stop.is_number() && step.is_number() {
-                        let (i, s, st) = (idx.num(), stop.num(), step.num());
+                    if let (Some(i), Some(s), Some(st)) = (
+                        for_number(self.l(), idx),
+                        for_number(self.l(), stop),
+                        for_number(self.l(), step),
+                    ) {
+                        setreg!(a + FORL_IDX, LuaValue::number(i));
+                        setreg!(a + FORL_STOP, LuaValue::number(s));
+                        setreg!(a + FORL_STEP, LuaValue::number(st));
                         setreg!(a + FORL_EXT, LuaValue::number_raw(i));
                         let enter = if st >= 0.0 { i <= s } else { i >= s };
                         if enter {
@@ -2942,6 +2963,19 @@ impl Interp {
 
 /// The three primitive values, indexed by KPRI/ISEQP operand (0/1/2).
 const PRI: [LuaValue; 3] = [LuaValue::NIL, LuaValue::FALSE, LuaValue::TRUE];
+
+/// Numeric coercion for `for` loop bounds (LuaJIT's `lj_tonumber` at the
+/// FORI dispatch): numbers pass through, strings are parsed.
+fn for_number(l: &LuaState, v: LuaValue) -> Option<f64> {
+    if v.is_number() {
+        return Some(v.num());
+    }
+    if let Some(sid) = v.as_string_id() {
+        let bytes = l.global().heap.strings.get(sid).to_vec();
+        return crate::strscan::scan_number(&bytes);
+    }
+    None
+}
 
 /// Raw equality used by ISEQ*/ISNE*: numbers compare by value (so `-0.0` and
 /// NaN behave), everything else by bit pattern (interned strings and GC
