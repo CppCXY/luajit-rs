@@ -198,7 +198,11 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
     };
     match opt.as_slice() {
         b"collect" | b"full" => {
+            // Run any pending finalizers before and after the collection
+            // (a full cycle may separate new ones in its atomic phase).
+            crate::vm::run_finalizers(l)?;
             crate::gc::full_gc(l.global());
+            crate::vm::run_finalizers(l)?;
             push(l, LuaValue::number(0.0));
             Ok(1)
         }
@@ -242,6 +246,9 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
                 g.heap.threshold
             };
             drop(g);
+            if l.global().heap.gc_state == crate::runtime::gc::GcState::Finalize {
+                crate::vm::run_finalizers(l)?;
+            }
             push(l, LuaValue::boolean(done));
             l.global().heap.threshold = new_threshold;
             Ok(1)

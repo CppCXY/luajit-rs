@@ -47,6 +47,13 @@ pub struct GcHeap {
     pub gc_state: GcState,
     pub gc_gray: Vec<Gray>,
     pub gc_grayagain: Vec<Gray>,
+    /// Weak tables found during marking, with their `__mode` bits. Cleared
+    /// in the atomic phase (entries whose key/value is about to be swept
+    /// are removed before any object is freed).
+    pub gc_weak: Vec<(GcPtr<LuaTable>, u8)>,
+    /// Objects waiting for their `__gc` finalizer. Filled by the atomic
+    /// phase; the VM drains it at the next safe point.
+    pub mmudata: Vec<crate::runtime::gc::Finalizable>,
     pub gc_sweep_pool: u8,
     pub gc_step_size: usize,
     /// Tri-color white bit (0 or 1), flips each GC cycle.
@@ -73,6 +80,8 @@ impl Default for GcHeap {
             gc_state: gc::GcState::Pause,
             gc_gray: Vec::new(),
             gc_grayagain: Vec::new(),
+            gc_weak: Vec::new(),
+            mmudata: Vec::new(),
             gc_sweep_pool: 0,
             gc_step_size: gc::GC_STEP_SIZE,
             current_white: 0,

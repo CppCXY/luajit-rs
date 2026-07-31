@@ -189,9 +189,35 @@ impl LuaTable {
     /// of every non-empty hash node. Keys of nil-value nodes are *not*
     /// marked (LuaJIT's dead-key policy: the stale reference stays in the
     /// node but is only ever compared by identity, never dereferenced).
-    pub(crate) fn gc_traverse(&self, mut mark: impl FnMut(LuaValue)) {
+    ///
+    /// Returns the table's weak-mode bits (`WEAKKEY`/`WEAKVAL`) when it is
+    /// a weak table; the weak side of the entries is then skipped (it is
+    /// resolved in the atomic phase by `clear_weak_entries`).
+    pub(crate) fn gc_traverse(&self, mut mark: impl FnMut(LuaValue)) -> u8 {
+        let weak = self.weak_mode();
         if let Some(mt) = self.metatable {
             mark(LuaValue::table(mt));
+        }
+        if weak != 0 {
+            if weak & gc::WEAKVAL == 0 {
+                for &v in &self.array {
+                    mark(v);
+                }
+            }
+            if self.has_hpart() {
+                for n in &self.node {
+                    if !n.val.is_nil() {
+                        debug_assert!(!n.key.is_nil(), "nil key in non-empty slot");
+                        if weak & gc::WEAKKEY == 0 {
+                            mark(n.key);
+                        }
+                        if weak & gc::WEAKVAL == 0 {
+                            mark(n.val);
+                        }
+                    }
+                }
+            }
+            return weak;
         }
         for &v in &self.array {
             mark(v);
@@ -202,6 +228,74 @@ impl LuaTable {
                     debug_assert!(!n.key.is_nil(), "nil key in non-empty slot");
                     mark(n.key);
                     mark(n.val);
+                }
+            }
+        }
+        0
+    }
+
+    /// `WEAKKEY`/`WEAKVAL` bits parsed from the metatable's `__mode`
+    /// string, or 0 for a strong table. Per `gc_traverse_tab`, the mode is
+    /// re-read on every traversal so runtime changes to `__mode` take
+    /// effect (the metatable itself is a strong table, so its keys are
+    /// always safe to dereference).
+    pub(crate) fn weak_mode(&self) -> u8 {
+        let Some(mt) = self.metatable else { return 0 };
+        let mut mode = 0u8;
+        if let Some(v) = mt.as_ref().scan_str_key(b"__mode")
+            && let Some(s) = v.as_string()
+        {
+            for &c in s.as_ref().as_bytes() {
+                match c {
+                    b'k' => mode |= gc::WEAKKEY,
+                    b'v' => mode |= gc::WEAKVAL,
+                    _ => {}
+                }
+            }
+        }
+        mode
+    }
+
+    /// Scan the hash part for a string key (used for GC-time metatable
+    /// lookups such as `__mode` / `__gc`, where no interner is available).
+    /// The metatable is a strong table, so its string keys are alive and
+    /// safe to dereference. Returns the value of the first match.
+    pub(crate) fn scan_str_key(&self, key: &[u8]) -> Option<LuaValue> {
+        if !self.has_hpart() {
+            return None;
+        }
+        for n in &self.node {
+            if n.val.is_nil() {
+                continue;
+            }
+            if let Some(s) = n.key.as_string()
+                && s.as_ref().as_bytes() == key
+            {
+                return Some(n.val);
+            }
+        }
+        None
+    }
+
+    /// Atomic-phase cleanup per `gc_clearweak`: drop entries whose key or
+    /// value is about to be collected. The value slot is cleared (the dead
+    /// key stays in the node, per LuaJIT's dead-key policy). Strings are
+    /// never weak references: they are marked and kept.
+    pub(crate) fn clear_weak_entries(&mut self, mode: u8) {
+        if mode & gc::WEAKVAL != 0 {
+            for tv in self.array.iter_mut() {
+                if gc::may_clear(*tv) {
+                    *tv = LuaValue::NIL;
+                }
+            }
+        }
+        if mode & (gc::WEAKKEY | gc::WEAKVAL) != 0 {
+            for n in self.node.iter_mut() {
+                if n.val.is_nil() {
+                    continue;
+                }
+                if gc::may_clear(n.key) || gc::may_clear(n.val) {
+                    n.val = LuaValue::NIL;
                 }
             }
         }

@@ -33,6 +33,39 @@ use crate::state::{LuaState, Suspend};
 use crate::table::LuaTable;
 use crate::value::*;
 
+/// Run all pending `__gc` finalizers (`lj_gc_finalize_udata`). Called at
+/// safe points while the collector is in the `Finalize` state; resets it
+/// to `Pause` once the list is drained. An error raised by a finalizer
+/// propagates to the caller (LuaJIT's ERRFIN behavior without a handler).
+pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
+    loop {
+        let g = l.global();
+        let Some(o) = g.heap.mmudata.pop() else {
+            g.heap.gc_state = crate::runtime::gc::GcState::Pause;
+            return Ok(());
+        };
+        // The finalizer ran: the object is now dead for the *next* cycle.
+        let mo = crate::meta::meta_lookup(g, o.value(), MM::Gc);
+        o.mark_finalized(g.heap.current_white);
+        drop(g);
+        if mo.is_nil() {
+            continue;
+        }
+        let saved_top = l.top;
+        l.stack_ensure(saved_top + 3 + STACK_SAFETY);
+        l.stack[saved_top] = mo;
+        l.stack[saved_top + 1] = LuaValue::NIL;
+        l.stack[saved_top + 2] = o.value();
+        match execute(l, saved_top, 1, -1) {
+            Ok(_) => l.top = saved_top,
+            Err(e) => {
+                l.top = saved_top;
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Frame type markers kept in the low bits of the frame-link slot at
 /// `base-1`, exactly as in LuaJIT's `lj_frame.h` (FR2 layout):
 ///
@@ -1321,7 +1354,7 @@ impl Interp {
                 }
                 BCOp::CAT => {
                     sync!();
-                    self.gc_check();
+                    self.gc_check()?;
                     let r = self.meta_cat(bc_b(ins), bc_c(ins))?;
                     setreg!(a, r);
                 }
@@ -1392,7 +1425,7 @@ impl Interp {
                 }
                 BCOp::FNEW => {
                     sync!();
-                    self.gc_check();
+                    self.gc_check()?;
                     let v = self.new_closure(bc_d(ins));
                     setreg!(a, v);
                 }
@@ -1403,14 +1436,14 @@ impl Interp {
                     let g = self.l().global();
                     if g.heap.should_collect() || g.heap.debt > 4096 {
                         sync!();
-                        self.gc_check();
+                        self.gc_check()?;
                     }
                     let t = self.l().heap().alloc_table(LuaTable::new(0, 0));
                     setreg!(a, LuaValue::table(t));
                 }
                 BCOp::TDUP => {
                     sync!();
-                    self.gc_check();
+                    self.gc_check()?;
                     let templ = match &self.proto().kgc[bc_d(ins) as usize] {
                         KGc::Table(t) => t.dup(),
                         KGc::TableRef(t) => t.as_ref().dup(),
@@ -1700,7 +1733,7 @@ impl Interp {
                                 if self.rec_started() {
                                     return Ok(Flow::Rec); // Hot exit side trace.
                                 }
-                                self.gc_check();
+                                self.gc_check()?;
                                 resync!();
                                 continue;
                             }
@@ -1786,7 +1819,7 @@ impl Interp {
                                 if self.rec_started() {
                                     return Ok(Flow::Rec); // Hot exit side trace.
                                 }
-                                self.gc_check();
+                                self.gc_check()?;
                                 resync!();
                             }
                             continue;
@@ -1959,7 +1992,7 @@ impl Interp {
                             if self.rec_started() {
                                 return Ok(Flow::Rec); // Hot exit: record a side trace.
                             }
-                            self.gc_check();
+                            self.gc_check()?;
                             resync!();
                             continue;
                         } else {
@@ -2015,7 +2048,7 @@ impl Interp {
                         if self.rec_started() {
                             return Ok(Flow::Rec); // Hot exit: record a side trace.
                         }
-                        self.gc_check();
+                        self.gc_check()?;
                         resync!();
                     }
                 }
@@ -2045,7 +2078,7 @@ impl Interp {
                     if self.rec_started() {
                         return Ok(Flow::Rec); // Hot exit: record a side trace.
                     }
-                    self.gc_check();
+                    self.gc_check()?;
                     resync!();
                 }
                 BCOp::JMP => jump!(ins),
@@ -2087,7 +2120,7 @@ impl Interp {
                         if self.rec_started() {
                             return Ok(Flow::Rec); // Hot exit: record a side trace.
                         }
-                        self.gc_check();
+                        self.gc_check()?;
                         resync!();
                     }
                 }
@@ -2366,16 +2399,25 @@ impl Interp {
     /// allocating opcode, with locals synced): the marker sees every live
     /// object through the stacks and roots. Fixes `l.top` up to the running
     /// frame's full extent first, since returns may have lowered it.
+    ///
+    /// Runs pending `__gc` finalizers too: an error raised by one
+    /// propagates from this allocating instruction, i.e. from inside any
+    /// enclosing `pcall` (mirroring LuaJIT, where it surfaces from the
+    /// allocation that triggered the collection).
     #[inline]
-    fn gc_check(&mut self) {
+    fn gc_check(&mut self) -> LuaResult<()> {
         let g = self.l().global();
         if g.heap.should_collect() || g.heap.debt > 4096 {
-            self.gc_collect();
+            self.gc_collect()?;
         }
+        if self.l().global().heap.gc_state == crate::runtime::gc::GcState::Finalize {
+            run_finalizers(self.l())?;
+        }
+        Ok(())
     }
 
     #[cold]
-    fn gc_collect(&mut self) {
+    fn gc_collect(&mut self) -> LuaResult<()> {
         let need = self.base + self.proto().framesize as usize;
         let l = self.l();
         if l.top < need {
@@ -2384,12 +2426,13 @@ impl Interp {
         let step_size = l.global().heap.gc_step_size;
         let paused = l.global().heap.gc_state == crate::runtime::gc::GcState::Pause;
         let stopped = l.global().heap.gc_stopped;
-        if stopped { return; }
+        if stopped { return Ok(()); }
         let g = l.global();
         if paused {
             crate::gc::start_gc_cycle(g);
         }
         crate::gc::gc_step(&mut g.heap, step_size);
+        Ok(())
     }
 
     #[cold]
@@ -2991,3 +3034,4 @@ pub fn resume_finish(
     co.c_depth -= 1;
     r
 }
+

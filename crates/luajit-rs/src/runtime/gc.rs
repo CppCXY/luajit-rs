@@ -33,6 +33,7 @@ pub struct GcHeader {
 const BIT_WHITE0: u8 = 0b0000_1000;
 const BIT_WHITE1: u8 = 0b0001_0000;
 const BIT_BLACK: u8 = 0b0010_0000;
+const BIT_FINALIZED: u8 = 0b0100_0000;
 const COLOR_MASK: u8 = BIT_WHITE0 | BIT_WHITE1 | BIT_BLACK;
 const AGE_MASK: u8 = 0b0000_0111;
 
@@ -93,6 +94,27 @@ impl GcHeader {
         } else {
             BIT_WHITE0
         }
+    }
+
+    /// `isfinalized`: the `__gc` finalizer has already run; the object is
+    /// just waiting for the sweep to collect it.
+    pub fn is_finalized(&self) -> bool {
+        self.rb() & BIT_FINALIZED != 0
+    }
+    pub fn set_finalized(&self) {
+        self.wb(self.rb() | BIT_FINALIZED);
+    }
+    /// Unmark: clear the tri-color bits (the sweep then keeps the object
+    /// alive without marking it, and weak tables keep its entries).
+    pub fn make_undead(&self) {
+        self.wb(self.rb() & !COLOR_MASK);
+    }
+    /// Set the color to the white bit of the *next* cycle, so the object
+    /// is swept one cycle after its finalizer ran ("finalized keys are
+    /// removed in two cycles").
+    pub fn make_dead_next(&self, current_white: u8) {
+        let color = if current_white == 0 { BIT_WHITE0 } else { BIT_WHITE1 };
+        self.wb((self.rb() & !COLOR_MASK) | BIT_FINALIZED | color);
     }
 
     pub fn age(&self) -> Age {
@@ -555,6 +577,20 @@ impl<T> GcPtr<T> {
         gc_header(self.0).marked.get()
     }
 
+    /// `isdead`: the object carries the white bit that the sweep phase is
+    /// about to collect. Mirrors LuaJIT's `isdead` for `gc_mayclear`.
+    pub(crate) fn is_dead(self, current_white: u8) -> bool {
+        gc_header(self.0).is_dead(current_white)
+    }
+
+    /// `iswhite`: the object is not marked (carries any white bit). This is
+    /// what `gc_mayclear` tests: an entry whose key/value was not marked in
+    /// this cycle is dropped from a weak table, even if the object would
+    /// only be swept one cycle later.
+    pub(crate) fn is_white(self) -> bool {
+        gc_header(self.0).is_white()
+    }
+
     pub fn set_marked(self) {
         let h = gc_header(self.0);
         h.marked.set(true);
@@ -596,10 +632,14 @@ use crate::proto::{KGc, Proto};
 use crate::runtime::userdata::GcUserData;
 use crate::state::{GcHeap, GlobalState, LuaState};
 use crate::table::LuaTable;
-use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LJ_TUDATA, LuaValue};
+use crate::value::{LJ_TCDATA, LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LJ_TUDATA, LuaValue};
 
 pub const GC_PAUSE: usize = 200;
 pub(crate) const GC_THRESHOLD_MIN: usize = 64 * 1024;
+
+/// Weak-table mode bits (mirror of LuaJIT's `LJ_GC_WEAKKEY`/`LJ_GC_WEAKVAL`).
+pub const WEAKKEY: u8 = 0x08;
+pub const WEAKVAL: u8 = 0x10;
 
 // Incremental GC state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -608,6 +648,10 @@ pub enum GcState {
     Propagate,
     Atomic,
     Sweep,
+    /// Sweep finished but there are objects waiting for their `__gc`
+    /// finalizers. The VM runs them at the next safe point
+    /// (`vm::run_finalizers`), which returns the collector to `Pause`.
+    Finalize,
 }
 pub const GC_STEP_SIZE: usize = 4096;
 
@@ -619,9 +663,53 @@ pub enum Gray {
     UserData(GcPtr<GcUserData>),
 }
 
+impl Gray {
+    fn ptr(&self) -> u64 {
+        match self {
+            Gray::Tab(p) => p.addr(),
+            Gray::Func(p) => p.addr(),
+            Gray::Proto(p) => p.addr(),
+            Gray::Thread(p) => p.addr(),
+            Gray::UserData(p) => p.addr(),
+        }
+    }
+}
+
+/// An object whose `__gc` finalizer must run. Collected during the atomic
+/// phase into `GcHeap.mmudata` and executed by the VM at the next safe
+/// point (after the sweep, so every object the finalizer may touch is
+/// still alive).
+pub enum Finalizable {
+    Table(GcPtr<LuaTable>),
+    UData(GcPtr<GcUserData>),
+}
+
+impl Finalizable {
+    pub fn value(&self) -> LuaValue {
+        match self {
+            Finalizable::Table(t) => LuaValue::table(*t),
+            Finalizable::UData(u) => LuaValue::userdata(*u),
+        }
+    }
+    pub fn metatable(&self) -> Option<GcPtr<LuaTable>> {
+        match self {
+            Finalizable::Table(t) => t.as_ref().metatable,
+            Finalizable::UData(u) => u.as_ref().metatable,
+        }
+    }
+    pub fn mark_finalized(&self, current_white: u8) {
+        match self {
+            Finalizable::Table(t) => gc_header(t.0).make_dead_next(current_white),
+            Finalizable::UData(u) => gc_header(u.0).make_dead_next(current_white),
+        }
+    }
+}
+
 struct Marker<'g> {
     gray: Vec<Gray>,
     strings: &'g Interner,
+    /// Weak tables discovered during traversal, with their `__mode` bits.
+    weak: Vec<(GcPtr<LuaTable>, u8)>,
 }
 impl<'g> Marker<'g> {
     fn mark_value(&mut self, v: LuaValue) {
@@ -678,6 +766,9 @@ impl<'g> Marker<'g> {
         }
     }
     fn mark_table(&mut self, t: GcPtr<LuaTable>) {
+        if t.addr() == 0 {
+            eprintln!("[gcprobe] mark_table(NULL)"); std::process::abort();
+        }
         if !t.is_marked() {
             t.set_marked();
             self.gray.push(Gray::Tab(t));
@@ -704,16 +795,31 @@ impl<'g> Marker<'g> {
                     }
                 }
                 KGc::ProtoRef(c) => this.mark_proto(*c),
-                KGc::Table(t) => t.gc_traverse(|v| this.mark_value(v)),
-                KGc::TableRef(t) => t.as_ref().gc_traverse(|v| this.mark_value(v)),
+                // Template tables are strong (no metatable): ignore the
+                // weak-mode return.
+                KGc::Table(t) => {
+                    t.gc_traverse(|v| this.mark_value(v));
+                }
+                KGc::TableRef(t) => {
+                    t.as_ref().gc_traverse(|v| this.mark_value(v));
+                }
                 KGc::Proto(_) | KGc::CData(_) => {}
             }
         }
     }
+    fn collect_weak(&mut self, t: GcPtr<LuaTable>, mode: u8) {
+        if mode != 0 && !self.weak.iter().any(|(p, _)| *p == t) {
+            self.weak.push((t, mode));
+        }
+    }
+
     fn propagate(&mut self) {
         while let Some(g) = self.gray.pop() {
             match g {
-                Gray::Tab(t) => t.as_ref().gc_traverse(|v| self.mark_value(v)),
+                Gray::Tab(t) => {
+                    let mode = t.as_ref().gc_traverse(|v| self.mark_value(v));
+                    self.collect_weak(t, mode);
+                }
                 Gray::Func(f) => match f.as_ref() {
                     GcFunc::Lua(c) => {
                         self.mark_table(c.env);
@@ -769,14 +875,18 @@ impl<'g> Marker<'g> {
                 return true;
             }
             let g = self.gray.pop().unwrap();
+            if g.ptr() == 0 {
+                eprintln!("[gcprobe] NULL GRAY ENTRY at work={} remaining={}", work, self.gray.len());
+                std::process::abort();
+            }
             match g {
                 Gray::Tab(t) => {
                     t.set_marked();
-                    t.as_ref().gc_traverse(|v| self.mark_value(v));
+                    let mode = t.as_ref().gc_traverse(|v| self.mark_value(v));
+                    self.collect_weak(t, mode);
                 }
                 Gray::Func(f) => {
-                    f.set_marked();
-                    match f.as_ref() {
+                    f.set_marked();                    match f.as_ref() {
                         GcFunc::Lua(c) => {
                             self.mark_table(c.env);
                             self.mark_proto(c.proto);
@@ -808,8 +918,12 @@ impl<'g> Marker<'g> {
                                 }
                             }
                             KGc::ProtoRef(c) => self.mark_proto(*c),
-                            KGc::Table(t) => t.gc_traverse(|v| self.mark_value(v)),
-                            KGc::TableRef(t) => t.as_ref().gc_traverse(|v| self.mark_value(v)),
+                            KGc::Table(t) => {
+                                t.gc_traverse(|v| self.mark_value(v));
+                            }
+                            KGc::TableRef(t) => {
+                                t.as_ref().gc_traverse(|v| self.mark_value(v));
+                            }
                             _ => {}
                         }
                     }
@@ -854,7 +968,7 @@ const fn size_upval() -> usize {
 /// Forward barrier: when a table (possibly BLACK) is written with a GC
 /// value, ensure the value is at least GRAY so the sweep doesn't free it.
 pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
-    if heap.gc_state == GcState::Pause {
+    if heap.gc_state == GcState::Pause || heap.gc_state == GcState::Finalize {
         return;
     }
     let gray = if heap.gc_state == GcState::Propagate {
@@ -916,7 +1030,7 @@ pub fn barrier_fwd(heap: &mut GcHeap, val: LuaValue) {
 /// including from the VM interpreter.
 #[inline]
 pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
-    if heap.gc_state == GcState::Pause {
+    if heap.gc_state == GcState::Pause || heap.gc_state == GcState::Finalize {
         return;
     }
     let h = gc_header(t.0);
@@ -948,6 +1062,7 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             let mut m = Marker {
                 gray: std::mem::take(&mut heap.gc_gray),
                 strings: &heap.strings,
+                weak: Vec::new(),
             };
             let done = m.propagate_step((step / 64).max(1));
             m.gray.extend(std::mem::take(&mut heap.gc_gray));
@@ -955,6 +1070,7 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
                 heap.gc_state = GcState::Atomic;
             }
             heap.gc_gray = m.gray;
+            heap.gc_weak.extend(m.weak);
             false
         }
         GcState::Atomic => {
@@ -962,11 +1078,37 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
                 let mut gray = std::mem::take(&mut heap.gc_grayagain);
                 gray.extend(std::mem::take(&mut heap.gc_gray));
                 if gray.is_empty() { break; }
-                let mut m = Marker { gray, strings: &heap.strings };
+                let mut m = Marker { gray, strings: &heap.strings, weak: Vec::new() };
                 m.propagate();
+                heap.gc_weak.extend(m.weak);
             }
             heap.gc_gray.clear();
             heap.gc_grayagain.clear();
+            // Separate objects that need a __gc finalizer. They are kept
+            // unmarked (sweep keeps them; weak tables keep their entries,
+            // so the finalizer can still reach them). Their metatables
+            // are marked so the __gc function stays alive.
+            let mmu = if std::env::var("LUARS_NO_FIN").is_ok() {
+                Vec::new()
+            } else {
+                separate_finalizable(heap)
+            };
+            if !mmu.is_empty() {
+                let mut m = Marker { gray: Vec::new(), strings: &heap.strings, weak: Vec::new() };
+                for o in &mmu {
+                    if let Some(mt) = o.metatable() {
+                        m.mark_table(mt);
+                    }
+                }
+                m.propagate();
+                heap.gc_gray.clear();
+                heap.gc_grayagain.clear();
+                heap.gc_weak.extend(m.weak);
+                heap.mmudata.extend(mmu);
+            }
+            // All marking done: drop weak-table entries whose key or value
+            // is about to be swept, before the sweep frees any object.
+            clear_weak(heap);
             heap.gc_state = GcState::Sweep;
             heap.gc_sweep_pool = 0;
             false
@@ -976,7 +1118,10 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
                 if heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() { break; }
                 let mut gray = std::mem::take(&mut heap.gc_grayagain);
                 gray.extend(std::mem::take(&mut heap.gc_gray));
-                let mut m = Marker { gray, strings: &heap.strings };
+                // No weak collection here: the atomic phase already ran
+                // clear_weak, and these gray re-traversals revisit tables
+                // that were collected there.
+                let mut m = Marker { gray, strings: &heap.strings, weak: Vec::new() };
                 m.propagate();
                 if m.gray.is_empty() && heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() {
                     break;
@@ -985,7 +1130,13 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             }
             let done = sweep_one_pool(heap);
             if done {
-                heap.gc_state = GcState::Pause;
+                // Finalized objects wait for the VM to run their __gc;
+                // stay in Finalize until then so no new cycle starts.
+                heap.gc_state = if heap.mmudata.is_empty() {
+                    GcState::Pause
+                } else {
+                    GcState::Finalize
+                };
                 let total = total_live(heap);
                 heap.total = total;
                 heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
@@ -997,6 +1148,12 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             } else {
                 false
             }
+        }
+        GcState::Finalize => {
+            // The VM runs pending finalizers at a safe point and resets
+            // the state to Pause; until then every cycle attempt is a
+            // no-op (new collections may start from run_finalizers).
+            true
         }
     }
 }
@@ -1013,7 +1170,11 @@ fn sweep_one_pool(heap: &mut GcHeap) -> bool {
         5 => { heap.protos.sweep_tricolor(heap.current_white, |_| {}); 6 }
         6 => { heap.userdatas.sweep_tricolor(heap.current_white, |_| {}); 7 }
         _ => {
-            heap.gc_state = GcState::Pause;
+            heap.gc_state = if heap.mmudata.is_empty() {
+                GcState::Pause
+            } else {
+                GcState::Finalize
+            };
             let total = total_live(heap);
             heap.total = total;
             heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
@@ -1049,7 +1210,78 @@ pub(crate) fn account_thread(th: &LuaState) -> usize {
     size_thread(th)
 }
 
+/// `gc_mayclear`: can this weak-table entry slot be dropped? Only GC
+/// objects can be weak references; strings cannot (they are marked and
+/// kept, per the Lua 5.1 semantics of interned strings), and any other
+/// object that was not marked this cycle (`is_white`) is cleared.
+pub(crate) fn may_clear(v: LuaValue) -> bool {
+    match v.itype() {
+        LJ_TSTR => {
+            if let Some(p) = v.as_string() {
+                p.set_marked();
+            }
+            false
+        }
+        LJ_TTAB => v.as_table().map_or(false, |p| p.is_white()),
+        LJ_TFUNC => v.as_func().map_or(false, |p| p.is_white()),
+        LJ_TTHREAD => v.as_thread().map_or(false, |p| p.is_white()),
+        LJ_TUDATA => v.as_userdata().map_or(false, |p| p.is_white()),
+        LJ_TCDATA => v.as_cdata().map_or(false, |p| p.is_white()),
+        _ => false,
+    }
+}
+
+/// `gc_clearweak`: atomic-phase cleanup of every weak table found during
+/// marking. Runs after all marking is done and before the sweep frees
+/// anything, so the `is_white` test is exact.
+fn clear_weak(heap: &mut GcHeap) {
+    let weak = std::mem::take(&mut heap.gc_weak);
+    for (t, mode) in weak {
+        t.as_mut().clear_weak_entries(mode);
+    }
+}
+
+/// Does this metatable provide a `__gc` finalizer (a non-nil `__gc`
+/// value)? Mirrors `lj_meta_fastg(g, mt, MM_gc)`.
+pub(crate) fn has_gc_meta(mt: Option<GcPtr<LuaTable>>) -> bool {
+    mt.map_or(false, |mt| mt.as_ref().scan_str_key(b"__gc").is_some())
+}
+
+/// `lj_gc_separateudata`: collect every dead object with a `__gc`
+/// metatable into the finalizer list. The objects are unmarked (the sweep
+/// keeps them, and weak tables keep their entries) so they survive until
+/// the VM runs the finalizer; `mark_finalized` then makes them die in the
+/// *next* cycle.
+fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
+    // Reverse iteration order: the pool holds objects oldest-first, but
+    // LuaJIT's mmudata list is LIFO (newest finalized first), which the
+    // gc.lua suite depends on (a[o] == 10-s).
+    let mut out = Vec::new();
+    for i in (0..heap.userdatas.objects.len()).rev() {
+        let u = heap.userdatas.objects[i];
+        let h = gc_header(u);
+        if h.is_white() && !h.is_finalized() && has_gc_meta(unsafe { u.as_ref() }.metatable) {
+            h.make_undead();
+            out.push(Finalizable::UData(GcPtr(u)));
+        }
+    }
+    for i in (0..heap.tables.objects.len()).rev() {
+        let t = heap.tables.objects[i];
+        let h = gc_header(t);
+        if h.is_white() && !h.is_finalized() && has_gc_meta(unsafe { t.as_ref() }.metatable) {
+            h.make_undead();
+            out.push(Finalizable::Table(GcPtr(t)));
+        }
+    }
+    out
+}
+
 pub fn full_gc(g: &mut GlobalState) {
+    // Pending finalizers keep the collector in the Finalize state; the VM
+    // runs them at a safe point (run_finalizers), not here.
+    if g.heap.gc_state == GcState::Finalize {
+        return;
+    }
     // Drain any in-progress cycle.
     while !gc_step(&mut g.heap, usize::MAX) {}
     // Start a fresh cycle.
@@ -1094,6 +1326,7 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
     let mut m = Marker {
         gray: Vec::with_capacity(64),
         strings: &g.heap.strings,
+        weak: Vec::new(),
     };
     m.mark_table(g.globals);
     m.mark_table(g.registry);

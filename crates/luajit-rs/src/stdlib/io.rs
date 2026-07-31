@@ -365,13 +365,21 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
             let mut files = FILES.lock().unwrap();
             match files.get_mut(id).and_then(|e| e.as_mut()) {
                 Some(Entry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
-                Some(Entry::Stdout) | Some(Entry::Stderr) => {
+                Some(Entry::Stdout) => {
                     drop(files);
                     let mut so = std::io::stdout();
                     chunks
                         .iter()
                         .try_for_each(|c| so.write_all(c))
                         .and_then(|_| so.flush())
+                }
+                Some(Entry::Stderr) => {
+                    drop(files);
+                    let mut se = std::io::stderr();
+                    chunks
+                        .iter()
+                        .try_for_each(|c| se.write_all(c))
+                        .and_then(|_| se.flush())
                 }
                 Some(Entry::Read(_) | Entry::Stdin) => {
                     return Err(l.runtime_error(b"file not opened for writing"));
@@ -716,7 +724,11 @@ fn io_type(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn open(l: &mut LuaState) {
-    lual_reg!(l, b"io", LibTarget::Global)
+    // Register the standard streams first: their ids must be stable.
+    let fdi = registry_put(Entry::Stdin);
+    let fdo = registry_put(Entry::Stdout);
+    let fde = registry_put(Entry::Stderr);
+    let io_tab = lual_reg!(l, b"io", LibTarget::Global)
         .func(b"open", io_open)
         .func(b"read", io_read)
         .func(b"write", io_write)
@@ -727,4 +739,9 @@ pub fn open(l: &mut LuaState) {
         .func(b"output", io_output)
         .func(b"type", io_type)
         .build();
+    for (name, fd) in [(b"stdin".as_slice(), fdi), (b"stdout", fdo), (b"stderr", fde)] {
+        let h = new_handle(l, fd);
+        let k = l.heap().str_value(l.heap().intern(name));
+        io_tab.as_mut().set(k, h);
+    }
 }
