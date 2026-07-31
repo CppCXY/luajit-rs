@@ -339,6 +339,9 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
     let saved_base = l.base;
     match crate::vm::execute(l, l.base, n, -1) {
         Ok(nret) => {
+            // `execute` leaves `l.base` at the callee frame: restore it
+            // before writing the results.
+            l.base = saved_base;
             // Shift results down so the true/false header can go first.
             l.stack_ensure(l.base + nret + 1);
             for i in (0..nret).rev() {
@@ -362,12 +365,16 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
     let _msgh = arg(l, 1); // error handler (NYI: not invoked on error)
     let n = nargs(l).saturating_sub(2);
+    let saved_base = l.base;
     l.stack_ensure(l.base + 2 + n);
-    for i in 0..n {
+    for i in (0..n).rev() {
         l.stack[l.base + 2 + i] = arg(l, i + 2);
     }
     match crate::vm::execute(l, l.base, n, -1) {
         Ok(nret) => {
+            // `execute` leaves `l.base` at the callee frame: restore it
+            // before writing the results (mirrors the Err branch).
+            l.base = saved_base;
             l.stack_ensure(l.base + nret + 1);
             for i in (0..nret).rev() {
                 l.stack[l.base + i + 1] = l.stack[l.base + i];
@@ -376,6 +383,9 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
             Ok(nret as i32 + 1)
         }
         Err(LuaError::Runtime) => {
+            // `execute` unwinds with `l.base` left at the callee frame:
+            // restore it before writing the results (mirrors lib_pcall).
+            l.base = saved_base;
             l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
