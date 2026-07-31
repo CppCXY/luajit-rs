@@ -216,30 +216,6 @@ fn dotty(ll: &mut LuaState) -> i32 {
     0
 }
 
-fn try_loadfile(lua: &mut Lua, name: &str) -> bool {
-    let ll = lua.main();
-    let src = match std::fs::read(name) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let _ = lua_settop(ll, 0);
-    if lual_loadstring(ll, &src).is_err() {
-        eprintln!("luajit-rs: compile error in {name}");
-        return false;
-    }
-    match lua_pcall(ll, 0, 0, 0) {
-        Ok(()) => true,
-        Err(LuaError::Runtime) => {
-            eprintln!("luajit-rs: {}", error_msg(ll));
-            false
-        }
-        Err(LuaError::Yield) => {
-            eprintln!("luajit-rs: attempt to yield");
-            false
-        }
-    }
-}
-
 fn dofile(lua: &mut Lua, name: &str) -> i32 {
     let ll = lua.main();
     let src = match std::fs::read(name) {

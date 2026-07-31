@@ -598,7 +598,7 @@ use crate::state::{GcHeap, GlobalState, LuaState};
 use crate::table::LuaTable;
 use crate::value::{LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LJ_TUDATA, LuaValue};
 
-pub(crate) const GC_PAUSE: usize = 200;
+pub const GC_PAUSE: usize = 200;
 pub(crate) const GC_THRESHOLD_MIN: usize = 64 * 1024;
 
 // Incremental GC state.
@@ -939,11 +939,8 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
         GcState::Pause => {
             let live = heap.total + heap.strings.bytes() + heap.table_extra;
             if live >= heap.threshold {
-                heap.debt += step;
-                // Advance threshold by a moderate fixed amount.  Debt
-                // will trip gc_check / C-call boundaries into calling
-                // full_gc() (which starts a proper cycle).
-                heap.threshold = live + 65536;
+                heap.debt += live - heap.threshold;
+                heap.threshold = live + GC_STEP_SIZE;
             }
             true
         }
@@ -952,7 +949,7 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
                 gray: std::mem::take(&mut heap.gc_gray),
                 strings: &heap.strings,
             };
-            let done = m.propagate_step(step / 64);
+            let done = m.propagate_step((step / 64).max(1));
             m.gray.extend(std::mem::take(&mut heap.gc_gray));
             if done && m.gray.is_empty() {
                 heap.gc_state = GcState::Atomic;
@@ -1017,7 +1014,7 @@ fn sweep_one_pool(heap: &mut GcHeap) -> bool {
         6 => { heap.userdatas.sweep_tricolor(heap.current_white, |_| {}); 7 }
         _ => {
             heap.gc_state = GcState::Pause;
-            let mut total = total_live(heap);
+            let total = total_live(heap);
             heap.total = total;
             heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
                 .max(GC_THRESHOLD_MIN)
@@ -1041,14 +1038,12 @@ fn total_live(heap: &GcHeap) -> usize {
     for cd in heap.cdatas.iter() {
         total += std::mem::size_of::<crate::runtime::cdata::CData>() + cd.data.len();
     }
-    total += heap.userdatas.len()
-        * (std::mem::size_of::<crate::runtime::userdata::GcUserData>()
-            + std::mem::size_of::<Box<dyn std::any::Any>>());
+    total += heap.userdatas.len() * std::mem::size_of::<crate::runtime::userdata::GcUserData>();
     total
 }
 
 fn size_thread(th: &LuaState) -> usize {
-    std::mem::size_of::<LuaState>() + th.stack.capacity() * std::mem::size_of::<LuaValue>()
+    std::mem::size_of::<LuaState>() + th.stack.len() * std::mem::size_of::<LuaValue>()
 }
 pub(crate) fn account_thread(th: &LuaState) -> usize {
     size_thread(th)
@@ -1061,9 +1056,20 @@ pub fn full_gc(g: &mut GlobalState) {
     start_gc_cycle(g);
     // Run it to completion.
     while !gc_step(&mut g.heap, usize::MAX) {}
-    debug_assert!(g.globals.is_marked(), "globals not marked after full_gc");
-    debug_assert!(g.registry.is_marked(), "registry not marked after full_gc");
-    debug_assert!(g.main().is_marked(), "main thread not marked after full_gc");
+    // Sweep clears the marked flag on every survivor, so liveness must be
+    // checked by pool membership instead of the tri-color bits.
+    debug_assert!(
+        g.heap.tables.iter().any(|t| t as *const _ == g.globals.as_ref() as *const _),
+        "globals freed after full_gc"
+    );
+    debug_assert!(
+        g.heap.tables.iter().any(|t| t as *const _ == g.registry.as_ref() as *const _),
+        "registry freed after full_gc"
+    );
+    debug_assert!(
+        g.heap.threads.iter().any(|t| t as *const _ == g.main().as_ref() as *const _),
+        "main thread freed after full_gc"
+    );
     g.heap.gc_gray.clear();
     g.heap.gc_grayagain.clear();
 }

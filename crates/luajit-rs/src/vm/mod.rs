@@ -227,8 +227,13 @@ fn call_c(
     l.base = args_base;
     l.top = args_base + nargs;
     let g = l.global();
-    if g.heap.should_collect() || g.heap.debt > 4096 {
-        crate::gc::full_gc(g);
+    let step_size = g.heap.gc_step_size;
+    let paused = g.heap.gc_state == crate::runtime::gc::GcState::Pause;
+    if (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped {
+        if paused {
+            crate::gc::start_gc_cycle(g);
+        }
+        crate::gc::gc_step(&mut g.heap, step_size);
         g.heap.debt = 0;
     }
     let r = f(l);
@@ -2376,7 +2381,15 @@ impl Interp {
         if l.top < need {
             l.top = need;
         }
-        crate::gc::full_gc(l.global());
+        let step_size = l.global().heap.gc_step_size;
+        let paused = l.global().heap.gc_state == crate::runtime::gc::GcState::Pause;
+        let stopped = l.global().heap.gc_stopped;
+        if stopped { return; }
+        let g = l.global();
+        if paused {
+            crate::gc::start_gc_cycle(g);
+        }
+        crate::gc::gc_step(&mut g.heap, step_size);
     }
 
     #[cold]
@@ -2527,8 +2540,13 @@ impl Interp {
         l.top = args_base + nargs;
         // C-call boundary is a GC safe point (args anchored, frames below).
         let g = l.global();
-        if g.heap.should_collect() || g.heap.debt > 4096 {
-            crate::gc::full_gc(g);
+        let step_size = g.heap.gc_step_size;
+        let paused = g.heap.gc_state == crate::runtime::gc::GcState::Pause;
+        if (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped {
+            if paused {
+                crate::gc::start_gc_cycle(g);
+            }
+            crate::gc::gc_step(&mut g.heap, step_size);
             g.heap.debt = 0;
         }
         let r = f(l);

@@ -51,6 +51,8 @@ pub struct GcHeap {
     pub gc_step_size: usize,
     /// Tri-color white bit (0 or 1), flips each GC cycle.
     pub current_white: u8,
+    /// When true, the collector will not auto-start from boundaries.
+    pub gc_stopped: bool,
 }
 
 impl Default for GcHeap {
@@ -74,6 +76,7 @@ impl Default for GcHeap {
             gc_sweep_pool: 0,
             gc_step_size: gc::GC_STEP_SIZE,
             current_white: 0,
+            gc_stopped: false,
         }
     }
 }
@@ -417,8 +420,8 @@ impl LuaState {
         if need >= self.stack.len() {
             let new_len = (self.stack.len() * 2).max(need + 16).min(self._max_stack);
             assert!(new_len <= self._max_stack, "stack overflow");
-            let old_ptr = self.stack.as_mut_ptr();
             let old_len = self.stack.len();
+            let old_ptr = self.stack.as_mut_ptr();
             self.stack.resize(new_len, LuaValue::NIL);
             let new_ptr = self.stack.as_mut_ptr();
             if old_ptr != new_ptr {
@@ -434,6 +437,12 @@ impl LuaState {
                         }
                     }
                 }
+            }
+            // Keep the incremental GC accounting in sync: size_thread
+            // measures stack.len(), so growth must land in heap.total.
+            let grown = (new_len - old_len) * std::mem::size_of::<LuaValue>();
+            if grown > 0 {
+                self.g.get().heap.total += grown;
             }
         }
     }

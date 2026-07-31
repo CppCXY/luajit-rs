@@ -205,22 +205,62 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
         b"step" => {
             let size = arg(l, 1).as_number().unwrap_or(0.0) as usize;
             let g = l.global();
-            let limit = if size == 0 { 1 } else { size * 1024 };
-            // Start a cycle if idle, then run one step.
+            // LuaJIT LUA_GCSTEP:
+            //   GCSize a = data << 10;
+            //   g->gc.threshold = (a <= g->gc.total) ? (g->gc.total - a) : 0;
+            //   while (g->gc.total >= g->gc.threshold)
+            //     if (lj_gc_step(L) > 0) { res = 1; break; }
+            //
+            // lj_gc_step does `do { lim -= gc_onestep } while lim > 0`.
+            // We emulate this: `lim` gc_step() calls per collectgarbage().
+            // Default size==0: 1 call (minimal step).  Larger size: more calls.
+            let a = size * 1024;
+            let live = g.heap.total + g.heap.strings.bytes() + g.heap.table_extra;
+            g.heap.threshold = if a <= live { live - a } else { 0 };
+            let mut lim = if size == 0 { 1u64 } else { size as u64 };
+            // Start a cycle if idle.
             if g.heap.gc_state == crate::runtime::gc::GcState::Pause {
                 crate::gc::start_gc_cycle(g);
             }
-            let done = crate::gc::gc_step(&mut g.heap, limit);
+            let mut done = false;
+            loop {
+                if lim == 0 { break; }
+                lim -= 1;
+                let step_done = crate::gc::gc_step(&mut g.heap, crate::runtime::gc::GC_STEP_SIZE);
+                // Detect completion: gc_step returned true, or the cycle finished
+                // behind our back (C-call boundary completed it).
+                if step_done || g.heap.gc_state == crate::runtime::gc::GcState::Pause {
+                    done = true;
+                    break;
+                }
+            }
+            // Restore threshold so C-call boundaries don't fire full_gc
+            // immediately.  LuaJIT's lj_gc_step debt logic does this.
+            let new_threshold = if !done {
+                g.heap.total + g.heap.strings.bytes() + crate::runtime::gc::GC_STEP_SIZE
+            } else {
+                g.heap.threshold
+            };
+            drop(g);
             push(l, LuaValue::boolean(done));
+            l.global().heap.threshold = new_threshold;
             Ok(1)
         }
-        b"stop" | b"restart" | b"setpause" | b"setstepmul" => {
+        b"stop" => {
+            l.global().heap.gc_stopped = true;
+            Ok(0)
+        }
+        b"restart" => {
+            l.global().heap.gc_stopped = false;
+            Ok(0)
+        }
+        b"setpause" | b"setstepmul" => {
             // GC parameters — no-op for now.
             Ok(0)
         }
         b"count" => {
             let heap = &l.global().heap;
-            let bytes = heap.total + heap.strings.bytes();
+            let bytes = heap.total + heap.strings.bytes() + heap.table_extra;
             push(l, LuaValue::number(bytes as f64 / 1024.0));
             Ok(1)
         }
@@ -230,7 +270,7 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
 
 fn lib_gcinfo(l: &mut LuaState) -> LuaResult<i32> {
     let heap = &l.global().heap;
-    let bytes = heap.total + heap.strings.bytes();
+    let bytes = heap.total + heap.strings.bytes() + heap.table_extra;
     push(l, LuaValue::number(bytes as f64 / 1024.0));
     Ok(1)
 }

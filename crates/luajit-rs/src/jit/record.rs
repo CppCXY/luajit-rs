@@ -1478,6 +1478,10 @@ impl Record {
                 tref_ref(tab),
                 tref_ref(carg),
             ));
+            // Stores may grow the table via the exit path: the loop must
+            // still reach a GC safe point, so a pure-array trace gets the
+            // same IR_GCSTEP guard as a hash-store one (deduped per trace).
+            self.rec_gcstep(l);
             self.needsnap = true;
             return Ok(());
         }
