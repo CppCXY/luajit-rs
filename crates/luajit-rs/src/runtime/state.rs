@@ -223,6 +223,8 @@ pub struct GlobalState {
     /// The currently running thread (LuaJIT's `cur_L`): the main thread or
     /// the innermost resumed coroutine.
     pub cur_l: Option<StateRef>,
+    /// PRNG state for `math.random` (xoshiro256**).
+    pub rng: crate::stdlib::math::RngState,
     /// The JIT compiler state (LuaJIT embeds `jit_State` in `GG_State`).
     pub jit: JitState,
     /// FFI C type system (lazy-initialised by `ffi.load` / first FFI call).
@@ -365,6 +367,11 @@ pub struct LuaState {
     pub openuv: Vec<GcPtr<Upval>>,
     /// The pending error object (`LuaError::Runtime`).
     pub errval: LuaValue,
+    /// While a metamethod invoked through the cold execute-recursion
+    /// paths (e.g. `__concat`) is running, the (name, function bits) of
+    /// the active metamethod — debug.getinfo uses it to report
+    /// `namewhat = "metamethod"` for the current frame.
+    pub mmname: Option<(&'static str, u64)>,
     /// The number of yielded values (`LuaError::Yield`).
     pub nyield: u32,
     /// Coroutine status.
@@ -381,6 +388,9 @@ pub struct LuaState {
     pub debug_pc: usize,
     /// Current chunk name for error location reporting.
     pub debug_chunkname: Vec<u8>,
+    /// The environment table of this (possibly coroutine) thread
+    /// (`debug.setfenv` on a thread; `getfenv(0)` reports it).
+    pub thread_env: GcPtr<LuaTable>,
 }
 
 impl LuaState {
@@ -410,6 +420,7 @@ impl LuaState {
             top: 0,
             openuv: Vec::new(),
             errval: LuaValue::NIL,
+            mmname: None,
             nyield: 0,
             status: if is_main {
                 CoStatus::Running
@@ -421,6 +432,7 @@ impl LuaState {
             c_base: 0,
             debug_pc: 0,
             debug_chunkname: Vec::new(),
+            thread_env: g.get_ref().globals,
         }
     }
 
@@ -635,6 +647,7 @@ impl Lua {
             basemt: [None; ITYPE_COUNT],
             mmname: [LuaValue::NIL; meta::MM_MAX],
             cur_l: None,
+            rng: crate::stdlib::math::RngState::fixed(),
             jit: JitState::new(),
             cts: None,
             boot_time: boot,

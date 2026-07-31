@@ -132,6 +132,34 @@ pub fn execute(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> L
     r
 }
 
+/// Like `execute`, but without counting as a C frame for yieldability:
+/// the protected calls (pcall/xpcall) may be yielded through.
+pub fn execute_yieldable(
+    l: &mut LuaState,
+    func_slot: usize,
+    nargs: usize,
+    want: i32,
+) -> LuaResult<usize> {
+    l.stack_ensure(func_slot + nargs + STACK_SAFETY);
+    execute_inner(l, func_slot, nargs, want)
+}
+
+/// Like `execute`, with an explicit frame link for the callee frame
+/// (xpcall's message handler chains to the failed call's frame).
+pub fn execute_link(
+    l: &mut LuaState,
+    func_slot: usize,
+    nargs: usize,
+    want: i32,
+    link: u64,
+) -> LuaResult<usize> {
+    l.c_depth += 1;
+    l.stack_ensure(func_slot + nargs + STACK_SAFETY);
+    let r = execute_inner_link(l, func_slot, nargs, want, Some(link));
+    l.c_depth -= 1;
+    r
+}
+
 /// Safety margin added to every stack_ensure: protects against a few
 /// extra slots written by CALL/VARG/TSETM frame setup.
 const STACK_SAFETY: usize = 64;
@@ -220,6 +248,19 @@ fn try_cdata_binop(
 }
 
 fn execute_inner(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) -> LuaResult<usize> {
+    execute_inner_link(l, func_slot, nargs, want, None)
+}
+
+/// Like `execute_inner`, but with an explicit frame link for the callee
+/// (used by xpcall's message handler to chain its frame to the failed
+/// call's frame so debug walks can see it).
+fn execute_inner_link(
+    l: &mut LuaState,
+    func_slot: usize,
+    nargs: usize,
+    want: i32,
+    link: Option<u64>,
+) -> LuaResult<usize> {
     let mut nargs = nargs;
     let f = l.stack[func_slot];
     let gf = match f.as_func() {
@@ -235,7 +276,7 @@ fn execute_inner(l: &mut LuaState, func_slot: usize, nargs: usize, want: i32) ->
         return call_c(l, cc.f, func_slot, nargs, want);
     }
     let mut vm = Interp::new(l);
-    let link = (((want + 1) as u64) << 3) | FRAME_C;
+    let link = link.unwrap_or_else(|| (((want + 1) as u64) << 3) | FRAME_C);
     vm.enter_lua(gf, func_slot, nargs, link);
     vm.run()
 }
@@ -281,6 +322,45 @@ fn call_c(
     let r = f(l);
     let n = match r {
         Ok(nv) => nv as usize,
+        Err(LuaError::Yield) => {
+            // The C callee yielded (coroutine.yield through a C caller
+            // like pcall): capture the resume point in the calling Lua
+            // frame, like suspend_call.
+            let ny = l.nyield as usize;
+            for i in 0..ny {
+                l.stack[func_slot + i] = l.stack[args_base + i];
+            }
+            let pc = l.debug_pc;
+            let cl = l
+                .stack
+                .get(func_slot.saturating_sub(2))
+                .and_then(|v| v.as_func())
+                .unwrap_or(l.stack[0].as_func().unwrap());
+            let a = match cl.as_ref() {
+                crate::func::GcFunc::Lua(c) => {
+                    let pt = c.proto.as_ref();
+                    if pc >= 1 && pc - 1 < pt.bc.len() {
+                        crate::bc::bc_a(pt.bc[pc - 1]) as usize
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            };
+            let base = func_slot.saturating_sub(a);
+            l.suspend = crate::state::Suspend::Call {
+                pc,
+                cl,
+                base,
+                slot: func_slot,
+                want,
+            };
+            l.top = (l.base + 8).max(func_slot + ny);
+            l.base = l.base;
+            l.base = saved_base;
+            l.top = saved_top;
+            return Err(LuaError::Yield);
+        }
         Err(e) => {
             l.base = saved_base;
             l.top = saved_top;
@@ -901,7 +981,7 @@ impl Interp {
                     let cond = val_eq(x, y);
                     if cond {
                         branch!(true);
-                    } else if x.is_table() && y.is_table() {
+                    } else if (x.is_table() || x.is_userdata()) && x.itype() == y.itype() {
                         sync!();
                         match self.meta_equal(x, y, 0)? {
                             Some(eq) => branch!(eq),
@@ -920,7 +1000,7 @@ impl Interp {
                     let cond = val_eq(x, y);
                     if cond {
                         branch!(false);
-                    } else if x.is_table() && y.is_table() {
+                    } else if (x.is_table() || x.is_userdata()) && x.itype() == y.itype() {
                         sync!();
                         match self.meta_equal(x, y, 1)? {
                             Some(eq) => branch!(!eq),
@@ -1031,8 +1111,13 @@ impl Interp {
                         setreg!(a, LuaValue::number(t.as_ref().len() as f64));
                     } else {
                         sync!();
-                        let r = self.meta_len(v)?;
-                        setreg!(a, r);
+                        match self.meta_len(v, a)? {
+                            Some(r) => setreg!(a, r),
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -2785,6 +2870,11 @@ impl Interp {
 
         if link & FRAME_TYPE_MASK == FRAME_C {
             let want = ((link >> 3) as i32) - 1;
+            // The custom xpcall-handler link encodes the failed frame's
+            // base in the delta, so the apparent want may exceed the
+            // stack: clamp the fill to what is actually there.
+            let cap = self.l().stack.len().saturating_sub(dst);
+            let want = want.min(cap as i32);
             let got = if want >= 0 {
                 for i in n..(want as usize) {
                     self.set_at(dst + i, LuaValue::NIL);
@@ -2797,7 +2887,8 @@ impl Interp {
             // references never reach the next cycle (the atomic clear is
             // bounded by frame_top to protect live Lua locals).
             let top_now = self.l().top;
-            for s in self.l().stack[dst + got..top_now].iter_mut() {
+            let keep = (dst + got).min(top_now);
+            for s in self.l().stack[keep..top_now].iter_mut() {
                 *s = LuaValue::NIL;
             }
             self.l().top = dst + got;
@@ -3068,6 +3159,9 @@ pub fn resume_continue(
         }
     }
     let mut vm = Interp::new(co);
+    if want < 0 {
+        vm.multres = nargs;
+    }
     vm.base = sbase;
     vm.cl = cl;
     vm.reload(cl);

@@ -17,12 +17,48 @@ fn lib_print(l: &mut LuaState) -> LuaResult<i32> {
     use std::io::Write;
     let n = nargs(l);
     let mut out = Vec::new();
+    // LuaJIT's print goes through the (thread) environment's tostring,
+    // so an overridden one is honored.
+    let ts_key = {
+        let sid = l.heap().intern(b"tostring");
+        l.heap().str_value(sid)
+    };
+    let env = LuaValue::table(l.thread_env);
+    let ts_fn = match crate::meta::metatable_of(l.global(), env) {
+        Some(_) => {
+            let mo = crate::meta::meta_lookup(l.global(), env, crate::meta::MM::Index);
+            match mo.as_table() {
+                Some(mt2) => mt2.as_ref().get(ts_key),
+                None => LuaValue::NIL,
+            }
+        }
+        None => l.thread_env.as_ref().get(ts_key),
+    };
     for i in 0..n {
         if i > 0 {
             out.push(b'\t');
         }
         let v = arg(l, i);
-        out.extend_from_slice(&tostring_meta(l, v)?);
+        let bytes = if ts_fn.is_func() {
+            let saved_top = l.top;
+            let saved_base = l.base;
+            let fs = l.top + 16;
+            l.stack_ensure(fs + 4);
+            l.stack[fs] = ts_fn;
+            l.stack[fs + 2] = v;
+            crate::vm::execute(l, fs, 1, 1)?;
+            let r = l.stack[fs];
+            l.top = saved_top;
+            l.base = saved_base;
+            if let Some(sid) = r.as_string_id() {
+                l.str_static(sid).to_vec()
+            } else {
+                return Err(l.runtime_error(b"'tostring' must return a string"));
+            }
+        } else {
+            tostring_meta(l, v)?
+        };
+        out.extend_from_slice(&bytes);
     }
     out.push(b'\n');
     let _ = std::io::stdout().lock().write_all(&out);
@@ -61,7 +97,40 @@ fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
 
 pub fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
-    let r = if v.is_number() {
+    let r = if nargs(l) > 1 {
+        // tonumber(e, base): parse e (string or number) in the given base.
+        let base = arg(l, 1).as_number().unwrap_or(0.0) as u32;
+        let s = if let Some(sid) = v.as_string_id() {
+            l.heap().strings.get(sid).to_vec()
+        } else if v.is_number() {
+            crate::strfmt::g14(v.num()).into_bytes()
+        } else {
+            Vec::new()
+        };
+        let mut r = LuaValue::NIL;
+        if base >= 2 && base <= 36 && !s.is_empty() {
+            let mut n: u64 = 0;
+            let mut any = false;
+            for &b in &s {
+                let d = match b {
+                    b'0'..=b'9' => (b - b'0') as u64,
+                    b'a'..=b'z' => (b - b'a' + 10) as u64,
+                    b'A'..=b'Z' => (b - b'A' + 10) as u64,
+                    _ => 0,
+                };
+                if d >= base as u64 {
+                    any = false;
+                    break;
+                }
+                n = n.wrapping_mul(base as u64).wrapping_add(d);
+                any = true;
+            }
+            if any {
+                r = LuaValue::number(n as f64);
+            }
+        }
+        r
+    } else if v.is_number() {
         v
     } else if let Some(sid) = v.as_string_id() {
         let bytes = l.heap().strings.get(sid).to_vec();
@@ -125,6 +194,29 @@ pub fn lib_next(l: &mut LuaState) -> LuaResult<i32> {
 
 fn lib_pairs(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
+    // __pairs metamethod (5.2): it returns the iterator triple.
+    let mo = crate::meta::meta_lookup(l.global(), t, crate::meta::MM::Pairs);
+    if !mo.is_nil() {
+        let obase = l.base;
+        let saved_top = l.top;
+        let fs = l.top + 16;
+        l.stack_ensure(fs + 4);
+        l.stack[fs] = mo;
+        l.stack[fs + 2] = t;
+        crate::vm::execute(l, fs, 1, 3)?;
+        let n = (l.top - fs).min(3);
+        l.stack_ensure(obase + 3);
+        for i in 0..3 {
+            l.stack[obase + i] = if i < n {
+                l.stack[fs + i]
+            } else {
+                LuaValue::NIL
+            };
+        }
+        l.top = obase + 3;
+        l.base = obase;
+        return Ok(3);
+    }
     let sid = l.heap().intern(b"next");
     let key = l.heap().str_value(sid);
     let next_fn = l.global().globals.as_ref().get(key);
@@ -153,6 +245,28 @@ pub fn lib_ipairs_iter(l: &mut LuaState) -> LuaResult<i32> {
 
 fn lib_ipairs(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
+    // __ipairs metamethod (5.2): it returns the iterator triple.
+    let mo = crate::meta::meta_lookup(l.global(), t, crate::meta::MM::Ipairs);
+    if !mo.is_nil() {
+        let obase = l.base;
+        let fs = l.top + 16;
+        l.stack_ensure(fs + 4);
+        l.stack[fs] = mo;
+        l.stack[fs + 2] = t;
+        crate::vm::execute(l, fs, 1, 3)?;
+        let n = (l.top - fs).min(3);
+        l.stack_ensure(obase + 3);
+        for i in 0..3 {
+            l.stack[obase + i] = if i < n {
+                l.stack[fs + i]
+            } else {
+                LuaValue::NIL
+            };
+        }
+        l.top = obase + 3;
+        l.base = obase;
+        return Ok(3);
+    }
     let sid = l.heap().intern(b"__ipairs_iter");
     let key = l.heap().str_value(sid);
     let iter = l.global().globals.as_ref().get(key);
@@ -361,7 +475,7 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
         l.stack[l.base + 2 + i] = arg(l, i + 1);
     }
     let saved_base = l.base;
-    match crate::vm::execute(l, l.base, n, -1) {
+    match crate::vm::execute_yieldable(l, l.base, n, -1) {
         Ok(nret) => {
             // `execute` leaves `l.base` at the callee frame: restore it
             // before writing the results.
@@ -387,14 +501,14 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
 
 /// `xpcall(f, msgh [, arg...])` — protected call with error handler.
 fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
-    let _msgh = arg(l, 1); // error handler (NYI: not invoked on error)
+    let msgh = arg(l, 1);
     let n = nargs(l).saturating_sub(2);
     let saved_base = l.base;
     l.stack_ensure(l.base + 2 + n);
     for i in (0..n).rev() {
         l.stack[l.base + 2 + i] = arg(l, i + 2);
     }
-    match crate::vm::execute(l, l.base, n, -1) {
+    match crate::vm::execute_yieldable(l, l.base, n, -1) {
         Ok(nret) => {
             // `execute` leaves `l.base` at the callee frame: restore it
             // before writing the results (mirrors the Err branch).
@@ -410,6 +524,41 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
             // `execute` unwinds with `l.base` left at the callee frame:
             // restore it before writing the results (mirrors lib_pcall).
             l.base = saved_base;
+            l.stack_ensure(l.base + 4);
+            // Invoke the message handler with the error object; its
+            // first result replaces the error (lj_ff_xpcall).
+            if msgh.is_func() {
+                // Preserve the failed call's frame below the handler and
+                // chain the handler's frame link to it, so debug walks
+                // (e.g. getlocal levels) can see the failed frame.
+                let fail_slot = l.base;
+                let fail_framesize = l.stack[fail_slot]
+                    .as_func()
+                    .and_then(|f| match f.as_ref() {
+                        crate::func::GcFunc::Lua(cl) => Some(cl.proto.as_ref().framesize as usize),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                let fs = fail_slot + 2 + fail_framesize;
+                l.stack_ensure(fs + 4);
+                l.stack[fs] = msgh;
+                l.stack[fs + 1] = LuaValue::NIL;
+                l.stack[fs + 2] = l.errval;
+                // Chain to the failed frame: the delta is the distance
+                // from the handler's base to the failed frame's base.
+                let delta = (fs + 2).saturating_sub(fail_slot + 2);
+                let link = ((delta as u64) << 3) | 1; // FRAME_C (vm/mod.rs)
+                let hr = crate::vm::execute_link(l, fs, 1, 1, link);
+                if std::env::var("LUAJIT_RS_XPCDBG").is_ok() {
+                    eprintln!("xpcall handler result: {:?} errval={:?}", hr, l.errval);
+                }
+                if let Ok(n) = hr
+                    && n >= 1
+                {
+                    l.errval = l.stack[fs];
+                }
+                l.base = saved_base;
+            }
             l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
@@ -449,6 +598,9 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
             crate::func::GcFunc::C(c) => c.env = tab,
         }
         push(l, o);
+    } else if let Some(t) = o.as_thread() {
+        t.get().thread_env = tab;
+        push(l, o);
     } else if o.is_number() {
         return Err(l.runtime_error(b"setfenv: numeric level not supported"));
     } else {
@@ -458,12 +610,15 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 /// `getfenv(f)` — the environment of a function (Lua 5.1).
-fn lib_getfenv(l: &mut LuaState) -> LuaResult<i32> {    let o = arg(l, 0);
+fn lib_getfenv(l: &mut LuaState) -> LuaResult<i32> {
+    let o = arg(l, 0);
     let env = match o.as_func() {
         Some(f) => match f.as_ref() {
             crate::func::GcFunc::Lua(c) => c.env,
             crate::func::GcFunc::C(c) => c.env,
         },
+        // getfenv(0): the environment of the running thread.
+        _ if o.as_number() == Some(0.0) => l.thread_env,
         _ => l.global().globals,
     };
     push(l, LuaValue::table(env));

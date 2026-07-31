@@ -47,6 +47,9 @@ pub struct Proto {
     pub numline: BCLine,
     /// Upvalue names for debug info and listings.
     pub uvnames: Vec<String>,
+    /// Local variable debug info: (register slot, startpc, endpc, name).
+    /// Used by debug.getinfo's function-name resolution.
+    pub varnames: Vec<(u8, u32, u32, String)>,
     /// Chunk name / source identifier (from load chunkname argument).
     pub source: Option<StrId>,
 }

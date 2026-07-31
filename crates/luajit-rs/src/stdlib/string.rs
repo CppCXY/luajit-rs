@@ -448,22 +448,22 @@ fn str_upper(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn str_rep(l: &mut LuaState) -> LuaResult<i32> {
-    let s = match arg(l, 0).as_string_id() {
-        Some(sid) => l.str_static(sid),
+    let s = match str_arg_coerce(l, 0, "rep") {
+        Some(s) => s,
         None => return Err(err_bad_arg_type(l, 1, "string.rep", "string", arg(l, 1-1))),
     };
-    let n = arg(l, 1).as_number().unwrap_or(0.0) as i64;
-    let sep = match arg(l, 2).as_string_id() {
-        Some(sid) => l.str_static(sid),
-        None => b"" as &[u8],
+    let n = num_arg_coerce(l, 1).unwrap_or(0.0) as i64;
+    let sep = match str_arg_coerce(l, 2, "rep") {
+        Some(s) => s,
+        None => Vec::new(),
     };
     let n = n.max(0) as usize;
     let mut out = Vec::with_capacity(s.len() * n + sep.len() * n.saturating_sub(1));
     for i in 0..n {
         if i > 0 {
-            out.extend_from_slice(sep);
+            out.extend_from_slice(&sep);
         }
-        out.extend_from_slice(s);
+        out.extend_from_slice(&s);
     }
     let sid = l.heap().intern(&out);
     push(l, l.heap().str_value(sid));
@@ -519,8 +519,24 @@ pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
         Some(s) => s,
         None => return Err(err_bad_arg_type(l, 1, "sub", "string", arg(l, 0))),
     };
-    let i = num_arg_coerce(l, 1).unwrap_or(1.0) as i64;
-    let j = num_arg_coerce(l, 2).map(|n| n as i64);
+    // The indices must be numbers (or numeric strings); a present but
+    // non-numeric argument is an error (luaL_checknumber semantics).
+    let coerce_index = |l: &mut LuaState, i: usize, name: &str| -> LuaResult<i64> {
+        let v = arg(l, i);
+        if v.is_nil() {
+            return Ok(if i == 1 { 1 } else { i64::MAX });
+        }
+        match num_arg_coerce(l, i) {
+            Some(n) => Ok(n as i64),
+            None => Err(err_bad_arg_type(l, i as u32 + 1, name, "number", v)),
+        }
+    };
+    let i = coerce_index(l, 1, "sub")?;
+    let j = if arg(l, 2).is_nil() {
+        None
+    } else {
+        Some(coerce_index(l, 2, "sub")?)
+    };
     let len = s.len() as i64;
     let a = if i < 0 {
         (len + i).max(0) as usize

@@ -174,13 +174,10 @@ fn tab_sort(l: &mut LuaState) -> LuaResult<i32> {
     let mut items: Vec<(i32, LuaValue)> = (1..=len).map(|i| (i, t.as_ref().get_int(i))).collect();
     let comp = arg(l, 1);
     if comp.is_func() {
-        introsort(l, &mut items, comp.as_func().unwrap())?;
+        introsort(l, &mut items, crate::stdlib::sort::Comparator::Lua(comp.as_func().unwrap()))?;
     } else {
-        items.sort_unstable_by(|a, b| {
-            a.1.num()
-                .partial_cmp(&b.1.num())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // No comparator: use the default `<` (numbers, strings, __lt).
+        introsort(l, &mut items, crate::stdlib::sort::Comparator::Default)?;
     }
     for (idx, (_, v)) in items.iter().enumerate() {
         t.as_mut().set_int(idx as i32 + 1, *v);

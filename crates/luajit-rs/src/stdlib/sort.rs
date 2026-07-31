@@ -13,12 +13,26 @@ use crate::runtime::gc::GcPtr;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
+/// The sort comparator: an explicit Lua function or the default `<`.
+#[derive(Clone, Copy)]
+pub enum Comparator {
+    Lua(crate::gc::GcPtr<crate::func::GcFunc>),
+    Default,
+}
+
+#[inline]
+fn cmp_apply(l: &mut LuaState, comp: Comparator, a: LuaValue, b: LuaValue) -> LuaResult<bool> {
+    match comp {
+        Comparator::Lua(c) => compare_lua(l, c, a, b),
+        Comparator::Default => compare_default(l, a, b),
+    }
+}
+
 /// Sort `items` in-place using the Lua comparator function `comp`.
-/// `comp` is a `GcPtr<GcFunc>` already validated as a function.
 pub fn introsort(
     l: &mut LuaState,
     items: &mut [(i32, LuaValue)],
-    comp: crate::gc::GcPtr<crate::func::GcFunc>,
+    comp: Comparator,
 ) -> LuaResult<()> {
     let n = items.len();
     if n <= 1 {
@@ -31,7 +45,7 @@ pub fn introsort(
 fn introsort_impl(
     l: &mut LuaState,
     items: &mut [(i32, LuaValue)],
-    comp: crate::gc::GcPtr<crate::func::GcFunc>,
+    comp: Comparator,
     lo: usize,
     hi: usize,
     depth: usize,
@@ -57,18 +71,18 @@ fn introsort_impl(
 fn partition(
     l: &mut LuaState,
     items: &mut [(i32, LuaValue)],
-    comp: crate::gc::GcPtr<crate::func::GcFunc>,
+    comp: Comparator,
     lo: usize,
     hi: usize,
 ) -> LuaResult<usize> {
     let mid = lo + (hi - lo) / 2;
-    if compare_lua(l, comp, items[mid].1, items[lo].1)? {
+    if cmp_apply(l, comp, items[mid].1, items[lo].1)? {
         items.swap(lo, mid);
     }
-    if compare_lua(l, comp, items[hi].1, items[lo].1)? {
+    if cmp_apply(l, comp, items[hi].1, items[lo].1)? {
         items.swap(lo, hi);
     }
-    if compare_lua(l, comp, items[hi].1, items[mid].1)? {
+    if cmp_apply(l, comp, items[hi].1, items[mid].1)? {
         items.swap(mid, hi);
     }
     let pivot = items[mid].1;
@@ -77,11 +91,11 @@ fn partition(
     let mut j = hi - 1;
     loop {
         i += 1;
-        while i < j && compare_lua(l, comp, items[i].1, pivot)? {
+        while i < j && cmp_apply(l, comp, items[i].1, pivot)? {
             i += 1;
         }
         j -= 1;
-        while j > i && compare_lua(l, comp, pivot, items[j].1)? {
+        while j > i && cmp_apply(l, comp, pivot, items[j].1)? {
             j -= 1;
         }
         if i >= j {
@@ -96,14 +110,14 @@ fn partition(
 fn insertion_sort(
     l: &mut LuaState,
     items: &mut [(i32, LuaValue)],
-    comp: crate::gc::GcPtr<crate::func::GcFunc>,
+    comp: Comparator,
     lo: usize,
     hi: usize,
 ) -> LuaResult<()> {
     for i in lo + 1..=hi {
         let mut j = i;
         while j > lo {
-            if compare_lua(l, comp, items[j].1, items[j - 1].1)? {
+            if cmp_apply(l, comp, items[j].1, items[j - 1].1)? {
                 items.swap(j, j - 1);
                 j -= 1;
             } else {
@@ -117,7 +131,7 @@ fn insertion_sort(
 fn heapsort(
     l: &mut LuaState,
     items: &mut [(i32, LuaValue)],
-    comp: GcPtr<GcFunc>,
+    comp: Comparator,
     lo: usize,
     hi: usize,
 ) -> LuaResult<()> {
@@ -135,7 +149,7 @@ fn heapsort(
 fn sift_down(
     l: &mut LuaState,
     items: &mut [(i32, LuaValue)],
-    comp: crate::gc::GcPtr<crate::func::GcFunc>,
+    comp: Comparator,
     lo: usize,
     n: usize,
     root: usize,
@@ -148,10 +162,10 @@ fn sift_down(
         }
         let right = left + 1;
         let mut largest = r;
-        if compare_lua(l, comp, items[lo + largest].1, items[lo + left].1)? {
+        if cmp_apply(l, comp, items[lo + largest].1, items[lo + left].1)? {
             largest = left;
         }
-        if right < n && compare_lua(l, comp, items[lo + largest].1, items[lo + right].1)? {
+        if right < n && cmp_apply(l, comp, items[lo + largest].1, items[lo + right].1)? {
             largest = right;
         }
         if largest == r {
@@ -183,6 +197,36 @@ fn compare_lua(
     } else {
         false
     };
+    l.top = saved_top;
+    l.base = saved_base;
+    Ok(r)
+}
+
+/// The default sort comparison (no explicit comparator): the `<`
+/// operator — numbers and strings directly, otherwise the `__lt`
+/// metamethod of the first operand.
+fn compare_default(l: &mut LuaState, a: LuaValue, b: LuaValue) -> LuaResult<bool> {
+    if a.is_number() && b.is_number() {
+        return Ok(a.num() < b.num());
+    }
+    if a.is_string() && b.is_string() {
+        let xb = l.heap().strings.get(a.as_string_id().unwrap());
+        let yb = l.heap().strings.get(b.as_string_id().unwrap());
+        return Ok(xb < yb);
+    }
+    let mo = crate::meta::meta_lookup(l.global(), a, crate::meta::MM::Lt);
+    if !mo.is_func() {
+        return Ok(false);
+    }
+    let saved_top = l.top;
+    let saved_base = l.base;
+    let func_slot = l.top + 16;
+    l.stack_ensure(func_slot + 4);
+    l.stack[func_slot] = mo;
+    l.stack[func_slot + 2] = a;
+    l.stack[func_slot + 3] = b;
+    let nret = crate::vm::execute(l, func_slot, 2, 1)?;
+    let r = nret > 0 && l.stack[func_slot].is_truthy();
     l.top = saved_top;
     l.base = saved_base;
     Ok(r)

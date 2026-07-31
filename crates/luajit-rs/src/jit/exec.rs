@@ -1047,57 +1047,51 @@ pub extern "C" fn jit_cat(a_bits: u64, b_bits: u64) -> u64 {
 
 /// Upvalue write: store `val_bits` into the cell at `cell_ptr`.
 /// The cell pointer is a stable heap address of an upvalue slot.
+/// Returns the value so a guarded caller can typecheck it (and so DCE
+/// keeps the side-effecting call alive).
 pub extern "C" fn jit_uset(cell_ptr: u64, val_bits: u64) -> u64 {
     unsafe {
         *(cell_ptr as *mut u64) = val_bits;
     }
-    0
+    val_bits
 }
 
-/// Vararg copy: reads `nvarg` values from the caller's frame and
-/// writes them to slots at `dst`. `frame_link` is the link word at
-/// bp-1, packed = (numparams<<16)|(dst<<8)|want.
+/// Vararg load: returns vararg number `index` (packed = (numparams<<16)
+/// | index), read from the caller's argument area below the frame base.
+/// `frame_link` is the link word recorded at trace time (used when the
+/// base points at the caller's frame in a Stitch trace). In the normal
+/// case the current frame link at bp-1 locates the area, so a re-entered
+/// trace picks up the *actual* vararg count of the current call; values
+/// beyond it are nil, mirroring the interpreter's BC_VARG fill.
 pub extern "C" fn jit_varg(base_ptr: u64, frame_link: u64, packed: u64) -> u64 {
     use crate::vm::FRAME_TYPE_MASK;
     use crate::vm::FRAME_VARG;
     if frame_link & FRAME_TYPE_MASK != FRAME_VARG {
         return u64::MAX;
     }
-    let numparams = (packed >> 16) as u32;
-    let dst = ((packed >> 8) & 0xFF) as u32;
-    let want = (packed & 0xFF) as u32;
-    let delta = (frame_link >> 3) as usize;
-    let nvarg = (delta - 2).saturating_sub(numparams as usize);
+    let numparams = (packed >> 16) as usize;
+    let index = (packed & 0xFFFF) as usize;
     let base = base_ptr as *mut LuaValue;
     // In a Stitch trace the base_ptr points to the caller's frame,
     // not the callee's.  Detect this: the callee's frame link (at
-    // base-2 for a normal trace) carries FRAME_VARG, while the
+    // base-1 for a normal trace) carries FRAME_VARG, while the
     // caller's does not.
-    let is_callee = unsafe { ((*base.sub(2)).to_bits() & FRAME_TYPE_MASK) == FRAME_VARG };
-    let callee_base: *mut LuaValue = if is_callee {
-        base
+    let is_callee = unsafe { ((*base.sub(1)).to_bits() & FRAME_TYPE_MASK) == FRAME_VARG };
+    let delta = if is_callee {
+        unsafe { ((*base.sub(1)).to_bits() >> 3) as usize }
     } else {
-        unsafe { base.add(delta + 2) }
+        (frame_link >> 3) as usize
     };
+    let nvarg = (delta - 2).saturating_sub(numparams);
+    if index >= nvarg {
+        return LuaValue::NIL.to_bits();
+    }
     let src = if is_callee {
-        unsafe { base.sub(delta).add(numparams as usize) }
+        unsafe { base.sub(delta).add(numparams + index) }
     } else {
-        unsafe { base.add(numparams as usize) }
+        unsafe { base.add(numparams + index) }
     };
-    let actual = if want == 0 {
-        nvarg
-    } else {
-        nvarg.min(want as usize)
-    };
-    for i in 0..actual {
-        unsafe { *callee_base.add(dst as usize + i) = *src.add(i) };
-    }
-    if want > 0 {
-        for i in actual..(want as usize) {
-            unsafe { *callee_base.add(dst as usize + i) = LuaValue::NIL };
-        }
-    }
-    actual as u64
+    unsafe { (*src).to_bits() }
 }
 
 #[cfg(target_arch = "wasm32")]

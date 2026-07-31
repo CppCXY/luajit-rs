@@ -37,9 +37,12 @@ pub enum MM {
     // The following are used in the standard libraries.
     Metatable,
     Tostring,
+    // Lua 5.2 iterator metamethods.
+    Pairs,
+    Ipairs,
 }
 
-pub const MM_MAX: usize = MM::Tostring as usize + 1;
+pub const MM_MAX: usize = MM::Ipairs as usize + 1;
 
 /// Last negative-cached metamethod (`MM_FAST = MM_len`).
 pub const MM_FAST: u8 = MM::Len as u8;
@@ -65,10 +68,14 @@ pub const MM_NAMES: [&[u8]; MM_MAX] = [
     b"__unm",
     b"__metatable",
     b"__tostring",
+    b"__pairs",
+    b"__ipairs",
 ];
 
 /// The metatable of a value: table's own, else the per-type base metatable
-/// (`lj_meta_lookup`'s dispatch on the object type).
+/// (`lj_meta_lookup`'s dispatch on the object type). Numbers share one
+/// slot: the NaN-boxed tag of a double varies with its value, so itype is
+/// normalized to the numeric tag for the lookup.
 #[inline]
 pub fn metatable_of(g: &GlobalState, o: LuaValue) -> Option<GcPtr<LuaTable>> {
     if let Some(t) = o.as_table() {
@@ -77,7 +84,7 @@ pub fn metatable_of(g: &GlobalState, o: LuaValue) -> Option<GcPtr<LuaTable>> {
         // Per-instance metatable takes precedence over base metatable.
         ud.as_ref().metatable.or_else(|| g.basemt_of(o.itype()))
     } else {
-        g.basemt_of(o.itype())
+        g.basemt_of(if o.is_number() { crate::value::LJ_TNUMX } else { o.itype() })
     }
 }
 

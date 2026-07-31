@@ -11,6 +11,12 @@ use super::GCtrace;
 use super::ir::*;
 use super::snap_ref;
 
+/// The upvalue-write helper call must never be eliminated: it is the
+/// trace's only memory-write effect.
+fn is_uset(ir: &IRIns) -> bool {
+    ir.op() == IROp::CALLL && ir.op2 as u32 == super::record::IRCALL_USET
+}
+
 /// `dce_marksnap`: mark all instructions referenced by snapshots.
 fn dce_marksnap(t: &mut GCtrace) {
     for i in 0..t.snapmap.len() {
@@ -34,7 +40,7 @@ fn dce_propagate(t: &mut GCtrace) {
         if ir.is_marked() {
             t.ir.ir_mut(ins).clear_mark();
             pchain[op] = ins as IRRef1;
-        } else if !ir.sideeff() {
+        } else if !ir.sideeff() && !is_uset(&ir) {
             // Reroute the original instruction chain and NOP it out.
             if pchain[op] == 0 {
                 t.ir.chain[op] = ir.prev;

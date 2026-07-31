@@ -191,6 +191,7 @@ pub fn tostring_meta(l: &mut LuaState, v: LuaValue) -> LuaResult<Vec<u8>> {
     }
     // mmcall: place the metamethod and arg above the current frame.
     let saved_top = l.top;
+    let saved_base = l.base;
     let fs = l.top + 16;
     assert!(
         fs + 16 < crate::state::STACK_MAX,
@@ -202,6 +203,7 @@ pub fn tostring_meta(l: &mut LuaState, v: LuaValue) -> LuaResult<Vec<u8>> {
     crate::vm::execute(l, fs, 1, 1)?;
     let r = l.stack[fs];
     l.top = saved_top;
+    l.base = saved_base;
     if let Some(sid) = r.as_string_id() {
         Ok(l.str_static(sid).to_vec())
     } else {

@@ -67,6 +67,7 @@ fn scan_dec(s: &[u8]) -> Option<f64> {
     } else {
         false
     };
+    let mag_start = i;
     while i < s.len() {
         let c = s[i];
         match c {
@@ -99,7 +100,9 @@ fn scan_dec(s: &[u8]) -> Option<f64> {
     if !seen_digit || (seen_exp && !exp_digits) {
         return None;
     }
-    let mut v = std::str::from_utf8(s).ok()?.parse::<f64>().ok()?;
+    // Parse the magnitude (without the leading sign, which the full
+    // string's parse would already apply) and negate explicitly.
+    let mut v = std::str::from_utf8(&s[mag_start..]).ok()?.parse::<f64>().ok()?;
     if neg {
         v = -v;
     }

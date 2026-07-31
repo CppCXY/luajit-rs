@@ -135,6 +135,7 @@ fn read_proto(r: &mut Reader, strs: &mut Interner) -> Proto {
         kstrv,
         uv,
         uvnames,
+        varnames: Vec::new(),
         flags,
         numparams,
         framesize,
