@@ -577,18 +577,17 @@ impl<T> GcPtr<T> {
         gc_header(self.0).marked.get()
     }
 
-    /// `isdead`: the object carries the white bit that the sweep phase is
-    /// about to collect. Mirrors LuaJIT's `isdead` for `gc_mayclear`.
-    pub(crate) fn is_dead(self, current_white: u8) -> bool {
-        gc_header(self.0).is_dead(current_white)
-    }
-
     /// `iswhite`: the object is not marked (carries any white bit). This is
     /// what `gc_mayclear` tests: an entry whose key/value was not marked in
     /// this cycle is dropped from a weak table, even if the object would
     /// only be swept one cycle later.
     pub(crate) fn is_white(self) -> bool {
         gc_header(self.0).is_white()
+    }
+
+    /// `isfinalized`: the `__gc` finalizer already ran (see `Finalizable`).
+    pub(crate) fn is_finalized(self) -> bool {
+        gc_header(self.0).is_finalized()
     }
 
     pub fn set_marked(self) {
@@ -663,18 +662,6 @@ pub enum Gray {
     UserData(GcPtr<GcUserData>),
 }
 
-impl Gray {
-    fn ptr(&self) -> u64 {
-        match self {
-            Gray::Tab(p) => p.addr(),
-            Gray::Func(p) => p.addr(),
-            Gray::Proto(p) => p.addr(),
-            Gray::Thread(p) => p.addr(),
-            Gray::UserData(p) => p.addr(),
-        }
-    }
-}
-
 /// An object whose `__gc` finalizer must run. Collected during the atomic
 /// phase into `GcHeap.mmudata` and executed by the VM at the next safe
 /// point (after the sweep, so every object the finalizer may touch is
@@ -708,6 +695,12 @@ impl Finalizable {
 struct Marker<'g> {
     gray: Vec<Gray>,
     strings: &'g Interner,
+    heap: *const GcHeap,
+    /// Atomic phase: stale stack slots above `top` may be cleared (the
+    /// interpreter is not running, so `top` is exact). During propagation
+    /// the interpreter may hold a lowered `top` (e.g. inside a C call),
+    /// and clearing would destroy live frame locals.
+    atomic: bool,
     /// Weak tables discovered during traversal, with their `__mode` bits.
     weak: Vec<(GcPtr<LuaTable>, u8)>,
 }
@@ -766,9 +759,6 @@ impl<'g> Marker<'g> {
         }
     }
     fn mark_table(&mut self, t: GcPtr<LuaTable>) {
-        if t.addr() == 0 {
-            eprintln!("[gcprobe] mark_table(NULL)"); std::process::abort();
-        }
         if !t.is_marked() {
             t.set_marked();
             self.gray.push(Gray::Tab(t));
@@ -848,7 +838,12 @@ impl<'g> Marker<'g> {
                 }
                 Gray::Thread(th) => {
                     let l = th.as_mut();
-                    for i in 0..l.top {
+                    // lj_gc_step_fixtop: mark the whole current frame (`top`
+                    // may be lowered to a C-call result area); stale slots
+                    // inside the frame are kept alive rather than freed out
+                    // from under us.
+                    let mark_to = l.top.max(l.frame_top);
+                    for i in 0..mark_to {
                         self.mark_value(l.stack[i]);
                     }
                     self.mark_value(l.errval);
@@ -858,8 +853,26 @@ impl<'g> Marker<'g> {
                     if let Some(cl) = l.suspend.call_cl() {
                         cl.set_marked();
                     }
-                    for s in l.stack[l.top..].iter_mut() {
-                        *s = LuaValue::NIL;
+                    if self.atomic {
+                        // lj_gc_step_fixtop: never clear slots below the
+                        // current Lua frame top (frame_top is exact here;
+                        // `top` may have been lowered to a C-call result
+                        // area).
+                        let clear_from = l.top.max(l.frame_top);
+                        for s in l.stack[clear_from..].iter_mut() {
+                            *s = LuaValue::NIL;
+                        }
+                    }
+                    // Threads are never black (LuaJIT's black2gray +
+                    // grayagain): the atomic phase re-traverses them and
+                    // clears stale slots written after their first pass.
+                    gc_header(th.0).make_gray();
+                    unsafe {
+                        (self.heap as *mut GcHeap)
+                            .as_mut()
+                            .unwrap()
+                            .gc_grayagain
+                            .push(Gray::Thread(th));
                     }
                 }
                 Gray::UserData(_) => {
@@ -875,10 +888,6 @@ impl<'g> Marker<'g> {
                 return true;
             }
             let g = self.gray.pop().unwrap();
-            if g.ptr() == 0 {
-                eprintln!("[gcprobe] NULL GRAY ENTRY at work={} remaining={}", work, self.gray.len());
-                std::process::abort();
-            }
             match g {
                 Gray::Tab(t) => {
                     t.set_marked();
@@ -931,7 +940,10 @@ impl<'g> Marker<'g> {
                 Gray::Thread(th) => {
                     th.set_marked();
                     let l = th.as_mut();
-                    for i in 0..l.top {
+                    // lj_gc_step_fixtop: mark the whole current frame (see
+                    // the propagate arm above).
+                    let mark_to = l.top.max(l.frame_top);
+                    for i in 0..mark_to {
                         self.mark_value(l.stack[i]);
                     }
                     self.mark_value(l.errval);
@@ -941,8 +953,26 @@ impl<'g> Marker<'g> {
                     if let Some(cl) = l.suspend.call_cl() {
                         cl.set_marked();
                     }
-                    for s in l.stack[l.top..].iter_mut() {
-                        *s = LuaValue::NIL;
+                    if self.atomic {
+                        // lj_gc_step_fixtop: never clear slots below the
+                        // current Lua frame top (frame_top is exact here;
+                        // `top` may have been lowered to a C-call result
+                        // area).
+                        let clear_from = l.top.max(l.frame_top);
+                        for s in l.stack[clear_from..].iter_mut() {
+                            *s = LuaValue::NIL;
+                        }
+                    }
+                    // Threads are never black (LuaJIT's black2gray +
+                    // grayagain): the atomic phase re-traverses them and
+                    // clears stale slots written after their first pass.
+                    gc_header(th.0).make_gray();
+                    unsafe {
+                        (self.heap as *mut GcHeap)
+                            .as_mut()
+                            .unwrap()
+                            .gc_grayagain
+                            .push(Gray::Thread(th));
                     }
                 }
                 Gray::UserData(_) => {}
@@ -1062,6 +1092,8 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             let mut m = Marker {
                 gray: std::mem::take(&mut heap.gc_gray),
                 strings: &heap.strings,
+                heap: heap as *const GcHeap,
+                atomic: false,
                 weak: Vec::new(),
             };
             let done = m.propagate_step((step / 64).max(1));
@@ -1074,11 +1106,13 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             false
         }
         GcState::Atomic => {
-            loop {
-                let mut gray = std::mem::take(&mut heap.gc_grayagain);
-                gray.extend(std::mem::take(&mut heap.gc_gray));
-                if gray.is_empty() { break; }
-                let mut m = Marker { gray, strings: &heap.strings, weak: Vec::new() };
+            // Atomic: mark the 2nd-chance list once (LuaJIT empties
+            // grayagain into gray and propagates a single round; threads
+            // re-register themselves and stay there until the next cycle).
+            let mut gray = std::mem::take(&mut heap.gc_grayagain);
+            gray.extend(std::mem::take(&mut heap.gc_gray));
+            if !gray.is_empty() {
+                let mut m = Marker { gray, strings: &heap.strings, heap: heap as *const GcHeap, atomic: true, weak: Vec::new() };
                 m.propagate();
                 heap.gc_weak.extend(m.weak);
             }
@@ -1094,7 +1128,7 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
                 separate_finalizable(heap)
             };
             if !mmu.is_empty() {
-                let mut m = Marker { gray: Vec::new(), strings: &heap.strings, weak: Vec::new() };
+                let mut m = Marker { gray: Vec::new(), strings: &heap.strings, heap: heap as *const GcHeap, atomic: true, weak: Vec::new() };
                 for o in &mmu {
                     if let Some(mt) = o.metatable() {
                         m.mark_table(mt);
@@ -1114,25 +1148,13 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             false
         }
         GcState::Sweep => {
-            loop {
-                if heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() { break; }
-                let mut gray = std::mem::take(&mut heap.gc_grayagain);
-                gray.extend(std::mem::take(&mut heap.gc_gray));
-                // No weak collection here: the atomic phase already ran
-                // clear_weak, and these gray re-traversals revisit tables
-                // that were collected there.
-                let mut m = Marker { gray, strings: &heap.strings, weak: Vec::new() };
-                m.propagate();
-                if m.gray.is_empty() && heap.gc_grayagain.is_empty() && heap.gc_gray.is_empty() {
-                    break;
-                }
-                heap.gc_gray = m.gray;
-            }
+            // No propagation in the sweep phase (threads sit in grayagain
+            // until the next atomic round); anything left over is from the
+            // atomic round already handled there.
             let done = sweep_one_pool(heap);
             if done {
-                // Finalized objects wait for the VM to run their __gc;
-                // stay in Finalize until then so no new cycle starts.
-                heap.gc_state = if heap.mmudata.is_empty() {
+                heap.gc_state = if std::env::var("LUARS_NO_FIN").is_ok() || heap.mmudata.is_empty()
+                {
                     GcState::Pause
                 } else {
                     GcState::Finalize
@@ -1214,7 +1236,9 @@ pub(crate) fn account_thread(th: &LuaState) -> usize {
 /// objects can be weak references; strings cannot (they are marked and
 /// kept, per the Lua 5.1 semantics of interned strings), and any other
 /// object that was not marked this cycle (`is_white`) is cleared.
-pub(crate) fn may_clear(v: LuaValue) -> bool {
+/// Finalized userdata is additionally dropped from *value* positions
+/// (LuaJIT: `isfinalized(udata) && val`).
+pub(crate) fn may_clear(v: LuaValue, is_val: bool) -> bool {
     match v.itype() {
         LJ_TSTR => {
             if let Some(p) = v.as_string() {
@@ -1225,7 +1249,9 @@ pub(crate) fn may_clear(v: LuaValue) -> bool {
         LJ_TTAB => v.as_table().map_or(false, |p| p.is_white()),
         LJ_TFUNC => v.as_func().map_or(false, |p| p.is_white()),
         LJ_TTHREAD => v.as_thread().map_or(false, |p| p.is_white()),
-        LJ_TUDATA => v.as_userdata().map_or(false, |p| p.is_white()),
+        LJ_TUDATA => v
+            .as_userdata()
+            .map_or(false, |p| p.is_white() || (is_val && p.is_finalized())),
         LJ_TCDATA => v.as_cdata().map_or(false, |p| p.is_white()),
         _ => false,
     }
@@ -1253,23 +1279,29 @@ pub(crate) fn has_gc_meta(mt: Option<GcPtr<LuaTable>>) -> bool {
 /// the VM runs the finalizer; `mark_finalized` then makes them die in the
 /// *next* cycle.
 fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
-    // Reverse iteration order: the pool holds objects oldest-first, but
-    // LuaJIT's mmudata list is LIFO (newest finalized first), which the
-    // gc.lua suite depends on (a[o] == 10-s).
+    // Pool order is oldest-first; collect in that order so the vector is
+    // [u, p1, ..., p10]. run_finalizers pops from the end, so the newest
+    // object is finalized first — LuaJIT's mmudata LIFO, which the gc.lua
+    // suite depends on (a[o] == 10-s).
     let mut out = Vec::new();
-    for i in (0..heap.userdatas.objects.len()).rev() {
+    for i in 0..heap.userdatas.objects.len() {
         let u = heap.userdatas.objects[i];
         let h = gc_header(u);
         if h.is_white() && !h.is_finalized() && has_gc_meta(unsafe { u.as_ref() }.metatable) {
+            // LuaJIT's gc_separateudata: mark FINALIZED right here so the
+            // atomic-phase clear_weak drops finalized userdata from weak
+            // *value* positions (gc_mayclear's `isfinalized && val`).
             h.make_undead();
+            h.set_finalized();
             out.push(Finalizable::UData(GcPtr(u)));
         }
     }
-    for i in (0..heap.tables.objects.len()).rev() {
+    for i in 0..heap.tables.objects.len() {
         let t = heap.tables.objects[i];
         let h = gc_header(t);
         if h.is_white() && !h.is_finalized() && has_gc_meta(unsafe { t.as_ref() }.metatable) {
             h.make_undead();
+            h.set_finalized();
             out.push(Finalizable::Table(GcPtr(t)));
         }
     }
@@ -1324,8 +1356,10 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
     g.heap.userdatas.update_current_white(cw);
     g.heap.gc_state = GcState::Propagate;
     let mut m = Marker {
-        gray: Vec::with_capacity(64),
-        strings: &g.heap.strings,
+            gray: Vec::with_capacity(64),
+            strings: &g.heap.strings,
+            heap: &g.heap as *const GcHeap,
+            atomic: false,
         weak: Vec::new(),
     };
     m.mark_table(g.globals);

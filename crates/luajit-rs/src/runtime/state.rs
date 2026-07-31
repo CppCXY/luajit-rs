@@ -353,6 +353,10 @@ pub struct LuaState {
     is_main: bool,
     /// The value stack / register file. Grows dynamically up to `_max_stack`.
     pub stack: Vec<LuaValue>,
+    /// Top of the current Lua frame (`base + framesize`), kept for the GC:
+    /// the collector must never clear slots below it even if `top` was
+    /// lowered to a C-call result area (`lj_gc_step_fixtop`).
+    pub frame_top: usize,
     _max_stack: usize,
     pub base: usize,
     pub top: usize,
@@ -400,6 +404,7 @@ impl LuaState {
                 v.resize(initial_len, LuaValue::NIL);
                 v
             },
+            frame_top: 0,
             _max_stack: max_stack,
             base: 0,
             top: 0,

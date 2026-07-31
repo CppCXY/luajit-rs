@@ -284,7 +284,7 @@ impl LuaTable {
     pub(crate) fn clear_weak_entries(&mut self, mode: u8) {
         if mode & gc::WEAKVAL != 0 {
             for tv in self.array.iter_mut() {
-                if gc::may_clear(*tv) {
+                if gc::may_clear(*tv, true) {
                     *tv = LuaValue::NIL;
                 }
             }
@@ -294,7 +294,7 @@ impl LuaTable {
                 if n.val.is_nil() {
                     continue;
                 }
-                if gc::may_clear(n.key) || gc::may_clear(n.val) {
+                if gc::may_clear(n.key, false) || gc::may_clear(n.val, true) {
                     n.val = LuaValue::NIL;
                 }
             }

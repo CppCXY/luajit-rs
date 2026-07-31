@@ -259,15 +259,25 @@ fn call_c(
     l.stack[args_base - 1] = LuaValue::from_bits(((saved_base as u64) << 3) | FRAME_LUA);
     l.base = args_base;
     l.top = args_base + nargs;
-    let g = l.global();
-    let step_size = g.heap.gc_step_size;
-    let paused = g.heap.gc_state == crate::runtime::gc::GcState::Pause;
-    if (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped {
+    let (step_size, paused, collect) = {
+        let g = l.global();
+        (
+            g.heap.gc_step_size,
+            g.heap.gc_state == crate::runtime::gc::GcState::Pause,
+            (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped,
+        )
+    };
+    if collect {
+        // lj_gc_step_fixtop: the collector may clear stack slots above
+        // `top`; the caller's frame locals sit below frame_top, so raise
+        // top past them for the duration of the step.
+        l.top = l.top.max(l.frame_top);
         if paused {
-            crate::gc::start_gc_cycle(g);
+            crate::gc::start_gc_cycle(l.global());
         }
-        crate::gc::gc_step(&mut g.heap, step_size);
-        g.heap.debt = 0;
+        crate::gc::gc_step(&mut l.global().heap, step_size);
+        l.global().heap.debt = 0;
+        l.top = args_base + nargs;
     }
     let r = f(l);
     let n = match r {
@@ -453,6 +463,7 @@ impl Interp {
         self.ksp = pt.kstrv.as_ptr();
         self.pc = 1; // skip the FUNCF/FUNCV header
         self.l().top = self.base + pt.framesize as usize;
+        self.l().frame_top = self.l().top;
     }
 
     fn reload(&mut self, cl: GcPtr<GcFunc>) {
@@ -600,6 +611,7 @@ impl Interp {
         let cl = self.at(caller_base - 2).as_func().unwrap();
         self.reload(cl);
         self.l().top = caller_base + self.proto().framesize as usize;
+        self.l().frame_top = self.l().top;
 
         match cont {
             Cont::Ra => {
@@ -1715,6 +1727,7 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
+                                self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             // A compiled callee (JFUNCF): enter its trace
                             // from the fresh frame.
@@ -1803,6 +1816,7 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
+                                self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             if !REC && bc_op(head) == BCOp::JFUNCF {
                                 sync!();
@@ -2392,6 +2406,7 @@ impl Interp {
         let bp = unsafe { self.sp.add(self.base) };
         self.reload_at(bp);
         self.l().top = self.base + self.proto().framesize as usize;
+        self.l().frame_top = self.l().top;
     }
 
     /// `lj_gc_check` + `lj_gc_step_fixtop`: run a collection if the
@@ -2582,15 +2597,25 @@ impl Interp {
         l.base = args_base;
         l.top = args_base + nargs;
         // C-call boundary is a GC safe point (args anchored, frames below).
-        let g = l.global();
-        let step_size = g.heap.gc_step_size;
-        let paused = g.heap.gc_state == crate::runtime::gc::GcState::Pause;
-        if (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped {
+        let (step_size, paused, collect) = {
+            let g = l.global();
+            (
+                g.heap.gc_step_size,
+                g.heap.gc_state == crate::runtime::gc::GcState::Pause,
+                (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped,
+            )
+        };
+        if collect {
+            // lj_gc_step_fixtop: protect the caller's frame locals from
+            // the collector's slot clearing (top was lowered to the arg
+            // area for this C call).
+            l.top = l.top.max(l.frame_top);
             if paused {
-                crate::gc::start_gc_cycle(g);
+                crate::gc::start_gc_cycle(l.global());
             }
-            crate::gc::gc_step(&mut g.heap, step_size);
-            g.heap.debt = 0;
+            crate::gc::gc_step(&mut l.global().heap, step_size);
+            l.global().heap.debt = 0;
+            l.top = args_base + nargs;
         }
         let r = f(l);
         let n = match r {
@@ -2746,6 +2771,13 @@ impl Interp {
             } else {
                 n
             };
+            // Clear the C frame's dead slots above the results so stale
+            // references never reach the next cycle (the atomic clear is
+            // bounded by frame_top to protect live Lua locals).
+            let top_now = self.l().top;
+            for s in self.l().stack[dst + got..top_now].iter_mut() {
+                *s = LuaValue::NIL;
+            }
             self.l().top = dst + got;
             return Some(got);
         }
@@ -2755,20 +2787,29 @@ impl Interp {
         let call_ins = unsafe { *ret_ip.sub(1) };
         let caller_base = dst - bc_a(call_ins) as usize;
         let want = bc_b(call_ins) as i32 - 1;
+        // Callee frame extent (before reload switches proto to the caller).
+        let callee_top = dst + 2 + self.proto().framesize as usize;
 
         self.base = caller_base;
         let cl = self.at(caller_base - 2).as_func().unwrap();
         self.reload(cl);
         self.pc = unsafe { ret_ip.offset_from(self.bcp) as usize };
 
-        if want >= 0 {
+        let keep = dst + if want >= 0 {
             for i in n..(want as usize) {
                 self.set_at(dst + i, LuaValue::NIL);
             }
-            self.l().top = dst + want as usize;
+            want as usize
         } else {
-            self.l().top = dst + n;
+            n
+        };
+        // Clear the callee frame's dead slots above the results (stale
+        // references must not survive into the next GC cycle).
+        let hi = callee_top.max(keep);
+        for s in self.l().stack[keep..hi].iter_mut() {
+            *s = LuaValue::NIL;
         }
+        self.l().top = keep;
         None
     }
 
@@ -3000,6 +3041,7 @@ pub fn resume_continue(
         _ => unreachable!(),
     };
     co.top = sbase + pt.framesize as usize;
+    co.frame_top = co.top;
     co.base = sbase;
     co.status = crate::state::CoStatus::Running;
     let r = vm.run();
