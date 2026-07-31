@@ -1,5 +1,5 @@
-use crate::runtime::cdata::CData;
 use crate::proto::{KGc, Proto};
+use crate::runtime::cdata::CData;
 use crate::string::Interner;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
@@ -152,7 +152,9 @@ pub fn undump(data: &[u8], strs: &mut Interner) -> Result<Proto, String> {
     r.pos = 3;
     let version = r.read_u8();
     if version != VERSION {
-        return Err(format!("bytecode version mismatch: got {version}, expected {VERSION}"));
+        return Err(format!(
+            "bytecode version mismatch: got {version}, expected {VERSION}"
+        ));
     }
     let _flags = r.read_u8();
     // Need to recursively read child protos first, then the main proto.

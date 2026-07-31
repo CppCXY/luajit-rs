@@ -108,7 +108,7 @@ impl GcHeap {
         t.heap = self as *const GcHeap;
         let size = t.gc_size();
         self.total += size;
-        gc::gc_step(self, size);  // GC first — may start a cycle
+        gc::gc_step(self, size); // GC first — may start a cycle
         self.account_alloc(size);
         self.tables.alloc(t)
     }
@@ -701,8 +701,7 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
         let mut parser = Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));
         std::panic::set_hook(prev_hook);
         match result {
             Ok(p) => p,

@@ -352,7 +352,7 @@ fn str_dump(l: &mut LuaState) -> LuaResult<i32> {
                     t
                 }
             };
-            let idx = cache.as_ref().len() as u32;
+            let idx = cache.as_ref().len();
             cache.as_mut().set_int(idx as i32, fv);
             let data = format!("\x1bLJ{}", idx);
             let sid = l.heap().intern(data.as_bytes());

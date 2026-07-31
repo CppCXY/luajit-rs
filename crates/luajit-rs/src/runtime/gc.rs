@@ -113,7 +113,11 @@ impl GcHeader {
     /// is swept one cycle after its finalizer ran ("finalized keys are
     /// removed in two cycles").
     pub fn make_dead_next(&self, current_white: u8) {
-        let color = if current_white == 0 { BIT_WHITE0 } else { BIT_WHITE1 };
+        let color = if current_white == 0 {
+            BIT_WHITE0
+        } else {
+            BIT_WHITE1
+        };
         self.wb((self.rb() & !COLOR_MASK) | BIT_FINALIZED | color);
     }
 
@@ -898,7 +902,8 @@ impl<'g> Marker<'g> {
                     self.collect_weak(t, mode);
                 }
                 Gray::Func(f) => {
-                    f.set_marked();                    match f.as_ref() {
+                    f.set_marked();
+                    match f.as_ref() {
                         GcFunc::Lua(c) => {
                             self.mark_table(c.env);
                             self.mark_proto(c.proto);
@@ -1115,7 +1120,13 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             let mut gray = std::mem::take(&mut heap.gc_grayagain);
             gray.extend(std::mem::take(&mut heap.gc_gray));
             if !gray.is_empty() {
-                let mut m = Marker { gray, strings: &heap.strings, heap: heap as *const GcHeap, atomic: true, weak: Vec::new() };
+                let mut m = Marker {
+                    gray,
+                    strings: &heap.strings,
+                    heap: heap as *const GcHeap,
+                    atomic: true,
+                    weak: Vec::new(),
+                };
                 m.propagate();
                 heap.gc_weak.extend(m.weak);
             }
@@ -1131,7 +1142,13 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
                 separate_finalizable(heap)
             };
             if !mmu.is_empty() {
-                let mut m = Marker { gray: Vec::new(), strings: &heap.strings, heap: heap as *const GcHeap, atomic: true, weak: Vec::new() };
+                let mut m = Marker {
+                    gray: Vec::new(),
+                    strings: &heap.strings,
+                    heap: heap as *const GcHeap,
+                    atomic: true,
+                    weak: Vec::new(),
+                };
                 for o in &mmu {
                     if let Some(mt) = o.metatable() {
                         m.mark_table(mt);
@@ -1185,15 +1202,38 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
 
 fn sweep_one_pool(heap: &mut GcHeap) -> bool {
     let done = match heap.gc_sweep_pool {
-        0 => { heap.strings.sweep(heap.current_white); 1 }
-        1 => { heap.tables.sweep_tricolor(heap.current_white, |_| {}); 2 }
-        2 => { heap.funcs.sweep_tricolor(heap.current_white, |_| {}); 3 }
-        3 => { heap.threads.sweep_tricolor(heap.current_white, |th| {
-            for &uv in &th.openuv { uv.as_mut().close(); }
-        }); 4 }
-        4 => { heap.upvals.sweep_tricolor(heap.current_white, |_| {}); 5 }
-        5 => { heap.protos.sweep_tricolor(heap.current_white, |_| {}); 6 }
-        6 => { heap.userdatas.sweep_tricolor(heap.current_white, |_| {}); 7 }
+        0 => {
+            heap.strings.sweep(heap.current_white);
+            1
+        }
+        1 => {
+            heap.tables.sweep_tricolor(heap.current_white, |_| {});
+            2
+        }
+        2 => {
+            heap.funcs.sweep_tricolor(heap.current_white, |_| {});
+            3
+        }
+        3 => {
+            heap.threads.sweep_tricolor(heap.current_white, |th| {
+                for &uv in &th.openuv {
+                    uv.as_mut().close();
+                }
+            });
+            4
+        }
+        4 => {
+            heap.upvals.sweep_tricolor(heap.current_white, |_| {});
+            5
+        }
+        5 => {
+            heap.protos.sweep_tricolor(heap.current_white, |_| {});
+            6
+        }
+        6 => {
+            heap.userdatas.sweep_tricolor(heap.current_white, |_| {});
+            7
+        }
         _ => {
             heap.gc_state = if heap.mmudata.is_empty() {
                 GcState::Pause
@@ -1216,11 +1256,19 @@ fn sweep_one_pool(heap: &mut GcHeap) -> bool {
 
 fn total_live(heap: &GcHeap) -> usize {
     let mut total = 0usize;
-    for t in heap.tables.iter() { total += t.gc_size(); }
-    for f in heap.funcs.iter() { total += size_func(f); }
+    for t in heap.tables.iter() {
+        total += t.gc_size();
+    }
+    for f in heap.funcs.iter() {
+        total += size_func(f);
+    }
     total += heap.upvals.len() * size_upval();
-    for p in heap.protos.iter() { total += p.gc_size(); }
-    for th in heap.threads.iter() { total += size_thread(th); }
+    for p in heap.protos.iter() {
+        total += p.gc_size();
+    }
+    for th in heap.threads.iter() {
+        total += size_thread(th);
+    }
     for cd in heap.cdatas.iter() {
         total += std::mem::size_of::<crate::runtime::cdata::CData>() + cd.data.len();
     }
@@ -1249,13 +1297,13 @@ pub(crate) fn may_clear(v: LuaValue, is_val: bool) -> bool {
             }
             false
         }
-        LJ_TTAB => v.as_table().map_or(false, |p| p.is_white()),
-        LJ_TFUNC => v.as_func().map_or(false, |p| p.is_white()),
-        LJ_TTHREAD => v.as_thread().map_or(false, |p| p.is_white()),
+        LJ_TTAB => v.as_table().is_some_and(|p| p.is_white()),
+        LJ_TFUNC => v.as_func().is_some_and(|p| p.is_white()),
+        LJ_TTHREAD => v.as_thread().is_some_and(|p| p.is_white()),
         LJ_TUDATA => v
             .as_userdata()
-            .map_or(false, |p| p.is_white() || (is_val && p.is_finalized())),
-        LJ_TCDATA => v.as_cdata().map_or(false, |p| p.is_white()),
+            .is_some_and(|p| p.is_white() || (is_val && p.is_finalized())),
+        LJ_TCDATA => v.as_cdata().is_some_and(|p| p.is_white()),
         _ => false,
     }
 }
@@ -1273,7 +1321,7 @@ fn clear_weak(heap: &mut GcHeap) {
 /// Does this metatable provide a `__gc` finalizer (a non-nil `__gc`
 /// value)? Mirrors `lj_meta_fastg(g, mt, MM_gc)`.
 pub(crate) fn has_gc_meta(mt: Option<GcPtr<LuaTable>>) -> bool {
-    mt.map_or(false, |mt| mt.as_ref().scan_str_key(b"__gc").is_some())
+    mt.is_some_and(|mt| mt.as_ref().scan_str_key(b"__gc").is_some())
 }
 
 /// `lj_gc_separateudata`: collect every dead object with a `__gc`
@@ -1326,15 +1374,24 @@ pub fn full_gc(g: &mut GlobalState) {
     // Sweep clears the marked flag on every survivor, so liveness must be
     // checked by pool membership instead of the tri-color bits.
     debug_assert!(
-        g.heap.tables.iter().any(|t| t as *const _ == g.globals.as_ref() as *const _),
+        g.heap
+            .tables
+            .iter()
+            .any(|t| std::ptr::eq(t, g.globals.as_ref())),
         "globals freed after full_gc"
     );
     debug_assert!(
-        g.heap.tables.iter().any(|t| t as *const _ == g.registry.as_ref() as *const _),
+        g.heap
+            .tables
+            .iter()
+            .any(|t| std::ptr::eq(t, g.registry.as_ref())),
         "registry freed after full_gc"
     );
     debug_assert!(
-        g.heap.threads.iter().any(|t| t as *const _ == g.main().as_ref() as *const _),
+        g.heap
+            .threads
+            .iter()
+            .any(|t| std::ptr::eq(t, g.main().as_ref())),
         "main thread freed after full_gc"
     );
     g.heap.gc_gray.clear();
@@ -1359,10 +1416,10 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
     g.heap.userdatas.update_current_white(cw);
     g.heap.gc_state = GcState::Propagate;
     let mut m = Marker {
-            gray: Vec::with_capacity(64),
-            strings: &g.heap.strings,
-            heap: &g.heap as *const GcHeap,
-            atomic: false,
+        gray: Vec::with_capacity(64),
+        strings: &g.heap.strings,
+        heap: &g.heap as *const GcHeap,
+        atomic: false,
         weak: Vec::new(),
     };
     m.mark_table(g.globals);

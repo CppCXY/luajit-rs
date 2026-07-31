@@ -220,7 +220,7 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             // Default size==0: 1 call (minimal step).  Larger size: more calls.
             let a = size * 1024;
             let live = g.heap.total + g.heap.strings.bytes() + g.heap.table_extra;
-            g.heap.threshold = if a <= live { live - a } else { 0 };
+            g.heap.threshold = live.saturating_sub(a);
             let mut lim = if size == 0 { 1u64 } else { size as u64 };
             // Start a cycle if idle.
             if g.heap.gc_state == crate::runtime::gc::GcState::Pause {
@@ -228,7 +228,9 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             }
             let mut done = false;
             loop {
-                if lim == 0 { break; }
+                if lim == 0 {
+                    break;
+                }
                 lim -= 1;
                 let step_done = crate::gc::gc_step(&mut g.heap, crate::runtime::gc::GC_STEP_SIZE);
                 // Detect completion: gc_step returned true, or the cycle finished
@@ -245,7 +247,6 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             } else {
                 g.heap.threshold
             };
-            drop(g);
             if l.global().heap.gc_state == crate::runtime::gc::GcState::Finalize {
                 crate::vm::run_finalizers(l)?;
             }

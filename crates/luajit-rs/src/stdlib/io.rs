@@ -571,25 +571,32 @@ fn io_flush(l: &mut LuaState) -> LuaResult<i32> {
             let mut files = FILES.lock().unwrap();
             match files.get_mut(id).and_then(|e| e.as_mut()) {
                 Some(Entry::Write(f)) => match f.flush() {
-                    Ok(()) => { push(l, LuaValue::TRUE); Ok(1) }
+                    Ok(()) => {
+                        push(l, LuaValue::TRUE);
+                        Ok(1)
+                    }
                     Err(e) => ret_fail(l, &e.to_string()),
                 },
                 Some(Entry::Stdout | Entry::Stderr) => {
                     drop(files);
                     match std::io::stdout().flush() {
-                        Ok(()) => { push(l, LuaValue::TRUE); Ok(1) }
+                        Ok(()) => {
+                            push(l, LuaValue::TRUE);
+                            Ok(1)
+                        }
                         Err(e) => ret_fail(l, &e.to_string()),
                     }
                 }
                 _ => Err(l.runtime_error(b"default output not writable")),
             }
         }
-        None => {
-            match std::io::stdout().flush() {
-                Ok(()) => { push(l, LuaValue::TRUE); Ok(1) }
-                Err(e) => ret_fail(l, &e.to_string()),
+        None => match std::io::stdout().flush() {
+            Ok(()) => {
+                push(l, LuaValue::TRUE);
+                Ok(1)
             }
-        }
+            Err(e) => ret_fail(l, &e.to_string()),
+        },
     }
 }
 
@@ -704,13 +711,31 @@ fn io_type(l: &mut LuaState) -> LuaResult<i32> {
     if v.as_table().is_some() {
         let sid = l.heap().intern(b"__fd");
         let k = l.heap().str_value(sid);
-        if v.as_table().unwrap().as_ref().get_str(k).as_number().is_some() {
+        if v.as_table()
+            .unwrap()
+            .as_ref()
+            .get_str(k)
+            .as_number()
+            .is_some()
+        {
             let files = FILES.lock().unwrap();
-            let fd = v.as_table().unwrap().as_ref().get_str(k).as_number().unwrap() as usize;
+            let fd = v
+                .as_table()
+                .unwrap()
+                .as_ref()
+                .get_str(k)
+                .as_number()
+                .unwrap() as usize;
             if let Some(entry) = files.get(fd).and_then(|e| e.as_ref()) {
                 match entry {
-                    Entry::Read(_) | Entry::Write(_) | Entry::Stdin | Entry::Stdout | Entry::Stderr => {
-                        let sid = l.heap().intern(b"file"); push(l, l.heap().str_value(sid)); return Ok(1)
+                    Entry::Read(_)
+                    | Entry::Write(_)
+                    | Entry::Stdin
+                    | Entry::Stdout
+                    | Entry::Stderr => {
+                        let sid = l.heap().intern(b"file");
+                        push(l, l.heap().str_value(sid));
+                        return Ok(1);
                     }
                 }
             }
@@ -739,7 +764,11 @@ pub fn open(l: &mut LuaState) {
         .func(b"output", io_output)
         .func(b"type", io_type)
         .build();
-    for (name, fd) in [(b"stdin".as_slice(), fdi), (b"stdout", fdo), (b"stderr", fde)] {
+    for (name, fd) in [
+        (b"stdin".as_slice(), fdi),
+        (b"stdout", fdo),
+        (b"stderr", fde),
+    ] {
         let h = new_handle(l, fd);
         let k = l.heap().str_value(l.heap().intern(name));
         io_tab.as_mut().set(k, h);

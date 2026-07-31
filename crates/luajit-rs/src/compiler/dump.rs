@@ -1,5 +1,5 @@
-use crate::proto::{KGc, Proto};
 use crate::lex::Interner;
+use crate::proto::{KGc, Proto};
 
 const MAGIC: &[u8] = b"\x1bLJ";
 const VERSION: u8 = 1;

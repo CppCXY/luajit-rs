@@ -47,7 +47,6 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
         // The finalizer ran: the object is now dead for the *next* cycle.
         let mo = crate::meta::meta_lookup(g, o.value(), MM::Gc);
         o.mark_finalized(g.heap.current_white);
-        drop(g);
         if mo.is_nil() {
             continue;
         }
@@ -1727,7 +1726,7 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
-                                self.l().frame_top = self.l().top;
+                            self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             // A compiled callee (JFUNCF): enter its trace
                             // from the fresh frame.
@@ -1816,7 +1815,7 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = cur_base!() + pt.framesize as usize;
-                                self.l().frame_top = self.l().top;
+                            self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             if !REC && bc_op(head) == BCOp::JFUNCF {
                                 sync!();
@@ -2441,7 +2440,9 @@ impl Interp {
         let step_size = l.global().heap.gc_step_size;
         let paused = l.global().heap.gc_state == crate::runtime::gc::GcState::Pause;
         let stopped = l.global().heap.gc_stopped;
-        if stopped { return Ok(()); }
+        if stopped {
+            return Ok(());
+        }
         let g = l.global();
         if paused {
             crate::gc::start_gc_cycle(g);
@@ -2795,14 +2796,15 @@ impl Interp {
         self.reload(cl);
         self.pc = unsafe { ret_ip.offset_from(self.bcp) as usize };
 
-        let keep = dst + if want >= 0 {
-            for i in n..(want as usize) {
-                self.set_at(dst + i, LuaValue::NIL);
-            }
-            want as usize
-        } else {
-            n
-        };
+        let keep = dst
+            + if want >= 0 {
+                for i in n..(want as usize) {
+                    self.set_at(dst + i, LuaValue::NIL);
+                }
+                want as usize
+            } else {
+                n
+            };
         // Clear the callee frame's dead slots above the results (stale
         // references must not survive into the next GC cycle).
         let hi = callee_top.max(keep);
@@ -3076,4 +3078,3 @@ pub fn resume_finish(
     co.c_depth -= 1;
     r
 }
-

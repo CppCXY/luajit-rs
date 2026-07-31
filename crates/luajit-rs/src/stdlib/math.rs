@@ -31,7 +31,7 @@ macro_rules! math1 {
                                     concat!("math.", stringify!($name)),
                                     "number",
                                     "",
-                                ))
+                                ));
                             }
                         }
                     } else {
@@ -41,7 +41,7 @@ macro_rules! math1 {
                             concat!("math.", stringify!($name)),
                             "number",
                             "",
-                        ))
+                        ));
                     }
                 }
             };

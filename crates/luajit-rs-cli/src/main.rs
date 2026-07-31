@@ -19,8 +19,7 @@ use luajit_rs::internal::state::{Lua, load};
 use luajit_rs::internal::table::LuaTable;
 use luajit_rs::{
     LuaError, LuaState, LuaValue, internal, lua_error_message, lua_getglobal, lua_gettop,
-    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring,
-    lual_openlibs,
+    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring, lual_openlibs,
 };
 
 const LUA_PROMPT: &str = "> ";
@@ -225,9 +224,12 @@ fn dofile(lua: &mut Lua, name: &str) -> i32 {
             return 1;
         }
     };
-    let _ = lua_settop(ll, 0);
+    lua_settop(ll, 0);
     if lual_loadstring(ll, &src).is_err() {
-        eprintln!("luajit-rs: compile error in {name}: {}", String::from_utf8_lossy(&src));
+        eprintln!(
+            "luajit-rs: compile error in {name}: {}",
+            String::from_utf8_lossy(&src)
+        );
         return 1;
     }
     match lua_pcall(ll, 0, 0, 0) {
@@ -245,7 +247,7 @@ fn dofile(lua: &mut Lua, name: &str) -> i32 {
 
 fn dostring(lua: &mut Lua, s: &str, name: &str) -> i32 {
     let ll = lua.main();
-    let _ = lua_settop(ll, 0);
+    lua_settop(ll, 0);
     if lual_loadstring(ll, s.as_bytes()).is_err() {
         eprintln!("luajit-rs: compile error in {name}");
         return 1;
@@ -294,7 +296,7 @@ fn run_args(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
                 //   lua_pushstring(L, name);
                 //   return report(L, docall(L, 1, 1));
                 let ll = lua.main();
-                let _ = lua_settop(ll, 0);
+                lua_settop(ll, 0);
                 lua_getglobal(ll, "require");
                 lua_pushstring(ll, name.as_bytes());
                 if lua_pcall(ll, 1, 0, 0) != Ok(()) {
@@ -443,7 +445,11 @@ fn main() {
         }
         let ll = lua.main();
         dotty(ll);
-    } else if (flags.argn as usize) >= args.len() && !flags.exec && !flags.version && flags.argn == 1 {
+    } else if (flags.argn as usize) >= args.len()
+        && !flags.exec
+        && !flags.version
+        && flags.argn == 1
+    {
         if stdin_is_tty() {
             println!("{VERSION}");
             let ll = lua.main();
