@@ -10,7 +10,7 @@ use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::{LJ_TNIL, LuaValue};
 
-use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, nargs, push, pushv, tostring_meta};
+use super::{LibTarget, arg, err_bad_arg_type, nargs, push, pushv, tostring_meta};
 use crate::lual_reg;
 
 fn lib_print(l: &mut LuaState) -> LuaResult<i32> {
@@ -110,7 +110,7 @@ pub fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
             Vec::new()
         };
         let mut r = LuaValue::NIL;
-        if base >= 2 && base <= 36 && !s.is_empty() {
+        if (2..=36).contains(&base) && !s.is_empty() {
             let mut n: u64 = 0;
             let mut any = false;
             for &b in &s {
@@ -158,7 +158,9 @@ fn lib_select(l: &mut LuaState) -> LuaResult<i32> {
     }
     let k = match first.as_number() {
         Some(k) if k >= 1.0 => k as usize,
-        _ => return Err(err_bad_arg_type(l, 1, "select", "number or '#'", arg(l, 1-1))),
+        _ => {
+            return Err(err_bad_arg_type(l, 1, "select", "number or '#'", arg(l, 0)));
+        }
     };
     let mut cnt = 0;
     l.stack_ensure(l.base + n.saturating_sub(k));
@@ -176,7 +178,7 @@ pub fn lib_next(l: &mut LuaState) -> LuaResult<i32> {
     let k = arg(l, 1);
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "next", "table", arg(l, 1-1))),
+        None => return Err(err_bad_arg_type(l, 1, "next", "table", arg(l, 0))),
     };
     // Lua 5.1: a non-nil key must actually be in the table.
     if !k.is_nil() && tab.as_ref().get(k).is_nil() {
@@ -200,7 +202,7 @@ fn lib_pairs(l: &mut LuaState) -> LuaResult<i32> {
     let mo = crate::meta::meta_lookup(l.global(), t, crate::meta::MM::Pairs);
     if !mo.is_nil() {
         let obase = l.base;
-        let saved_top = l.top;
+        let _saved_top = l.top;
         let fs = l.top + 16;
         l.stack_ensure(fs + 4);
         l.stack[fs] = mo;
@@ -233,7 +235,7 @@ pub fn lib_ipairs_iter(l: &mut LuaState) -> LuaResult<i32> {
     let i = arg(l, 1).as_number().unwrap_or(0.0) + 1.0;
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "ipairs", "table", arg(l, 1-1))),
+        None => return Err(err_bad_arg_type(l, 1, "ipairs", "table", arg(l, 0))),
     };
     let v = tab.as_ref().get_int(i as i32);
     if v.is_nil() {
@@ -270,7 +272,7 @@ fn lib_ipairs(l: &mut LuaState) -> LuaResult<i32> {
         return Ok(3);
     }
     let sid = l.heap().intern(b"__ipairs_iter");
-    let key = l.heap().str_value(sid);
+    let _key = l.heap().str_value(sid);
     let iter = l.global().ipairs_iter;
     pushv(l, &[iter, t, LuaValue::number(0.0)]);
     Ok(3)
@@ -281,10 +283,18 @@ fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
     let mt = arg(l, 1);
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "setmetatable", "table", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "setmetatable", "table", arg(l, 0)));
+        }
     };
     if !mt.is_table() && !mt.is_nil() {
-        return Err(err_bad_arg_type(l, 2, "setmetatable", "nil or table", arg(l, 2-1)));
+        return Err(err_bad_arg_type(
+            l,
+            2,
+            "setmetatable",
+            "nil or table",
+            arg(l, 2 - 1),
+        ));
     }
     // Protected metatable check (lj_meta_lookup(o, MM_metatable)).
     if !crate::meta::meta_lookup(l.global(), t, MM::Metatable).is_nil() {
@@ -394,7 +404,13 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             push(l, LuaValue::number(bytes as f64 / 1024.0));
             Ok(1)
         }
-        _ => Err(err_bad_arg_type(l, 1, "collectgarbage", "option string", arg(l, 1-1))),
+        _ => Err(err_bad_arg_type(
+            l,
+            1,
+            "collectgarbage",
+            "option string",
+            arg(l, 0),
+        )),
     }
 }
 
@@ -410,7 +426,7 @@ pub fn lib_rawget(l: &mut LuaState) -> LuaResult<i32> {
     let k = arg(l, 1);
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "rawget", "table", arg(l, 1-1))),
+        None => return Err(err_bad_arg_type(l, 1, "rawget", "table", arg(l, 0))),
     };
     push(l, tab.as_ref().get(k));
     Ok(1)
@@ -422,7 +438,7 @@ pub fn lib_rawset(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 2);
     let tab = match t.as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "rawset", "table", arg(l, 1-1))),
+        None => return Err(err_bad_arg_type(l, 1, "rawset", "table", arg(l, 0))),
     };
     tab.as_mut().set(k, v);
     push(l, t);
@@ -456,17 +472,14 @@ fn lib_error(l: &mut LuaState) -> LuaResult<i32> {
     // function (LuaJIT's lj_ff_error: a C caller such as pcall/xpcall has
     // no location to report).
     let link = l.stack[l.base - 1].to_bits();
-    let caller_is_lua = (link & 3) == 0
-        && {
-            let sb = (link >> 3) as usize;
-            sb >= 2
-                && l.stack[sb - 2].as_func().map_or(false, |f| {
-                    matches!(f.as_ref(), crate::func::GcFunc::Lua(_))
-                })
-        };
-    if caller_is_lua
-        && let Some(sid) = msg.as_string_id()
-    {
+    let caller_is_lua = (link & 3) == 0 && {
+        let sb = (link >> 3) as usize;
+        sb >= 2
+            && l.stack[sb - 2]
+                .as_func()
+                .is_some_and(|f| matches!(f.as_ref(), crate::func::GcFunc::Lua(_)))
+    };
+    if caller_is_lua && let Some(sid) = msg.as_string_id() {
         let bytes = l.heap().strings.get(sid).to_vec();
         return Err(l.runtime_error_level(&bytes, level as u32));
     }
@@ -533,7 +546,6 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
             };
             Err(LuaError::Yield)
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -652,7 +664,7 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
     let o = arg(l, 0);
     let tab = match arg(l, 1).as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 2, "setfenv", "table", arg(l, 2-1))),
+        None => return Err(err_bad_arg_type(l, 2, "setfenv", "table", arg(l, 2 - 1))),
     };
     if let Some(f) = o.as_func() {
         match f.as_mut() {
@@ -666,7 +678,13 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
     } else if o.is_number() {
         return Err(l.runtime_error(b"setfenv: numeric level not supported"));
     } else {
-        return Err(err_bad_arg_type(l, 1, "setfenv", "function or number", arg(l, 1-1)));
+        return Err(err_bad_arg_type(
+            l,
+            1,
+            "setfenv",
+            "function or number",
+            arg(l, 0),
+        ));
     }
     Ok(1)
 }
@@ -694,7 +712,7 @@ fn lib_rawlen(l: &mut LuaState) -> LuaResult<i32> {
         t.as_ref().len() as f64
     } else if let Some(sid) = v.as_string_id() {
         l.str_static(sid).len() as f64
-    } else if let Some(ud) = v.as_userdata() {
+    } else if let Some(_ud) = v.as_userdata() {
         // Lua 5.2: userdata length is the size of its memory block.
         std::mem::size_of::<GcUserData>() as f64
     } else {
@@ -816,7 +834,13 @@ fn lib_load(l: &mut LuaState) -> LuaResult<i32> {
             }
         }
     } else {
-        Err(err_bad_arg_type(l, 1, "load", "string or function", arg(l, 1-1)))
+        Err(err_bad_arg_type(
+            l,
+            1,
+            "load",
+            "string or function",
+            arg(l, 0),
+        ))
     }
 }
 
@@ -824,7 +848,9 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
     let code = match v.as_string() {
         Some(s) => s.as_ref().as_bytes().to_vec(),
-        None => return Err(err_bad_arg_type(l, 1, "loadstring", "string", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "loadstring", "string", arg(l, 0)));
+        }
     };
     let chunkname = if nargs(l) >= 2 {
         let nv = arg(l, 1);
@@ -857,7 +883,7 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_loadfile(l: &mut LuaState) -> LuaResult<i32> {
     let filename = match arg(l, 0).as_string() {
         Some(s) => s.as_ref().as_bytes().to_vec(),
-        None => return Err(err_bad_arg_type(l, 1, "loadfile", "string", arg(l, 1-1))),
+        None => return Err(err_bad_arg_type(l, 1, "loadfile", "string", arg(l, 0))),
     };
     let chunkname = std::str::from_utf8(&filename)
         .unwrap_or("=(loadfile)")
@@ -920,14 +946,15 @@ fn lib_module(l: &mut LuaState) -> LuaResult<i32> {
     let name = arg(l, 0);
     let modt = l.heap().alloc_table(LuaTable::new(0, 4));
     let g = l.global();
-    let env = g.globals;
+    let _env = g.globals;
     let name_v = name;
     let k = l.heap().str_value(l.heap().intern(b"_M"));
     modt.as_mut().set(k, name_v);
     let k = l.heap().str_value(l.heap().intern(b"_NAME"));
     modt.as_mut().set(k, name_v);
     let k = l.heap().str_value(l.heap().intern(b"_PACKAGE"));
-    modt.as_mut().set(k, l.heap().str_value(l.heap().intern(b"")));
+    modt.as_mut()
+        .set(k, l.heap().str_value(l.heap().intern(b"")));
     push(l, LuaValue::table(modt));
     Ok(1)
 }
@@ -954,7 +981,6 @@ fn lib_dofile(l: &mut LuaState) -> LuaResult<i32> {
         l.stack[l.base + i] = l.stack[fs + i];
     }
     l.top = l.base + n;
-    l.base = l.base;
     Ok(n as i32)
 }
 

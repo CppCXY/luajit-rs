@@ -9,7 +9,7 @@ use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 
-use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, push, tostring_bytes};
+use super::{LibTarget, arg, err_bad_arg_type, push, tostring_bytes};
 use crate::lual_reg;
 use crate::stdlib::pattern::{CaptureValue, find, gsub};
 
@@ -32,11 +32,21 @@ fn push_captures(l: &mut LuaState, captures: &[CaptureValue], text: &[u8], base:
 fn str_find(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg_type(l, 1, "string.find", "string", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "string.find", "string", arg(l, 0)));
+        }
     };
     let pat = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg_type(l, 2, "string.find", "string", arg(l, 2-1))),
+        None => {
+            return Err(err_bad_arg_type(
+                l,
+                2,
+                "string.find",
+                "string",
+                arg(l, 2 - 1),
+            ));
+        }
     };
     let init = arg(l, 2).as_number().map_or(1, |n| n.max(1.0) as usize);
     let plain = arg(l, 3).is_truthy();
@@ -78,11 +88,21 @@ fn str_find(l: &mut LuaState) -> LuaResult<i32> {
 fn str_match(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg_type(l, 1, "string.match", "string", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "string.match", "string", arg(l, 0)));
+        }
     };
     let pat = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg_type(l, 2, "string.match", "string", arg(l, 2-1))),
+        None => {
+            return Err(err_bad_arg_type(
+                l,
+                2,
+                "string.match",
+                "string",
+                arg(l, 2 - 1),
+            ));
+        }
     };
     let init = arg(l, 2).as_number().map_or(1, |n| n.max(1.0) as usize);
 
@@ -113,11 +133,21 @@ fn str_match(l: &mut LuaState) -> LuaResult<i32> {
 fn str_gmatch(l: &mut LuaState) -> LuaResult<i32> {
     let text = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg_type(l, 1, "string.gmatch", "string", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "string.gmatch", "string", arg(l, 0)));
+        }
     };
     let pat = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg_type(l, 2, "string.gmatch", "string", arg(l, 2-1))),
+        None => {
+            return Err(err_bad_arg_type(
+                l,
+                2,
+                "string.gmatch",
+                "string",
+                arg(l, 2 - 1),
+            ));
+        }
     };
     let text_sid = l.heap().intern(&text);
     let pat_sid = l.heap().intern(&pat);
@@ -181,11 +211,21 @@ fn gmatch_iter(l: &mut LuaState) -> LuaResult<i32> {
 fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg_type(l, 1, "string.gsub", "string", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "string.gsub", "string", arg(l, 0)));
+        }
     };
     let pat = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg_type(l, 2, "string.gsub", "string", arg(l, 2-1))),
+        None => {
+            return Err(err_bad_arg_type(
+                l,
+                2,
+                "string.gsub",
+                "string",
+                arg(l, 2 - 1),
+            ));
+        }
     };
     let repl_arg = arg(l, 2);
     let max = arg(l, 3).as_number().map(|n| n as usize);
@@ -201,7 +241,15 @@ fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
     } else {
         let repl = match repl_arg.as_string_id() {
             Some(sid) => l.str_static(sid).to_vec(),
-            None => return Err(err_bad_arg_type(l, 3, "string.gsub", "string or function", arg(l, 3-1))),
+            None => {
+                return Err(err_bad_arg_type(
+                    l,
+                    3,
+                    "string.gsub",
+                    "string or function",
+                    arg(l, 3 - 1),
+                ));
+            }
         };
         match gsub(&s, &pat, &repl, max) {
             Ok((result, count)) => {
@@ -300,7 +348,9 @@ fn call_lua_fn(
 pub fn str_byte(l: &mut LuaState) -> LuaResult<i32> {
     let s = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid),
-        None => return Err(err_bad_arg_type(l, 1, "string.byte", "string", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "string.byte", "string", arg(l, 0)));
+        }
     };
     let i = arg(l, 1).as_number().unwrap_or(1.0) as i64;
     let j = arg(l, 2).as_number().map_or(i, |n| n as i64);
@@ -336,10 +386,10 @@ pub fn str_char(l: &mut LuaState) -> LuaResult<i32> {
                     "char",
                     "number",
                     arg(l, i),
-                ))
+                ));
             }
         };
-        if c < 0.0 || c > 255.0 || c.fract() != 0.0 {
+        if !(0.0..=255.0).contains(&c) || c.fract() != 0.0 {
             return Err(l.runtime_error(b"out of range"));
         }
         out.push(c as u8);
@@ -374,14 +424,16 @@ fn str_dump(l: &mut LuaState) -> LuaResult<i32> {
             push(l, l.heap().str_value(sid));
             Ok(1)
         }
-        None => Err(err_bad_arg_type(l, 1, "string.dump", "function", arg(l, 1-1))),
+        None => Err(err_bad_arg_type(l, 1, "string.dump", "function", arg(l, 0))),
     }
 }
 
 fn str_format(l: &mut LuaState) -> LuaResult<i32> {
     let fmt = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
-        None => return Err(err_bad_arg_type(l, 1, "string.format", "string", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "string.format", "string", arg(l, 0)));
+        }
     };
     let n = lua_gettop(l);
     enum Owned {
@@ -424,7 +476,7 @@ pub fn str_len(l: &mut LuaState) -> LuaResult<i32> {
         // Lua 5.1: numbers are coerced to strings (luaL_checklstring).
         crate::stdlib::tostring_bytes(l, v).len()
     } else {
-        return Err(err_bad_arg_type(l, 1, "len", "string", arg(l, 1-1)));
+        return Err(err_bad_arg_type(l, 1, "len", "string", arg(l, 0)));
     };
     push(l, LuaValue::number(len as f64));
     Ok(1)
@@ -451,13 +503,12 @@ fn str_upper(l: &mut LuaState) -> LuaResult<i32> {
 fn str_rep(l: &mut LuaState) -> LuaResult<i32> {
     let s = match str_arg_coerce(l, 0, "rep") {
         Some(s) => s,
-        None => return Err(err_bad_arg_type(l, 1, "string.rep", "string", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "string.rep", "string", arg(l, 0)));
+        }
     };
     let n = num_arg_coerce(l, 1).unwrap_or(0.0) as i64;
-    let sep = match str_arg_coerce(l, 2, "rep") {
-        Some(s) => s,
-        None => Vec::new(),
-    };
+    let sep = str_arg_coerce(l, 2, "rep").unwrap_or_default();
     let n = n.max(0) as usize;
     let mut out = Vec::with_capacity(s.len() * n + sep.len() * n.saturating_sub(1));
     for i in 0..n {
@@ -505,7 +556,7 @@ fn str_reverse(l: &mut LuaState) -> LuaResult<i32> {
                 // Lua 5.1: numbers are coerced to strings.
                 crate::stdlib::tostring_bytes(l, v)
             } else {
-                return Err(err_bad_arg_type(l, 1, "reverse", "string", arg(l, 1-1)));
+                return Err(err_bad_arg_type(l, 1, "reverse", "string", arg(l, 0)));
             }
         }
     };
@@ -521,7 +572,7 @@ fn str_reverse(l: &mut LuaState) -> LuaResult<i32> {
 /// numbers the arguments from the receiver, so the self is not counted in
 /// error messages.
 fn is_method_call(l: &LuaState) -> bool {
-    use crate::bc::{BCIns, bc_a, bc_b, bc_d, bc_op, BCOp};
+    use crate::bc::{BCIns, BCOp, bc_a, bc_b, bc_d, bc_op};
     // The C function's frame: func at base-2, link (the caller's return
     // PC) at base-1.
     let Some(link) = l.stack.get(l.base.wrapping_sub(1)).map(|v| v.to_bits()) else {
@@ -548,7 +599,7 @@ fn is_method_call(l: &LuaState) -> bool {
         }
         a = bc_a(call_ins);
         caller_base = l.base.saturating_sub(4 + a as usize);
-        pc_from_link = Some(unsafe { ret_ip as usize });
+        pc_from_link = Some(ret_ip as usize);
     };
     if caller_base < 2 {
         return false;
@@ -587,8 +638,7 @@ fn is_method_call(l: &LuaState) -> bool {
                 }
                 return false;
             }
-            BCOp::KSHORT | BCOp::KPRI | BCOp::KSTR | BCOp::KNUM | BCOp::KCDATA
-            | BCOp::MOV => {
+            BCOp::KSHORT | BCOp::KPRI | BCOp::KSTR | BCOp::KNUM | BCOp::KCDATA | BCOp::MOV => {
                 k -= 1;
             }
             _ => return false,
@@ -613,13 +663,7 @@ pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
         }
         match num_arg_coerce(l, i) {
             Some(n) => Ok(n as i64),
-            None => Err(err_bad_arg_type(
-                l,
-                argnum(i as u32 + 1),
-                name,
-                "number",
-                v,
-            )),
+            None => Err(err_bad_arg_type(l, argnum(i as u32 + 1), name, "number", v)),
         }
     };
     let i = coerce_index(l, 1, "sub")?;

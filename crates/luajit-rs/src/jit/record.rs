@@ -15,7 +15,7 @@ use crate::bc::*;
 use crate::gc::GcPtr;
 use crate::jit::exec::{self, jit_str_byte, jit_tget, jit_tnextk};
 use crate::jit::{bc_addr, opt_fold};
-use crate::meta::{meta_fast, MM};
+use crate::meta::MM;
 use crate::proto::Proto;
 use crate::state::LuaState;
 use crate::value::LuaValue;
@@ -2634,10 +2634,7 @@ impl Record {
                 if std::env::var("LUAJIT_RS_VARGDBG").is_ok() {
                     for i in 0..want {
                         let si = (self.baseslot as u32 + dst + i) as usize;
-                        eprintln!(
-                            "  after: slot[{}] = {:#x}",
-                            si, self.slot[si]
-                        );
+                        eprintln!("  after: slot[{}] = {:#x}", si, self.slot[si]);
                     }
                 }
             }

@@ -400,7 +400,6 @@ fn call_c(
                 value_slot,
             };
             l.top = (l.base + 8).max(func_slot + ny);
-            l.base = l.base;
             l.base = saved_base;
             l.top = saved_top;
             return Err(LuaError::Yield);
@@ -874,7 +873,9 @@ impl Interp {
                     if cond {
                         jump!(jmp);
                     }
-                } else if let (Some(x), Some(y)) = (cdata_u64(self.l(), xv), cdata_u64(self.l(), yv)) {
+                } else if let (Some(x), Some(y)) =
+                    (cdata_u64(self.l(), xv), cdata_u64(self.l(), yv))
+                {
                     let x_is_ull = cdata_is_ull(xv);
                     let y_is_ull = cdata_is_ull(yv);
                     let cond = if x_is_ull == y_is_ull {
@@ -1163,12 +1164,8 @@ impl Interp {
                         let n = self.l().heap().strings.get(sid).len();
                         setreg!(a, LuaValue::number(n as f64));
                     } else if let Some(t) = v.as_table()
-                        && !crate::meta::meta_fast(
-                            self.l().global(),
-                            t.as_ref().metatable,
-                            MM::Len,
-                        )
-                        .is_some()
+                        && !crate::meta::meta_fast(self.l().global(), t.as_ref().metatable, MM::Len)
+                            .is_some()
                     {
                         setreg!(a, LuaValue::number(t.as_ref().len() as f64));
                     } else {
@@ -2719,7 +2716,13 @@ impl Interp {
         // A yield through pcall/xpcall rewrote the suspend with the
         // protected flag and moved the yield values to *its* slot; the
         // outer capture must keep both.
-        let protected = matches!(self.l().suspend, Suspend::Call { protected: true, .. });
+        let protected = matches!(
+            self.l().suspend,
+            Suspend::Call {
+                protected: true,
+                ..
+            }
+        );
         // A yield through pcall/xpcall: the yield values were moved to the
         // inner yield call's slot (the recorded value_slot).
         let (src, value_slot) = if protected {
@@ -3158,7 +3161,8 @@ fn for_number(l: &LuaState, v: LuaValue) -> Option<f64> {
 fn val_eq(l: &LuaState, a: LuaValue, b: LuaValue) -> bool {
     if a.is_number() && b.is_number() {
         a.num() == b.num()
-    } else if let (Some(ca), _) = (a.as_cdata(), b.is_number()) {        if b.is_number() {
+    } else if let (Some(ca), _) = (a.as_cdata(), b.is_number()) {
+        if b.is_number() {
             // Numeric value match, or the raw low-32 pattern when the
             // number only matches the truncated bits (unsigned small
             // types compared against a large Lua number).
@@ -3244,6 +3248,7 @@ pub(crate) fn vm_pow(mut x: f64, y: f64) -> f64 {
 
 /// Resume a coroutine suspended via `Suspend::Call`. Rebuilds the Interp
 /// from the saved state and re-enters the dispatch loop.
+#[allow(clippy::too_many_arguments)]
 pub fn resume_continue(
     co: &mut LuaState,
     slot: usize,

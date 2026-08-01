@@ -160,7 +160,8 @@ impl Interp {
         rb: LuaValue,
         rc: LuaValue,
         a: u32,
-    ) -> LuaResult<Option<LuaValue>> {        if let (Some(b), Some(c)) = (str2num(self.l(), rb), str2num(self.l(), rc)) {
+    ) -> LuaResult<Option<LuaValue>> {
+        if let (Some(b), Some(c)) = (str2num(self.l(), rb), str2num(self.l(), rc)) {
             return Ok(Some(LuaValue::number_raw(foldarith(mm, b, c))));
         }
         // Pointer arithmetic: a cdata +/- a number steps by the element
@@ -169,40 +170,36 @@ impl Interp {
         if let Some(cd) = rb.as_cdata()
             && let Some(n) = rc.as_number()
             && (mm == MM::Add || mm == MM::Sub)
+            && let Some(v) = self.pointer_arith(cd, n, mm == MM::Add)
         {
-            if let Some(v) = self.pointer_arith(cd, n, mm == MM::Add) {
-                return Ok(Some(v));
-            }
+            return Ok(Some(v));
         }
         if let Some(cd) = rc.as_cdata()
             && let Some(n) = rb.as_number()
             && mm == MM::Add
+            && let Some(v) = self.pointer_arith(cd, n, true)
         {
-            if let Some(v) = self.pointer_arith(cd, n, true) {
-                return Ok(Some(v));
-            }
+            return Ok(Some(v));
         }
         // Pointer difference: `cdata - cdata` yields the element count.
         if mm == MM::Sub
             && let (Some(c1), Some(c2)) = (rb.as_cdata(), rc.as_cdata())
         {
             let g = self.l().global();
-            if let Some(cts) = &g.cts {
-                if c1.as_ref().ctypeid == c2.as_ref().ctypeid {
-                    let raw = cts.raw(c1.as_ref().ctypeid);
-                    use crate::ffi::{ctype_cid, ctype_isarray, ctype_ispointer};
-                    if ctype_isarray(raw.info) || ctype_ispointer(raw.info) {
-                        // Same storage → plain element difference of the
-                        // alias offsets.
-                        let (o1, s1) = crate::runtime::cdata::resolve_ptr(c1);
-                        let (o2, s2) = crate::runtime::cdata::resolve_ptr(c2);
-                        if s1 == s2 {
-                            let elem_sz = cts.raw(ctype_cid(raw.info)).size as i64;
-                            if elem_sz != 0 {
-                                return Ok(Some(LuaValue::number(
-                                    ((o1 - o2) / elem_sz) as f64,
-                                )));
-                            }
+            if let Some(cts) = &g.cts
+                && c1.as_ref().ctypeid == c2.as_ref().ctypeid
+            {
+                let raw = cts.raw(c1.as_ref().ctypeid);
+                use crate::ffi::{ctype_cid, ctype_isarray, ctype_ispointer};
+                if ctype_isarray(raw.info) || ctype_ispointer(raw.info) {
+                    // Same storage → plain element difference of the
+                    // alias offsets.
+                    let (o1, s1) = crate::runtime::cdata::resolve_ptr(c1);
+                    let (o2, s2) = crate::runtime::cdata::resolve_ptr(c2);
+                    if s1 == s2 {
+                        let elem_sz = cts.raw(ctype_cid(raw.info)).size as i64;
+                        if elem_sz != 0 {
+                            return Ok(Some(LuaValue::number(((o1 - o2) / elem_sz) as f64)));
                         }
                     }
                 }
@@ -545,7 +542,7 @@ impl Interp {
                     self.l().mmname = Some(("__concat", mo2.to_bits()));
                     let r = execute(self.l(), fs, n, 1);
                     self.l().mmname = saved;
-                    let r = r?;
+                    let _r = r?;
                     self.sp = self.l().stack.as_mut_ptr();
                     let r = self.at(fs);
                     self.l().top = st;

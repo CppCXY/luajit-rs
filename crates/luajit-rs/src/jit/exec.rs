@@ -1104,6 +1104,3 @@ pub fn trace_exec(_l: &mut crate::state::LuaState, _base: usize, _traceno: u32) 
         shift: 0,
     }
 }
-
-
-

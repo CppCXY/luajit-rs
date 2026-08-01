@@ -7,7 +7,7 @@ use crate::state::LuaState;
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 
-use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, push};
+use super::{LibTarget, arg, err_bad_arg_type, push};
 use crate::lual_reg;
 
 use super::sort::introsort;
@@ -15,7 +15,9 @@ use super::sort::introsort;
 pub fn tab_concat(l: &mut LuaState) -> LuaResult<i32> {
     let t = match arg(l, 0).as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "table.concat", "table", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "table.concat", "table", arg(l, 0)));
+        }
     };
     let sep = match arg(l, 1).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
@@ -66,7 +68,9 @@ pub fn tab_concat(l: &mut LuaState) -> LuaResult<i32> {
 pub fn tab_insert(l: &mut LuaState) -> LuaResult<i32> {
     let t = match arg(l, 0).as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "table.insert", "table", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "table.insert", "table", arg(l, 0)));
+        }
     };
     let n = lua_gettop(l);
     if n == 2 {
@@ -92,12 +96,20 @@ pub fn tab_insert(l: &mut LuaState) -> LuaResult<i32> {
 fn tab_move(l: &mut LuaState) -> LuaResult<i32> {
     let a1 = match arg(l, 0).as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "table.move", "table", arg(l, 1-1))),
+        None => return Err(err_bad_arg_type(l, 1, "table.move", "table", arg(l, 0))),
     };
     let f = arg(l, 1).as_number().unwrap_or(1.0) as i64;
     let e = match arg(l, 2).as_number() {
         Some(n) => n as i64,
-        None => return Err(err_bad_arg_type(l, 3, "table.move", "number", arg(l, 3-1))),
+        None => {
+            return Err(err_bad_arg_type(
+                l,
+                3,
+                "table.move",
+                "number",
+                arg(l, 3 - 1),
+            ));
+        }
     };
     let t_pos = arg(l, 3).as_number().unwrap_or(1.0) as i64;
     let a2 = arg(l, 4).as_table();
@@ -141,13 +153,23 @@ pub fn tab_pack(l: &mut LuaState) -> LuaResult<i32> {
 pub fn tab_remove(l: &mut LuaState) -> LuaResult<i32> {
     let t = match arg(l, 0).as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "table.remove", "table", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "table.remove", "table", arg(l, 0)));
+        }
     };
     let len = t.as_ref().len() as i32;
     let pos = match arg(l, 1).as_number() {
         Some(n) if n >= 1.0 => n as i32,
         None => len,
-        _ => return Err(err_bad_arg_type(l, 2, "table.remove", "number", arg(l, 2-1))),
+        _ => {
+            return Err(err_bad_arg_type(
+                l,
+                2,
+                "table.remove",
+                "number",
+                arg(l, 2 - 1),
+            ));
+        }
     }
     .max(1)
     .min(len);
@@ -168,13 +190,17 @@ pub fn tab_remove(l: &mut LuaState) -> LuaResult<i32> {
 fn tab_sort(l: &mut LuaState) -> LuaResult<i32> {
     let t = match arg(l, 0).as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "table.sort", "table", arg(l, 1-1))),
+        None => return Err(err_bad_arg_type(l, 1, "table.sort", "table", arg(l, 0))),
     };
     let len = t.as_ref().len() as i32;
     let mut items: Vec<(i32, LuaValue)> = (1..=len).map(|i| (i, t.as_ref().get_int(i))).collect();
     let comp = arg(l, 1);
     if comp.is_func() {
-        introsort(l, &mut items, crate::stdlib::sort::Comparator::Lua(comp.as_func().unwrap()))?;
+        introsort(
+            l,
+            &mut items,
+            crate::stdlib::sort::Comparator::Lua(comp.as_func().unwrap()),
+        )?;
     } else {
         // No comparator: use the default `<` (numbers, strings, __lt).
         introsort(l, &mut items, crate::stdlib::sort::Comparator::Default)?;
@@ -188,7 +214,9 @@ fn tab_sort(l: &mut LuaState) -> LuaResult<i32> {
 fn tab_unpack(l: &mut LuaState) -> LuaResult<i32> {
     let t = match arg(l, 0).as_table() {
         Some(t) => t,
-        None => return Err(err_bad_arg_type(l, 1, "table.unpack", "table", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "table.unpack", "table", arg(l, 0)));
+        }
     };
     let i = arg(l, 1).as_number().unwrap_or(1.0) as i32;
     let j = arg(l, 2).as_number().unwrap_or(t.as_ref().len() as f64) as i32;
@@ -234,13 +262,13 @@ pub fn open(l: &mut LuaState) {
 
 fn tab_foreach(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
-    let f = arg(l, 1);
+    let _f = arg(l, 1);
     let tab = match t.as_table() {
         Some(t) => t,
         None => return Err(err_bad_arg_type(l, 1, "foreach", "table", t)),
     };
     let mut k = LuaValue::NIL;
-    while let Some((nk, v)) = tab.as_ref().next(k) {
+    while let Some((nk, _v)) = tab.as_ref().next(k) {
         k = nk;
         if crate::vm::execute(l, l.top + 2, 2, 1).is_err() {
             break;

@@ -445,10 +445,10 @@ impl<'a> Parser<'a> {
 
         if self.tok != Token::LBrace {
             // Forward declaration: reuse an existing tag, else create.
-            if let Some(tag) = &tag {
-                if let Some(&id) = self.cts.tags.get(tag) {
-                    return Ok(id);
-                }
+            if let Some(tag) = &tag
+                && let Some(&id) = self.cts.tags.get(tag)
+            {
+                return Ok(id);
             }
             let id = self.cts.top;
             let sinfo = ct_info(CT::Struct, if is_union { ctinfo::UNION } else { 0 });
@@ -471,7 +471,7 @@ impl<'a> Parser<'a> {
         }
         self.next(); // {
 
-        let first_field_id = self.cts.top;
+        let _first_field_id = self.cts.top;
         let mut total_size: u64 = 0;
         let mut max_align: u32 = 1;
         let mut field_infos: Vec<(String, u32, u32)> = Vec::new(); // (name, type_id, offset)
@@ -487,11 +487,10 @@ impl<'a> Parser<'a> {
             // `type a, b, c;` — a comma-separated field name continues
             // with the previous declaration specifier.
             let mut fdecl = if self.tok == Token::Ident {
-                let prev_type = prev_fdecl_type;
-                if prev_type.is_some() {
+                if let Some(prev_type) = prev_fdecl_type {
                     DeclSpec {
                         flags: 0,
-                        type_id: prev_type.unwrap(),
+                        type_id: prev_type,
                     }
                 } else {
                     self.parse_decl_spec()?
@@ -738,11 +737,11 @@ impl<'a> Parser<'a> {
             if self.tok == Token::Question {
                 array_count = u32::MAX;
                 self.next();
-            } else if self.tok == Token::Integer {
-                if let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>() {
-                    array_count = n.max(1);
-                    self.next();
-                }
+            } else if self.tok == Token::Integer
+                && let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>()
+            {
+                array_count = n.max(1);
+                self.next();
             }
             while self.tok != Token::RBracket && self.tok != Token::Eof {
                 self.next();
@@ -962,15 +961,20 @@ impl<'a> Parser<'a> {
         self.cts.tab.push(CType {
             info,
             size: 0,
-            sib: if num_params > 0 { first_param_id as u16 } else { 0 },
+            sib: if num_params > 0 {
+                first_param_id as u16
+            } else {
+                0
+            },
             next: 0,
             name: 0,
         });
         self.cts.top = func_id + 1;
         self.cts.names.insert(name.to_string(), func_id);
-        self.cts
-            .symbols
-            .insert(name.to_string(), asm_name.unwrap_or_else(|| name.to_string()));
+        self.cts.symbols.insert(
+            name.to_string(),
+            asm_name.unwrap_or_else(|| name.to_string()),
+        );
         Ok(())
     }
 }

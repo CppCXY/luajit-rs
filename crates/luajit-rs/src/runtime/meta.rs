@@ -93,7 +93,11 @@ pub fn metatable_of(g: &GlobalState, o: LuaValue) -> Option<GcPtr<LuaTable>> {
             .flatten()
             .or_else(|| g.basemt_of(crate::value::LJ_TCDATA))
     } else {
-        g.basemt_of(if o.is_number() { crate::value::LJ_TNUMX } else { o.itype() })
+        g.basemt_of(if o.is_number() {
+            crate::value::LJ_TNUMX
+        } else {
+            o.itype()
+        })
     }
 }
 

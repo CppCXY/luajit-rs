@@ -37,7 +37,7 @@ pub fn resolve_cdata(cd: &CData) -> (i64, &CData) {
     let mut off = 0i64;
     loop {
         if let Some(b) = cur.base {
-            let b = unsafe { b.as_ref() };
+            let b = b.as_ref();
             off += cur.offset;
             cur = b;
         } else {

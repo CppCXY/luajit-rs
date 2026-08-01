@@ -8,8 +8,6 @@
 //! `2*floor(log2(n))` recursion levels.
 
 use crate::err::LuaResult;
-use crate::runtime::func::GcFunc;
-use crate::runtime::gc::GcPtr;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 

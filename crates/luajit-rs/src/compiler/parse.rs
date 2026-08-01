@@ -1731,10 +1731,10 @@ impl<'a> Parser<'a> {
         let mut varnames: Vec<(u8, u32, u32, String)> = Vec::new();
         for v in &self.vstack[fs.vbase..] {
             if let VName::Str(sid) = &v.name {
-                let end = if v.endpc == 0 { n as u32 } else { v.endpc as u32 };
+                let end = if v.endpc == 0 { n as u32 } else { v.endpc };
                 varnames.push((
                     v.slot,
-                    v.startpc as u32,
+                    v.startpc,
                     end,
                     String::from_utf8_lossy(self.ls.strs.get(*sid)).into_owned(),
                 ));

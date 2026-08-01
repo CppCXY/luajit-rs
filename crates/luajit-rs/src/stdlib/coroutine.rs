@@ -11,7 +11,7 @@
 //!   yielding is legal only when no `execute()` re-entry (pcall, C
 //!   callback, nested resume) sits between the resume point and the yield.
 
-use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, nargs, push};
+use super::{LibTarget, arg, err_bad_arg_type, nargs, push};
 use crate::err::{LuaError, LuaResult};
 use crate::func::{CClosure, GcFunc};
 use crate::lual_reg;
@@ -124,7 +124,13 @@ pub(crate) fn do_resume(
 fn lib_create(l: &mut LuaState) -> LuaResult<i32> {
     let f = arg(l, 0);
     if !f.is_func() {
-        return Err(err_bad_arg_type(l, 1, "coroutine.create", "function", arg(l, 1-1)));
+        return Err(err_bad_arg_type(
+            l,
+            1,
+            "coroutine.create",
+            "function",
+            arg(l, 0),
+        ));
     }
     let co_ref = crate::state::new_thread(l);
     let co = co_ref.get();
@@ -138,7 +144,15 @@ fn lib_resume(l: &mut LuaState) -> LuaResult<i32> {
     let tv = arg(l, 0);
     let co_ref = match tv.as_thread() {
         Some(p) => p,
-        None => return Err(err_bad_arg_type(l, 1, "coroutine.resume", "thread", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(
+                l,
+                1,
+                "coroutine.resume",
+                "thread",
+                arg(l, 0),
+            ));
+        }
     };
     let n = nargs(l).saturating_sub(1);
     let outcome = match do_resume(l, co_ref, l.base + 1, n) {
@@ -200,7 +214,15 @@ fn lib_status(l: &mut LuaState) -> LuaResult<i32> {
     let tv = arg(l, 0);
     let co = match tv.as_thread() {
         Some(p) => p,
-        None => return Err(err_bad_arg_type(l, 1, "coroutine.status", "thread", arg(l, 1-1))),
+        None => {
+            return Err(err_bad_arg_type(
+                l,
+                1,
+                "coroutine.status",
+                "thread",
+                arg(l, 0),
+            ));
+        }
     };
     let name: &[u8] = match co.get().status {
         CoStatus::Running => b"running",
@@ -234,7 +256,13 @@ fn lib_isyieldable(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_wrap(l: &mut LuaState) -> LuaResult<i32> {
     let f = arg(l, 0);
     if !f.is_func() {
-        return Err(err_bad_arg_type(l, 1, "coroutine.wrap", "function", arg(l, 1-1)));
+        return Err(err_bad_arg_type(
+            l,
+            1,
+            "coroutine.wrap",
+            "function",
+            arg(l, 0),
+        ));
     }
     let co_ref = crate::state::new_thread(l);
     {

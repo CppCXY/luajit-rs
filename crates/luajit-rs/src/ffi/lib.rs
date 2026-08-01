@@ -9,9 +9,7 @@ use std::ffi::CString;
 use crate::err::LuaResult;
 use crate::ffi::clib;
 use crate::ffi::parser::parse;
-use crate::ffi::{
-    CT, CTState, CType, CTypeID, ct_info, ctype_align, ctype_cid, ctype_isnum, ctype_ispointer,
-};
+use crate::ffi::{CT, CTState, CType, CTypeID, ct_info, ctype_align, ctype_cid, ctype_ispointer};
 use crate::func::{CClosure, CFunction, GcFunc};
 use crate::gc::GcPtr;
 use crate::meta::MM;
@@ -120,7 +118,9 @@ fn check_type_name(l: &mut LuaState, name: &str) -> LuaResult<u32> {
         let mut best_len = 0;
         let bytes = trimmed.as_bytes();
         for i in 1..=trimmed.len() {
-            if bytes[i - 1] == b' ' || bytes[i - 1] == b'*' || bytes[i - 1] == b'('
+            if bytes[i - 1] == b' '
+                || bytes[i - 1] == b'*'
+                || bytes[i - 1] == b'('
                 || bytes[i - 1] == b'['
             {
                 let cand = trimmed[..i - 1].trim();
@@ -129,14 +129,12 @@ fn check_type_name(l: &mut LuaState, name: &str) -> LuaResult<u32> {
                 }
                 let cand_cv = strip_cv(cand);
                 let known = quick_type_id(&cand_cv).is_some()
-                    || quick_type_id(&cand).is_some()
-                    || l
-                        .global()
+                    || quick_type_id(cand).is_some()
+                    || l.global()
                         .cts
                         .as_ref()
                         .is_some_and(|c| c.names.contains_key(&cand_cv))
-                    || l
-                        .global()
+                    || l.global()
                         .cts
                         .as_ref()
                         .is_some_and(|c| c.names.contains_key(cand));
@@ -147,7 +145,10 @@ fn check_type_name(l: &mut LuaState, name: &str) -> LuaResult<u32> {
             }
         }
         if best_len > 0 {
-            (trimmed[..best].trim().to_string(), trimmed[best..].trim().to_string())
+            (
+                trimmed[..best].trim().to_string(),
+                trimmed[best..].trim().to_string(),
+            )
         } else {
             (trimmed.to_string(), String::new())
         }
@@ -156,8 +157,7 @@ fn check_type_name(l: &mut LuaState, name: &str) -> LuaResult<u32> {
     let whole_cv = strip_cv(trimmed);
     if !declarator.is_empty()
         && (quick_type_id(&whole_cv).is_some()
-            || l
-                .global()
+            || l.global()
                 .cts
                 .as_ref()
                 .is_some_and(|c| c.names.contains_key(&whole_cv)))
@@ -176,9 +176,7 @@ fn check_type_name(l: &mut LuaState, name: &str) -> LuaResult<u32> {
     let mut toks = DeclTok::new(declarator.as_bytes());
     let id = parse_abs_decl(l, base_id, &mut toks)?;
     if toks.pos != toks.src.len() {
-        return Err(l.runtime_error(
-            format!("ffi: cannot parse '{}'", name).as_bytes(),
-        ));
+        return Err(l.runtime_error(format!("ffi: cannot parse '{}'", name).as_bytes()));
     }
     Ok(id)
 }
@@ -235,10 +233,7 @@ impl<'a> DeclTok<'a> {
         let start = self.pos;
         while self.pos < self.src.len()
             && !self.src[self.pos].is_ascii_whitespace()
-            && !matches!(
-                self.src[self.pos],
-                b'*' | b'(' | b')' | b'[' | b']' | b','
-            )
+            && !matches!(self.src[self.pos], b'*' | b'(' | b')' | b'[' | b']' | b',')
         {
             self.pos += 1;
         }
@@ -273,7 +268,7 @@ fn parse_abs_decl(l: &mut LuaState, base: u32, toks: &mut DeclTok) -> LuaResult<
             qual |= crate::ffi::ctinfo::VOLATILE;
         } else {
             toks.pos -= t.len(); // push back
-            let _ = toks.skip_ws();
+            toks.skip_ws();
         }
     }
     // A `(` after the stars is a function suffix when its content is a
@@ -285,8 +280,7 @@ fn parse_abs_decl(l: &mut LuaState, base: u32, toks: &mut DeclTok) -> LuaResult<
         toks.pos = save;
         let name = String::from_utf8_lossy(&inner_tok);
         let known = quick_type_id(&name).is_some()
-            || l
-                .global()
+            || l.global()
                 .cts
                 .as_ref()
                 .is_some_and(|c| c.names.contains_key(&name.to_string()))
@@ -333,7 +327,7 @@ fn parse_decl_suffixes(l: &mut LuaState, mut t: u32, toks: &mut DeclTok) -> LuaR
                         n = v.max(1);
                     } else {
                         toks.pos -= tok.len();
-                        let _ = toks.skip_ws();
+                        toks.skip_ws();
                     }
                 }
                 if toks.next_tok().as_deref() != Some(b"]".as_slice()) {
@@ -361,10 +355,12 @@ fn parse_decl_suffixes(l: &mut LuaState, mut t: u32, toks: &mut DeclTok) -> LuaR
                         None => return Err(l.runtime_error(b"ffi: expected ')' in declarator")),
                         _ => {
                             let ptok = toks.next_tok().unwrap_or_default();
-                            let pid = quick_type_id(&String::from_utf8_lossy(&ptok))
-                                .or_else(|| {
+                            let pid =
+                                quick_type_id(&String::from_utf8_lossy(&ptok)).or_else(|| {
                                     l.global().cts.as_ref().and_then(|c| {
-                                        c.names.get(&String::from_utf8_lossy(&ptok).into_owned()).copied()
+                                        c.names
+                                            .get(&String::from_utf8_lossy(&ptok).into_owned())
+                                            .copied()
                                     })
                                 });
                             if let Some(pid) = pid {
@@ -389,8 +385,8 @@ fn make_array_type(cts: &mut CTState, elem: u32, n: u32) -> u32 {
     let elem_sz = cts.raw(elem).size;
     let total_sz = elem_sz.saturating_mul(n);
     let info = ct_info(CT::Array, 0) | elem;
-    if let Some(existing) = (0..cts.top as usize)
-        .find(|&i| cts.tab[i].info == info && cts.tab[i].size == total_sz)
+    if let Some(existing) =
+        (0..cts.top as usize).find(|&i| cts.tab[i].info == info && cts.tab[i].size == total_sz)
     {
         return existing as u32;
     }
@@ -428,7 +424,11 @@ fn make_func_type(cts: &mut CTState, ret: u32, params: Vec<u32>) -> u32 {
     cts.tab.push(CType {
         info: ct_info(CT::Func, 0) | ret,
         size: 0,
-        sib: if params.is_empty() { 0 } else { first_param as u16 },
+        sib: if params.is_empty() {
+            0
+        } else {
+            first_param as u16
+        },
         next: 0,
         name: 0,
     });
@@ -461,38 +461,6 @@ fn strip_cv(name: &str) -> String {
         }
     }
     s
-}
-
-/// If `count > 1`, create or reuse an array `CType` wrapping the base type.
-fn wrap_array(l: &mut LuaState, base_id: u32, count: usize) -> LuaResult<u32> {
-    if count == 1 {
-        return Ok(base_id);
-    }
-    let cts = cts_of(l);
-    let base_sz = cts.raw(base_id).size;
-    // count == 0 marks a variable-length array ("[?]").
-    let total_sz = if count == 0 {
-        u32::MAX
-    } else {
-        base_sz.saturating_mul(count as u32)
-    };
-    // Search existing array types for a match.
-    let info = ct_info(CT::Array, 0) | base_id;
-    for i in 0..cts.top as usize {
-        if cts.tab[i].info == info && cts.tab[i].size == total_sz {
-            return Ok(i as u32);
-        }
-    }
-    let id = cts.top;
-    cts.tab.push(CType {
-        info,
-        size: total_sz,
-        sib: 0,
-        next: 0,
-        name: 0,
-    });
-    cts.top = id + 1;
-    Ok(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -583,148 +551,149 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
             }
         } else {
             let v2 = arg(l, 1);
-        if nvals > 1 && crate::ffi::ctype_isstruct(cts_of(l).raw(id).info) {
-            // Struct with sequential field initializers
-            // (ffi.new("struct { int a,b,c; }", 1, 2, 3)).
-            let fields: Vec<(u32, u32)> = {
-                let raw = cts_of(l).raw(id);
-                let mut cur = raw.info & 0xFFFF; // First field (struct info).
-                let mut out = Vec::new();
-                while cur != 0 {
-                    let f = cts_of(l).tab.get(cur as usize);
-                    let Some(f) = f else { break };
-                    out.push((f.info & 0xFFFF, f.size));
-                    cur = f.sib as u32;
-                }
-                out
-            };
-            for (fi, &(ftype, foff)) in fields.iter().enumerate() {
-                let arg_i = fi + 1;
-                if arg_i > nvals {
-                    break;
-                }
-                let v = arg(l, arg_i);
+            if nvals > 1 && crate::ffi::ctype_isstruct(cts_of(l).raw(id).info) {
+                // Struct with sequential field initializers
+                // (ffi.new("struct { int a,b,c; }", 1, 2, 3)).
+                let fields: Vec<(u32, u32)> = {
+                    let raw = cts_of(l).raw(id);
+                    let mut cur = raw.info & 0xFFFF; // First field (struct info).
+                    let mut out = Vec::new();
+                    while cur != 0 {
+                        let f = cts_of(l).tab.get(cur as usize);
+                        let Some(f) = f else { break };
+                        out.push((f.info & 0xFFFF, f.size));
+                        cur = f.sib as u32;
+                    }
+                    out
+                };
+                for (fi, &(ftype, foff)) in fields.iter().enumerate() {
+                    let arg_i = fi + 1;
+                    if arg_i > nvals {
+                        break;
+                    }
+                    let v = arg(l, arg_i);
 
-                let ftype_raw = cts_of(l).raw(ftype);
-                let sz = ftype_raw.size as usize;
-                if let Some(n) = v.as_number() {
-                    let mut ebuf = vec![0u8; sz.max(1)];
-                    write_scalar_value(&mut ebuf, ftype, n);
-                    if foff as usize + sz <= cd.data.len() {
-                        cd.data[foff as usize..foff as usize + sz].copy_from_slice(&ebuf);
-                    }
-                } else if let Some(src) = v.as_cdata() {
-                    if crate::ffi::ctype_ispointer(ftype_raw.info) {
-                        // Pointer field: store the storage address.
-                        let (off, root) = crate::runtime::cdata::resolve_ptr(src);
-                        let addr = (root.as_ref().data.as_ptr() as i64).wrapping_add(off);
-                        let a = foff as usize;
-                        if sz == 8 && a + 8 <= cd.data.len() {
-                            cd.data[a..a + 8].copy_from_slice(&(addr as usize).to_ne_bytes());
-                        } else if sz == 4 && a + 4 <= cd.data.len() {
-                            cd.data[a..a + 4].copy_from_slice(&(addr as u32).to_le_bytes());
+                    let ftype_raw = cts_of(l).raw(ftype);
+                    let sz = ftype_raw.size as usize;
+                    if let Some(n) = v.as_number() {
+                        let mut ebuf = vec![0u8; sz.max(1)];
+                        write_scalar_value(&mut ebuf, ftype, n);
+                        if foff as usize + sz <= cd.data.len() {
+                            cd.data[foff as usize..foff as usize + sz].copy_from_slice(&ebuf);
                         }
-                    } else if foff as usize + sz <= cd.data.len() {
-                        let n = src.as_ref().data.len().min(sz);
-                        cd.data[foff as usize..foff as usize + n]
-                            .copy_from_slice(&src.as_ref().data[..n]);
+                    } else if let Some(src) = v.as_cdata() {
+                        if crate::ffi::ctype_ispointer(ftype_raw.info) {
+                            // Pointer field: store the storage address.
+                            let (off, root) = crate::runtime::cdata::resolve_ptr(src);
+                            let addr = (root.as_ref().data.as_ptr() as i64).wrapping_add(off);
+                            let a = foff as usize;
+                            if sz == 8 && a + 8 <= cd.data.len() {
+                                cd.data[a..a + 8].copy_from_slice(&(addr as usize).to_ne_bytes());
+                            } else if sz == 4 && a + 4 <= cd.data.len() {
+                                cd.data[a..a + 4].copy_from_slice(&(addr as u32).to_le_bytes());
+                            }
+                        } else if foff as usize + sz <= cd.data.len() {
+                            let n = src.as_ref().data.len().min(sz);
+                            cd.data[foff as usize..foff as usize + n]
+                                .copy_from_slice(&src.as_ref().data[..n]);
+                        }
                     }
                 }
-            }
-        } else if let Some(src) = v2.as_cdata() {
-            // Construct from an existing cdata: copy its bytes.
-            let n = src.as_ref().data.len().min(cd.data.len());
-            cd.data[..n].copy_from_slice(&src.as_ref().data[..n]);
-        } else if let Some(tab) = v2.as_table() {
-            // Initializer table: copy array/struct elements.
-            let n = tab.as_ref().len() as usize;
-            if n == 0 {
-            } else {
-                let first = tab.as_ref().get_int(1);
-                if first.is_number() {
-                    // Flat array of scalars: write 4-byte ints.
-                    for i in 0..n {
-                        let v = tab.as_ref().get_int(i as i32 + 1);
-                        let off = i * 4;
-                        if off + 4 <= cd.data.len() {
-                            let val = v.as_number().unwrap_or(0.0) as i32;
-                            cd.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
-                        }
-                    }
-                } else if first.as_table().is_some() {
-                    // Array of structs/tables: recursively fill each element.
-                    let cts = cts_of(l);
-                    let raw_ct = cts.raw(id);
-                    let elem_id = if ctype_ispointer(raw_ct.info) {
-                        ctype_cid(raw_ct.info)
-                    } else {
-                        id
-                    };
-                    let elem_sz = cts.raw(elem_id).size as usize;
-                    if elem_sz > 0 {
+            } else if let Some(src) = v2.as_cdata() {
+                // Construct from an existing cdata: copy its bytes.
+                let n = src.as_ref().data.len().min(cd.data.len());
+                cd.data[..n].copy_from_slice(&src.as_ref().data[..n]);
+            } else if let Some(tab) = v2.as_table() {
+                // Initializer table: copy array/struct elements.
+                let n = tab.as_ref().len() as usize;
+                if n == 0 {
+                } else {
+                    let first = tab.as_ref().get_int(1);
+                    if first.is_number() {
+                        // Flat array of scalars: write 4-byte ints.
                         for i in 0..n {
-                            let sub = tab.as_ref().get_int(i as i32 + 1);
-                            if let Some(st) = sub.as_table() {
-                                let sub_n = st.as_ref().len() as usize;
-                                for j in 0..sub_n {
-                                    let fv = st.as_ref().get_int(j as i32 + 1);
-                                    let off = i * elem_sz + j * 4;
-                                    if off + 4 <= cd.data.len() {
-                                        let val = fv.as_number().unwrap_or(0.0) as i32;
-                                        cd.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                            let v = tab.as_ref().get_int(i as i32 + 1);
+                            let off = i * 4;
+                            if off + 4 <= cd.data.len() {
+                                let val = v.as_number().unwrap_or(0.0) as i32;
+                                cd.data[off..off + 4].copy_from_slice(&val.to_le_bytes());
+                            }
+                        }
+                    } else if first.as_table().is_some() {
+                        // Array of structs/tables: recursively fill each element.
+                        let cts = cts_of(l);
+                        let raw_ct = cts.raw(id);
+                        let elem_id = if ctype_ispointer(raw_ct.info) {
+                            ctype_cid(raw_ct.info)
+                        } else {
+                            id
+                        };
+                        let elem_sz = cts.raw(elem_id).size as usize;
+                        if elem_sz > 0 {
+                            for i in 0..n {
+                                let sub = tab.as_ref().get_int(i as i32 + 1);
+                                if let Some(st) = sub.as_table() {
+                                    let sub_n = st.as_ref().len() as usize;
+                                    for j in 0..sub_n {
+                                        let fv = st.as_ref().get_int(j as i32 + 1);
+                                        let off = i * elem_sz + j * 4;
+                                        if off + 4 <= cd.data.len() {
+                                            let val = fv.as_number().unwrap_or(0.0) as i32;
+                                            cd.data[off..off + 4]
+                                                .copy_from_slice(&val.to_le_bytes());
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
-            }
-        } else if let Some(n) = v2.as_number() {
-            // A scalar type initializes its value; a variable-length
-            // array takes the element count; a fixed-size array is
-            // filled with the (byte) value.
-            let raw = cts_of(l).raw(id);
-            if crate::ffi::ctype_isarray(raw.info) {
-                if raw.size == u32::MAX {
-                    let elem_id = crate::ffi::ctype_cid(raw.info);
-                    let elem = cts_of(l).raw(elem_id).size as usize;
+            } else if let Some(n) = v2.as_number() {
+                // A scalar type initializes its value; a variable-length
+                // array takes the element count; a fixed-size array is
+                // filled with the (byte) value.
+                let raw = cts_of(l).raw(id);
+                if crate::ffi::ctype_isarray(raw.info) {
+                    if raw.size == u32::MAX {
+                        let elem_id = crate::ffi::ctype_cid(raw.info);
+                        let elem = cts_of(l).raw(elem_id).size as usize;
+                        let count = n as usize;
+                        if count > 0 {
+                            cd = CData::new(id, count * elem.max(1));
+                        }
+                    } else {
+                        // Fixed-size array: the value fills every element.
+                        let (elem_id, raw_size) = {
+                            let raw = cts_of(l).raw(id);
+                            (crate::ffi::ctype_cid(raw.info), raw.size)
+                        };
+                        let esz = cts_of(l).raw(elem_id).size as usize;
+                        let mut ebuf = vec![0u8; esz.max(1)];
+                        write_scalar_value(&mut ebuf, elem_id, n);
+                        let mut d = vec![0u8; raw_size as usize];
+                        for chunk in d.chunks_mut(esz.max(1)) {
+                            let k = chunk.len().min(ebuf.len());
+                            chunk[..k].copy_from_slice(&ebuf[..k]);
+                        }
+                        cd = CData {
+                            ctypeid: id,
+                            data: d.into_boxed_slice(),
+                            base: None,
+                            offset: 0,
+                        };
+                    }
+                } else if crate::ffi::ctype_ispointer(raw.info) {
                     let count = n as usize;
                     if count > 0 {
-                        cd = CData::new(id, count * elem.max(1));
+                        cd = CData::new(id, count);
                     }
                 } else {
-                    // Fixed-size array: the value fills every element.
-                    let (elem_id, raw_size) = {
-                        let raw = cts_of(l).raw(id);
-                        (crate::ffi::ctype_cid(raw.info), raw.size)
-                    };
-                    let esz = cts_of(l).raw(elem_id).size as usize;
-                    let mut ebuf = vec![0u8; esz.max(1)];
-                    write_scalar_value(&mut ebuf, elem_id, n);
-                    let mut d = vec![0u8; raw_size as usize];
-                    for chunk in d.chunks_mut(esz.max(1)) {
-                        let k = chunk.len().min(ebuf.len());
-                        chunk[..k].copy_from_slice(&ebuf[..k]);
-                    }
-                    cd = CData {
-                        ctypeid: id,
-                        data: d.into_boxed_slice(),
-                        base: None,
-                        offset: 0,
-                    };
+                    let mut d = cd.data.to_vec();
+                    write_scalar_value(&mut d, id, n);
+                    cd.data = d.into_boxed_slice();
                 }
-            } else if crate::ffi::ctype_ispointer(raw.info) {
-                let count = n as usize;
-                if count > 0 {
-                    cd = CData::new(id, count);
-                }
-            } else {
-                let mut d = cd.data.to_vec();
-                write_scalar_value(&mut d, id, n);
-                cd.data = d.into_boxed_slice();
             }
         }
-    }
     }
 
     let ptr = l.global().heap.cdatas.alloc(cd);
@@ -752,8 +721,8 @@ fn write_scalar_value(data: &mut [u8], ctypeid: u32, n: f64) {
         id if id == CTypeID::UInt16 as u32 => write(0, &(u as u16).to_le_bytes()),
         id if id == CTypeID::Int32 as u32 => write(0, &(i as i32).to_le_bytes()),
         id if id == CTypeID::UInt32 as u32 => write(0, &(u as u32).to_le_bytes()),
-        id if id == CTypeID::Int64 as u32 => write(0, &(i as i64).to_le_bytes()),
-        id if id == CTypeID::UInt64 as u32 => write(0, &(u as u64).to_le_bytes()),
+        id if id == CTypeID::Int64 as u32 => write(0, &i.to_le_bytes()),
+        id if id == CTypeID::UInt64 as u32 => write(0, &u.to_le_bytes()),
         id if id == CTypeID::Float as u32 => write(0, &(n as f32).to_le_bytes()),
         id if id == CTypeID::Double as u32 => write(0, &n.to_le_bytes()),
         _ => write(0, &(i as i32).to_le_bytes()),
@@ -824,17 +793,14 @@ pub fn ffi_typeof(l: &mut LuaState) -> LuaResult<i32> {
                         cd.as_ref().ctypeid
                     };
                     type_name_of_id(l, id)
-                } else if let Some(s2) = a.as_string_id() {
-                    Some(l.heap().strings.get(s2).to_vec())
                 } else {
-                    None
+                    a.as_string_id().map(|s2| l.heap().strings.get(s2).to_vec())
                 };
-                if let Some(rep) = rep {
-
-                    if let Some(pos) = text.iter().position(|&b| b == b'$') {
-                        text.splice(pos..pos + 1, rep);
-                        replaced = true;
-                    }
+                if let Some(rep) = rep
+                    && let Some(pos) = text.iter().position(|&b| b == b'$')
+                {
+                    text.splice(pos..pos + 1, rep);
+                    replaced = true;
                 }
             }
             if replaced {
@@ -863,9 +829,7 @@ fn type_name_of_id(l: &LuaState, id: u32) -> Option<Vec<u8>> {
         } else {
             "struct "
         };
-        return Some(
-            format!("{}{}", prefix, String::from_utf8_lossy(&base)).into_bytes(),
-        );
+        return Some(format!("{}{}", prefix, String::from_utf8_lossy(&base)).into_bytes());
     }
     if kind == crate::ffi::CT::Ptr || kind == crate::ffi::CT::Array || kind == crate::ffi::CT::Func
     {
@@ -879,9 +843,7 @@ fn type_name_of_id(l: &LuaState, id: u32) -> Option<Vec<u8>> {
             if crate::ffi::ctype_iscomplex(r.info) {
                 break; // `complex` / `complex float` are bases.
             }
-            if k == crate::ffi::CT::Ptr || k == crate::ffi::CT::Array {
-                cur = ctype_cid(r.info);
-            } else if k == crate::ffi::CT::Func {
+            if k == crate::ffi::CT::Ptr || k == crate::ffi::CT::Array || k == crate::ffi::CT::Func {
                 cur = ctype_cid(r.info);
             } else {
                 break;
@@ -1007,7 +969,7 @@ fn type_name_of_id_inner(l: &LuaState, id: u32) -> Option<Vec<u8>> {
         return Some(format!("{} *", String::from_utf8_lossy(&elem)).into_bytes());
     }
     // Predefined scalar types.
-    let n = match id as u32 {
+    let n = match id {
         v if v == crate::ffi::CTypeID::Void as u32 => "void",
         v if v == crate::ffi::CTypeID::Bool as u32 => "bool",
         v if v == crate::ffi::CTypeID::CChar as u32 => "char",
@@ -1030,7 +992,7 @@ fn type_name_of_id_inner(l: &LuaState, id: u32) -> Option<Vec<u8>> {
 
 fn type_value(l: &mut LuaState, id: u32) -> LuaResult<i32> {
     let mut cd = CData::new(CTypeID::CTypeIDType as u32, 4);
-    cd.data[..4].copy_from_slice(&(id as u32).to_le_bytes());
+    cd.data[..4].copy_from_slice(&id.to_le_bytes());
     let ptr = l.global().heap.cdatas.alloc(cd);
     push(l, LuaValue::cdata(ptr));
     Ok(1)
@@ -1041,9 +1003,7 @@ pub fn ffi_istype(l: &mut LuaState) -> LuaResult<i32> {
     let ok = match arg(l, 1).as_cdata() {
         Some(cd) => {
             let c = cd.as_ref();
-            let id2 = if c.ctypeid == crate::ffi::CTypeID::CTypeIDType as u32
-                && c.data.len() >= 4
-            {
+            let id2 = if c.ctypeid == crate::ffi::CTypeID::CTypeIDType as u32 && c.data.len() >= 4 {
                 u32::from_le_bytes(c.data[..4].try_into().unwrap_or([0; 4]))
             } else {
                 c.ctypeid
@@ -1060,9 +1020,7 @@ pub fn ffi_istype(l: &mut LuaState) -> LuaResult<i32> {
                 && ct1.size == ct2.size;
             if ct1.info == ct2.info && ct1.size == ct2.size {
                 true
-            } else if crate::ffi::ctype_isstruct(ct1.info)
-                && crate::ffi::ctype_isptr(ct2.info)
-            {
+            } else if crate::ffi::ctype_isstruct(ct1.info) && crate::ffi::ctype_isptr(ct2.info) {
                 // A struct type matches a pointer-to-struct value.
                 let p2 = crate::ffi::ctype_cid(ct2.info);
                 crate::ffi::ctype_isstruct(cts.raw(p2).info)
@@ -1074,9 +1032,7 @@ pub fn ffi_istype(l: &mut LuaState) -> LuaResult<i32> {
                     let c2 = cts.raw(p2);
                     crate::ffi::ctype_type(c1.info) == crate::ffi::ctype_type(c2.info)
                         && c1.size == c2.size
-                } else if crate::ffi::ctype_isnum(ct1.info)
-                    || crate::ffi::ctype_isvoid(ct1.info)
-                {
+                } else if crate::ffi::ctype_isnum(ct1.info) || crate::ffi::ctype_isvoid(ct1.info) {
                     // Ignore qualifiers (const/volatile) and the long flag.
                     const QUAL_LONG: u32 = 0x0340_0000;
                     (ct1.info ^ ct2.info) & !QUAL_LONG == 0
@@ -1124,7 +1080,11 @@ pub fn ffi_copy(l: &mut LuaState) -> LuaResult<i32> {
     let src = arg(l, 1);
     let len = arg(l, 2).as_number().unwrap_or(0.0) as usize;
     let (d_off, d_root) = crate::runtime::cdata::resolve_ptr(dst);
-    let dlen = d_root.as_ref().data.len().saturating_sub(d_off.max(0) as usize);
+    let dlen = d_root
+        .as_ref()
+        .data
+        .len()
+        .saturating_sub(d_off.max(0) as usize);
     let d_start = d_off.max(0) as usize;
     let n = len.min(dlen);
 
@@ -1166,12 +1126,7 @@ pub fn ffi_fill(l: &mut LuaState) -> LuaResult<i32> {
         .ok_or_else(|| err_bad_arg(l, 1, "ffi.fill", "cdata", ""))?;
     let len = arg(l, 1).as_number().unwrap_or(0.0) as usize;
     let byte = if nargs(l) > 2 {
-        let b = arg(l, 2)
-            .as_number()
-            .map(|n| (n as i64) as u8)
-            .unwrap_or(0);
-
-        b
+        arg(l, 2).as_number().map(|n| (n as i64) as u8).unwrap_or(0)
     } else {
         0
     };
@@ -1323,19 +1278,23 @@ fn cdata_tostring_bytes(l: &LuaState, v: LuaValue) -> Vec<u8> {
                 crate::strfmt::g14(x)
             }
         };
-        let sign = if im < 0.0 || (im == 0.0 && im.is_sign_negative()) { "-" } else { "+" };
+        let sign = if im < 0.0 || (im == 0.0 && im.is_sign_negative()) {
+            "-"
+        } else {
+            "+"
+        };
         // Special values use a capital imaginary suffix ("inf-infI").
-        let suffix = if re.is_finite() && im.is_finite() { "i" } else { "I" };
+        let suffix = if re.is_finite() && im.is_finite() {
+            "i"
+        } else {
+            "I"
+        };
         return format!("{}{}{}{}", fmt(re), sign, fmt(im.abs()), suffix).into_bytes();
     }
     // Pointer / struct / union / array: cdata<type>: 0xADDR.
     let tname = type_name_of_id(l, c.ctypeid).unwrap_or_else(|| b"void".to_vec());
     let addr = c.data.as_ptr() as usize;
-    let s = format!(
-        "cdata<{}>: 0x{:x}",
-        String::from_utf8_lossy(&tname),
-        addr
-    );
+    let s = format!("cdata<{}>: 0x{:x}", String::from_utf8_lossy(&tname), addr);
     s.into_bytes()
 }
 
@@ -1368,10 +1327,10 @@ fn field_offset(cts: &CTState, ctypeid: u32, name: &str) -> Option<(u32, u32)> {
         let ftype = ctype_cid(f.info);
         let ftype_raw = cts.raw(ftype);
         let fk = crate::ffi::ctype_type(ftype_raw.info);
-        if fk == crate::ffi::CT::Struct || fk == crate::ffi::CT::Struct {
-            if let Some((tid, off)) = field_offset(cts, ftype, name) {
-                return Some((tid, f.size + off));
-            }
+        if fk == crate::ffi::CT::Struct
+            && let Some((tid, off)) = field_offset(cts, ftype, name)
+        {
+            return Some((tid, f.size + off));
         }
         cur = f.sib as u32;
     }
@@ -1540,9 +1499,7 @@ fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let Some((field_type_id, offset)) = field_offset(cts, target_id, &name) else {
-        return Err(l.runtime_error(
-            format!("no member '{}' in cdata", name).as_bytes(),
-        ));
+        return Err(l.runtime_error(format!("no member '{}' in cdata", name).as_bytes()));
     };
 
     let field_ct = cts.raw(field_type_id);
@@ -1575,7 +1532,8 @@ fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
                     }
                 }
                 found.unwrap_or_else(|| unsafe {
-                    std::slice::from_raw_parts((addr as *const u8).add(offset as usize), sz).to_vec()
+                    std::slice::from_raw_parts((addr as *const u8).add(offset as usize), sz)
+                        .to_vec()
                 })
             } else {
                 vec![0u8; sz]
@@ -1611,7 +1569,11 @@ fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
         let (boff, root) = crate::runtime::cdata::resolve_ptr(cd);
         let data = &root.as_ref().data;
         let base_addr = if boff + 8 <= data.len() as i64 {
-            i64::from_ne_bytes(data[(boff as usize)..(boff as usize) + 8].try_into().unwrap())
+            i64::from_ne_bytes(
+                data[(boff as usize)..(boff as usize) + 8]
+                    .try_into()
+                    .unwrap(),
+            )
         } else {
             0
         };
@@ -1729,11 +1691,19 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
                     let d_off = j * de_sz;
                     if s_off + se_sz <= src.as_ref().data.len() && d_off + de_sz <= ebuf.len() {
                         let v = if se_sz == 8 {
-                            f64::from_le_bytes(src.as_ref().data[s_off..s_off + 8].try_into().unwrap())
+                            f64::from_le_bytes(
+                                src.as_ref().data[s_off..s_off + 8].try_into().unwrap(),
+                            )
                         } else {
-                            f32::from_le_bytes(src.as_ref().data[s_off..s_off + 4].try_into().unwrap()) as f64
+                            f32::from_le_bytes(
+                                src.as_ref().data[s_off..s_off + 4].try_into().unwrap(),
+                            ) as f64
                         };
-                        write_scalar_value(&mut ebuf[d_off..d_off + de_sz], crate::ffi::ctype_cid(dst_raw.info), v);
+                        write_scalar_value(
+                            &mut ebuf[d_off..d_off + de_sz],
+                            crate::ffi::ctype_cid(dst_raw.info),
+                            v,
+                        );
                     }
                 }
             } else {
@@ -1773,7 +1743,7 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let raw_ct = cts.raw(cd.as_ref().ctypeid);
-    let (target_id, is_ptr) = if ctype_ispointer(raw_ct.info) {
+    let (target_id, _is_ptr) = if ctype_ispointer(raw_ct.info) {
         (ctype_cid(raw_ct.info), true)
     } else {
         (cd.as_ref().ctypeid, false)
@@ -1791,7 +1761,11 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
             let elem = cts.raw(ctype_cid(target_raw.info));
             let sz = elem.size as usize;
             let mut ebuf = vec![0u8; sz];
-            write_scalar_value(&mut ebuf, ctype_cid(target_raw.info), val.as_number().unwrap_or(0.0));
+            write_scalar_value(
+                &mut ebuf,
+                ctype_cid(target_raw.info),
+                val.as_number().unwrap_or(0.0),
+            );
             let (boff, root) = crate::runtime::cdata::resolve_ptr(cd);
             let data = &mut root.as_mut().data;
             let a = (boff + off) as usize;
@@ -1827,7 +1801,7 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
         return Ok(0);
     }
 
-    let v = val.as_number().unwrap_or(0.0) as i32;
+    let _v = val.as_number().unwrap_or(0.0) as i32;
     let ptr_val: Option<i64> = if let Some(src) = val.as_cdata() {
         // A cdata value stored into a pointer field: its storage address.
         let (off, root) = crate::runtime::cdata::resolve_ptr(src);
@@ -1838,15 +1812,14 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
 
     // A pointer field stores a cdata value's storage address.
     let field_is_ptr = crate::ffi::ctype_isptr(cts.raw(field_type_id).info);
-    if field_is_ptr && ptr_val.is_some() {
+    if field_is_ptr && let Some(pv) = ptr_val {
         let (boff, root) = crate::runtime::cdata::resolve_ptr(cd);
         let data = &mut root.as_mut().data;
         let a = (boff + offset as i64) as usize;
         let sz = cts.raw(field_type_id).size as usize;
-        let pv = ptr_val.unwrap() as usize;
 
         if sz == 8 && a + 8 <= data.len() {
-            data[a..a + 8].copy_from_slice(&pv.to_ne_bytes());
+            data[a..a + 8].copy_from_slice(&(pv as usize).to_ne_bytes());
         } else if sz == 4 && a + 4 <= data.len() {
             data[a..a + 4].copy_from_slice(&(pv as u32).to_le_bytes());
         }
@@ -1927,7 +1900,11 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
     // (lj_ccall's conversion; e.g. number -> pointer is not allowed).
     // The asm("name") override decides the C symbol to resolve.
     let ctypeid = cts_of(l).names.get(&name).copied();
-    let sym_name = cts_of(l).symbols.get(&name).cloned().unwrap_or(name.clone());
+    let sym_name = cts_of(l)
+        .symbols
+        .get(&name)
+        .cloned()
+        .unwrap_or(name.clone());
     let addr = clib::resolve_symbol(&sym_name).unwrap_or(0) as f64;
     if addr == 0.0 {
         push(l, LuaValue::NIL);
@@ -2075,7 +2052,7 @@ fn call_c(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn type_name_of(l: &LuaState, v: LuaValue) -> String {
+fn type_name_of(_l: &LuaState, v: LuaValue) -> String {
     if v.is_number() {
         "number".to_string()
     } else if v.is_string() {

@@ -29,7 +29,7 @@ fn cont_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
     if slot < 4 {
         return None;
     }
-    use crate::bc::{bc_op, BCOp};
+    use crate::bc::{BCOp, bc_op};
     let saved_pc = l.stack[slot - 3].to_bits() as usize;
     let link = l.stack[slot - 1].to_bits();
     let delta = (link >> 3) as usize;
@@ -48,7 +48,7 @@ fn cont_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
 
     // The continuation's saved PC points one past the triggering
     // instruction (the interpreter resumes there after the metamethod).
-    if saved_pc == 0 || saved_pc - 1 >= pt.bc.len() {
+    if saved_pc == 0 || saved_pc > pt.bc.len() {
         return None;
     }
     let name = match bc_op(pt.bc[saved_pc - 1]) {
@@ -77,7 +77,7 @@ fn cont_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
 /// the caller's return PC, the CALL instruction before it holds the
 /// callee register, and the local variable debug info maps it to a name.
 fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, String)> {
-    use crate::bc::{BCIns, bc_a, bc_b, bc_op, BCOp};
+    use crate::bc::{BCIns, BCOp, bc_a, bc_b, bc_op};
     if slot < 2 {
         return None;
     }
@@ -238,7 +238,9 @@ fn self_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
     }
     let link = l.stack[slot - 1].to_bits();
     let ft = link & FRAME_TYPE_MASK;
-    if ft == 2 /* FRAME_CONT */ || ft == 1 /* FRAME_C */ {
+    if ft == 2 /* FRAME_CONT */ || ft == 1
+    /* FRAME_C */
+    {
         return cont_mm_name(l, slot);
     }
     None
@@ -612,7 +614,7 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
             }
             cur_link = l.stack[slot - 1].to_bits();
         }
-        let frame_type = cur_link & FRAME_TYPE_MASK;
+        let _frame_type = cur_link & FRAME_TYPE_MASK;
 
         if let Some(fv) = func.as_func() {
             match fv.as_ref() {

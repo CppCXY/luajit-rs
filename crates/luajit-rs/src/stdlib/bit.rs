@@ -3,7 +3,7 @@ use crate::err::{LuaError, LuaResult};
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
-use super::{err_bad_arg_type, LibTarget, arg, err_bad_arg, push};
+use super::{LibTarget, arg, err_bad_arg, push};
 use crate::lual_reg;
 
 /// `lj_num2bit`: wrapping num -> int32. The bias add rounds to nearest
@@ -219,14 +219,30 @@ macro_rules! bit_shift {
 
 bit_shift!(lshift, "bit.lshift", |x, n| x.wrapping_shl(n), |x, n| x
     .wrapping_shl(n));
-bit_shift!(rshift, "bit.rshift", |x, n| ((x as u32).wrapping_shr(n))
-    as i32, |x, n| x.wrapping_shr(n));
-bit_shift!(arshift, "bit.arshift", |x, n| x.wrapping_shr(n), |x, n|
-    ((x as i64).wrapping_shr(n)) as u64);
-bit_shift!(rol, "bit.rol", |x, n| (x as u32).rotate_left(n) as i32,
-    |x, n| x.rotate_left(n));
-bit_shift!(ror, "bit.ror", |x, n| (x as u32).rotate_right(n) as i32,
-    |x, n| x.rotate_right(n));
+bit_shift!(
+    rshift,
+    "bit.rshift",
+    |x, n| ((x as u32).wrapping_shr(n)) as i32,
+    |x, n| x.wrapping_shr(n)
+);
+bit_shift!(
+    arshift,
+    "bit.arshift",
+    |x, n| x.wrapping_shr(n),
+    |x, n| ((x as i64).wrapping_shr(n)) as u64
+);
+bit_shift!(
+    rol,
+    "bit.rol",
+    |x, n| (x as u32).rotate_left(n) as i32,
+    |x, n| x.rotate_left(n)
+);
+bit_shift!(
+    ror,
+    "bit.ror",
+    |x, n| (x as u32).rotate_right(n) as i32,
+    |x, n| x.rotate_right(n)
+);
 
 fn tohex(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
@@ -251,9 +267,17 @@ fn tohex(l: &mut LuaState) -> LuaResult<i32> {
         let x = bitarg64(l, 0, "bit.tohex")?;
         let digits = digits.clamp(1, 16);
         if upper {
-            format!("{:0width$X}", x & (!0u64 >> (64 - digits * 4)), width = digits)
+            format!(
+                "{:0width$X}",
+                x & (!0u64 >> (64 - digits * 4)),
+                width = digits
+            )
         } else {
-            format!("{:0width$x}", x & (!0u64 >> (64 - digits * 4)), width = digits)
+            format!(
+                "{:0width$x}",
+                x & (!0u64 >> (64 - digits * 4)),
+                width = digits
+            )
         }
     } else {
         let x = bitarg(l, 0, "bit.tohex")? as u32;

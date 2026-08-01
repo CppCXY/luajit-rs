@@ -412,11 +412,7 @@ fn fmt_float(spec: &str, conv: u8, n: f64) -> String {
         b'e' | b'E' => fmt_e(n.abs(), p, conv == b'E', hash),
         b'g' | b'G' => {
             let s = fmt_g(n.abs(), if prec.is_some() { p.max(1) } else { 6 }, hash);
-            if conv == b'G' {
-                s.to_uppercase()
-            } else {
-                s
-            }
+            if conv == b'G' { s.to_uppercase() } else { s }
         }
         _ => unreachable!(),
     };
@@ -468,7 +464,7 @@ fn fmt_e(n: f64, prec: usize, upper: bool, hash: bool) -> String {
 
 fn fmt_g(n: f64, prec: usize, hash: bool) -> String {
     if n == 0.0 {
-        return if hash { "0".to_string() } else { "0".to_string() };
+        return "0".to_string();
     }
     // The exponent of the *rounded* value (from the e-form) decides the
     // style, like the C library.
@@ -476,13 +472,18 @@ fn fmt_g(n: f64, prec: usize, hash: bool) -> String {
     let exp: i32 = e_s.split_once('e').unwrap().1.parse().unwrap();
     if exp < -4 || exp >= prec as i32 {
         // e-style with the mantissa trimmed (kept with #).
-        let (mant, e) = e_s.split_once('e').unwrap();
+        let (mant, _e) = e_s.split_once('e').unwrap();
         let mant = if hash {
             mant.to_string()
         } else {
             mant.trim_end_matches('0').trim_end_matches('.').to_string()
         };
-        format!("{}e{}{:02}", mant, if exp < 0 { '-' } else { '+' }, exp.abs())
+        format!(
+            "{}e{}{:02}",
+            mant,
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
     } else {
         let decimals = (prec as i32 - 1 - exp).max(0) as usize;
         let s = format!("{:.*}", decimals, n);
