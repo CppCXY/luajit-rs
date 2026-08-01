@@ -323,7 +323,9 @@ pub enum Suspend {
     /// `pc` with `cl`, delivering the resume args at `slot` per `want`.
     /// `protected` marks a yield through a `pcall`/`xpcall` frame: the
     /// resume args must be delivered with a `true` prefix (the pcall's
-    /// success flag), like LuaJIT's pcall continuation.
+    /// success flag), like LuaJIT's pcall continuation. `value_slot` is
+    /// where the yield values live (may differ from `slot` when the
+    /// protected call's own frame sits elsewhere).
     Call {
         pc: usize,
         cl: GcPtr<GcFunc>,
@@ -331,6 +333,7 @@ pub enum Suspend {
         slot: usize,
         want: i32,
         protected: bool,
+        value_slot: usize,
     },
     /// Yield through a tail call (`return coroutine.yield(...)`) or from
     /// the entry C function: resume performs a *return* of the resume args

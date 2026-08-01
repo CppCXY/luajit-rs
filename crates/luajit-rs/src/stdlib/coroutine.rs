@@ -77,6 +77,7 @@ pub(crate) fn do_resume(
             slot,
             want,
             protected,
+            ..
         } => {
             co.suspend = Suspend::Start;
             co.stack_ensure(slot + 2 + nargs);

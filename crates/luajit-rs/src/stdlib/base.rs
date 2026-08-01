@@ -516,6 +516,10 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
                 .get(saved_base.saturating_sub(2))
                 .and_then(|v| v.as_func())
                 .unwrap_or(l.stack[0].as_func().unwrap());
+            let value_slot = match l.suspend {
+                crate::state::Suspend::Call { value_slot, .. } => value_slot,
+                _ => saved_base,
+            };
             l.suspend = crate::state::Suspend::Call {
                 pc: l.debug_pc,
                 cl,
@@ -523,6 +527,7 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
                 slot: saved_base.saturating_sub(2),
                 want: -1,
                 protected: true,
+                value_slot,
             };
             Err(LuaError::Yield)
         }

@@ -348,10 +348,10 @@ fn call_c(
                 _ => 0,
             };
             let base = func_slot.saturating_sub(a);
-            let protected = matches!(
-                l.suspend,
-                crate::state::Suspend::Call { protected: true, .. }
-            );
+            let (protected, value_slot) = match l.suspend {
+                crate::state::Suspend::Call { protected: p, .. } => (p, func_slot),
+                _ => (false, func_slot),
+            };
             l.suspend = crate::state::Suspend::Call {
                 pc,
                 cl,
@@ -359,6 +359,7 @@ fn call_c(
                 slot: func_slot,
                 want,
                 protected,
+                value_slot,
             };
             l.top = (l.base + 8).max(func_slot + ny);
             l.base = l.base;
@@ -2659,22 +2660,16 @@ impl Interp {
         // protected flag and moved the yield values to *its* slot; the
         // outer capture must keep both.
         let protected = matches!(self.l().suspend, Suspend::Call { protected: true, .. });
-        // A yield through pcall/xpcall: the yield values still sit in the
-        // inner yield call's argument area (recorded in the suspend).
-        let src = if protected {
+        // A yield through pcall/xpcall: the yield values were moved to the
+        // inner yield call's slot (the recorded value_slot).
+        let (src, value_slot) = if protected {
             match self.l().suspend {
-                Suspend::Call { slot, .. } => slot + 2,
-                _ => func_slot + 2,
+                Suspend::Call { value_slot: vs, .. } => (vs, func_slot),
+                _ => (func_slot + 2, func_slot),
             }
         } else {
-            func_slot + 2
+            (func_slot + 2, func_slot)
         };
-        if std::env::var("LUAJIT_RS_YDBG").is_ok() {
-            eprintln!(
-                "suspend_call: func_slot={} ny={} protected={} src={}",
-                func_slot, ny, protected, src
-            );
-        }
         for i in 0..ny {
             let v = self.at(src + i);
             self.set_at(func_slot + i, v);
@@ -2687,6 +2682,7 @@ impl Interp {
             slot: func_slot,
             want,
             protected,
+            value_slot,
         };
         l.top = (self.base + self.proto().framesize as usize).max(func_slot + ny);
         l.base = self.base;
