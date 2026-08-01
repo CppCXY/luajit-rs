@@ -348,12 +348,17 @@ fn call_c(
                 _ => 0,
             };
             let base = func_slot.saturating_sub(a);
+            let protected = matches!(
+                l.suspend,
+                crate::state::Suspend::Call { protected: true, .. }
+            );
             l.suspend = crate::state::Suspend::Call {
                 pc,
                 cl,
                 base,
                 slot: func_slot,
                 want,
+                protected,
             };
             l.top = (l.base + 8).max(func_slot + ny);
             l.base = l.base;
@@ -2650,8 +2655,28 @@ impl Interp {
     #[cold]
     fn suspend_call(&mut self, func_slot: usize, want: i32) -> LuaError {
         let ny = self.l().nyield as usize;
+        // A yield through pcall/xpcall rewrote the suspend with the
+        // protected flag and moved the yield values to *its* slot; the
+        // outer capture must keep both.
+        let protected = matches!(self.l().suspend, Suspend::Call { protected: true, .. });
+        // A yield through pcall/xpcall: the yield values still sit in the
+        // inner yield call's argument area (recorded in the suspend).
+        let src = if protected {
+            match self.l().suspend {
+                Suspend::Call { slot, .. } => slot + 2,
+                _ => func_slot + 2,
+            }
+        } else {
+            func_slot + 2
+        };
+        if std::env::var("LUAJIT_RS_YDBG").is_ok() {
+            eprintln!(
+                "suspend_call: func_slot={} ny={} protected={} src={}",
+                func_slot, ny, protected, src
+            );
+        }
         for i in 0..ny {
-            let v = self.at(func_slot + 2 + i);
+            let v = self.at(src + i);
             self.set_at(func_slot + i, v);
         }
         let l = self.l();
@@ -2661,6 +2686,7 @@ impl Interp {
             base: self.base,
             slot: func_slot,
             want,
+            protected,
         };
         l.top = (self.base + self.proto().framesize as usize).max(func_slot + ny);
         l.base = self.base;
@@ -3141,26 +3167,35 @@ pub fn resume_continue(
     pc: usize,
     cl: GcPtr<GcFunc>,
     sbase: usize,
+    protected: bool,
 ) -> LuaResult<usize> {
     co.c_depth += 1;
     // Note: no stack_ensure needed — the suspended frame was alive at
     // yield time and stack length never shrinks.
-    if want >= 0 {
+    let args_at = slot + 2;
+    if protected {
+        // The yield happened inside pcall/xpcall: the continuation reads
+        // `true, <resume args>` as the protected call's results.
+        co.stack[slot] = LuaValue::TRUE;
+        for i in 0..nargs {
+            co.stack[slot + 1 + i] = co.stack[args_at + i];
+        }
+    } else if want >= 0 {
         let limit = nargs.min(want as usize);
         for i in 0..limit {
-            co.stack[slot + i] = co.stack[slot + 2 + i];
+            co.stack[slot + i] = co.stack[args_at + i];
         }
         for i in limit..(want as usize) {
             co.stack[slot + i] = LuaValue::NIL;
         }
     } else {
         for i in 0..nargs {
-            co.stack[slot + i] = co.stack[slot + 2 + i];
+            co.stack[slot + i] = co.stack[args_at + i];
         }
     }
     let mut vm = Interp::new(co);
     if want < 0 {
-        vm.multres = nargs;
+        vm.multres = if protected { nargs + 1 } else { nargs };
     }
     vm.base = sbase;
     vm.cl = cl;

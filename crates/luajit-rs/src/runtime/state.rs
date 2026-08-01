@@ -321,12 +321,16 @@ pub enum Suspend {
     Start,
     /// Yield from a `CALL coroutine.yield` in a Lua frame: continue at
     /// `pc` with `cl`, delivering the resume args at `slot` per `want`.
+    /// `protected` marks a yield through a `pcall`/`xpcall` frame: the
+    /// resume args must be delivered with a `true` prefix (the pcall's
+    /// success flag), like LuaJIT's pcall continuation.
     Call {
         pc: usize,
         cl: GcPtr<GcFunc>,
         base: usize,
         slot: usize,
         want: i32,
+        protected: bool,
     },
     /// Yield through a tail call (`return coroutine.yield(...)`) or from
     /// the entry C function: resume performs a *return* of the resume args
@@ -367,6 +371,10 @@ pub struct LuaState {
     pub openuv: Vec<GcPtr<Upval>>,
     /// The pending error object (`LuaError::Runtime`).
     pub errval: LuaValue,
+    /// Args-base slot of the Lua frame that was executing when `error`
+    /// was raised (set by lib_error, consumed by lib_xpcall's handler
+    /// frame chain so debug walks see the raise-time frames below it).
+    pub err_raise_slot: usize,
     /// While a metamethod invoked through the cold execute-recursion
     /// paths (e.g. `__concat`) is running, the (name, function bits) of
     /// the active metamethod — debug.getinfo uses it to report
@@ -420,6 +428,7 @@ impl LuaState {
             top: 0,
             openuv: Vec::new(),
             errval: LuaValue::NIL,
+            err_raise_slot: 0,
             mmname: None,
             nyield: 0,
             status: if is_main {
@@ -542,10 +551,18 @@ impl LuaState {
 
     /// Raise a runtime error carrying a string message with source location.
     pub fn runtime_error(&mut self, msg: impl AsRef<[u8]>) -> LuaError {
+        self.runtime_error_level(msg, 1)
+    }
+
+    /// `runtime_error` with `error()`-style `level` semantics: 1 = the
+    /// direct caller's location, 2 = the caller's caller, etc.
+    pub fn runtime_error_level(&mut self, msg: impl AsRef<[u8]>, level: u32) -> LuaError {
         let mut full = msg.as_ref().to_vec();
 
+        let mut skip = level.saturating_sub(1) as usize;
         let mut slot = self.base;
-        for _ in 0..8 {
+        let mut pc_from_link: Option<usize> = None;
+        for _ in 0..16 {
             if slot < 2 {
                 break;
             }
@@ -555,10 +572,43 @@ impl LuaState {
                 match fv.as_ref() {
                     GcFunc::Lua(cl) => {
                         let pt = cl.proto.as_ref();
-                        let pc = self
-                            .debug_pc
-                            .saturating_sub(1)
-                            .min(pt.lines.len().saturating_sub(1));
+                        if skip > 0 {
+                            // Not the position frame: walk to the caller.
+                            skip -= 1;
+                            let ft = link_bits & FRAME_TYPE_MASK;
+                            if ft == 0 && link_bits != 0 {
+                                if ((link_bits >> 3) as usize) < self.stack.len() {
+                                    slot = (link_bits >> 3) as usize;
+                                } else {
+                                    // The return PC lives in the *caller's*
+                                    // proto, so carry the raw address and
+                                    // resolve the offset against the
+                                    // position frame's proto below.
+                                    let ret_ip = link_bits as *const crate::bc::BCIns;
+                                    pc_from_link = Some(ret_ip as usize);
+                                    let call_ins = unsafe { *ret_ip.sub(1) };
+                                    let a = crate::bc::bc_a(call_ins) as usize;
+                                    slot = slot.saturating_sub(2 + a);
+                                }
+                                continue;
+                            }
+                            break;
+                        }
+                        let pc = match pc_from_link {
+                            // Frame reached via a Lua link: the return PC
+                            // points past the CALL; the CALL itself sits at
+                            // pc-1 (both carry the same statement's line,
+                            // but the RET0/jump at the return PC may sit on
+                            // a later line).
+                            Some(p) => {
+                                let off = unsafe {
+                                    (p as *const crate::bc::BCIns).offset_from(pt.bc.as_ptr())
+                                } as usize;
+                                off.saturating_sub(1)
+                            }
+                            None => self.debug_pc.saturating_sub(1),
+                        }
+                        .min(pt.lines.len().saturating_sub(1));
                         let line = if pc < pt.lines.len() {
                             pt.lines[pc] as usize
                         } else {
@@ -584,13 +634,19 @@ impl LuaState {
                         break;
                     }
                     GcFunc::C(_) => {
-                        // Walk to caller via frame link.
-                        // FRAME_LUA=0 means the link encodes the caller's base.
+                        // Walk to caller via frame link. FRAME_LUA=0 means
+                        // the link encodes the caller's base; otherwise it
+                        // is the caller's return PC.
                         let ft = link_bits & FRAME_TYPE_MASK;
-                        if ft == 0
-                        /* FRAME_LUA */
-                        {
-                            slot = (link_bits >> 3) as usize;
+                        if ft == 0 && link_bits != 0 {
+                            if ((link_bits >> 3) as usize) < self.stack.len() {
+                                slot = (link_bits >> 3) as usize;
+                            } else {
+                                let ret_ip = link_bits as *const crate::bc::BCIns;
+                                let call_ins = unsafe { *ret_ip.sub(1) };
+                                let a = crate::bc::bc_a(call_ins) as usize;
+                                slot = slot.saturating_sub(2 + a);
+                            }
                             continue;
                         }
                         break;

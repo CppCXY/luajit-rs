@@ -76,13 +76,14 @@ pub(crate) fn do_resume(
             base,
             slot,
             want,
+            protected,
         } => {
             co.suspend = Suspend::Start;
             co.stack_ensure(slot + 2 + nargs);
             for i in 0..nargs {
                 co.stack[slot + 2 + i] = l.stack[args_at + i];
             }
-            crate::vm::resume_continue(co, slot, want, nargs, pc, cl, base)
+            crate::vm::resume_continue(co, slot, want, nargs, pc, cl, base, protected)
         }
         Suspend::Return { base, slot } => {
             co.suspend = Suspend::Start;

@@ -442,6 +442,14 @@ fn lib_error(l: &mut LuaState) -> LuaResult<i32> {
         l.errval = if msg.is_nil() { LuaValue::NIL } else { msg };
         return Err(LuaError::Runtime);
     }
+    // Remember the frame that called `error`: its stack slots survive the
+    // unwind, so an enclosing xpcall handler can chain to it and debug
+    // walks (getlocal levels) still see it below the error's C frame.
+    if let Some(link) = l.stack.get(l.base.wrapping_sub(1)).map(|v| v.to_bits())
+        && (link & 3) == 0
+    {
+        l.err_raise_slot = (link >> 3) as usize;
+    }
     // The position prefix is added only when the direct caller is a Lua
     // function (LuaJIT's lj_ff_error: a C caller such as pcall/xpcall has
     // no location to report).
@@ -458,7 +466,7 @@ fn lib_error(l: &mut LuaState) -> LuaResult<i32> {
         && let Some(sid) = msg.as_string_id()
     {
         let bytes = l.heap().strings.get(sid).to_vec();
-        return Err(l.runtime_error(&bytes));
+        return Err(l.runtime_error_level(&bytes, level as u32));
     }
     l.errval = if msg.is_nil() { LuaValue::NIL } else { msg };
     Err(LuaError::Runtime)
@@ -495,6 +503,29 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
             l.stack[l.base + 1] = l.errval;
             Ok(2)
         }
+        Err(LuaError::Yield) => {
+            // The yield happened *inside* this protected call (e.g.
+            // pcall(coroutine.yield, ...)): rewrite the captured suspend
+            // so the resumption lands after pcall's own CALL and delivers
+            // `true, <yield values>` as its results. The continuation
+            // must run in the *caller's* frame (pcall's own CALL site),
+            // not the frame that yielded.
+            l.base = saved_base;
+            let cl = l
+                .stack
+                .get(saved_base.saturating_sub(2))
+                .and_then(|v| v.as_func())
+                .unwrap_or(l.stack[0].as_func().unwrap());
+            l.suspend = crate::state::Suspend::Call {
+                pc: l.debug_pc,
+                cl,
+                base: saved_base,
+                slot: saved_base.saturating_sub(2),
+                want: -1,
+                protected: true,
+            };
+            Err(LuaError::Yield)
+        }
         Err(e) => Err(e),
     }
 }
@@ -530,8 +561,19 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
             if msgh.is_func() {
                 // Preserve the failed call's frame below the handler and
                 // chain the handler's frame link to it, so debug walks
-                // (e.g. getlocal levels) can see the failed frame.
-                let fail_slot = l.base;
+                // (e.g. getlocal levels) can see the failed frame. When
+                // the error was raised by `error()` from a nested call,
+                // chain to the raise-time frame (its slots survive the
+                // unwind) instead of the post-unwind base.
+                let fail_slot = if l.err_raise_slot >= 2 {
+                    // The raise slot is the frame's args base; the chain
+                    // expects the target frame's func slot (below it).
+                    let s = l.err_raise_slot - 2;
+                    l.err_raise_slot = 0;
+                    s
+                } else {
+                    l.base
+                };
                 let fail_framesize = l.stack[fail_slot]
                     .as_func()
                     .and_then(|f| match f.as_ref() {

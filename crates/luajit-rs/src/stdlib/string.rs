@@ -514,6 +514,88 @@ fn str_reverse(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
+/// True when the running string-library function was invoked as a method
+/// (`s:sub(...)`): the caller's bytecode is `MOV(self,obj); TGETS(func,
+/// obj,key); CALL(func,..)` (lj_debug.c's "method" pattern). LuaJIT then
+/// numbers the arguments from the receiver, so the self is not counted in
+/// error messages.
+fn is_method_call(l: &LuaState) -> bool {
+    use crate::bc::{BCIns, bc_a, bc_b, bc_d, bc_op, BCOp};
+    // The C function's frame: func at base-2, link (the caller's return
+    // PC) at base-1.
+    let Some(link) = l.stack.get(l.base.wrapping_sub(1)).map(|v| v.to_bits()) else {
+        return false;
+    };
+    // FRAME_LUA only (frame type 0). The link is either the caller's
+    // return PC or a caller-base delta (the C-call frames).
+    if link & 0x7 != 0 || link == 0 {
+        return false;
+    }
+    let a;
+    let caller_base;
+    let mut pc_from_link: Option<usize> = None;
+    if ((link >> 3) as usize) < l.stack.len() {
+        // C-call frame: link = the caller's base. The func sits at
+        // l.base-2, which is caller_base + a.
+        caller_base = (link >> 3) as usize;
+        a = (l.base.saturating_sub(2).saturating_sub(caller_base)) as u32;
+    } else {
+        let ret_ip = link as *const BCIns;
+        let call_ins = unsafe { *ret_ip.sub(1) };
+        if bc_op(call_ins) != BCOp::CALL {
+            return false;
+        }
+        a = bc_a(call_ins);
+        caller_base = l.base.saturating_sub(4 + a as usize);
+        pc_from_link = Some(unsafe { ret_ip as usize });
+    };
+    if caller_base < 2 {
+        return false;
+    }
+    let Some(cf) = l.stack.get(caller_base - 2).and_then(|v| v.as_func()) else {
+        return false;
+    };
+    let crate::func::GcFunc::Lua(cl) = cf.as_ref() else {
+        return false;
+    };
+    let pt = cl.proto.as_ref();
+    let pc = match pc_from_link {
+        Some(addr) => {
+            let p = addr as *const BCIns;
+            (unsafe { p.offset_from(pt.bc.as_ptr()) }) as usize
+        }
+        None => l.debug_pc,
+    };
+    if pc < 2 {
+        return false;
+    }
+    // Scan back from the CALL over the argument-setup instructions to
+    // the TGETS and the preceding MOV(self, obj) — the method pattern.
+    let mut k = pc - 1;
+    while k > 0 {
+        match bc_op(pt.bc[k - 1]) {
+            BCOp::TGETS | BCOp::TGETV => {
+                let tgets = pt.bc[k - 1];
+                if k >= 2 {
+                    let mov = pt.bc[k - 2];
+                    // The VM compiles methods in the frame-2 layout:
+                    // MOV(self at func+1+fr2, obj); TGETS(func, obj, key).
+                    return bc_op(mov) == BCOp::MOV
+                        && bc_a(mov) == a + 1 + 1
+                        && bc_d(mov) == bc_b(tgets);
+                }
+                return false;
+            }
+            BCOp::KSHORT | BCOp::KPRI | BCOp::KSTR | BCOp::KNUM | BCOp::KCDATA
+            | BCOp::MOV => {
+                k -= 1;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
     let s = match str_arg_coerce(l, 0, "sub") {
         Some(s) => s,
@@ -521,6 +603,8 @@ pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
     };
     // The indices must be numbers (or numeric strings); a present but
     // non-numeric argument is an error (luaL_checknumber semantics).
+    let method = is_method_call(l);
+    let argnum = |n: u32| if method { n - 1 } else { n };
     let coerce_index = |l: &mut LuaState, i: usize, name: &str| -> LuaResult<i64> {
         let v = arg(l, i);
         if v.is_nil() {
@@ -528,7 +612,13 @@ pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
         }
         match num_arg_coerce(l, i) {
             Some(n) => Ok(n as i64),
-            None => Err(err_bad_arg_type(l, i as u32 + 1, name, "number", v)),
+            None => Err(err_bad_arg_type(
+                l,
+                argnum(i as u32 + 1),
+                name,
+                "number",
+                v,
+            )),
         }
     };
     let i = coerce_index(l, 1, "sub")?;
