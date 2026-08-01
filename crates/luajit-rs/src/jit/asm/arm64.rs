@@ -498,6 +498,8 @@ struct Asm<'a> {
     phi_homes: Vec<(IRRef, u8)>,
     link: Option<*const u8>,
     stub_tails: Vec<(u32, u32)>,
+    stack_end_addr: u64,
+    exit_base_addr: u64,
 }
 
 // map x64 CC to ARM64 CC: x64 jcc semantics (after cmp/after ucomisd)
@@ -531,7 +533,12 @@ impl<'a> Asm<'a> {
     }
 
     // ═══ NYI scan ═══════════════════════════════════════════════════════════
-    fn new(tr: &'a GCtrace, link: Option<*const u8>) -> Result<Asm<'a>, TraceError> {
+    fn new(
+        tr: &'a GCtrace,
+        link: Option<*const u8>,
+        stack_end_addr: u64,
+        exit_base_addr: u64,
+    ) -> Result<Asm<'a>, TraceError> {
         let nins = Self::iidx(tr.ir.nins());
         let nk = (REF_BIAS - tr.ir.nk()) as usize;
         let mut a = Asm {
@@ -553,6 +560,8 @@ impl<'a> Asm<'a> {
             phi_homes: Vec::new(),
             link,
             stub_tails: Vec::new(),
+            stack_end_addr,
+            exit_base_addr,
         };
         for r in REF_FIRST..tr.ir.nins() {
             let ins = tr.ir.ir(r);
@@ -1942,7 +1951,7 @@ impl<'a> Asm<'a> {
             let room = (255 + 8) * 8;
             self.code.mov64(RSCRATCH, (delta + room) as u64);
             self.code.add_rr(RSCRATCH, RSCRATCH, RBASE);
-            self.code.mov64(RSCRATCH2, exec::stack_end_cell_addr());
+            self.code.mov64(RSCRATCH2, self.stack_end_addr);
             self.code.ldr(RSCRATCH3, RSCRATCH2, 0);
             self.code.cmp_rr(RSCRATCH, RSCRATCH3);
             self.guard(cond::HI);
@@ -1963,7 +1972,7 @@ impl<'a> Asm<'a> {
                 let room = (255 + 8) * 8;
                 self.code.mov64(RSCRATCH, (delta + room) as u64);
                 self.code.add_rr(RSCRATCH, RSCRATCH, RBASE);
-                self.code.mov64(RSCRATCH2, exec::stack_end_cell_addr());
+                self.code.mov64(RSCRATCH2, self.stack_end_addr);
                 self.code.ldr(RSCRATCH3, RSCRATCH2, 0);
                 self.code.cmp_rr(RSCRATCH, RSCRATCH3);
                 self.guard(cond::HI);
@@ -1986,7 +1995,7 @@ impl<'a> Asm<'a> {
         // ── epilogue ──
         let epilogue = self.code.len();
         // Store BASE to exit_base cell
-        self.code.mov64(RSCRATCH, exec::exit_base_cell_addr());
+        self.code.mov64(RSCRATCH, self.exit_base_addr);
         self.code.str(RBASE, RSCRATCH, 0);
         // Restore callee-saved regs
         for i in 0..SAVED_GPR_PAIRS {
@@ -2059,11 +2068,13 @@ impl<'a> Asm<'a> {
 pub fn assemble(
     tr: &GCtrace,
     link: Option<*const u8>,
+    stack_end_addr: u64,
+    exit_base_addr: u64,
 ) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
     if tr.linktype == TraceLink::Downrec {
         return Err(TraceError::NYIIR);
     }
-    Asm::new(tr, link)?.emit()
+    Asm::new(tr, link, stack_end_addr, exit_base_addr)?.emit()
 }
 
 pub fn patch_exit(area: &mut McodeArea, stub_tails: &[(u32, u32)], exitno: u32, target: *const u8) {

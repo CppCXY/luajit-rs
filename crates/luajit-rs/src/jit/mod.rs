@@ -351,46 +351,8 @@ impl Prng {
 /// in `GG_State`): profiling counters, the trace registry, penalties and
 /// Optional JIT diagnostics: counts of compiled traces and abort reasons,
 /// gated by the `LUARS_JITDBG` environment variable. Each distinct reason
-/// prints once when it first fires.
-#[cfg(not(target_arch = "wasm32"))]
-pub static JIT_STATS: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
-
-#[cfg(not(target_arch = "wasm32"))]
-fn stats_bump_impl(key: String) {
-    if std::env::var("LUARS_JITDBG").is_ok()
-        && let Ok(mut m) = JIT_STATS.lock()
-    {
-        let mut found = false;
-        for (k, c) in m.iter_mut() {
-            if *k == key {
-                *c += 1;
-                if *c == 1 {
-                    eprintln!("JITSTAT {key}");
-                }
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            m.push((key.clone(), 1));
-            eprintln!("JITSTAT {key}");
-        }
-    }
-}
-#[cfg(not(target_arch = "wasm32"))]
-pub fn stats_bump(key: &'static str) {
-    stats_bump_impl(key.to_string());
-}
-/// Count an abort with its bytecode site, e.g. "NYI: bytecode @ CALL".
-#[cfg(not(target_arch = "wasm32"))]
-pub fn stats_bump_site(key: &str, site: &str) {
-    stats_bump_impl(format!("{key} @ {site}"));
-}
-#[cfg(target_arch = "wasm32")]
-pub fn stats_bump(_key: &'static str) {}
-#[cfg(target_arch = "wasm32")]
-pub fn stats_bump_site(_key: &str, _site: &str) {}
-
+/// prints once when it first fires. Per-VM state (no shared statics), so
+/// multiple Lua states do not interfere.
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for JitState {
     fn drop(&mut self) {
@@ -445,6 +407,16 @@ pub struct JitState {
     pub trace_dump: bool,
     /// Trace dump level 2 (LUAJIT_RS_TRDUMP=2), cached at startup.
     pub trace_dump2: bool,
+    /// JIT diagnostics counts (LUARS_JITDBG): each distinct reason prints
+    /// once on its first occurrence. Per-VM: no shared statics.
+    pub stats: Vec<(String, usize)>,
+    /// Stack-end cell read by the machine-code recursive tails for their
+    /// headroom check (the mcode embeds this field's address, which is
+    /// stable because `GlobalState` lives in a `Box`).
+    pub stack_end: std::cell::Cell<u64>,
+    /// BASE-register report from the machine-code epilogue (same address
+    /// stability contract as `stack_end`).
+    pub exit_base: std::cell::Cell<u64>,
 }
 
 impl JitState {
@@ -481,17 +453,64 @@ impl JitState {
             trace_dump2: std::env::var("LUAJIT_RS_TRDUMP").as_deref() == Ok("2"),
             #[cfg(target_arch = "wasm32")]
             trace_dump2: false,
+            stats: Vec::new(),
+            stack_end: std::cell::Cell::new(0),
+            exit_base: std::cell::Cell::new(0),
         };
         js.init_hotcount();
         js
     }
 
+    /// Address of the `stack_end` cell, embedded in machine code at
+    /// assembly time. Safe because `GlobalState` is heap-pinned (`Box`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn stack_end_cell_addr(&self) -> u64 {
+        std::ptr::addr_of!(self.stack_end) as u64
+    }
+    /// Address of the `exit_base` cell (same contract as `stack_end_cell_addr`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn exit_base_cell_addr(&self) -> u64 {
+        std::ptr::addr_of!(self.exit_base) as u64
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stats_bump_impl(&mut self, key: String) {
+        if std::env::var("LUARS_JITDBG").is_ok() {
+            let mut found = false;
+            for (k, c) in self.stats.iter_mut() {
+                if *k == key {
+                    *c += 1;
+                    if *c == 1 {
+                        eprintln!("JITSTAT {key}");
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                self.stats.push((key.clone(), 1));
+                eprintln!("JITSTAT {key}");
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn stats_bump(&mut self, key: &'static str) {
+        self.stats_bump_impl(key.to_string());
+    }
+    /// Count an abort with its bytecode site, e.g. "NYI: bytecode @ CALL".
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn stats_bump_site(&mut self, key: &str, site: &str) {
+        self.stats_bump_impl(format!("{key} @ {site}"));
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn stats_bump(&mut self, _key: &'static str) {}
+    #[cfg(target_arch = "wasm32")]
+    pub fn stats_bump_site(&mut self, _key: &str, _site: &str) {}
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn stats_dump(&self) {
-        if std::env::var("LUARS_JITDBG").is_ok()
-            && let Ok(m) = JIT_STATS.lock()
-        {
-            let mut v = m.clone();
+        if std::env::var("LUARS_JITDBG").is_ok() {
+            let mut v = self.stats.clone();
             v.sort_unstable_by_key(|(_, c)| std::cmp::Reverse(*c));
             for (k, c) in v {
                 eprintln!("JITSTAT {k}: {c}");

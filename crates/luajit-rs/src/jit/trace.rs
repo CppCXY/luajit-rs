@@ -374,9 +374,9 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
                         .join(" ");
                     eprintln!("JITABORT {} at pc={} ({})", e.message(), pc, desc);
                 }
-                super::stats_bump(e.message());
+                g.jit.stats_bump(e.message());
                 if pc < rec.pt.as_ref().bc.len() {
-                    super::stats_bump_site(
+                    g.jit.stats_bump_site(
                         e.message(),
                         &format!("{:?}", bc_op(rec.pt.as_ref().bc[pc])),
                     );
@@ -405,7 +405,7 @@ pub fn rec_abort_error(g: &mut GlobalState) {
 fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, lnk: TraceNo) {
     let js = &mut g.jit;
     let traceno = rec.cur.traceno;
-    super::stats_bump("TRACE-COMPILED");
+    js.stats_bump("TRACE-COMPILED");
     let (parent, exitno) = (rec.parent, rec.exitno as usize);
     rec.cur.linktype = linktype;
     rec.cur.link = lnk;
@@ -450,7 +450,13 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         opt_narrow::opt_narrow(&mut trace.ir);
         opt_sink::opt_sink(&mut trace);
         if !js.no_asm
-            && let Ok((mc, inner, tails)) = asm::assemble(&trace, link_target, arch)
+            && let Ok((mc, inner, tails)) = asm::assemble(
+                &trace,
+                link_target,
+                arch,
+                js.stack_end_cell_addr(),
+                js.exit_base_cell_addr(),
+            )
         {
             if js.trace_dump {
                 eprintln!(

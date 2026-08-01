@@ -105,11 +105,13 @@ struct PhiInfo {
 pub fn assemble(
     tr: &GCtrace,
     link: Option<*const u8>,
+    stack_end_addr: u64,
+    exit_base_addr: u64,
 ) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
     if tr.linktype == TraceLink::Downrec {
         return Err(TraceError::NYIIR); // Down-recursion tails NYI.
     }
-    Asm::new(tr, link)?.emit()
+    Asm::new(tr, link, stack_end_addr, exit_base_addr)?.emit()
 }
 
 /// `lj_asm_patchexit`: retarget every exit stub of `exitno` to jump
@@ -168,6 +170,10 @@ struct Asm<'a> {
     link: Option<*const u8>,
     /// Patchable stub tail offsets: (snapshot index, code offset).
     stub_tails: Vec<(u32, u32)>,
+    /// Address of the per-VM `JitState.stack_end` cell (mcode embeds it).
+    stack_end_addr: u64,
+    /// Address of the per-VM `JitState.exit_base` cell (mcode embeds it).
+    exit_base_addr: u64,
 }
 
 /// One exit: flush the snapshot values still held in registers at the
@@ -198,7 +204,12 @@ impl<'a> Asm<'a> {
 
     /// Scan the IR: reject NYI opcodes, record last-use positions and the
     /// set of refs that must live in `env` for exits.
-    fn new(tr: &'a GCtrace, link: Option<*const u8>) -> Result<Asm<'a>, TraceError> {
+    fn new(
+        tr: &'a GCtrace,
+        link: Option<*const u8>,
+        stack_end_addr: u64,
+        exit_base_addr: u64,
+    ) -> Result<Asm<'a>, TraceError> {
         let nins = Self::iidx(tr.ir.nins());
         let nk = (REF_BIAS - tr.ir.nk()) as usize;
         let mut a = Asm {
@@ -219,6 +230,8 @@ impl<'a> Asm<'a> {
             s0: [Owner::None; NREG],
             link,
             stub_tails: Vec::new(),
+            stack_end_addr,
+            exit_base_addr,
         };
         #[cfg(target_arch = "x86_64")]
         let sse41 = std::arch::is_x86_feature_detected!("sse4.1");
@@ -544,7 +557,7 @@ impl<'a> Asm<'a> {
             // rax = prospective frame top: max framesize (255) + margin.
             self.mov_rr64(RAX, RBASE);
             self.add_r64_imm32(RAX, delta + (255 + 8) * 8);
-            self.mov_r64_imm64(RCX, exec::stack_end_cell_addr());
+            self.mov_r64_imm64(RCX, self.stack_end_addr);
             self.cmp_r64_mem(RAX, RCX, 0);
             self.guard(CC_A);
             if delta != 0 {
@@ -567,7 +580,7 @@ impl<'a> Asm<'a> {
             if delta != 0 {
                 self.mov_rr64(RAX, RBASE);
                 self.add_r64_imm32(RAX, delta + (255 + 8) * 8);
-                self.mov_r64_imm64(RCX, exec::stack_end_cell_addr());
+                self.mov_r64_imm64(RCX, self.stack_end_addr);
                 self.cmp_r64_mem(RAX, RCX, 0);
                 self.guard(CC_A);
                 self.add_r64_imm32(RBASE, delta);
@@ -587,7 +600,7 @@ impl<'a> Asm<'a> {
         // back to the executor, restore the callee-saved xmm (Win64),
         // return eax.
         let epilogue = self.code.len();
-        self.mov_r64_imm64(RCX, exec::exit_base_cell_addr());
+        self.mov_r64_imm64(RCX, self.exit_base_addr);
         self.mov_mem_r64(RCX, 0, RBASE);
         #[cfg(windows)]
         {

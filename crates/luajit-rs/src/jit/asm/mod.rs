@@ -37,14 +37,20 @@ pub const HOST_ARCH: Arch = if cfg!(target_arch = "x86_64") {
 
 /// Assemble a completed trace for `arch`. On error the caller keeps
 /// `mcode = None` and the portable executor runs the trace.
+/// `stack_end_addr`/`exit_base_addr` are the addresses of the per-VM
+/// `JitState` cells the machine code embeds for the recursive-tail
+/// headroom check and the epilogue BASE report (stable because the
+/// `GlobalState` is heap-pinned).
 pub fn assemble(
     tr: &GCtrace,
     link: Option<*const u8>,
     arch: Arch,
+    stack_end_addr: u64,
+    exit_base_addr: u64,
 ) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
     match arch {
-        Arch::X64 => x64::assemble(tr, link),
-        Arch::Arm64 => arm64::assemble(tr, link),
+        Arch::X64 => x64::assemble(tr, link, stack_end_addr, exit_base_addr),
+        Arch::Arm64 => arm64::assemble(tr, link, stack_end_addr, exit_base_addr),
         _ => Err(TraceError::NYIBC),
     }
 }

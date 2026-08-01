@@ -85,8 +85,11 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
     let r = loop {
         // The recursive machine-code tails check their stack headroom
         // against this bound (re-bound each iteration: growth happens
-        // only here in Rust).
-        STACK_END.with(|c| c.set(unsafe { l.stack.as_ptr().add(l.stack.len()) } as u64));
+        // only here in Rust). Per-VM cell: the mcode embeds its address.
+        l.global()
+            .jit
+            .stack_end
+            .set(unsafe { l.stack.as_ptr().add(l.stack.len()) } as u64);
         // The traces are owned by the registry inside GlobalState; the
         // executor additionally mutates the Lua stack. Split the borrows
         // via raw pointers — the registry never drops traces while one
@@ -112,8 +115,8 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             let code = entry(unsafe { l.stack.as_mut_ptr().add(cbase) }, env.as_mut_ptr()) as usize;
             // Recursive/call-link tails shift the base register inside
             // the mcode chain: recover the actual exit base from the
-            // epilogue's report.
-            let exit_base = EXIT_BASE.with(|c| c.get());
+            // epilogue's report (per-VM cell).
+            let exit_base = l.global().jit.exit_base.get();
             cbase = (exit_base - l.stack.as_ptr() as u64) as usize / 8;
             let exit_trace = (code >> 16) as TraceNo;
             if exit_trace != current {
@@ -839,25 +842,6 @@ thread_local! {
     /// Heap of the VM currently executing a trace (set by `trace_exec`).
     static JIT_HEAP: std::cell::Cell<*mut GcHeap> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
-    /// One-past-the-end address of the current Lua stack buffer, for
-    /// the machine-code recursive tails' headroom check.
-    static STACK_END: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// BASE register value at the last machine-code exit: recursive and
-    /// call-link tails shift the base inside mcode chains, invisibly to
-    /// Rust — the epilogue reports it back through this cell.
-    static EXIT_BASE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Address of the stack-end cell (embedded in recursive mcode tails).
-#[allow(dead_code)]
-pub(super) fn stack_end_cell_addr() -> u64 {
-    STACK_END.with(|c| c.as_ptr() as u64)
-}
-
-/// Address of the exit-base cell (embedded in the mcode epilogue).
-#[allow(dead_code)]
-pub(super) fn exit_base_cell_addr() -> u64 {
-    EXIT_BASE.with(|c| c.as_ptr() as u64)
 }
 
 #[inline]
