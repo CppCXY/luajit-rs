@@ -46,6 +46,7 @@ impl Interp {
                             return Ok(Some(v));
                         }
                         GcFunc::Lua(_) => {
+                            self.l().mmname = Some(("__index", mo.to_bits()));
                             self.mmcall_cont(Cont::Ra, a, mo, &[cur, k]);
                             return Ok(None);
                         }
@@ -66,6 +67,7 @@ impl Interp {
                             return Ok(Some(v));
                         }
                         GcFunc::Lua(_) => {
+                            self.l().mmname = Some(("__index", mo.to_bits()));
                             self.mmcall_cont(Cont::Ra, a, mo, &[cur, k]);
                             return Ok(None);
                         }
@@ -350,11 +352,10 @@ impl Interp {
         let c = cd.as_ref();
         let raw = cts.raw(c.ctypeid);
         use crate::ffi::{ctype_cid, ctype_isarray, ctype_ispointer};
-        let elem_sz = if ctype_isarray(raw.info) || ctype_ispointer(raw.info) {
-            cts.raw(ctype_cid(raw.info)).size as i64
-        } else {
-            1
-        };
+        if !ctype_isarray(raw.info) && !ctype_ispointer(raw.info) {
+            return None; // Scalar/struct cdata: no pointer arithmetic.
+        }
+        let elem_sz = cts.raw(ctype_cid(raw.info)).size as i64;
         let mut delta = (n as i64) * elem_sz;
         if !add {
             delta = -delta;
@@ -615,6 +616,9 @@ fn foldarith(mm: MM, b: f64, c: f64) -> f64 {
 /// callee as the first argument and installs the metamethod as the callee.
 /// Returns the new argument count.
 pub(super) fn meta_call(l: &mut LuaState, func_slot: usize, nargs: usize) -> LuaResult<usize> {
+    // __call frames are reported by their call-site name ("local t"),
+    // not as a metamethod; clear any stale mmname first.
+    l.mmname = None;
     let f = l.stack[func_slot];
     // The __call metamethod may itself be a non-function (a table with
     // its own __call, a primitive with a call metatable, ...). Resolve

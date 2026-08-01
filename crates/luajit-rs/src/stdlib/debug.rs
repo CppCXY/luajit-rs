@@ -26,6 +26,9 @@ fn set_basemt_for(l: &mut LuaState, o: &LuaValue, mt: Option<GcPtr<LuaTable>>) {
 /// saved PC sits at `slot - 3` (in the caller's proto); the bytecode
 /// there is the triggering instruction.
 fn cont_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
+    if slot < 4 {
+        return None;
+    }
     use crate::bc::{bc_op, BCOp};
     let saved_pc = l.stack[slot - 3].to_bits() as usize;
     let link = l.stack[slot - 1].to_bits();
@@ -214,6 +217,34 @@ fn walk_frames(l: &LuaState, mut level: i32) -> Option<(usize, GcPtr<crate::func
         } else {
             break;
         }
+    }
+    None
+}
+
+/// The metamethod name of a frame, when it is one: mmcall frames carry
+/// the triggering instruction's saved PC (cont_mm_name); frames reached
+/// through the execute-recursion paths carry LuaState.mmname.
+fn self_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
+    if let Some((name, fbits)) = l.mmname {
+        if std::env::var("LUAJIT_RS_TRDBG").is_ok() {
+            eprintln!(
+                "self_mm_name: slot={} mm={} fbits={:#x} s0={:#x}",
+                slot,
+                name,
+                fbits,
+                l.stack.first().map(|v| v.to_bits()).unwrap_or(0),
+            );
+        }
+        for s in slot.saturating_sub(5)..slot {
+            if l.stack[s].to_bits() == fbits {
+                return Some(name);
+            }
+        }
+    }
+    let link = l.stack[slot - 1].to_bits();
+    let ft = link & FRAME_TYPE_MASK;
+    if ft == 2 /* FRAME_CONT */ || ft == 1 /* FRAME_C */ {
+        return cont_mm_name(l, slot);
     }
     None
 }
@@ -574,12 +605,16 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
                     } else {
                         pt.firstline as usize
                     };
-                    trace.push_str(&format!(
-                        "\t{}:{}: in {}\n",
-                        src,
-                        line,
-                        if first { "main chunk" } else { "function" }
-                    ));
+                    // LuaJIT prints the function name for metamethod
+                    // frames ("in function '__index'"); other Lua frames
+                    // stay anonymous here.
+                    let mut label = if first { "main chunk" } else { "function" }.to_string();
+                    if !first {
+                        if let Some(mm) = self_mm_name(l, slot) {
+                            label = format!("function '{}'", mm);
+                        }
+                    }
+                    trace.push_str(&format!("\t{}:{}: in {}\n", src, line, label));
                     first = false;
                 }
                 GcFunc::C(_) => {
