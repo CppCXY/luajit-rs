@@ -83,6 +83,15 @@ pub fn metatable_of(g: &GlobalState, o: LuaValue) -> Option<GcPtr<LuaTable>> {
     } else if let Some(ud) = o.as_userdata() {
         // Per-instance metatable takes precedence over base metatable.
         ud.as_ref().metatable.or_else(|| g.basemt_of(o.itype()))
+    } else if let Some(cd) = o.as_cdata() {
+        // A metatype registered via ffi.metatype takes precedence over
+        // the shared cdata metatable.
+        let id = cd.as_ref().ctypeid;
+        g.ctype_mts
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .or_else(|| g.basemt_of(crate::value::LJ_TCDATA))
     } else {
         g.basemt_of(if o.is_number() { crate::value::LJ_TNUMX } else { o.itype() })
     }

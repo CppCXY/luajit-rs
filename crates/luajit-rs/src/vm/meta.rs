@@ -158,9 +158,54 @@ impl Interp {
         rb: LuaValue,
         rc: LuaValue,
         a: u32,
-    ) -> LuaResult<Option<LuaValue>> {
-        if let (Some(b), Some(c)) = (str2num(self.l(), rb), str2num(self.l(), rc)) {
+    ) -> LuaResult<Option<LuaValue>> {        if let (Some(b), Some(c)) = (str2num(self.l(), rb), str2num(self.l(), rc)) {
             return Ok(Some(LuaValue::number_raw(foldarith(mm, b, c))));
+        }
+        // Pointer arithmetic: a cdata +/- a number steps by the element
+        // size (array/pointer cdata). The result is a cdata whose payload
+        // is offset from the original.
+        if let Some(cd) = rb.as_cdata()
+            && let Some(n) = rc.as_number()
+            && (mm == MM::Add || mm == MM::Sub)
+        {
+            if let Some(v) = self.pointer_arith(cd, n, mm == MM::Add) {
+                return Ok(Some(v));
+            }
+        }
+        if let Some(cd) = rc.as_cdata()
+            && let Some(n) = rb.as_number()
+            && mm == MM::Add
+        {
+            if let Some(v) = self.pointer_arith(cd, n, true) {
+                return Ok(Some(v));
+            }
+        }
+        // Pointer difference: `cdata - cdata` yields the element count.
+        if mm == MM::Sub
+            && let (Some(c1), Some(c2)) = (rb.as_cdata(), rc.as_cdata())
+        {
+            let g = self.l().global();
+            if let Some(cts) = &g.cts {
+                let a = c1.as_ref();
+                let b = c2.as_ref();
+                if a.ctypeid == b.ctypeid && a.data.len() <= 8 && b.data.len() <= 8 {
+                    let mut buf1 = [0u8; 8];
+                    buf1[..a.data.len()].copy_from_slice(&a.data);
+                    let mut buf2 = [0u8; 8];
+                    buf2[..b.data.len()].copy_from_slice(&b.data);
+                    let diff = i64::from_le_bytes(buf1).wrapping_sub(i64::from_le_bytes(buf2));
+                    let raw = cts.raw(a.ctypeid);
+                    use crate::ffi::{ctype_cid, ctype_isarray, ctype_ispointer};
+                    let elem_sz = if ctype_isarray(raw.info) || ctype_ispointer(raw.info) {
+                        cts.raw(ctype_cid(raw.info)).size as i64
+                    } else {
+                        1
+                    };
+                    if elem_sz != 0 {
+                        return Ok(Some(LuaValue::number((diff / elem_sz) as f64)));
+                    }
+                }
+            }
         }
         let g = self.l().global();
         let mut mo = meta_lookup(g, rb, mm);
@@ -291,6 +336,53 @@ impl Interp {
     /// `lj_meta_equal`: `__eq` for two tables/userdata that are not
     /// raw-equal. Returns `Some(is_equal)` or `None` for Lua continuation.
     /// `ne` is 0 for ISEQV, 1 for ISNEV (selects Condt/Condf).
+    /// `cdata +/- number`: step by the element size of an array/pointer
+    /// cdata; the result keeps the same payload type with the data
+    /// shifted, so subsequent indexing/pointer math stays consistent.
+    fn pointer_arith(
+        &self,
+        cd: crate::gc::GcPtr<crate::runtime::cdata::CData>,
+        n: f64,
+        add: bool,
+    ) -> Option<LuaValue> {
+        let g = self.l().global();
+        let cts = g.cts.as_ref()?;
+        let c = cd.as_ref();
+        let raw = cts.raw(c.ctypeid);
+        use crate::ffi::{ctype_cid, ctype_isarray, ctype_ispointer};
+        let elem_sz = if ctype_isarray(raw.info) || ctype_ispointer(raw.info) {
+            cts.raw(ctype_cid(raw.info)).size as i64
+        } else {
+            1
+        };
+        let mut delta = (n as i64) * elem_sz;
+        if !add {
+            delta = -delta;
+        }
+        // The payload is a byte buffer (arrays) or a pointer-sized value:
+        // shift an 8-byte window by the byte delta.
+        let sz = c.data.len();
+        let mut data = c.data.to_vec();
+        if sz <= 8 {
+            let mut buf = [0u8; 8];
+            buf[..sz].copy_from_slice(&data);
+            let v = i64::from_le_bytes(buf);
+            let nv = v.wrapping_add(delta);
+            buf.copy_from_slice(&nv.to_le_bytes());
+            data = buf[..sz].to_vec();
+        }
+        let p = self
+            .l()
+            .global()
+            .heap
+            .cdatas
+            .alloc(crate::runtime::cdata::CData {
+                ctypeid: c.ctypeid,
+                data: data.into_boxed_slice(),
+            });
+        Some(LuaValue::cdata(p))
+    }
+
     pub(super) fn meta_equal(
         &mut self,
         o1: LuaValue,

@@ -662,8 +662,56 @@ impl<'a> Parser<'a> {
         self.next(); // eat typedef
         let decl = self.parse_decl_spec()?;
         let name = self.ident()?;
-        let info = ct_info(CT::Typedef, 0) | decl.type_id;
-        let sz = self.cts.get(decl.type_id).size;
+        // Parse array declarator brackets (e.g. `typedef int arr_t[10]`).
+        let mut array_count: u32 = 1;
+        while self.tok == Token::LBracket {
+            self.next(); // eat [
+            if self.tok == Token::Question {
+                array_count = u32::MAX;
+                self.next();
+            } else if self.tok == Token::Integer {
+                if let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>() {
+                    array_count = n.max(1);
+                    self.next();
+                }
+            }
+            while self.tok != Token::RBracket && self.tok != Token::Eof {
+                self.next();
+            }
+            if self.tok == Token::RBracket {
+                self.next(); // eat ]
+            }
+        }
+        let base_id = decl.type_id;
+        let type_id = if array_count > 1 {
+            let elem = self.cts.get(base_id);
+            let total_sz = if array_count == u32::MAX {
+                u32::MAX
+            } else {
+                elem.size.saturating_mul(array_count)
+            };
+            let info = ct_info(CT::Array, 0) | base_id;
+            let existing = (0..self.cts.top as usize)
+                .find(|&i| self.cts.tab[i].info == info && self.cts.tab[i].size == total_sz);
+            if let Some(id) = existing {
+                id as u32
+            } else {
+                let id = self.cts.top;
+                self.cts.tab.push(CType {
+                    info,
+                    size: total_sz,
+                    sib: 0,
+                    next: 0,
+                    name: 0,
+                });
+                self.cts.top = self.cts.top.saturating_add(1);
+                id
+            }
+        } else {
+            base_id
+        };
+        let info = ct_info(CT::Typedef, 0) | type_id;
+        let sz = self.cts.get(type_id).size;
         let id = self.cts.top;
         self.cts.tab.push(CType {
             info,

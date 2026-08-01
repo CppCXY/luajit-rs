@@ -56,8 +56,13 @@ pub(crate) fn quick_type_id(name: &str) -> Option<u32> {
 
 /// On-demand pointer type creation: returns a new `CT::Ptr` → `pointee_id`.
 fn make_ptr_type(cts: &mut CTState, pointee_id: u32) -> u32 {
-    let ptr_id = cts.top;
     let info = ct_info(CT::Ptr, 3 << 16) | pointee_id; // 8-byte alignment
+    for i in 0..cts.top as usize {
+        if cts.tab[i].info == info {
+            return i as u32;
+        }
+    }
+    let ptr_id = cts.top;
     cts.tab.push(CType {
         info,
         size: 8,
@@ -115,6 +120,9 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
         (name.clone(), 1)
     };
 
+    // Strip cv-qualifiers for type lookup ("const int" == "int").
+    let base_name = strip_cv(&base_name);
+
     // First try the full base name including pointer suffixes.
     if let Some(id) = quick_type_id(&base_name) {
         return wrap_array(l, id, array_count);
@@ -167,6 +175,33 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
         return Err(err_bad_arg(l, 1, "ffi", "C type", ""));
     };
     wrap_array(l, id, array_count)
+}
+
+/// Strip leading/trailing `const`/`volatile` qualifiers for lookup.
+fn strip_cv(name: &str) -> String {
+    let mut s = name.trim().to_string();
+    loop {
+        let t = s.trim();
+        let changed = if let Some(rest) = t
+            .strip_prefix("const ")
+            .or_else(|| t.strip_prefix("volatile "))
+        {
+            s = rest.trim().to_string();
+            true
+        } else if let Some(rest) = t
+            .strip_suffix(" const")
+            .or_else(|| t.strip_suffix(" volatile"))
+        {
+            s = rest.trim().to_string();
+            true
+        } else {
+            false
+        };
+        if !changed {
+            break;
+        }
+    }
+    s
 }
 
 /// If `count > 1`, create or reuse an array `CType` wrapping the base type.
@@ -318,23 +353,27 @@ fn write_scalar_value(data: &mut [u8], ctypeid: u32, n: f64) {
         if off + bytes.len() <= data.len() {
             data[off..off + bytes.len()].copy_from_slice(bytes);
         }
-    };    match ctypeid {
-        id if id == CTypeID::Int8 as u32 => write(0, &(n as i8).to_le_bytes()),
-        id if id == CTypeID::UInt8 as u32 => write(0, &(n as u8).to_le_bytes()),
-        id if id == CTypeID::CChar as u32 => write(0, &(n as i8).to_le_bytes()),
-        id if id == CTypeID::Bool as u32 => write(0, &(n as u8).to_le_bytes()),
-        id if id == CTypeID::Int16 as u32 => write(0, &(n as i16).to_le_bytes()),
-        id if id == CTypeID::UInt16 as u32 => write(0, &(n as u16).to_le_bytes()),
-        id if id == CTypeID::Int32 as u32 => write(0, &(n as i32).to_le_bytes()),
-        id if id == CTypeID::UInt32 as u32 => write(0, &(n as u32).to_le_bytes()),
-        id if id == CTypeID::Int64 as u32 => write(0, &(n as i64).to_le_bytes()),
-        id if id == CTypeID::UInt64 as u32 => write(0, &(n as u64).to_le_bytes()),
+    };
+    // Go through i64/u64 so the narrow casts wrap instead of saturating
+    // (Rust's float->int `as` saturates).
+    let i = n as i64;
+    let u = n as u64;
+    match ctypeid {
+        id if id == CTypeID::Int8 as u32 => write(0, &(i as i8).to_le_bytes()),
+        id if id == CTypeID::UInt8 as u32 => write(0, &(u as u8).to_le_bytes()),
+        id if id == CTypeID::CChar as u32 => write(0, &(i as i8).to_le_bytes()),
+        id if id == CTypeID::Bool as u32 => write(0, &(u as u8).to_le_bytes()),
+        id if id == CTypeID::Int16 as u32 => write(0, &(i as i16).to_le_bytes()),
+        id if id == CTypeID::UInt16 as u32 => write(0, &(u as u16).to_le_bytes()),
+        id if id == CTypeID::Int32 as u32 => write(0, &(i as i32).to_le_bytes()),
+        id if id == CTypeID::UInt32 as u32 => write(0, &(u as u32).to_le_bytes()),
+        id if id == CTypeID::Int64 as u32 => write(0, &(i as i64).to_le_bytes()),
+        id if id == CTypeID::UInt64 as u32 => write(0, &(u as u64).to_le_bytes()),
         id if id == CTypeID::Float as u32 => write(0, &(n as f32).to_le_bytes()),
         id if id == CTypeID::Double as u32 => write(0, &n.to_le_bytes()),
-        _ => write(0, &(n as i32).to_le_bytes()),
+        _ => write(0, &(i as i32).to_le_bytes()),
     }
 }
-
 pub fn ffi_sizeof(l: &mut LuaState) -> LuaResult<i32> {
     let nargs = nargs(l);
     if let Some(cd) = arg(l, 0).as_cdata() {
@@ -390,10 +429,63 @@ pub fn ffi_typeof(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn ffi_istype(l: &mut LuaState) -> LuaResult<i32> {
-    let id = check_ctype(l)?;
-    let ok = arg(l, 1)
-        .as_cdata()
-        .is_some_and(|cd| cd.as_ref().ctypeid == id);
+    let id1 = check_ctype(l)?;
+    let ok = match arg(l, 1).as_cdata() {
+        Some(cd) => {
+            let c = cd.as_ref();
+            let id2 = if c.ctypeid == crate::ffi::CTypeID::CTypeIDType as u32
+                && c.data.len() >= 4
+            {
+                u32::from_le_bytes(c.data[..4].try_into().unwrap_or([0; 4]))
+            } else {
+                c.ctypeid
+            };
+            let cts = cts_of(l);
+            let ct1 = cts.raw(id1);
+            let ct2 = cts.raw(id2);
+            if std::env::var("LUAJIT_RS_FFIDBG").is_ok() {
+                eprintln!(
+                    "istype: id1={} id2={} info1={:#x} info2={:#x} sz1={} sz2={}",
+                    id1, id2, ct1.info, ct2.info, ct1.size, ct2.size
+                );
+            }
+            // LuaJIT's ffi_istype: identical types match; otherwise the
+            // kind and size must agree (pointers check pointee
+            // compatibility, numbers/voids compare modulo qualifiers).
+            let same_kind_size = crate::ffi::ctype_type(ct1.info)
+                == crate::ffi::ctype_type(ct2.info)
+                && ct1.size == ct2.size;
+            if ct1.info == ct2.info && ct1.size == ct2.size {
+                true
+            } else if crate::ffi::ctype_isstruct(ct1.info)
+                && crate::ffi::ctype_isptr(ct2.info)
+            {
+                // A struct type matches a pointer-to-struct value.
+                let p2 = crate::ffi::ctype_cid(ct2.info);
+                crate::ffi::ctype_isstruct(cts.raw(p2).info)
+            } else if same_kind_size {
+                if crate::ffi::ctype_ispointer(ct1.info) {
+                    let p1 = crate::ffi::ctype_cid(ct1.info);
+                    let p2 = crate::ffi::ctype_cid(ct2.info);
+                    let c1 = cts.raw(p1);
+                    let c2 = cts.raw(p2);
+                    crate::ffi::ctype_type(c1.info) == crate::ffi::ctype_type(c2.info)
+                        && c1.size == c2.size
+                } else if crate::ffi::ctype_isnum(ct1.info)
+                    || crate::ffi::ctype_isvoid(ct1.info)
+                {
+                    // Ignore qualifiers (const/volatile) and the long flag.
+                    const QUAL_LONG: u32 = 0x0340_0000;
+                    (ct1.info ^ ct2.info) & !QUAL_LONG == 0
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        None => false,
+    };
     push(l, if ok { LuaValue::TRUE } else { LuaValue::FALSE });
     Ok(1)
 }
@@ -918,9 +1010,23 @@ pub fn ffi_load(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn ffi_metatype(l: &mut LuaState) -> LuaResult<i32> {
-    let _ct = arg(l, 0);
-    let _mt = arg(l, 1);
-    push(l, LuaValue::NIL);
+    let id = check_ctype(l)?;
+    let mt = arg(l, 1);
+    if !mt.is_table() {
+        return Err(err_bad_arg(l, 2, "ffi.metatype", "table", ""));
+    }
+    let mt = mt.as_table().unwrap();
+    let g = l.global();
+    if g.ctype_mts.len() <= id as usize {
+        g.ctype_mts.resize(id as usize + 1, None);
+    }
+    g.ctype_mts[id as usize] = Some(mt);
+    // The type value itself gets the ctype metatable (so it stays
+    // callable); its payload holds the registered type id.
+    let mut cd = CData::new(CTypeID::CTypeIDType as u32, 4);
+    cd.data[..4].copy_from_slice(&id.to_le_bytes());
+    let p = l.global().heap.cdatas.alloc(cd);
+    push(l, LuaValue::cdata(p));
     Ok(1)
 }
 

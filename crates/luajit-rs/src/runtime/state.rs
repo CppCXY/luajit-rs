@@ -229,6 +229,9 @@ pub struct GlobalState {
     pub jit: JitState,
     /// FFI C type system (lazy-initialised by `ffi.load` / first FFI call).
     pub cts: Option<CTState>,
+    /// Per-ctype metatables registered by `ffi.metatype`, indexed by
+    /// ctype id (each cdata's metatable lookup consults this first).
+    pub ctype_mts: Vec<Option<GcPtr<LuaTable>>>,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
@@ -709,6 +712,7 @@ impl Lua {
             rng: crate::stdlib::math::RngState::fixed(),
             jit: JitState::new(),
             cts: None,
+            ctype_mts: Vec::new(),
             boot_time: boot,
             main: None,
         }));
