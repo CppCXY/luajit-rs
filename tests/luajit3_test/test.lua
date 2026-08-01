@@ -9,7 +9,7 @@ local tests = {
   "expr_coal",
   "expr_cond",
   "expr_customary",
-  -- "expr_nav",       -- NYI: navigation operator
+  "expr_nav",
   "expr_shortfunc",
 }
 

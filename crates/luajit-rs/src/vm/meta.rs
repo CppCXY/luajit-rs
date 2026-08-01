@@ -9,7 +9,7 @@
 //! metamethods need continuation frames.
 
 use super::*;
-use crate::meta::{MM, meta_fast, meta_lookup};
+use crate::meta::{MM, meta_fast, meta_lookup, metatable_of};
 
 const LJ_MAX_IDXCHAIN: usize = 100;
 
@@ -46,6 +46,7 @@ impl Interp {
                             return Ok(Some(v));
                         }
                         GcFunc::Lua(_) => {
+                            self.l().mmname = Some(("__index", mo.to_bits()));
                             self.mmcall_cont(Cont::Ra, a, mo, &[cur, k]);
                             return Ok(None);
                         }
@@ -66,6 +67,7 @@ impl Interp {
                             return Ok(Some(v));
                         }
                         GcFunc::Lua(_) => {
+                            self.l().mmname = Some(("__index", mo.to_bits()));
                             self.mmcall_cont(Cont::Ra, a, mo, &[cur, k]);
                             return Ok(None);
                         }
@@ -162,6 +164,47 @@ impl Interp {
         if let (Some(b), Some(c)) = (str2num(self.l(), rb), str2num(self.l(), rc)) {
             return Ok(Some(LuaValue::number_raw(foldarith(mm, b, c))));
         }
+        // Pointer arithmetic: a cdata +/- a number steps by the element
+        // size (array/pointer cdata). The result is a cdata whose payload
+        // is offset from the original.
+        if let Some(cd) = rb.as_cdata()
+            && let Some(n) = rc.as_number()
+            && (mm == MM::Add || mm == MM::Sub)
+            && let Some(v) = self.pointer_arith(cd, n, mm == MM::Add)
+        {
+            return Ok(Some(v));
+        }
+        if let Some(cd) = rc.as_cdata()
+            && let Some(n) = rb.as_number()
+            && mm == MM::Add
+            && let Some(v) = self.pointer_arith(cd, n, true)
+        {
+            return Ok(Some(v));
+        }
+        // Pointer difference: `cdata - cdata` yields the element count.
+        if mm == MM::Sub
+            && let (Some(c1), Some(c2)) = (rb.as_cdata(), rc.as_cdata())
+        {
+            let g = self.l().global();
+            if let Some(cts) = &g.cts
+                && c1.as_ref().ctypeid == c2.as_ref().ctypeid
+            {
+                let raw = cts.raw(c1.as_ref().ctypeid);
+                use crate::ffi::{ctype_cid, ctype_isarray, ctype_ispointer};
+                if ctype_isarray(raw.info) || ctype_ispointer(raw.info) {
+                    // Same storage → plain element difference of the
+                    // alias offsets.
+                    let (o1, s1) = crate::runtime::cdata::resolve_ptr(c1);
+                    let (o2, s2) = crate::runtime::cdata::resolve_ptr(c2);
+                    if s1 == s2 {
+                        let elem_sz = cts.raw(ctype_cid(raw.info)).size as i64;
+                        if elem_sz != 0 {
+                            return Ok(Some(LuaValue::number(((o1 - o2) / elem_sz) as f64)));
+                        }
+                    }
+                }
+            }
+        }
         let g = self.l().global();
         let mut mo = meta_lookup(g, rb, mm);
         if mo.is_nil() {
@@ -184,16 +227,34 @@ impl Interp {
                 }
             }
         }
-        // Non-function metamethod: chain is unusual but valid.
-        // Retry by indexing the metamethod.
-        Err(self
-            .l()
-            .runtime_error(b"attempt to perform arithmetic on a non-number value"))
+        // Non-function metamethod: chain is unusual but valid — the
+        // metamethod is itself called through its __call (the original
+        // metamethod becomes the first argument).
+        let Some(mo2) = resolve_callable(self.l(), mo) else {
+            return Err(self
+                .l()
+                .runtime_error(b"attempt to perform arithmetic on a non-number value"));
+        };
+        let args = [mo, rb, rc];
+        match mo2.as_func().unwrap().as_ref() {
+            GcFunc::C(cc) => {
+                let v = self.call_c_fn(cc.f, mo2, &args)?;
+                Ok(Some(v))
+            }
+            GcFunc::Lua(_) => {
+                self.mmcall_cont(Cont::Ra, a, mo2, &args);
+                Ok(None)
+            }
+        }
     }
 
     /// `lj_meta_comp`: ordered comparison slow path.  `op` follows the
     /// bytecode encoding: ISLT=0, ISGE=1, ISLE=2, ISGT=3.
     /// Returns `Some(cond)` when resolved inline, `None` for continuation.
+    ///
+    /// Only the first operand's metamethod is consulted (LuaJIT semantics;
+    /// the second operand's metatable may differ). LE without `__le` falls
+    /// back to `not (o2 < o1)` through the second operand's `__lt`.
     pub(super) fn meta_comp(
         &mut self,
         mut o1: LuaValue,
@@ -215,10 +276,10 @@ impl Interp {
                 let mm = if (op & 2) != 0 { MM::Le } else { MM::Lt };
                 let g = self.l().global();
                 let mo = meta_lookup(g, o1, mm);
-                let mo2 = meta_lookup(g, o2, mm);
-                if mo.is_nil() || !obj_equal(mo, mo2) {
+                if mo.is_nil() {
                     if (op & 2) != 0 {
-                        // MM_le not found: retry with MM_lt, swapped.
+                        // MM_le not found: retry with MM_lt, swapped
+                        // (i.e. `not (o2 < o1)`).
                         std::mem::swap(&mut o1, &mut o2);
                         op ^= 3;
                         continue;
@@ -227,28 +288,42 @@ impl Interp {
                         .l()
                         .runtime_error(b"attempt to compare incompatible values"));
                 }
+                let cont = if (op & 1) != 0 {
+                    Cont::Condf
+                } else {
+                    Cont::Condt
+                };
                 if mo.is_func() {
-                    let cont = if (op & 1) != 0 {
-                        Cont::Condf
-                    } else {
-                        Cont::Condt
-                    };
+                    let args = [o1, o2];
                     match mo.as_func().unwrap().as_ref() {
                         GcFunc::C(cc) => {
-                            let v = self.call_c_fn(cc.f, mo, &[o1, o2])?;
-                            let cond = v.is_truthy();
-                            return Ok(Some(cond ^ ((op & 1) != 0)));
+                            let v = self.call_c_fn(cc.f, mo, &args)?;
+                            return Ok(Some(v.is_truthy() ^ ((op & 1) != 0)));
                         }
                         GcFunc::Lua(_) => {
-                            self.mmcall_cont(cont, 0, mo, &[o1, o2]);
+                            self.mmcall_cont(cont, 0, mo, &args);
                             return Ok(None);
                         }
                     }
                 }
-                // Non-function metamethod: shouldn't happen, error.
-                return Err(self
-                    .l()
-                    .runtime_error(b"attempt to compare incompatible values"));
+                // Non-function metamethod: call it through its __call
+                // (the metamethod value becomes the first argument).
+                let Some(mo2) = resolve_callable(self.l(), mo) else {
+                    return Err(self
+                        .l()
+                        .runtime_error(b"attempt to compare incompatible values"));
+                };
+                let args = [mo, o1, o2];
+                match mo2.as_func().unwrap().as_ref() {
+                    GcFunc::C(cc) => {
+                        let v = self.call_c_fn(cc.f, mo2, &args)?;
+                        return Ok(Some(v.is_truthy() ^ ((op & 1) != 0)));
+                    }
+                    GcFunc::Lua(_) => {
+                        self.mmcall_cont(cont, 0, mo2, &args);
+                        return Ok(None);
+                    }
+                }
             }
         }
         Err(self
@@ -256,23 +331,75 @@ impl Interp {
             .runtime_error(b"attempt to compare incompatible values"))
     }
 
-    /// `lj_meta_equal`: `__eq` for two tables that are not raw-equal.
-    /// Returns `Some(is_equal)` or `None` for Lua continuation.  `ne` is
-    /// 0 for ISEQV, 1 for ISNEV (selects Condt/Condf).
+    /// `lj_meta_equal`: `__eq` for two tables/userdata that are not
+    /// raw-equal. Returns `Some(is_equal)` or `None` for Lua continuation.
+    /// `ne` is 0 for ISEQV, 1 for ISNEV (selects Condt/Condf).
+    /// `cdata +/- number`: step by the element size of an array/pointer
+    /// cdata. The result *aliases* the original storage (base + byte
+    /// offset), so writes through the pointer land in the original object
+    /// and pointer difference / comparisons resolve consistently.
+    fn pointer_arith(
+        &self,
+        cd: crate::gc::GcPtr<crate::runtime::cdata::CData>,
+        n: f64,
+        add: bool,
+    ) -> Option<LuaValue> {
+        let g = self.l().global();
+        let cts = g.cts.as_ref()?;
+        let c = cd.as_ref();
+        let raw = cts.raw(c.ctypeid);
+        use crate::ffi::{ctype_cid, ctype_isarray, ctype_ispointer};
+        if !ctype_isarray(raw.info) && !ctype_ispointer(raw.info) {
+            return None; // Scalar/struct cdata: no pointer arithmetic.
+        }
+        let elem_sz = cts.raw(ctype_cid(raw.info)).size as i64;
+        let mut delta = (n as i64) * elem_sz;
+        if !add {
+            delta = -delta;
+        }
+        // The alias chain: this cdata's own base/offset, else itself.
+        let (base_off, root) = {
+            let mut cur = cd;
+            let mut off = 0i64;
+            loop {
+                let c = cur.as_ref();
+                if let Some(b) = c.base {
+                    off += c.offset;
+                    cur = b;
+                } else {
+                    break;
+                }
+            }
+            (off, cur)
+        };
+        let p = self
+            .l()
+            .global()
+            .heap
+            .cdatas
+            .alloc(crate::runtime::cdata::CData {
+                ctypeid: c.ctypeid,
+                data: Box::new([]),
+                base: Some(root),
+                offset: base_off + delta,
+            });
+        Some(LuaValue::cdata(p))
+    }
+
     pub(super) fn meta_equal(
         &mut self,
         o1: LuaValue,
         o2: LuaValue,
         ne: u32,
     ) -> LuaResult<Option<bool>> {
-        let t1 = o1.as_table().unwrap();
         let g = self.l().global();
-        let mo = match meta_fast(g, t1.as_ref().metatable, MM::Eq) {
+        let mt1 = metatable_of(g, o1);
+        let mo = match mt1.and_then(|mt| meta_fast(g, Some(mt), MM::Eq)) {
             Some(mo) => mo,
             None => return Ok(Some(false)),
         };
-        if t1.as_ref().metatable != o2.as_table().unwrap().as_ref().metatable {
-            match meta_fast(g, o2.as_table().unwrap().as_ref().metatable, MM::Eq) {
+        if mt1 != metatable_of(g, o2) {
+            match metatable_of(g, o2).and_then(|mt| meta_fast(g, Some(mt), MM::Eq)) {
                 Some(mo2) if obj_equal(mo, mo2) => {}
                 _ => return Ok(Some(false)),
             }
@@ -291,25 +418,67 @@ impl Interp {
                 }
             }
         }
-        Ok(Some(false))
+        // Non-function metamethod: call it through its __call (the
+        // metamethod value becomes the first argument).
+        let Some(mo2) = resolve_callable(self.l(), mo) else {
+            return Ok(Some(false));
+        };
+        let cont = if ne != 0 { Cont::Condf } else { Cont::Condt };
+        let args = [mo, o1, o2];
+        match mo2.as_func().unwrap().as_ref() {
+            GcFunc::C(cc) => {
+                let v = self.call_c_fn(cc.f, mo2, &args)?;
+                let is_eq = v.is_truthy();
+                Ok(Some(is_eq))
+            }
+            GcFunc::Lua(_) => {
+                self.mmcall_cont(cont, 0, mo2, &args);
+                Ok(None)
+            }
+        }
     }
 
-    /// `lj_meta_len`: `__len` metamethod (via execute recursion).
-    pub(super) fn meta_len(&mut self, o: LuaValue) -> LuaResult<LuaValue> {
+    /// `lj_meta_len`: `__len` metamethod. Passes the object twice
+    /// (LuaJIT 2.1 5.2-compat semantics). Returns `Some(len)` when
+    /// resolved inline or `None` for a Lua continuation frame.
+    pub(super) fn meta_len(&mut self, o: LuaValue, a: u32) -> LuaResult<Option<LuaValue>> {
         let mo = meta_lookup(self.l().global(), o, MM::Len);
         if mo.is_nil() {
             return Err(self
                 .l()
                 .runtime_error(b"attempt to get length of a non-table value"));
         }
-        let fs = self.mm_frame();
-        let st = self.l().top;
-        self.set_at(fs, mo);
-        self.set_at(fs + 2, o);
-        execute(self.l(), fs, 1, 1)?;
-        let r = self.at(fs);
-        self.l().top = st;
-        Ok(r)
+        if mo.is_func() {
+            let args = [o, o];
+            match mo.as_func().unwrap().as_ref() {
+                GcFunc::C(cc) => {
+                    let v = self.call_c_fn(cc.f, mo, &args)?;
+                    return Ok(Some(v));
+                }
+                GcFunc::Lua(_) => {
+                    self.mmcall_cont(Cont::Ra, a, mo, &args);
+                    return Ok(None);
+                }
+            }
+        }
+        // Non-function metamethod: call it through its __call (the
+        // metamethod value becomes the first argument).
+        let Some(mo2) = resolve_callable(self.l(), mo) else {
+            return Err(self
+                .l()
+                .runtime_error(b"attempt to get length of a non-table value"));
+        };
+        let args = [mo, o, o];
+        match mo2.as_func().unwrap().as_ref() {
+            GcFunc::C(cc) => {
+                let v = self.call_c_fn(cc.f, mo2, &args)?;
+                Ok(Some(v))
+            }
+            GcFunc::Lua(_) => {
+                self.mmcall_cont(Cont::Ra, a, mo2, &args);
+                Ok(None)
+            }
+        }
     }
 
     /// `lj_meta_cat`: iterative concat over `b..=c` (absolute slots),
@@ -346,12 +515,35 @@ impl Interp {
                     mo = meta_lookup(g, o2, MM::Concat);
                 }
                 if !mo.is_nil() {
+                    // Non-function metamethods are called through their
+                    // __call chain (the metamethod value becomes the
+                    // first argument).
+                    let (mo2, args, n) = if mo.is_func() {
+                        (mo, [o1, o2, LuaValue::NIL], 2)
+                    } else {
+                        let Some(mo2) = resolve_callable(self.l(), mo) else {
+                            return Err(self
+                                .l()
+                                .runtime_error(b"attempt to concatenate a non-string value"));
+                        };
+                        (mo2, [mo, o1, o2], 3)
+                    };
                     let fs = self.mm_frame();
                     let st = self.l().top;
-                    self.set_at(fs, mo);
-                    self.set_at(fs + 2, o1);
-                    self.set_at(fs + 3, o2);
-                    execute(self.l(), fs, 2, 1)?;
+                    self.set_at(fs, mo2);
+                    self.set_at(fs + 2, args[0]);
+                    self.set_at(fs + 3, args[1]);
+                    if n == 3 {
+                        self.set_at(fs + 4, args[2]);
+                    }
+                    // Expose the metamethod name for debug.getinfo
+                    // (the frame is a plain C-call frame).
+                    let saved = self.l().mmname;
+                    self.l().mmname = Some(("__concat", mo2.to_bits()));
+                    let r = execute(self.l(), fs, n, 1);
+                    self.l().mmname = saved;
+                    let _r = r?;
+                    self.sp = self.l().stack.as_mut_ptr();
                     let r = self.at(fs);
                     self.l().top = st;
                     top -= 1;
@@ -426,15 +618,39 @@ fn foldarith(mm: MM, b: f64, c: f64) -> f64 {
 /// callee as the first argument and installs the metamethod as the callee.
 /// Returns the new argument count.
 pub(super) fn meta_call(l: &mut LuaState, func_slot: usize, nargs: usize) -> LuaResult<usize> {
+    // __call frames are reported by their call-site name ("local t"),
+    // not as a metamethod; clear any stale mmname first.
+    l.mmname = None;
     let f = l.stack[func_slot];
-    let mo = meta_lookup(l.global(), f, MM::Call);
-    if !mo.is_func() {
+    // The __call metamethod may itself be a non-function (a table with
+    // its own __call, a primitive with a call metatable, ...). Resolve
+    // the chain to the first function, like LuaJIT's repeated dispatch.
+    let Some(mo) = resolve_callable(l, f) else {
         return Err(l.runtime_error(b"attempt to call a non-function value"));
-    }
+    };
     for i in (0..nargs).rev() {
         l.stack[func_slot + 3 + i] = l.stack[func_slot + 2 + i];
     }
     l.stack[func_slot + 2] = f;
     l.stack[func_slot] = mo;
     Ok(nargs + 1)
+}
+
+/// Follow the `__call` chain of `v` (which must not be a function) to
+/// the first function, e.g. a table whose `__call` is a table with a
+/// `__call`, or a number whose `__call` comes from a debug-set metatable
+/// that itself forwards. Returns None when the chain runs out (or
+/// circles for more than a few levels).
+fn resolve_callable(l: &LuaState, v: LuaValue) -> Option<LuaValue> {
+    let mut mo = meta_lookup(l.global(), v, MM::Call);
+    for _ in 0..4 {
+        if mo.is_func() {
+            return Some(mo);
+        }
+        if mo.is_nil() {
+            return None;
+        }
+        mo = meta_lookup(l.global(), mo, MM::Call);
+    }
+    None
 }

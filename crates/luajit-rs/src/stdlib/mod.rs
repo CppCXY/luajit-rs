@@ -191,6 +191,7 @@ pub fn tostring_meta(l: &mut LuaState, v: LuaValue) -> LuaResult<Vec<u8>> {
     }
     // mmcall: place the metamethod and arg above the current frame.
     let saved_top = l.top;
+    let saved_base = l.base;
     let fs = l.top + 16;
     assert!(
         fs + 16 < crate::state::STACK_MAX,
@@ -202,6 +203,7 @@ pub fn tostring_meta(l: &mut LuaState, v: LuaValue) -> LuaResult<Vec<u8>> {
     crate::vm::execute(l, fs, 1, 1)?;
     let r = l.stack[fs];
     l.top = saved_top;
+    l.base = saved_base;
     if let Some(sid) = r.as_string_id() {
         Ok(l.str_static(sid).to_vec())
     } else {
@@ -218,6 +220,115 @@ pub fn err_bad_arg(l: &mut LuaState, n: u32, func: &str, expected: &str, got: &s
     l.runtime_error(msg.as_bytes())
 }
 
+/// Type name for `luaL_typename`-style messages; a nil argument is
+/// spelled "no value" (LuaJIT's fast-function convention).
+pub fn type_name(v: LuaValue) -> &'static str {
+    if v.is_nil() {
+        "no value"
+    } else if v.is_number() {
+        "number"
+    } else if v.is_string() {
+        "string"
+    } else if v == LuaValue::FALSE || v == LuaValue::TRUE {
+        "boolean"
+    } else if v.is_table() {
+        "table"
+    } else if v.is_func() {
+        "function"
+    } else if v.is_thread() {
+        "thread"
+    } else if v.is_userdata() {
+        "userdata"
+    } else if v.is_cdata() {
+        "cdata"
+    } else {
+        "userdata"
+    }
+}
+
+/// `err_bad_arg` with the offending value's type filled in.
+pub fn err_bad_arg_type(
+    l: &mut LuaState,
+    n: u32,
+    func: &str,
+    expected: &str,
+    got: LuaValue,
+) -> LuaError {
+    err_bad_arg(l, n, func, expected, type_name(got))
+}
+
+/// Numeric cdata -> f64 (LuaJIT's `cdata_to_number` for bit ops and
+/// arithmetic fallbacks). Pointers/voids are not convertible.
+pub fn cdata_to_number(cd: &crate::runtime::cdata::CData) -> Option<f64> {
+    use crate::ffi::CTypeID;
+    let id = cd.ctypeid;
+    let d = &cd.data;
+    let v = match id {
+        id if id == CTypeID::Int8 as u32 => d.first().copied().unwrap_or(0) as i8 as f64,
+        id if id == CTypeID::UInt8 as u32 => d.first().copied().unwrap_or(0) as f64,
+        id if id == CTypeID::CChar as u32 => d.first().copied().unwrap_or(0) as i8 as f64,
+        id if id == CTypeID::Bool as u32 => {
+            if d.first().copied().unwrap_or(0) != 0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        id if id == CTypeID::Int16 as u32 => {
+            i16::from_le_bytes(d[..2].try_into().unwrap_or([0; 2])) as f64
+        }
+        id if id == CTypeID::UInt16 as u32 => {
+            u16::from_le_bytes(d[..2].try_into().unwrap_or([0; 2])) as f64
+        }
+        id if id == CTypeID::Int32 as u32 => {
+            i32::from_le_bytes(d[..4].try_into().unwrap_or([0; 4])) as f64
+        }
+        id if id == CTypeID::UInt32 as u32 => {
+            u32::from_le_bytes(d[..4].try_into().unwrap_or([0; 4])) as f64
+        }
+        id if id == CTypeID::Int64 as u32 => {
+            if d.len() >= 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&d[..8]);
+                i64::from_le_bytes(b) as f64
+            } else {
+                return None;
+            }
+        }
+        id if id == CTypeID::UInt64 as u32 => {
+            if d.len() >= 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&d[..8]);
+                u64::from_le_bytes(b) as f64
+            } else {
+                return None;
+            }
+        }
+        id if id == CTypeID::Float as u32 => {
+            f32::from_le_bytes(d[..4].try_into().unwrap_or([0; 4])) as f64
+        }
+        id if id == CTypeID::Double as u32 => {
+            f64::from_le_bytes(d[..8].try_into().unwrap_or([0; 8]))
+        }
+        _ => {
+            // Enum types and other table-defined numerics: interpret by
+            // payload size (enums are int-sized).
+            match d.len() {
+                1 => d.first().copied().unwrap_or(0) as i8 as f64,
+                2 => i16::from_le_bytes(d[..2].try_into().unwrap_or([0; 2])) as f64,
+                4 => i32::from_le_bytes(d[..4].try_into().unwrap_or([0; 4])) as f64,
+                8 => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&d[..8]);
+                    i64::from_le_bytes(b) as f64
+                }
+                _ => return None,
+            }
+        }
+    };
+    Some(v)
+}
+
 /// Install every standard library.
 pub fn open_libs(l: &mut LuaState) {
     base::open(l);
@@ -229,7 +340,7 @@ pub fn open_libs(l: &mut LuaState) {
     jit::open(l);
     os::open(l);
     io::open(l);
-    package::open(l);
     debug::open(l);
+    package::open(l);
     ffi::open(l);
 }

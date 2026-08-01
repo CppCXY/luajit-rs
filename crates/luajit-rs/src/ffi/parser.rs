@@ -17,6 +17,7 @@ enum Token {
     Eof,
     Ident,
     Integer,
+    String,
     // Operators & punctuation
     Star,
     Amp,
@@ -224,6 +225,18 @@ impl<'a> Lexer<'a> {
                 self.buf.push(c);
                 self.number_tail()
             }
+            b'"' | b'\'' => {
+                self.buf.clear();
+                let quote = c;
+                loop {
+                    let c2 = self.advance();
+                    if c2 == 0 || c2 == quote {
+                        break;
+                    }
+                    self.buf.push(c2);
+                }
+                Token::String
+            }
             b'-' => Token::Minus,
             b'+' => Token::Plus,
             b'<' => Token::LAngle,
@@ -422,12 +435,21 @@ impl<'a> Parser<'a> {
     fn parse_struct_or_union(&mut self) -> Result<u32, String> {
         let is_union = self.tok == Token::KwUnion;
         self.next(); // eat struct/union
-        if self.tok == Token::Ident {
+        let tag: Option<String> = if self.tok == Token::Ident {
+            let t = String::from_utf8_lossy(&self.lex.buf).to_string();
             self.next();
-        } // optional tag
+            Some(t)
+        } else {
+            None
+        };
 
         if self.tok != Token::LBrace {
-            // Forward declaration
+            // Forward declaration: reuse an existing tag, else create.
+            if let Some(tag) = &tag
+                && let Some(&id) = self.cts.tags.get(tag)
+            {
+                return Ok(id);
+            }
             let id = self.cts.top;
             let sinfo = ct_info(CT::Struct, if is_union { ctinfo::UNION } else { 0 });
             self.cts.tab.push(CType {
@@ -442,14 +464,19 @@ impl<'a> Parser<'a> {
                 .top
                 .checked_add(1)
                 .ok_or_else(|| "too many C types (overflow)".to_string())?;
+            if let Some(tag) = &tag {
+                self.cts.tags.insert(tag.clone(), id);
+            }
             return Ok(id);
         }
         self.next(); // {
 
-        let first_field_id = self.cts.top;
+        let _first_field_id = self.cts.top;
         let mut total_size: u64 = 0;
         let mut max_align: u32 = 1;
         let mut field_infos: Vec<(String, u32, u32)> = Vec::new(); // (name, type_id, offset)
+        let mut field_ids: Vec<u32> = Vec::new();
+        let mut prev_fdecl_type: Option<u32> = None;
         let mut guard: usize = 0;
 
         while self.tok != Token::RBrace && self.tok != Token::Eof {
@@ -457,7 +484,26 @@ impl<'a> Parser<'a> {
             if guard > 10000 {
                 return Err(format!("infinite loop in struct body, tok={:?}", self.tok));
             }
-            let fdecl = self.parse_decl_spec()?;
+            // `type a, b, c;` — a comma-separated field name continues
+            // with the previous declaration specifier.
+            let mut fdecl = if self.tok == Token::Ident {
+                if let Some(prev_type) = prev_fdecl_type {
+                    DeclSpec {
+                        flags: 0,
+                        type_id: prev_type,
+                    }
+                } else {
+                    self.parse_decl_spec()?
+                }
+            } else {
+                self.parse_decl_spec()?
+            };
+
+            // Pointer declarators (`type *name`).
+            while self.tok == Token::Star {
+                fdecl.type_id = crate::ffi::lib::make_ptr_type(self.cts, fdecl.type_id);
+                self.next();
+            }
 
             // Skip pointer/declarator tokens (*, **, etc.) before the field name.
             while self.tok == Token::Star || self.tok == Token::Slash {
@@ -473,12 +519,20 @@ impl<'a> Parser<'a> {
                 String::new()
             };
 
-            // Parse array declarator brackets (e.g. f[2][3]).
+            // Parse array declarator brackets (e.g. f[2][3]). Even a
+            // one-element `t[1]` is an array type.
             let mut array_multiplier: u32 = 1;
+            let mut is_array = false;
             while self.tok == Token::LBracket {
+                is_array = true;
                 self.next(); // eat [
                 let mut array_num: u32 = 1;
-                if self.tok == Token::Integer {
+                if self.tok == Token::Question {
+                    // Variable-length array: size u32::MAX, resolved at
+                    // allocation time.
+                    array_num = u32::MAX;
+                    self.next();
+                } else if self.tok == Token::Integer {
                     if let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>() {
                         array_num = n.max(1);
                     }
@@ -493,7 +547,7 @@ impl<'a> Parser<'a> {
                 array_multiplier = array_multiplier.saturating_mul(array_num);
             }
 
-            let field_type_id = if array_multiplier > 1 {
+            let field_type_id = if array_multiplier > 1 || is_array {
                 let elem_ct = self.cts.get(fdecl.type_id);
                 let total_sz = elem_ct.size.saturating_mul(array_multiplier);
                 let info = ct_info(CT::Array, 0) | fdecl.type_id;
@@ -517,6 +571,9 @@ impl<'a> Parser<'a> {
             } else {
                 fdecl.type_id
             };
+            // Comma-separated fields (`type a, b;`) share the *computed*
+            // field type (an array declarator changes it).
+            prev_fdecl_type = Some(field_type_id);
 
             // Bitfield
             if self.tok == Token::Colon {
@@ -534,6 +591,7 @@ impl<'a> Parser<'a> {
             }
             if self.tok == Token::Semicolon {
                 self.next();
+                prev_fdecl_type = None; // New declaration specifier starts.
             }
 
             // Extract field info before any mutable ops on cts
@@ -555,6 +613,7 @@ impl<'a> Parser<'a> {
             };
 
             let finfo = ct_info(CT::Field, 0) | field_type_id;
+            let field_id = self.cts.top;
             self.cts.tab.push(CType {
                 info: finfo,
                 size: field_offset as u32,
@@ -562,6 +621,7 @@ impl<'a> Parser<'a> {
                 next: 0,
                 name: 0,
             });
+            field_ids.push(field_id);
             if !field_name.is_empty() {
                 field_infos.push((field_name, field_type_id, field_offset as u32));
             }
@@ -580,35 +640,48 @@ impl<'a> Parser<'a> {
 
         total_size = (total_size + max_align as u64 - 1) & !(max_align as u64 - 1);
 
-        // Link field siblings
-        let num_fields = self.cts.top - first_field_id;
-        for i in 0..num_fields {
-            let idx = (first_field_id + i) as usize;
-            let sib = if i + 1 < num_fields {
-                (first_field_id + i + 1) as u16
-            } else {
-                0
-            };
-            self.cts.tab[idx].sib = sib;
+        // Link field siblings (the actual field ids — pointer types may
+        // have been created between fields).
+        for (i, &fid) in field_ids.iter().enumerate() {
+            self.cts.tab[fid as usize].sib = field_ids.get(i + 1).copied().unwrap_or(0) as u16;
         }
 
-        // The struct type itself (insert at end, after fields)
+        // The struct type itself (insert at end, after fields). A
+        // previously forward-declared tag gets its entry completed.
+        let first_field = field_ids.first().copied().unwrap_or(0);
         let sinfo = ct_info(CT::Struct, if is_union { ctinfo::UNION } else { 0 })
-            | first_field_id
+            | first_field
             | (max_align.trailing_zeros() << ctinfo::SHIFT_ALIGN);
-        self.cts.tab.push(CType {
-            info: sinfo,
-            size: total_size as u32,
-            sib: 0,
-            next: 0,
-            name: 0,
-        });
-        self.cts.top = self
-            .cts
-            .top
-            .checked_add(1)
-            .ok_or_else(|| "too many C types (overflow)".to_string())?;
-        let struct_id = self.cts.top - 1;
+        let struct_id = if let Some(tag) = &tag
+            && let Some(&fwd_id) = self.cts.tags.get(tag)
+        {
+            self.cts.tab[fwd_id as usize] = CType {
+                info: sinfo,
+                size: total_size as u32,
+                sib: 0,
+                next: 0,
+                name: 0,
+            };
+            fwd_id
+        } else {
+            self.cts.tab.push(CType {
+                info: sinfo,
+                size: total_size as u32,
+                sib: 0,
+                next: 0,
+                name: 0,
+            });
+            self.cts.top = self
+                .cts
+                .top
+                .checked_add(1)
+                .ok_or_else(|| "too many C types (overflow)".to_string())?;
+            let id = self.cts.top - 1;
+            if let Some(tag) = &tag {
+                self.cts.tags.insert(tag.clone(), id);
+            }
+            id
+        };
         // Register field names
         for (name, type_id, offset) in field_infos {
             self.cts
@@ -657,8 +730,56 @@ impl<'a> Parser<'a> {
         self.next(); // eat typedef
         let decl = self.parse_decl_spec()?;
         let name = self.ident()?;
-        let info = ct_info(CT::Typedef, 0) | decl.type_id;
-        let sz = self.cts.get(decl.type_id).size;
+        // Parse array declarator brackets (e.g. `typedef int arr_t[10]`).
+        let mut array_count: u32 = 1;
+        while self.tok == Token::LBracket {
+            self.next(); // eat [
+            if self.tok == Token::Question {
+                array_count = u32::MAX;
+                self.next();
+            } else if self.tok == Token::Integer
+                && let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>()
+            {
+                array_count = n.max(1);
+                self.next();
+            }
+            while self.tok != Token::RBracket && self.tok != Token::Eof {
+                self.next();
+            }
+            if self.tok == Token::RBracket {
+                self.next(); // eat ]
+            }
+        }
+        let base_id = decl.type_id;
+        let type_id = if array_count > 1 {
+            let elem = self.cts.get(base_id);
+            let total_sz = if array_count == u32::MAX {
+                u32::MAX
+            } else {
+                elem.size.saturating_mul(array_count)
+            };
+            let info = ct_info(CT::Array, 0) | base_id;
+            let existing = (0..self.cts.top as usize)
+                .find(|&i| self.cts.tab[i].info == info && self.cts.tab[i].size == total_sz);
+            if let Some(id) = existing {
+                id as u32
+            } else {
+                let id = self.cts.top;
+                self.cts.tab.push(CType {
+                    info,
+                    size: total_sz,
+                    sib: 0,
+                    next: 0,
+                    name: 0,
+                });
+                self.cts.top = self.cts.top.saturating_add(1);
+                id
+            }
+        } else {
+            base_id
+        };
+        let info = ct_info(CT::Typedef, 0) | type_id;
+        let sz = self.cts.get(type_id).size;
         let id = self.cts.top;
         self.cts.tab.push(CType {
             info,
@@ -728,11 +849,133 @@ impl<'a> Parser<'a> {
             }
             Token::Eof => Ok(()),
             _ => {
-                let _decl = self.parse_decl_spec()?;
+                let decl = self.parse_decl_spec()?;
+                // Function declaration: `ret name(params) [asm("sym")];` —
+                // register the prototype so ffi.C lookups can validate
+                // call arguments against the declared parameter types.
+                if self.tok == Token::Ident {
+                    let name = String::from_utf8_lossy(&self.lex.buf).to_string();
+                    self.next();
+                    if self.tok == Token::LParen {
+                        self.parse_func_decl(decl, &name)?;
+                        return Ok(());
+                    }
+                }
                 self.skip_until_semicolon();
                 Ok(())
             }
         }
+    }
+
+    /// `ret name(param types) ...;` — register a function prototype:
+    /// a `CT::Func` entry whose child is the return type and whose field
+    /// chain holds the parameter types.
+    fn parse_func_decl(&mut self, decl: DeclSpec, name: &str) -> Result<(), String> {
+        self.expect(Token::LParen)?;
+        let mut params: Vec<u32> = Vec::new();
+        while self.tok != Token::RParen && self.tok != Token::Eof {
+            // `(void)` — empty parameter list.
+            if self.tok == Token::KwVoid {
+                let save_pos = self.lex.pos;
+                let save_buf = self.lex.buf.clone();
+                self.next();
+                if self.tok == Token::RParen {
+                    break;
+                }
+                self.lex.pos = save_pos;
+                self.lex.buf = save_buf;
+                self.tok = Token::KwVoid;
+            }
+            let pdecl = self.parse_decl_spec()?;
+            let mut ptype = pdecl.type_id;
+            // Pointer declarators (`ffi_err_point* op1`).
+            while self.tok == Token::Star || self.tok == Token::Slash {
+                if self.tok == Token::Star {
+                    ptype = crate::ffi::lib::make_ptr_type(self.cts, ptype);
+                }
+                self.next();
+            }
+            // Skip the parameter name (and any array brackets).
+            if self.tok == Token::Ident {
+                self.next();
+            }
+            while self.tok == Token::LBracket && self.tok != Token::Eof {
+                self.next();
+                while self.tok != Token::RBracket && self.tok != Token::Eof {
+                    self.next();
+                }
+                if self.tok == Token::RBracket {
+                    self.next();
+                }
+            }
+            params.push(ptype);
+            if self.tok == Token::Comma {
+                self.next();
+            }
+        }
+        self.expect(Token::RParen)?;
+        // Optional asm("name") — the real C symbol to resolve — then skip
+        // any remaining attributes to the semicolon.
+        let mut asm_name: Option<String> = None;
+        while self.tok != Token::Semicolon && self.tok != Token::Eof {
+            if self.tok == Token::Ident
+                && String::from_utf8_lossy(&self.lex.buf).eq_ignore_ascii_case("asm")
+            {
+                self.next();
+                if self.tok == Token::LParen {
+                    self.next();
+                    if self.tok == Token::String {
+                        asm_name = Some(String::from_utf8_lossy(&self.lex.buf).to_string());
+                    }
+                }
+            }
+            self.next();
+        }
+        if self.tok == Token::Semicolon {
+            self.next();
+        }
+
+        let num_params = params.len();
+        // Capture the field base *after* param parsing (make_ptr_type may
+        // have appended pointer types in the loop).
+        let first_param_id = self.cts.top;
+        for (i, &ptype) in params.iter().enumerate() {
+            let fid = first_param_id + i as u32;
+            self.cts.tab.push(CType {
+                info: ct_info(CT::Field, 0) | ptype,
+                size: 0,
+                sib: if i + 1 < num_params {
+                    (fid + 1) as u16
+                } else {
+                    0
+                },
+                next: 0,
+                name: 0,
+            });
+            self.cts.top = fid + 1;
+        }
+        let func_id = self.cts.top;
+        // The func's child (info low bits) is the return type; its `sib`
+        // chains to the first parameter field (lj_ctype.h layout).
+        let info = ct_info(CT::Func, 0) | decl.type_id;
+        self.cts.tab.push(CType {
+            info,
+            size: 0,
+            sib: if num_params > 0 {
+                first_param_id as u16
+            } else {
+                0
+            },
+            next: 0,
+            name: 0,
+        });
+        self.cts.top = func_id + 1;
+        self.cts.names.insert(name.to_string(), func_id);
+        self.cts.symbols.insert(
+            name.to_string(),
+            asm_name.unwrap_or_else(|| name.to_string()),
+        );
+        Ok(())
     }
 }
 

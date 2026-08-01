@@ -242,6 +242,19 @@ pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
                 let n = next_num(&mut ai)?;
                 out.extend_from_slice(fmt_float(spec, conv, n).as_bytes());
             }
+            b'a' | b'A' => {
+                let n = next_num(&mut ai)?;
+                let (left, _zero, space, width, prec) = parse_spec(spec);
+                let plus = spec.as_bytes().contains(&b'+');
+                let prec = prec.unwrap_or(13);
+                let mut s = fmt_a(n, prec, conv == b'A');
+                if n.is_sign_positive() && plus {
+                    s.insert(0, '+');
+                } else if n.is_sign_positive() && space && !s.starts_with(' ') {
+                    s.insert(0, ' ');
+                }
+                out.extend_from_slice(&pad(s.into_bytes(), width, left));
+            }
             b's' => {
                 let a = args
                     .get(ai)
@@ -281,17 +294,21 @@ pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn parse_spec(spec: &str) -> (bool, bool, Option<usize>, Option<usize>) {
+fn parse_spec(spec: &str) -> (bool, bool, bool, Option<usize>, Option<usize>) {
     let b = spec.as_bytes();
     let mut i = 0;
     let mut left = false;
     let mut zero = false;
+    let mut space = false;
     while i < b.len() && matches!(b[i], b'-' | b'+' | b' ' | b'#' | b'0') {
         if b[i] == b'-' {
             left = true;
         }
         if b[i] == b'0' {
             zero = true;
+        }
+        if b[i] == b' ' {
+            space = true;
         }
         i += 1;
     }
@@ -313,7 +330,7 @@ fn parse_spec(spec: &str) -> (bool, bool, Option<usize>, Option<usize>) {
         }
         prec = Some(spec[ps..i].parse().unwrap_or(0));
     }
-    (left, zero, width, prec)
+    (left, zero, space, width, prec)
 }
 
 fn pad(s: Vec<u8>, width: Option<usize>, left: bool) -> Vec<u8> {
@@ -335,14 +352,20 @@ fn pad(s: Vec<u8>, width: Option<usize>, left: bool) -> Vec<u8> {
 }
 
 fn pad_int(spec: &str, digits: &str, negative: bool) -> String {
-    let (left, zero, width, prec) = parse_spec(spec);
+    let (left, zero, space, width, prec) = parse_spec(spec);
     let mut body = digits.trim_start_matches('-').to_string();
     if let Some(p) = prec {
         while body.len() < p {
             body.insert(0, '0');
         }
     }
-    let sign = if negative { "-" } else { "" };
+    let sign = if negative {
+        "-"
+    } else if space {
+        " "
+    } else {
+        ""
+    };
     if zero
         && !left
         && prec.is_none()
@@ -364,7 +387,7 @@ fn pad_int(spec: &str, digits: &str, negative: bool) -> String {
 }
 
 fn pad_str(spec: &str, s: &[u8]) -> Vec<u8> {
-    let (left, _zero, width, prec) = parse_spec(spec);
+    let (left, _zero, _space, width, prec) = parse_spec(spec);
     let s = match prec {
         Some(p) if p < s.len() => &s[..p],
         _ => s,
@@ -373,19 +396,35 @@ fn pad_str(spec: &str, s: &[u8]) -> Vec<u8> {
 }
 
 fn fmt_float(spec: &str, conv: u8, n: f64) -> String {
-    let (left, zero, width, prec) = parse_spec(spec);
+    let (left, zero, space, width, prec) = parse_spec(spec);
+    let hash = spec.as_bytes().contains(&b'#');
+    let plus = spec.as_bytes().contains(&b'+');
     let p = prec.unwrap_or(6);
     let mut body = match conv {
-        b'f' | b'F' => format!("{:.*}", p, n.abs()),
-        b'e' => fmt_e(n.abs(), p, false),
-        b'E' => fmt_e(n.abs(), p, true),
+        b'f' | b'F' => {
+            let s = format!("{:.*}", p, n.abs());
+            if hash && !s.contains('.') {
+                format!("{}.", s)
+            } else {
+                s
+            }
+        }
+        b'e' | b'E' => fmt_e(n.abs(), p, conv == b'E', hash),
         b'g' | b'G' => {
-            let s = fmt_g(n.abs(), if prec.is_some() { p.max(1) } else { 6 });
+            let s = fmt_g(n.abs(), if prec.is_some() { p.max(1) } else { 6 }, hash);
             if conv == b'G' { s.to_uppercase() } else { s }
         }
         _ => unreachable!(),
     };
-    let sign = if n.is_sign_negative() { "-" } else { "" };
+    let sign = if n.is_sign_negative() {
+        "-"
+    } else if plus {
+        "+"
+    } else if space {
+        " "
+    } else {
+        ""
+    };
     if zero
         && !left
         && let Some(w) = width
@@ -405,37 +444,157 @@ fn fmt_float(spec: &str, conv: u8, n: f64) -> String {
     String::from_utf8(pad(body.into_bytes(), width, left)).unwrap()
 }
 
-fn fmt_e(n: f64, prec: usize, upper: bool) -> String {
+fn fmt_e(n: f64, prec: usize, upper: bool, hash: bool) -> String {
     let s = format!("{:.*e}", prec, n);
     let (m, e) = s.split_once('e').unwrap();
     let exp: i32 = e.parse().unwrap();
+    let mant = if hash && !m.contains('.') {
+        format!("{}.", m)
+    } else {
+        m.to_string()
+    };
     format!(
         "{}{}{}{:02}",
-        m,
+        mant,
         if upper { 'E' } else { 'e' },
         if exp < 0 { '-' } else { '+' },
         exp.abs()
     )
 }
 
-fn fmt_g(n: f64, prec: usize) -> String {
+fn fmt_g(n: f64, prec: usize, hash: bool) -> String {
     if n == 0.0 {
         return "0".to_string();
     }
-    let exp = n.abs().log10().floor() as i32;
+    // The exponent of the *rounded* value (from the e-form) decides the
+    // style, like the C library.
+    let e_s = format!("{:.*e}", prec - 1, n);
+    let exp: i32 = e_s.split_once('e').unwrap().1.parse().unwrap();
     if exp < -4 || exp >= prec as i32 {
-        let m = format!("{:.*e}", prec.saturating_sub(1), n);
-        let (mant, e) = m.split_once('e').unwrap();
-        let ex: i32 = e.parse().unwrap();
-        let mant = mant.trim_end_matches('0').trim_end_matches('.');
-        format!("{}e{}{:02}", mant, if ex < 0 { '-' } else { '+' }, ex.abs())
+        // e-style with the mantissa trimmed (kept with #).
+        let (mant, _e) = e_s.split_once('e').unwrap();
+        let mant = if hash {
+            mant.to_string()
+        } else {
+            mant.trim_end_matches('0').trim_end_matches('.').to_string()
+        };
+        format!(
+            "{}e{}{:02}",
+            mant,
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
     } else {
         let decimals = (prec as i32 - 1 - exp).max(0) as usize;
         let s = format!("{:.*}", decimals, n);
-        if s.contains('.') {
+        if hash {
+            s
+        } else if s.contains('.') {
             s.trim_end_matches('0').trim_end_matches('.').to_string()
         } else {
             s
         }
     }
+}
+
+/// Hex float formatting (`%a`/`%A`): `[-]0x1.HEXP±N`.
+fn fmt_a(n: f64, prec: usize, upper: bool) -> String {
+    let (prefix, hexes) = if upper {
+        ("0X", "0123456789ABCDEF")
+    } else {
+        ("0x", "0123456789abcdef")
+    };
+    let hex_digit = |v: usize| hexes.as_bytes()[v] as char;
+    let mut v = n;
+    let sign = if v.is_sign_negative() {
+        v = -v;
+        "-"
+    } else {
+        ""
+    };
+    if v == 0.0 {
+        return format!("{}{}0p+0", sign, prefix);
+    }
+    let bits = v.to_bits();
+    let exp = ((bits >> 52) & 0x7FF) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (e2, mant) = if exp == 0 {
+        // Subnormal: normalize by finding the highest set bit.
+        let lz = frac.leading_zeros() as i32;
+        let shift = lz - 11;
+        let m = frac << shift;
+        (-1023 - shift, m)
+    } else {
+        (exp - 1023, (1u64 << 52) | frac)
+    };
+    // The mantissa's hex digits after "1.": 13 digits from the 52-bit
+    // fraction.
+    let mut digits = String::with_capacity(13);
+    let mut m = mant;
+    for _ in 0..13 {
+        digits.push(hex_digit(((m >> 48) & 0xF) as usize));
+        m <<= 4;
+    }
+    if prec == 0 {
+        // Round to the nearest whole power of two: a first fraction
+        // digit >= 8 carries into the integer part ("0x2p+...").
+        let first = ((mant >> 48) & 0xF) as usize;
+        let (whole, e2) = if first >= 8 { (2, e2) } else { (1, e2) };
+        return format!(
+            "{}{}{}p{}{}",
+            sign,
+            prefix,
+            whole,
+            if e2 < 0 { '-' } else { '+' },
+            e2.abs()
+        );
+    }
+    let (frac_s, e2) = if prec <= 13 {
+        // The first `prec` digits (trailing zeros kept), rounded.
+        let keep = prec.min(13);
+        let mut ds: Vec<char> = digits.chars().take(keep).collect();
+        while ds.len() < keep {
+            ds.push('0');
+        }
+        let next = digits
+            .chars()
+            .nth(keep)
+            .map(|c| c.to_digit(16).unwrap() as i32)
+            .unwrap_or(0);
+        let mut e2 = e2;
+        if next >= 8 {
+            // Round up with carry.
+            let mut i = keep as i32 - 1;
+            loop {
+                if i < 0 {
+                    ds.insert(0, '1');
+                    ds.pop();
+                    e2 += 1;
+                    break;
+                }
+                let d = ds[i as usize].to_digit(16).unwrap() as i32 + 1;
+                if d < 16 {
+                    ds[i as usize] = hex_digit(d as usize);
+                    break;
+                }
+                ds[i as usize] = '0';
+                i -= 1;
+            }
+        }
+        (ds.into_iter().collect(), e2)
+    } else {
+        // No precision: the 13 significant digits, trimmed.
+        let s: String = digits.trim_end_matches('0').to_string();
+        (if s.is_empty() { "0".to_string() } else { s }, e2)
+    };
+    let exp_letter = if upper { 'P' } else { 'p' };
+    format!(
+        "{}{}1.{}p{}{}",
+        sign,
+        prefix,
+        frac_s,
+        if e2 < 0 { '-' } else { '+' },
+        e2.abs()
+    )
+    .replace('p', &exp_letter.to_string())
 }

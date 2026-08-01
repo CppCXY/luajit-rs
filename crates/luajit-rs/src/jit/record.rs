@@ -15,6 +15,7 @@ use crate::bc::*;
 use crate::gc::GcPtr;
 use crate::jit::exec::{self, jit_str_byte, jit_tget, jit_tnextk};
 use crate::jit::{bc_addr, opt_fold};
+use crate::meta::MM;
 use crate::proto::Proto;
 use crate::state::LuaState;
 use crate::value::LuaValue;
@@ -857,7 +858,14 @@ impl Record {
 
     /// `lj_record_objcmp`: record a raw object equality comparison.
     /// 0 = same, 1 = different but same type, 2 = different types.
-    fn objcmp(&mut self, a: TRef, b: TRef, av: LuaValue, bv: LuaValue) -> Result<u32, TraceError> {
+    fn objcmp(
+        &mut self,
+        l: &LuaState,
+        a: TRef,
+        b: TRef,
+        av: LuaValue,
+        bv: LuaValue,
+    ) -> Result<u32, TraceError> {
         let diff = !val_eq(av, bv);
         if !(tref_isk(a) && tref_isk(b)) {
             let ta = tref_type(a);
@@ -866,6 +874,21 @@ impl Record {
                 return Ok(2); // Two different types are never equal.
             }
             if ta > IRT_TRUE {
+                // Tables with an __eq metamethod cannot be compared by
+                // identity alone: abort so the interpreter re-runs the
+                // comparison (and the metamethod) — emitting the guard
+                // first would leave a stitched trace whose exit skips it.
+                if ta == IRT_TAB {
+                    let g = l.global();
+                    let has_eq = |v: LuaValue| {
+                        v.as_table().is_some_and(|t| {
+                            crate::meta::meta_fast(g, t.as_ref().metatable, MM::Eq).is_some()
+                        })
+                    };
+                    if has_eq(av) || has_eq(bv) {
+                        return Err(TraceError::NYIBC);
+                    }
+                }
                 // For GC types the address identity is the equality.
                 let o = if diff { IROp::NE } else { IROp::EQ };
                 self.cur.ir.emitir(irtg(o, ta), tref_ref(a), tref_ref(b))?;
@@ -1860,6 +1883,20 @@ impl Record {
                 if !tref_isnum(c) {
                     return Err(TraceError::NYIBC);
                 }
+                // Out-of-range exits to the interpreter, which raises
+                // "out of range" (string.char(300) is an error).
+                let k0 = self.cur.ir.knum(0.0);
+                let k255 = self.cur.ir.knum(255.0);
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::UGE, IRT_GUARD | IRT_INT),
+                    tref_ref(c),
+                    tref_ref(k0),
+                ));
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::ULE, IRT_GUARD | IRT_INT),
+                    tref_ref(c),
+                    tref_ref(k255),
+                ));
                 res[0] = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CALLL, IRT_STR),
                     tref_ref(c),
@@ -1904,31 +1941,10 @@ impl Record {
                         tref_ref(carg),
                     ));
                 } else if nargs == 3 {
-                    // Positional form: table.insert(t, pos, v).
-                    let posv = argv[1];
-                    let posn = posv.as_number().ok_or(TraceError::NYIBC)?;
-                    let pi = posn as i32;
-                    if pi as f64 != posn || pi < 1 {
-                        return Err(TraceError::NYIBC);
-                    }
-                    if (pi as u32) >= t.as_ref().asize {
-                        return Err(TraceError::NYIBC);
-                    }
-                    let key = self.base_ref(a + 3);
-                    if !tref_isnum(key) {
-                        return Err(TraceError::NYIBC);
-                    }
-                    let val = self.base_ref(a + 4);
-                    let carg = self.cur.ir.emit_ins(IRIns::new(
-                        irt(IROp::CARG, IRT_NIL),
-                        tref_ref(key),
-                        tref_ref(val),
-                    ));
-                    self.cur.ir.emit_ins(IRIns::new(
-                        irt(IROp::ASTORE, IRT_NIL),
-                        tref_ref(tab),
-                        tref_ref(carg),
-                    ));
+                    // Positional insert shifts [pos..#t] up by one: a loop
+                    // the trace can't express faithfully. Keep it in the
+                    // interpreter (whose tab_insert does the shift).
+                    return Err(TraceError::NYIBC);
                 } else {
                     return Err(TraceError::NYIBC);
                 }
@@ -2333,7 +2349,7 @@ impl Record {
                         self.comp_fixup(pc, ((op as u8) & 1 == 1) != diff);
                     } else {
                         self.comp_prep();
-                        let diff = self.objcmp(ra, rc, rav, rcv)?;
+                        let diff = self.objcmp(l, ra, rc, rav, rcv)?;
                         if diff == 1 && tref_istab(ra) {
                             return Err(TraceError::NYIBC); // __eq metamethod NYI.
                         }
@@ -2562,33 +2578,65 @@ impl Record {
                 if link & FRAME_TYPE_MASK != FRAME_VARG {
                     return Err(TraceError::NYIBC);
                 }
+                // The varargs live in stable slots below the frame base
+                // (the caller's argument area; the frame link encodes the
+                // offset). Bind each requested result register to a call
+                // that loads the value straight from that area — the same
+                // address the interpreter's BC_VARG reads — so the values
+                // stay correct on every loop iteration, unlike a stack-slot
+                // hand-off whose write would be invisible to DCE.
                 let delta = (link >> 3) as usize;
                 let nparams = self.pt.as_ref().numparams as usize;
                 let nvarg = (delta - 2).saturating_sub(nparams);
                 let dst = bc_a(ins) as u32;
-                let want = if bc_b(ins) == 0 {
-                    nvarg as u32
-                } else {
-                    (bc_b(ins) - 1) as u32
-                };
-                let packed = ((nparams as u32) << 16) | ((dst as u32) << 8) | want;
+                // Multres VARG (B=0) hands the count to a following
+                // CALL/RET through the VM's multres state, which a trace
+                // cannot represent: the count varies per call, so a
+                // stitched trace would replay a stale number of values.
+                if bc_b(ins) == 0 {
+                    return Err(TraceError::NYIBC);
+                }
+                let want = (bc_b(ins) - 1) as u32;
                 let k_link = self.cur.ir.kint64(link);
-                let k_packed = self.cur.ir.kint64(packed as u64);
-                let c1 = self.cur.ir.emit_ins(IRIns::new(
+                let c_link = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CARG, irt_type(IRT_NIL)),
-                    REF_BIAS, // → base pointer via RBASE register
+                    REF_BIAS, // base pointer via the RBASE register
                     tref_ref(k_link),
                 ));
-                let carg = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CARG, irt_type(IRT_NIL)),
-                    tref_ref(c1),
-                    tref_ref(k_packed),
-                ));
-                self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CALLL, IRT_NIL),
-                    tref_ref(carg),
-                    IRCALL_VARG,
-                ));
+                for i in 0..want {
+                    let tr = if (i as usize) < nvarg {
+                        // Fill beyond the actual vararg count with nil.
+                        let v = unsafe { *bp.add(nparams + i as usize).sub(delta) };
+                        let t = Self::value_irt(v);
+                        let packed = ((nparams as u32) << 16) | i;
+                        let k_packed = self.cur.ir.kint64(packed as u64);
+                        let carg = self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::CARG, irt_type(IRT_NIL)),
+                            tref_ref(c_link),
+                            tref_ref(k_packed),
+                        ));
+                        self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::CALLL, IRT_GUARD | t),
+                            tref_ref(carg),
+                            IRCALL_VARG,
+                        ))
+                    } else {
+                        tref_pri(IRT_NIL)
+                    };
+                    self.set_base(dst + i, tr);
+                }
+                // The result registers are live stack slots: cover them
+                // with maxslot, or the next dst-mode instruction's gap
+                // clear (record_ins) would zero them out of the slot map.
+                if dst + want > self.maxslot {
+                    self.maxslot = dst + want;
+                }
+                if std::env::var("LUAJIT_RS_VARGDBG").is_ok() {
+                    for i in 0..want {
+                        let si = (self.baseslot as u32 + dst + i) as usize;
+                        eprintln!("  after: slot[{}] = {:#x}", si, self.slot[si]);
+                    }
+                }
             }
 
             BCOp::USETV | BCOp::USETS | BCOp::USETN | BCOp::USETP => {
@@ -2605,17 +2653,16 @@ impl Record {
                 let cell = uv.as_ref().value_ptr() as u64;
                 self.specialize_curfn(l, base, fnval)?;
                 let ptr_k = self.cur.ir.kint64(cell);
-                // rb is preloaded as Var for USETV; rc/D is preloaded for
-                // USETS (str), USETN (num), USETP (pri).
-                let val_ref = match op {
-                    BCOp::USETV => rb,
-                    _ => rc,
-                };
+                // The value sits in the D operand for USETV and in the
+                // C operand for USETS/USETN/USETP (all preloaded as `rc`).
+                let val_ref = rc;
                 let carg = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CARG, irt_type(IRT_NIL)),
                     tref_ref(ptr_k),
                     tref_ref(val_ref),
                 ));
+                // The upvalue write must survive DCE (opt_dce treats
+                // IRCALL_USET as side-effecting).
                 self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CALLL, IRT_NIL),
                     tref_ref(carg),

@@ -373,9 +373,8 @@ impl<'a> Parser<'a> {
     fn const_cdata(&mut self, e: &ExpDesc) -> u32 {
         let fs = self.cur_mut();
         let (ctypeid, size) = if e.aux == 2 {
-            // Imaginary literal: store as a complex double (2 x f64).
-            // We use a raw size-16 blob; the CT type is resolved at runtime.
-            (crate::ffi::CTypeID::Void as u32, 16u32)
+            // Imaginary literal: a complex double (2 x f64).
+            (crate::ffi::CTypeID::ComplexDouble as u32, 16u32)
         } else if e.aux == 1 {
             (crate::ffi::CTypeID::UInt64 as u32, 8u32)
         } else {
@@ -1726,6 +1725,22 @@ impl<'a> Parser<'a> {
             uvnames.push(name);
         }
 
+        // Local variable debug info (for debug.getinfo's funcname
+        // resolution): (register, startpc, endpc, name). Still-live
+        // variables (endpc == 0) span to the end of the proto.
+        let mut varnames: Vec<(u8, u32, u32, String)> = Vec::new();
+        for v in &self.vstack[fs.vbase..] {
+            if let VName::Str(sid) = &v.name {
+                let end = if v.endpc == 0 { n as u32 } else { v.endpc };
+                varnames.push((
+                    v.slot,
+                    v.startpc,
+                    end,
+                    String::from_utf8_lossy(self.ls.strs.get(*sid)).into_owned(),
+                ));
+            }
+        }
+
         self.vstack.truncate(fs.vbase);
 
         Proto {
@@ -1741,6 +1756,7 @@ impl<'a> Parser<'a> {
             firstline: fs.linedefined,
             numline,
             uvnames,
+            varnames,
             source: None,
         }
     }
@@ -3030,7 +3046,8 @@ impl<'a> Parser<'a> {
                     self.ls.next();
                     self.parse_goto();
                 } else {
-                    self.parse_call_assign();
+                    // `goto` is a keyword: `goto = 1` is a syntax error.
+                    self.err_syntax("<name> expected");
                 }
             }
             _ => {

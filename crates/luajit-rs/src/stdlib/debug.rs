@@ -4,17 +4,128 @@ use crate::gc::GcPtr;
 use crate::state::LuaState;
 use crate::stdlib::{arg, err_bad_arg, nargs, push, pushv};
 use crate::table::LuaTable;
-use crate::value::{LJ_TFALSE, LJ_TTRUE, LuaValue};
+use crate::value::{LJ_TFALSE, LJ_TNUMX, LJ_TTRUE, LuaValue};
 use crate::vm::FRAME_TYPE_MASK;
 
 fn set_basemt_for(l: &mut LuaState, o: &LuaValue, mt: Option<GcPtr<LuaTable>>) {
     let g = l.global();
-    g.set_basemt(o.itype(), mt);
+    // Numbers share a single base metatable slot: the raw itype of a
+    // double varies with its value (the NaN-boxing puts the exponent
+    // in the tag), so normalize to the numeric tag.
+    let it = if o.is_number() { LJ_TNUMX } else { o.itype() };
+    g.set_basemt(it, mt);
     if o.itype() == LJ_TFALSE {
         g.set_basemt(LJ_TTRUE, mt);
     } else if o.itype() == LJ_TTRUE {
         g.set_basemt(LJ_TFALSE, mt);
     }
+}
+
+/// The metamethod name of the instruction that triggered a `FRAME_CONT`
+/// continuation frame (`lj_debug.c`'s frame_iscont name switch). The
+/// saved PC sits at `slot - 3` (in the caller's proto); the bytecode
+/// there is the triggering instruction.
+fn cont_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
+    if slot < 4 {
+        return None;
+    }
+    use crate::bc::{BCOp, bc_op};
+    let saved_pc = l.stack[slot - 3].to_bits() as usize;
+    let link = l.stack[slot - 1].to_bits();
+    let delta = (link >> 3) as usize;
+    if delta == 0 || delta > slot {
+        return None;
+    }
+    let caller_base = slot - delta;
+    if caller_base < 2 {
+        return None;
+    }
+    let pt = l.stack[caller_base - 2].as_func()?;
+    let pt = match pt.as_ref() {
+        GcFunc::Lua(cl) => cl.proto.as_ref(),
+        _ => return None,
+    };
+
+    // The continuation's saved PC points one past the triggering
+    // instruction (the interpreter resumes there after the metamethod).
+    if saved_pc == 0 || saved_pc > pt.bc.len() {
+        return None;
+    }
+    let name = match bc_op(pt.bc[saved_pc - 1]) {
+        BCOp::ISLT | BCOp::ISGE => "__lt",
+        BCOp::ISLE | BCOp::ISGT => "__le",
+        BCOp::ISEQV | BCOp::ISNEV => "__eq",
+        BCOp::ADDVN | BCOp::ADDNV | BCOp::ADDVV => "__add",
+        BCOp::SUBVN | BCOp::SUBNV | BCOp::SUBVV => "__sub",
+        BCOp::MULVN | BCOp::MULNV | BCOp::MULVV => "__mul",
+        BCOp::DIVVN | BCOp::DIVNV | BCOp::DIVVV => "__div",
+        BCOp::MODVN | BCOp::MODNV | BCOp::MODVV => "__mod",
+        BCOp::POW => "__pow",
+        BCOp::UNM => "__unm",
+        BCOp::LEN => "__len",
+        BCOp::CAT => "__concat",
+        BCOp::TGETV | BCOp::TGETS | BCOp::TGETB | BCOp::GGET => "__index",
+        BCOp::TSETV | BCOp::TSETS | BCOp::TSETB | BCOp::GSET | BCOp::TSETM => "__newindex",
+        BCOp::CALL | BCOp::CALLT => "__call",
+        _ => "?",
+    };
+    Some(name)
+}
+
+/// Resolve the function name of a Lua frame from its caller's bytecode
+/// (lj_debug_funcname's local/global/method cases): the FRAME_LUA link is
+/// the caller's return PC, the CALL instruction before it holds the
+/// callee register, and the local variable debug info maps it to a name.
+fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, String)> {
+    use crate::bc::{BCIns, BCOp, bc_a, bc_b, bc_op};
+    if slot < 2 {
+        return None;
+    }
+    let link = l.stack[slot - 1].to_bits();
+    if (link & FRAME_TYPE_MASK) != 0 || link == 0 {
+        return None; // FRAME_LUA only.
+    }
+    let ret_ip = link as *const BCIns;
+    let call_ins = unsafe { *ret_ip.sub(1) };
+    let op = bc_op(call_ins);
+    if !matches!(
+        op,
+        BCOp::CALL | BCOp::CALLT | BCOp::CALLM | BCOp::CALLMT | BCOp::ITERC | BCOp::ITERN
+    ) {
+        return None;
+    }
+    let callee_reg = bc_a(call_ins);
+    let caller_base = slot.saturating_sub(2 + callee_reg as usize);
+    if caller_base < 2 {
+        return None;
+    }
+    let pt = l.stack[caller_base - 2].as_func()?;
+    let pt = match pt.as_ref() {
+        GcFunc::Lua(cl) => cl.proto.as_ref(),
+        _ => return None,
+    };
+    let pc = unsafe { ret_ip.offset_from(pt.bc.as_ptr()) } as usize;
+    if pc == 0 {
+        return None;
+    }
+    let call_pc = (pc - 1) as u32;
+    // The compiler may move the callee to a fresh register right before
+    // the CALL (e.g. MOV r, local); resolve through it.
+    let mut callee_reg = callee_reg;
+    if call_pc > 0 {
+        let prev = pt.bc[(call_pc - 1) as usize];
+        if bc_op(prev) == BCOp::MOV && bc_a(prev) == callee_reg {
+            callee_reg = bc_b(prev);
+        }
+    }
+    for (reg, spc, epc, name) in &pt.varnames {
+        let end = if *epc == 0 { pt.bc.len() as u32 } else { *epc };
+        if *reg as u32 == callee_reg && *spc <= call_pc && call_pc <= end {
+            return Some(("local", name.clone()));
+        }
+    }
+    // The callee is not a local variable (e.g. a GGET result).
+    None
 }
 
 fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
@@ -71,15 +182,66 @@ fn walk_frames(l: &LuaState, mut level: i32) -> Option<(usize, GcPtr<crate::func
                     return Some((slot, fv));
                 }
             }
-            // Walk to caller
-            if ft == 0 /* FRAME_LUA */ && link != 0 {
-                slot = (link >> 3) as usize;
-            } else {
-                break;
+            // Walk to caller. A FRAME_LUA link is either the caller's
+            // return PC (Lua-to-Lua calls) or a caller-base delta (the
+            // C-call frames): the latter is always a small stack index.
+            // FRAME_C / FRAME_CONT links carry a caller base in the
+            // delta (xpcall's handler chains its frame to the failed
+            // call; metamethod continuations chain to their caller) and
+            // count as an extra (C-side) level.
+            match ft {
+                0 /* FRAME_LUA */ if link != 0 => {
+                    if ((link >> 3) as usize) < l.stack.len() {
+                        slot = (link >> 3) as usize;
+                    } else {
+                        let ret_ip = link as *const crate::bc::BCIns;
+                        let call_ins = unsafe { *ret_ip.sub(1) };
+                        let a = crate::bc::bc_a(call_ins) as usize;
+                        slot = slot.saturating_sub(2 + a);
+                    }
+                }
+                1 /* FRAME_C */ | 2 /* FRAME_CONT */ if link != 0 => {
+                    // The C-side frame counts as a level of its own.
+                    level -= 1;
+                    if level == 0 {
+                        return None; // A C-side frame is not a Lua frame.
+                    }
+                    // The delta is the distance back to the caller's base.
+                    let d = (link >> 3) as usize;
+                    if d == 0 || d > slot {
+                        return None;
+                    }
+                    slot -= d;
+                }
+                _ => break,
             }
         } else {
             break;
         }
+    }
+    None
+}
+
+/// The metamethod name of a frame, when it is one: mmcall frames carry
+/// the triggering instruction's saved PC (cont_mm_name); frames reached
+/// through the execute-recursion paths carry LuaState.mmname.
+fn self_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
+    if slot < 4 {
+        return None;
+    }
+    if let Some((name, fbits)) = l.mmname {
+        for s in slot.saturating_sub(5)..slot {
+            if l.stack[s].to_bits() == fbits {
+                return Some(name);
+            }
+        }
+    }
+    let link = l.stack[slot - 1].to_bits();
+    let ft = link & FRAME_TYPE_MASK;
+    if ft == 2 /* FRAME_CONT */ || ft == 1
+    /* FRAME_C */
+    {
+        return cont_mm_name(l, slot);
     }
     None
 }
@@ -230,9 +392,39 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
                 t.as_mut().set_str(str_val(l, "func"), l.stack[slot - 2]);
             }
             if flags & WHAT_N != 0 {
-                // Try to find name from caller
-                t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
-                t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
+                // Metamethod continuation frames report the metamethod
+                // name (e.g. "__index"), like LuaJIT's lj_debug_funcname.
+                // FRAME_CONT == 2 (vm/mod.rs).
+                let link = l.stack[slot - 1].to_bits();
+                if (link & FRAME_TYPE_MASK) == 2 {
+                    if let Some(name) = cont_mm_name(l, slot) {
+                        t.as_mut().set_str(str_val(l, "name"), str_val(l, name));
+                        t.as_mut()
+                            .set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
+                    } else {
+                        t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
+                        t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
+                    }
+                } else if let Some((name, fbits)) = l.mmname {
+                    // Metamethods invoked through the execute-recursion
+                    // paths (e.g. __concat) expose their name this way.
+                    if l.stack[slot - 2].to_bits() == fbits {
+                        t.as_mut().set_str(str_val(l, "name"), str_val(l, name));
+                        t.as_mut()
+                            .set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
+                    } else {
+                        t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
+                        t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
+                    }
+                } else if let Some((namewhat, name)) = funcname_from_caller(l, slot) {
+                    t.as_mut().set_str(str_val(l, "name"), str_val(l, &name));
+                    t.as_mut()
+                        .set_str(str_val(l, "namewhat"), str_val(l, namewhat));
+                } else {
+                    // Try to find name from caller
+                    t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
+                    t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
+                }
             }
         }
         crate::func::GcFunc::C(_) => {
@@ -307,6 +499,12 @@ fn lib_getfenv(l: &mut LuaState) -> LuaResult<i32> {
             GcFunc::Lua(c) => c.env,
             GcFunc::C(c) => c.env,
         },
+        // getfenv(0): the environment of the running thread.
+        _ if o.as_number() == Some(0.0) => l.thread_env,
+        _ if o.as_thread().is_some() => o
+            .as_thread()
+            .map(|t| t.get().thread_env)
+            .unwrap_or(l.thread_env),
         _ => l.global().globals,
     };
     push(l, LuaValue::table(env));
@@ -324,9 +522,48 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
             GcFunc::Lua(c) => c.env = tab,
             GcFunc::C(c) => c.env = tab,
         }
+    } else if let Some(t) = o.as_thread() {
+        t.get().thread_env = tab;
     }
     push(l, LuaValue::number(0.0));
     Ok(1)
+}
+
+/// Move one frame up (toward the caller) following `link`; resolves the
+/// VARG pseudo-frames of the frame being left. Returns the caller's
+/// frame base, or `None` at the chain's end.
+fn walk_next(l: &LuaState, mut slot: usize, mut cur_link: u64) -> Option<usize> {
+    // Skip VARG pseudo-frames above the frame being left.
+    while (cur_link & FRAME_TYPE_MASK) == 3 {
+        slot = slot.saturating_sub((cur_link >> 3) as usize);
+        if slot < 2 {
+            return None;
+        }
+        cur_link = l.stack[slot - 1].to_bits();
+    }
+    let frame_type = cur_link & FRAME_TYPE_MASK;
+    match frame_type {
+        0 /* FRAME_LUA */ if cur_link != 0 => {
+            if ((cur_link >> 3) as usize) < l.stack.len() {
+                Some((cur_link >> 3) as usize)
+            } else {
+                let ret_ip = cur_link as *const crate::bc::BCIns;
+                let call_ins = unsafe { *ret_ip.sub(1) };
+                let a = crate::bc::bc_a(call_ins) as usize;
+                Some(slot.saturating_sub(2 + a))
+            }
+        }
+        1 /* FRAME_C */ | 2 /* FRAME_CONT */ if cur_link != 0 => {
+            // The delta is the distance back to the caller's base.
+            let d = (cur_link >> 3) as usize;
+            if d == 0 || d > slot {
+                None
+            } else {
+                Some(slot - d)
+            }
+        }
+        _ => None,
+    }
 }
 
 // ── debug.traceback ─────────────────────────────────────────────────────────
@@ -350,12 +587,24 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
 
     let mut slot = l.base;
     let mut first = true;
+    let mut first_lua = true;
+    // luaL_traceback starts at level 1: the traceback handler's own frame
+    // (the frame executing right now) is skipped.
+    if slot >= 2 {
+        let link = l.stack[slot - 1].to_bits();
+        if let Some(next) = walk_next(l, slot, link) {
+            slot = next;
+        } else {
+            slot = 0;
+        }
+    }
     for _ in 0..64 {
         if slot < 2 {
             break;
         }
         let func = l.stack[slot - 2];
         let mut cur_link = l.stack[slot - 1].to_bits();
+        let orig_slot = slot;
         while (cur_link & FRAME_TYPE_MASK) == 3
         /* FRAME_VARG */
         {
@@ -365,7 +614,7 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
             }
             cur_link = l.stack[slot - 1].to_bits();
         }
-        let frame_type = cur_link & FRAME_TYPE_MASK;
+        let _frame_type = cur_link & FRAME_TYPE_MASK;
 
         if let Some(fv) = func.as_func() {
             match fv.as_ref() {
@@ -397,18 +646,42 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
                             0
                         }
                     };
+                    // The first Lua frame below the handler is the failed
+                    // frame: prefer the recorded raise site (error line),
+                    // which its frame link alone cannot provide.
+                    let pc = if first_lua {
+                        if let Some((fbits, epc)) = l.err_raise_pc
+                            && func.to_bits() == fbits
+                            && epc < pt.bc.len()
+                        {
+                            l.err_raise_pc = None;
+                            epc
+                        } else {
+                            pc
+                        }
+                    } else {
+                        pc
+                    };
                     let line = if pc < pt.lines.len() {
                         pt.lines[pc] as usize
                     } else {
                         pt.firstline as usize
                     };
-                    trace.push_str(&format!(
-                        "\t{}:{}: in {}\n",
-                        src,
-                        line,
-                        if first { "main chunk" } else { "function" }
-                    ));
+                    // LuaJIT prints the function name for metamethod
+                    // frames ("in function '__index'"); other Lua frames
+                    // stay anonymous here. The main chunk (firstline 0)
+                    // gets its own label.
+                    let mut label = if pt.firstline == 0 {
+                        "main chunk".to_string()
+                    } else {
+                        "function".to_string()
+                    };
+                    if let Some(mm) = self_mm_name(l, orig_slot) {
+                        label = format!("function '{}'", mm);
+                    }
+                    trace.push_str(&format!("\t{}:{}: in {}\n", src, line, label));
                     first = false;
+                    first_lua = false;
                 }
                 GcFunc::C(_) => {
                     trace.push_str("\t[C]: in function\n");
@@ -417,9 +690,9 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
             }
         }
 
-        // Walk to caller
-        if frame_type == 0 && cur_link != 0 {
-            slot = (cur_link >> 3) as usize;
+        // Walk to caller.
+        if let Some(next) = walk_next(l, slot, cur_link) {
+            slot = next;
         } else {
             break;
         }
@@ -547,13 +820,23 @@ fn lib_getlocal(l: &mut LuaState) -> LuaResult<i32> {
                 return Ok(1);
             }
             let idx = slot + local - 1;
-            let name = str_val(l, "");
+            // The variable name comes from the proto's debug info.
+            let name = pt
+                .varnames
+                .iter()
+                .find(|(reg, spc, epc, _)| {
+                    let end = if *epc == 0 { pt.bc.len() as u32 } else { *epc };
+                    *reg as usize == local - 1 && *spc <= end
+                })
+                .map(|(_, _, _, n)| n.clone())
+                .unwrap_or_default();
             let val = if idx < l.stack.len() {
                 l.stack[idx]
             } else {
                 LuaValue::NIL
             };
-            pushv(l, &[name, val]);
+            let name_v = str_val(l, &name);
+            pushv(l, &[name_v, val]);
             Ok(2)
         }
         GcFunc::C(_) => {
@@ -600,6 +883,7 @@ fn lib_setlocal(l: &mut LuaState) -> LuaResult<i32> {
 
 pub fn open(l: &mut LuaState) {
     crate::stdlib::reg::LibBuilder::new(l, b"debug", crate::stdlib::reg::LibTarget::Global)
+        .func(b"debug", lib_debug_debug)
         .func(b"setmetatable", lib_setmetatable)
         .func(b"getmetatable", lib_getmetatable)
         .func(b"getregistry", lib_getregistry)
@@ -611,8 +895,15 @@ pub fn open(l: &mut LuaState) {
         .func(b"sethook", lib_sethook)
         .func(b"getupvalue", lib_getupvalue)
         .func(b"setupvalue", lib_setupvalue)
+        .func(b"upvaluejoin", lib_upvaluejoin)
         .func(b"getlocal", lib_getlocal)
         .func(b"setlocal", lib_setlocal)
-        .func(b"upvaluejoin", lib_upvaluejoin)
         .build();
+}
+
+fn lib_debug_debug(l: &mut LuaState) -> LuaResult<i32> {
+    // The interactive debugger prompt is not implemented; the tests only
+    // check its presence.
+    push(l, LuaValue::NIL);
+    Ok(0)
 }

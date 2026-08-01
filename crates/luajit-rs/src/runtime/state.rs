@@ -223,10 +223,19 @@ pub struct GlobalState {
     /// The currently running thread (LuaJIT's `cur_L`): the main thread or
     /// the innermost resumed coroutine.
     pub cur_l: Option<StateRef>,
+    /// PRNG state for `math.random` (xoshiro256**).
+    pub rng: crate::stdlib::math::RngState,
     /// The JIT compiler state (LuaJIT embeds `jit_State` in `GG_State`).
     pub jit: JitState,
     /// FFI C type system (lazy-initialised by `ffi.load` / first FFI call).
     pub cts: Option<CTState>,
+    /// Per-ctype metatables registered by `ffi.metatype`, indexed by
+    /// ctype id (each cdata's metatable lookup consults this first).
+    pub ctype_mts: Vec<Option<GcPtr<LuaTable>>>,
+    /// `ffi.errno` state (the tests set/read it through FFI).
+    pub ffi_errno: i32,
+    /// The internal ipairs iterator closure (not exposed as a global).
+    pub ipairs_iter: LuaValue,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
@@ -319,12 +328,19 @@ pub enum Suspend {
     Start,
     /// Yield from a `CALL coroutine.yield` in a Lua frame: continue at
     /// `pc` with `cl`, delivering the resume args at `slot` per `want`.
+    /// `protected` marks a yield through a `pcall`/`xpcall` frame: the
+    /// resume args must be delivered with a `true` prefix (the pcall's
+    /// success flag), like LuaJIT's pcall continuation. `value_slot` is
+    /// where the yield values live (may differ from `slot` when the
+    /// protected call's own frame sits elsewhere).
     Call {
         pc: usize,
         cl: GcPtr<GcFunc>,
         base: usize,
         slot: usize,
         want: i32,
+        protected: bool,
+        value_slot: usize,
     },
     /// Yield through a tail call (`return coroutine.yield(...)`) or from
     /// the entry C function: resume performs a *return* of the resume args
@@ -365,6 +381,20 @@ pub struct LuaState {
     pub openuv: Vec<GcPtr<Upval>>,
     /// The pending error object (`LuaError::Runtime`).
     pub errval: LuaValue,
+    /// Args-base slot of the Lua frame that was executing when `error`
+    /// was raised (set by lib_error, consumed by lib_xpcall's handler
+    /// frame chain so debug walks see the raise-time frames below it).
+    pub err_raise_slot: usize,
+    /// The (function bits, bytecode index) of the frame where the current
+    /// runtime error was raised — traceback uses it to report the error
+    /// line on the failed frame (the frame link alone only shows the
+    /// caller's call site).
+    pub err_raise_pc: Option<(u64, usize)>,
+    /// While a metamethod invoked through the cold execute-recursion
+    /// paths (e.g. `__concat`) is running, the (name, function bits) of
+    /// the active metamethod — debug.getinfo uses it to report
+    /// `namewhat = "metamethod"` for the current frame.
+    pub mmname: Option<(&'static str, u64)>,
     /// The number of yielded values (`LuaError::Yield`).
     pub nyield: u32,
     /// Coroutine status.
@@ -381,6 +411,9 @@ pub struct LuaState {
     pub debug_pc: usize,
     /// Current chunk name for error location reporting.
     pub debug_chunkname: Vec<u8>,
+    /// The environment table of this (possibly coroutine) thread
+    /// (`debug.setfenv` on a thread; `getfenv(0)` reports it).
+    pub thread_env: GcPtr<LuaTable>,
 }
 
 impl LuaState {
@@ -410,6 +443,9 @@ impl LuaState {
             top: 0,
             openuv: Vec::new(),
             errval: LuaValue::NIL,
+            err_raise_slot: 0,
+            err_raise_pc: None,
+            mmname: None,
             nyield: 0,
             status: if is_main {
                 CoStatus::Running
@@ -421,6 +457,7 @@ impl LuaState {
             c_base: 0,
             debug_pc: 0,
             debug_chunkname: Vec::new(),
+            thread_env: g.get_ref().globals,
         }
     }
 
@@ -530,10 +567,18 @@ impl LuaState {
 
     /// Raise a runtime error carrying a string message with source location.
     pub fn runtime_error(&mut self, msg: impl AsRef<[u8]>) -> LuaError {
+        self.runtime_error_level(msg, 1)
+    }
+
+    /// `runtime_error` with `error()`-style `level` semantics: 1 = the
+    /// direct caller's location, 2 = the caller's caller, etc.
+    pub fn runtime_error_level(&mut self, msg: impl AsRef<[u8]>, level: u32) -> LuaError {
         let mut full = msg.as_ref().to_vec();
 
+        let mut skip = level.saturating_sub(1) as usize;
         let mut slot = self.base;
-        for _ in 0..8 {
+        let mut pc_from_link: Option<usize> = None;
+        for _ in 0..16 {
             if slot < 2 {
                 break;
             }
@@ -543,10 +588,46 @@ impl LuaState {
                 match fv.as_ref() {
                     GcFunc::Lua(cl) => {
                         let pt = cl.proto.as_ref();
-                        let pc = self
-                            .debug_pc
-                            .saturating_sub(1)
-                            .min(pt.lines.len().saturating_sub(1));
+                        if skip > 0 {
+                            // Not the position frame: walk to the caller.
+                            skip -= 1;
+                            let ft = link_bits & FRAME_TYPE_MASK;
+                            if ft == 0 && link_bits != 0 {
+                                if ((link_bits >> 3) as usize) < self.stack.len() {
+                                    slot = (link_bits >> 3) as usize;
+                                } else {
+                                    // The return PC lives in the *caller's*
+                                    // proto, so carry the raw address and
+                                    // resolve the offset against the
+                                    // position frame's proto below.
+                                    let ret_ip = link_bits as *const crate::bc::BCIns;
+                                    pc_from_link = Some(ret_ip as usize);
+                                    let call_ins = unsafe { *ret_ip.sub(1) };
+                                    let a = crate::bc::bc_a(call_ins) as usize;
+                                    slot = slot.saturating_sub(2 + a);
+                                }
+                                continue;
+                            }
+                            break;
+                        }
+                        let pc = match pc_from_link {
+                            // Frame reached via a Lua link: the return PC
+                            // points past the CALL; the CALL itself sits at
+                            // pc-1 (both carry the same statement's line,
+                            // but the RET0/jump at the return PC may sit on
+                            // a later line).
+                            Some(p) => {
+                                let off = unsafe {
+                                    (p as *const crate::bc::BCIns).offset_from(pt.bc.as_ptr())
+                                } as usize;
+                                off.saturating_sub(1)
+                            }
+                            None => self.debug_pc.saturating_sub(1),
+                        }
+                        .min(pt.lines.len().saturating_sub(1));
+                        // Remember the raise site so the traceback can
+                        // report the failed frame's error line.
+                        self.err_raise_pc = Some((func.to_bits(), pc));
                         let line = if pc < pt.lines.len() {
                             pt.lines[pc] as usize
                         } else {
@@ -572,13 +653,19 @@ impl LuaState {
                         break;
                     }
                     GcFunc::C(_) => {
-                        // Walk to caller via frame link.
-                        // FRAME_LUA=0 means the link encodes the caller's base.
+                        // Walk to caller via frame link. FRAME_LUA=0 means
+                        // the link encodes the caller's base; otherwise it
+                        // is the caller's return PC.
                         let ft = link_bits & FRAME_TYPE_MASK;
-                        if ft == 0
-                        /* FRAME_LUA */
-                        {
-                            slot = (link_bits >> 3) as usize;
+                        if ft == 0 && link_bits != 0 {
+                            if ((link_bits >> 3) as usize) < self.stack.len() {
+                                slot = (link_bits >> 3) as usize;
+                            } else {
+                                let ret_ip = link_bits as *const crate::bc::BCIns;
+                                let call_ins = unsafe { *ret_ip.sub(1) };
+                                let a = crate::bc::bc_a(call_ins) as usize;
+                                slot = slot.saturating_sub(2 + a);
+                            }
                             continue;
                         }
                         break;
@@ -635,8 +722,12 @@ impl Lua {
             basemt: [None; ITYPE_COUNT],
             mmname: [LuaValue::NIL; meta::MM_MAX],
             cur_l: None,
+            rng: crate::stdlib::math::RngState::fixed(),
             jit: JitState::new(),
             cts: None,
+            ctype_mts: Vec::new(),
+            ffi_errno: 0,
+            ipairs_iter: LuaValue::NIL,
             boot_time: boot,
             main: None,
         }));
@@ -688,8 +779,8 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
         if let Ok(idx) = idx_str.parse::<u32>() {
             let cache_key = g.heap.intern(b"__LUARS_DUMP_CACHE");
             let key = g.heap.str_value(cache_key);
-            let globals = g.globals.as_ref();
-            if let Some(fv) = globals.get(key).as_table()
+            let registry = g.registry.as_ref();
+            if let Some(fv) = registry.get(key).as_table()
                 && fv.as_ref().get_int(idx as i32).is_func()
             {
                 return Ok(fv.as_ref().get_int(idx as i32));

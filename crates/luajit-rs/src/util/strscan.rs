@@ -59,6 +59,15 @@ fn scan_dec(s: &[u8]) -> Option<f64> {
     let mut seen_exp = false;
     let mut exp_digits = false;
     let mut i = 0;
+    // Leading sign (LuaJIT's strscan accepts "-1.5" and "+1e2").
+    let neg = if i < s.len() && (s[i] == b'-' || s[i] == b'+') {
+        let n = s[i] == b'-';
+        i += 1;
+        n
+    } else {
+        false
+    };
+    let mag_start = i;
     while i < s.len() {
         let c = s[i];
         match c {
@@ -91,7 +100,16 @@ fn scan_dec(s: &[u8]) -> Option<f64> {
     if !seen_digit || (seen_exp && !exp_digits) {
         return None;
     }
-    std::str::from_utf8(s).ok()?.parse::<f64>().ok()
+    // Parse the magnitude (without the leading sign, which the full
+    // string's parse would already apply) and negate explicitly.
+    let mut v = std::str::from_utf8(&s[mag_start..])
+        .ok()?
+        .parse::<f64>()
+        .ok()?;
+    if neg {
+        v = -v;
+    }
+    Some(v)
 }
 
 fn scan_hex(s: &[u8]) -> Option<f64> {

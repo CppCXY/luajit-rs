@@ -1,6 +1,4 @@
-//! Math library: every function from LuaJIT's `math.*` except `random`
-//! and `randomseed` (which need rng state).  Constants are set via
-//! `table.new` + `table.set`.
+//! Math library.  Constants are set via `table.new` + `table.set`.
 
 #![allow(dead_code)] // `atan`、`log` 由宏生成,在 lib 表中使用
 
@@ -8,8 +6,74 @@ use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::value::LuaValue;
 
-use super::{LibTarget, arg, err_bad_arg, nargs, push, pushv};
+use super::{LibTarget, arg, err_bad_arg, err_bad_arg_type, nargs, push, pushv};
 use crate::lual_reg;
+
+/// Tausworthe PRNG state (period 2^223), bit-exact with LuaJIT's
+/// `lj_prng.c` / `lib_math.c:random_seed` so the test-suite sequences
+/// match.
+#[derive(Clone, Copy)]
+pub struct RngState {
+    u: [u64; 4],
+}
+
+impl RngState {
+    /// The fixed initial state (lj_prng_seed_fixed).
+    pub fn fixed() -> Self {
+        RngState {
+            u: [
+                0xa0d277570a345b8c,
+                0x764a296c5d4aa64f,
+                0x51220704070adeaa,
+                0x2a2717b5a7b7b927,
+            ],
+        }
+    }
+
+    /// `random_seed(rs, d)`: derive the four state words from a double.
+    pub fn seed(&mut self, d: f64) {
+        let mut r: u32 = 0x11090601; // 64-k[i] as four 8-bit constants.
+        let mut d = d;
+        for i in 0..4 {
+            let m = 1u64 << (r & 255);
+            r >>= 8;
+            d = d * std::f64::consts::PI + std::f64::consts::E;
+            let mut bits = d.to_bits();
+            if bits < m {
+                bits += m;
+            }
+            self.u[i] = bits;
+        }
+        for _ in 0..10 {
+            self.next_u64();
+        }
+    }
+
+    /// The TW223 step: update all four generators, xor their outputs.
+    fn tw223_step(&mut self) -> u64 {
+        const CFG: [(u32, u32, u32); 4] = [(63, 31, 18), (58, 19, 28), (55, 24, 7), (47, 21, 8)];
+        let mut r = 0u64;
+        for (i, &(k, q, s)) in CFG.iter().enumerate() {
+            let mut z = self.u[i];
+            z = (((z << q) ^ z) >> (k - s)) ^ ((z & (u64::MAX << (64 - k))) << s);
+            r ^= z;
+            self.u[i] = z;
+        }
+        r
+    }
+
+    #[inline]
+    pub fn next_u64(&mut self) -> u64 {
+        self.tw223_step()
+    }
+
+    /// A double in [0, 1) (`lj_prng_u64d` - 1.0).
+    #[inline]
+    pub fn next_f64(&mut self) -> f64 {
+        let r = self.tw223_step();
+        f64::from_bits((r & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000) - 1.0
+    }
+}
 
 macro_rules! math1 {
     ($name:ident, $fn:expr) => {
@@ -25,23 +89,11 @@ macro_rules! math1 {
                         match crate::strscan::scan_number(l.str_static(sid)) {
                             Some(n) => n,
                             None => {
-                                return Err(err_bad_arg(
-                                    l,
-                                    1,
-                                    concat!("math.", stringify!($name)),
-                                    "number",
-                                    "",
-                                ));
+                                return Err(err_bad_arg_type(l, 1, stringify!($name), "number", v));
                             }
                         }
                     } else {
-                        return Err(err_bad_arg(
-                            l,
-                            1,
-                            concat!("math.", stringify!($name)),
-                            "number",
-                            "",
-                        ));
+                        return Err(err_bad_arg_type(l, 1, stringify!($name), "number", v));
                     }
                 }
             };
@@ -73,7 +125,7 @@ math1!(tanh, f64::tanh);
 fn math_atan2(l: &mut LuaState) -> LuaResult<i32> {
     let y = match arg(l, 0).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 1, "math.atan", "number", "")),
+        None => return Err(err_bad_arg_type(l, 1, "math.atan", "number", arg(l, 0))),
     };
     let x = arg(l, 1).as_number().unwrap_or(1.0);
     push(l, LuaValue::number(y.atan2(x)));
@@ -83,11 +135,11 @@ fn math_atan2(l: &mut LuaState) -> LuaResult<i32> {
 pub fn math_fmod(l: &mut LuaState) -> LuaResult<i32> {
     let x = match arg(l, 0).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 1, "math.fmod", "number", "")),
+        None => return Err(err_bad_arg_type(l, 1, "math.fmod", "number", arg(l, 0))),
     };
     let y = match arg(l, 1).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 2, "math.fmod", "number", "")),
+        None => return Err(err_bad_arg_type(l, 2, "math.fmod", "number", arg(l, 2 - 1))),
     };
     push(l, LuaValue::number(x % y));
     Ok(1)
@@ -97,7 +149,9 @@ fn math_frexp(l: &mut LuaState) -> LuaResult<i32> {
     // frexp: decompose x into m * 2^e where 0.5 <= |m| < 1.
     let x = match arg(l, 0).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 1, "math.frexp", "number", "")),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "math.frexp", "number", arg(l, 0)));
+        }
     };
     if x == 0.0 {
         pushv(l, &[LuaValue::number(0.0), LuaValue::number(0.0)]);
@@ -113,11 +167,21 @@ fn math_frexp(l: &mut LuaState) -> LuaResult<i32> {
 fn math_ldexp(l: &mut LuaState) -> LuaResult<i32> {
     let m = match arg(l, 0).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 1, "math.ldexp", "number", "")),
+        None => {
+            return Err(err_bad_arg_type(l, 1, "math.ldexp", "number", arg(l, 0)));
+        }
     };
     let e = match arg(l, 1).as_number() {
         Some(n) => n as i32,
-        None => return Err(err_bad_arg(l, 2, "math.ldexp", "number", "")),
+        None => {
+            return Err(err_bad_arg_type(
+                l,
+                2,
+                "math.ldexp",
+                "number",
+                arg(l, 2 - 1),
+            ));
+        }
     };
     push(l, LuaValue::number(m * (2.0f64).powi(e)));
     Ok(1)
@@ -127,7 +191,7 @@ fn math_logx(l: &mut LuaState) -> LuaResult<i32> {
     // log(x [, base])
     let x = match arg(l, 0).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 1, "math.log", "number", "")),
+        None => return Err(err_bad_arg_type(l, 1, "math.log", "number", arg(l, 0))),
     };
     let base = arg(l, 1).as_number();
     push(
@@ -179,7 +243,7 @@ pub fn math_min(l: &mut LuaState) -> LuaResult<i32> {
 fn math_modf(l: &mut LuaState) -> LuaResult<i32> {
     let x = match arg(l, 0).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 1, "math.modf", "number", "")),
+        None => return Err(err_bad_arg_type(l, 1, "math.modf", "number", arg(l, 0))),
     };
     let int = x.trunc();
     pushv(l, &[LuaValue::number(int), LuaValue::number(x - int)]);
@@ -189,34 +253,48 @@ fn math_modf(l: &mut LuaState) -> LuaResult<i32> {
 fn math_pow(l: &mut LuaState) -> LuaResult<i32> {
     let x = match arg(l, 0).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 1, "math.pow", "number", "")),
+        None => return Err(err_bad_arg_type(l, 1, "math.pow", "number", arg(l, 0))),
     };
     let y = match arg(l, 1).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 2, "math.pow", "number", "")),
+        None => return Err(err_bad_arg_type(l, 2, "math.pow", "number", arg(l, 2 - 1))),
     };
     push(l, LuaValue::number(x.powf(y)));
     Ok(1)
 }
 
 fn math_random(l: &mut LuaState) -> LuaResult<i32> {
-    // NYI: deterministic for now.
-    let m = arg(l, 0).as_number();
-    let n = arg(l, 1).as_number();
-    push(
-        l,
-        LuaValue::number(match (m, n) {
-            (None, _) => 0.0,
-            (Some(u), None) => u % 1.0,
-            (Some(lo), Some(_hi)) => lo,
-        }),
-    );
+    let rng = &mut l.global().rng;
+    let n = nargs(l);
+    let d = rng.next_f64();
+    if n > 0 {
+        let r1 = arg(l, 0).as_number().unwrap_or(0.0);
+        if n == 1 {
+            // random(r1): integer in [1, r1].
+            push(l, LuaValue::number((d * r1).floor() + 1.0));
+        } else {
+            // random(r1, r2): integer in [r1, r2].
+            let r2 = arg(l, 1).as_number().unwrap_or(0.0);
+            if r1 > r2 {
+                return Err(err_bad_arg(l, 1, "random", "number", "interval is empty"));
+            }
+            push(l, LuaValue::number((d * (r2 - r1 + 1.0)).floor() + r1));
+        }
+    } else {
+        // random(): double in [0, 1).
+        push(l, LuaValue::number(d));
+    }
     Ok(1)
 }
 
 fn math_randomseed(l: &mut LuaState) -> LuaResult<i32> {
-    push(l, LuaValue::number(0.0));
-    Ok(1)
+    if nargs(l) > 0 {
+        let s = arg(l, 0).as_number().unwrap_or(0.0);
+        l.global().rng.seed(s);
+    } else {
+        l.global().rng = RngState::fixed();
+    }
+    Ok(0)
 }
 
 fn math_tointeger(l: &mut LuaState) -> LuaResult<i32> {
@@ -255,11 +333,11 @@ fn math_type(l: &mut LuaState) -> LuaResult<i32> {
 fn math_ult(l: &mut LuaState) -> LuaResult<i32> {
     let m = match arg(l, 0).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 1, "math.ult", "number", "")),
+        None => return Err(err_bad_arg_type(l, 1, "math.ult", "number", arg(l, 0))),
     };
     let n = match arg(l, 1).as_number() {
         Some(n) => n,
-        None => return Err(err_bad_arg(l, 2, "math.ult", "number", "")),
+        None => return Err(err_bad_arg_type(l, 2, "math.ult", "number", arg(l, 2 - 1))),
     };
     push(l, LuaValue::boolean((m as u64) < (n as u64)));
     Ok(1)
@@ -271,6 +349,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"acos", acos)
         .func(b"asin", asin)
         .func(b"atan", math_atan2)
+        .func(b"atan2", math_atan2)
         .func(b"ceil", ceil)
         .func(b"cos", cos)
         .func(b"cosh", cosh)
@@ -280,7 +359,6 @@ pub fn open(l: &mut LuaState) {
         .func(b"fmod", math_fmod)
         .func(b"frexp", math_frexp)
         .func(b"ldexp", math_ldexp)
-        .func(b"log10", log10)
         .func(b"log", math_logx)
         .func(b"max", math_max)
         .func(b"min", math_min)
@@ -294,12 +372,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"sqrt", sqrt)
         .func(b"tan", tan)
         .func(b"tanh", tanh)
-        .func(b"tointeger", math_tointeger)
-        .func(b"type", math_type)
-        .func(b"ult", math_ult)
         .value(b"pi", LuaValue::number(std::f64::consts::PI))
-        .value(b"huge", LuaValue::number(f64::MAX))
-        .value(b"maxinteger", LuaValue::number(i64::MAX as f64))
-        .value(b"mininteger", LuaValue::number(i64::MIN as f64))
+        .value(b"huge", LuaValue::number(f64::INFINITY))
         .build();
 }
