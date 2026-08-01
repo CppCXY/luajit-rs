@@ -819,6 +819,7 @@ impl<'a> Asm<'a> {
             rec::IRCALL_TAB_CONCAT => exec::jit_tconcat as *const () as u64,
             rec::IRCALL_CAT => exec::jit_cat as *const () as u64,
             rec::IRCALL_USET => exec::jit_uset as *const () as u64,
+            rec::IRCALL_TOSTR_NUM => exec::jit_tostr_num as *const () as u64,
             _ => unreachable!("bad IRCALL index"),
         };
         match rec::ircall_arity(idx) {

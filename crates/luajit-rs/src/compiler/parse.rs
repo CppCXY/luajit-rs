@@ -1,6 +1,8 @@
 mod funcstate;
 
 use crate::bc::*;
+#[cfg(any())]
+use crate::bc::{bc_a, bc_b, bc_c, bc_d};
 use crate::lex::*;
 use crate::proto::{
     KGc, PROTO_BITOP, PROTO_CHILD, PROTO_FFI, PROTO_FIXUP_RETURN, PROTO_HAS_RETURN,
@@ -9,7 +11,6 @@ use crate::proto::{
 use crate::table::LuaTable;
 use crate::value::LuaValue;
 use funcstate::{FuncScope, FuncState};
-
 const LJ_MAX_LOCVAR: u32 = 200;
 const LJ_MAX_UPVAL: u32 = 60;
 const LJ_MAX_SLOTS: u32 = 250;
@@ -543,8 +544,16 @@ impl<'a> Parser<'a> {
 
     fn bcreg_free(&mut self, reg: BCReg) {
         if reg >= self.cur().nactvar {
-            self.cur_mut().freereg -= 1;
-            debug_assert!(reg == self.cur().freereg);
+            if reg == self.cur().freereg - 1 {
+                // A temporary register at the top of the free range.
+                self.cur_mut().freereg -= 1;
+            } else {
+                // A local slot reserved for a `local x = ...` whose
+                // initializer references the not-yet-active variable
+                // (e.g. `local a = a`): its register equals freereg and
+                // must not be freed.
+                debug_assert!(reg == self.cur().freereg);
+            }
         }
     }
 
@@ -1328,64 +1337,92 @@ impl<'a> Parser<'a> {
         while vidx != VINDEX_NONE {
             let v = self.vstack[vidx as usize].clone();
             if v.name == VName::Str(name) {
-                let top = self.fs.len() - 1;
-                if vidx as usize >= self.fs[top].vbase {
-                    *e = ExpDesc::init(VLocal, v.slot as u32);
-                    e.aux = vidx as u32;
-                } else {
-                    e.aux = vidx as u32;
-                    let nuv = self.fs[top].nuv as usize;
-                    let mut found = false;
-                    for uvidx in 0..nuv {
-                        if self.fs[top].uvmap[uvidx] == vidx {
-                            let aux = e.aux;
-                            *e = ExpDesc::init(VUpval, uvidx as u32);
-                            e.aux = aux;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        let aux = e.aux;
-                        *e = ExpDesc::init(VUpval, self.fs[top].nuv as u32);
-                        e.aux = aux;
-                        let mut fi = top;
-                        loop {
-                            let nuv = self.fs[fi].nuv as usize;
-                            self.checklimit(nuv as u32, LJ_MAX_UPVAL, "upvalues");
-                            self.fs[fi].uvmap[nuv] = vidx;
-                            self.fs[fi].nuv = (nuv + 1) as u8;
-                            let pend = (fi, nuv);
-                            fi -= 1;
-                            if vidx as usize >= self.fs[fi].vbase {
-                                self.fs[pend.0].uvtmp[pend.1] = vidx;
-                                self.fscope_uvmark(fi, v.slot as u32);
-                                break;
-                            }
-                            let n = self.fs[fi].nuv as usize;
-                            let mut uvi = None;
-                            for uvidx in 0..n {
-                                if self.fs[fi].uvmap[uvidx] == vidx {
-                                    uvi = Some(uvidx);
-                                    break;
-                                }
-                            }
-                            if let Some(uvidx) = uvi {
-                                self.fs[pend.0].uvtmp[pend.1] =
-                                    (LJ_MAX_VSTACK as usize + uvidx) as u16;
-                                break;
-                            }
-                            self.fs[pend.0].uvtmp[pend.1] = (LJ_MAX_VSTACK as usize + n) as u16;
-                        }
-                    }
-                }
-                return vidx as u32;
+                return self.var_resolve(e, vidx, v.slot as u32);
             }
             vidx = self.vstack[vidx as usize].prev;
+        }
+        // A local declared in the current `local` statement is not in the
+        // vhash yet (it is activated by var_add only after the initializer),
+        // so an immediate `local assert = assert` resolves the outer
+        // variable or the global. But a *nested function body* parsed
+        // inside the initializer must see it:
+        //   local g = function() return g end
+        // scans the pending declarations (startpc == 0) of the enclosing
+        // functions' current statements. Pending locals of the *current*
+        // function are excluded: its immediate initializer must not see
+        // them.
+        let top = self.fs.len() - 1;
+        if top > 0 {
+            let pend_from = self.fs[0].pend_start;
+            let mut i = self.vstack.len();
+            while i > pend_from {
+                i -= 1;
+                let v = &self.vstack[i];
+                if v.startpc == 0 && v.name == VName::Str(name) && i < self.fs[top].vbase {
+                    return self.var_resolve(e, i as u16, v.slot as u32);
+                }
+            }
         }
         *e = ExpDesc::init(VGlobal, 0);
         e.sval = name;
         VINDEX_NONE as u32
+    }
+
+    /// Resolve a found variable: a local of the current function becomes
+    /// `VLocal`; a local of an enclosing function becomes (or reuses) an
+    /// upvalue.
+    fn var_resolve(&mut self, e: &mut ExpDesc, vidx: u16, slot: u32) -> u32 {
+        let top = self.fs.len() - 1;
+        if vidx as usize >= self.fs[top].vbase {
+            *e = ExpDesc::init(VLocal, slot);
+            e.aux = vidx as u32;
+        } else {
+            e.aux = vidx as u32;
+            let nuv = self.fs[top].nuv as usize;
+            let mut found = false;
+            for uvidx in 0..nuv {
+                if self.fs[top].uvmap[uvidx] == vidx {
+                    let aux = e.aux;
+                    *e = ExpDesc::init(VUpval, uvidx as u32);
+                    e.aux = aux;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                let aux = e.aux;
+                *e = ExpDesc::init(VUpval, self.fs[top].nuv as u32);
+                e.aux = aux;
+                let mut fi = top;
+                loop {
+                    let nuv = self.fs[fi].nuv as usize;
+                    self.checklimit(nuv as u32, LJ_MAX_UPVAL, "upvalues");
+                    self.fs[fi].uvmap[nuv] = vidx;
+                    self.fs[fi].nuv = (nuv + 1) as u8;
+                    let pend = (fi, nuv);
+                    fi -= 1;
+                    if vidx as usize >= self.fs[fi].vbase {
+                        self.fs[pend.0].uvtmp[pend.1] = vidx;
+                        self.fscope_uvmark(fi, slot);
+                        break;
+                    }
+                    let n = self.fs[fi].nuv as usize;
+                    let mut uvi = None;
+                    for uvidx in 0..n {
+                        if self.fs[fi].uvmap[uvidx] == vidx {
+                            uvi = Some(uvidx);
+                            break;
+                        }
+                    }
+                    if let Some(uvidx) = uvi {
+                        self.fs[pend.0].uvtmp[pend.1] = (LJ_MAX_VSTACK as usize + uvidx) as u16;
+                        break;
+                    }
+                    self.fs[pend.0].uvtmp[pend.1] = (LJ_MAX_VSTACK as usize + n) as u16;
+                }
+            }
+        }
+        vidx as u32
     }
 
     fn var_assign_check(&self, e: &ExpDesc) {
@@ -2578,9 +2615,17 @@ impl<'a> Parser<'a> {
                 }
                 self.vhash = vhsave;
             } else {
+                let base_slot = self.cur().nactvar;
+                self.cur_mut().pend_start = self.vstack.len();
                 loop {
                     let name = self.lex_str();
-                    self.var_new(nvars, VName::Str(name));
+                    let vidx = self.var_new(nvars, VName::Str(name));
+                    // The local is deliberately NOT linked into the vhash
+                    // yet: the immediate initializer must resolve the outer
+                    // variable or global (`local assert = assert`), while
+                    // nested function bodies find it via the pending scan in
+                    // `var_lookup`.
+                    self.vstack[vidx].slot = (base_slot + nvars) as u8;
                     nvars += 1;
                     if !self.lex_opt(Tok::Char(b',')) {
                         break;

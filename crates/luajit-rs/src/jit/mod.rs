@@ -349,6 +349,55 @@ impl Prng {
 
 /// The JIT compiler state, hanging off the `GlobalState` (LuaJIT embeds it
 /// in `GG_State`): profiling counters, the trace registry, penalties and
+/// Optional JIT diagnostics: counts of compiled traces and abort reasons,
+/// gated by the `LUARS_JITDBG` environment variable. Each distinct reason
+/// prints once when it first fires.
+#[cfg(not(target_arch = "wasm32"))]
+pub static JIT_STATS: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stats_bump_impl(key: String) {
+    if std::env::var("LUARS_JITDBG").is_ok()
+        && let Ok(mut m) = JIT_STATS.lock()
+    {
+        let mut found = false;
+        for (k, c) in m.iter_mut() {
+            if *k == key {
+                *c += 1;
+                if *c == 1 {
+                    eprintln!("JITSTAT {key}");
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            m.push((key.clone(), 1));
+            eprintln!("JITSTAT {key}");
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn stats_bump(key: &'static str) {
+    stats_bump_impl(key.to_string());
+}
+/// Count an abort with its bytecode site, e.g. "NYI: bytecode @ CALL".
+#[cfg(not(target_arch = "wasm32"))]
+pub fn stats_bump_site(key: &str, site: &str) {
+    stats_bump_impl(format!("{key} @ {site}"));
+}
+#[cfg(target_arch = "wasm32")]
+pub fn stats_bump(_key: &'static str) {}
+#[cfg(target_arch = "wasm32")]
+pub fn stats_bump_site(_key: &str, _site: &str) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for JitState {
+    fn drop(&mut self) {
+        self.stats_dump();
+    }
+}
+
 /// the active recording context.
 pub struct JitState {
     /// JIT_F_* flags.
@@ -436,6 +485,21 @@ impl JitState {
         js.init_hotcount();
         js
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn stats_dump(&self) {
+        if std::env::var("LUARS_JITDBG").is_ok()
+            && let Ok(m) = JIT_STATS.lock()
+        {
+            let mut v = m.clone();
+            v.sort_unstable_by_key(|(_, c)| std::cmp::Reverse(*c));
+            for (k, c) in v {
+                eprintln!("JITSTAT {k}: {c}");
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn stats_dump(&self) {}
 
     /// Find an existing root trace starting at `pt.bc[pc]`. Until the
     /// backend patches JLOOP/JFORL into the bytecode, this lookup is how

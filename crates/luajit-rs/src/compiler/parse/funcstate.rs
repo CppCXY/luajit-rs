@@ -54,6 +54,11 @@ pub(crate) struct FuncState {
     pub uvtmp: [u16; 60],
     /// Stack of open scope blocks.
     pub scopes: Vec<FuncScope>,
+    /// Vstack index where the current `local` statement's declarations
+    /// started. Those locals are not in the vhash yet (they are only
+    /// activated by `var_add` after the initializer), but they are visible
+    /// to nested function bodies parsed inside the initializer.
+    pub pend_start: usize,
 }
 
 impl FuncState {
@@ -79,6 +84,7 @@ impl FuncState {
             uvmap: [0; 60],
             uvtmp: [0; 60],
             scopes: Vec::new(),
+            pend_start: 0,
         }
     }
 }

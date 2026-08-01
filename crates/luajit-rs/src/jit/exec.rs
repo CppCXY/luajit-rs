@@ -398,6 +398,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                                 record::IRCALL_STR_LEN => jit_str_len(x),
                                 record::IRCALL_STR_CHAR => jit_str_char(x),
                                 record::IRCALL_TAB_LEN => jit_alen(x),
+                                record::IRCALL_TOSTR_NUM => jit_tostr_num(x),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -948,6 +949,14 @@ pub extern "C" fn jit_str_char(c_bits: u64) -> u64 {
     jit_intern(&[b])
 }
 
+/// tostring(number): exact decimal formatting, matching the interpreter.
+pub extern "C" fn jit_tostr_num(n_bits: u64) -> u64 {
+    let n = f64::from_bits(n_bits);
+    let mut buf = [0u8; 64];
+    let len = crate::strfmt::g14_to_buf(n, &mut buf);
+    jit_intern(&buf[..len])
+}
+
 // -- Table allocation and library helpers ------------------------------------
 
 /// BC_TNEW: a fresh empty table (the interpreter ignores the size hint).
@@ -1028,6 +1037,7 @@ pub extern "C" fn jit_tconcat(tab_bits: u64, sep_bits: u64) -> u64 {
 /// String concatenation (.. operator) for two Lua values. Returns a
 /// string GCref on success, or LuaValue::NIL if either operand is
 /// neither a string nor a number (guard exit → interpreter).
+/// BC_CAT helper: concatenate two string/number values.
 pub extern "C" fn jit_cat(a_bits: u64, b_bits: u64) -> u64 {
     let a = LuaValue::from_bits(a_bits);
     let b = LuaValue::from_bits(b_bits);

@@ -364,6 +364,23 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             } else {
                 g.jit.err = e;
                 g.jit.state = TraceState::Err;
+                if std::env::var("LUARS_JITDBG").is_ok() && pc > 0 {
+                    let bc = &rec.pt.as_ref().bc;
+                    let lo = pc.saturating_sub(2);
+                    let hi = (pc + 1).min(bc.len());
+                    let desc = (lo..hi)
+                        .map(|i| format!("{i}:{:?}", bc_op(bc[i])))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!("JITABORT {} at pc={} ({})", e.message(), pc, desc);
+                }
+                super::stats_bump(e.message());
+                if pc < rec.pt.as_ref().bc.len() {
+                    super::stats_bump_site(
+                        e.message(),
+                        &format!("{:?}", bc_op(rec.pt.as_ref().bc[pc])),
+                    );
+                }
                 trace_abort(g);
             }
             false
@@ -388,6 +405,7 @@ pub fn rec_abort_error(g: &mut GlobalState) {
 fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, lnk: TraceNo) {
     let js = &mut g.jit;
     let traceno = rec.cur.traceno;
+    super::stats_bump("TRACE-COMPILED");
     let (parent, exitno) = (rec.parent, rec.exitno as usize);
     rec.cur.linktype = linktype;
     rec.cur.link = lnk;
@@ -910,10 +928,10 @@ mod tests {
         // parked with SNAPCOUNT_DONE and never re-examined.
         let (f, pt) = load_proto(
             &mut lua,
-            "local ts = tostring \
+            "local mr = math.random \
              local s = 0 \
              for i = 1, 100000 do \
-               if i % 2 == 0 then ts(i) s = s + 2 else s = s + 1 end \
+               if i % 2 == 0 then mr() s = s + 2 else s = s + 1 end \
              end return s",
         );
         let r = call(lua.main(), f, &[]).unwrap();

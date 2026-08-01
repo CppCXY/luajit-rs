@@ -89,7 +89,7 @@ pub fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
+pub fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
     let bytes = tostring_meta(l, v)?;
     let sid = l.heap().intern(&bytes);

@@ -62,12 +62,13 @@ pub const IRCALL_TAB_CONCAT: u32 = 8;
 pub const IRCALL_CAT: u32 = 9;
 pub const IRCALL_USET: u32 = 10;
 pub const IRCALL_VARG: u32 = 11;
+pub const IRCALL_TOSTR_NUM: u32 = 12;
 
 /// Argument count of an IRCALL: 1 = op1 is the argument, 2 = op1 is a
 /// CARG pair, 3 = op1 is CARG(CARG(a, b), c).
 pub fn ircall_arity(idx: u32) -> u32 {
     match idx {
-        IRCALL_STR_LEN | IRCALL_STR_CHAR | IRCALL_TAB_LEN => 1,
+        IRCALL_STR_LEN | IRCALL_STR_CHAR | IRCALL_TAB_LEN | IRCALL_TOSTR_NUM => 1,
         IRCALL_STR_SUB | IRCALL_VARG => 3,
         _ => 2,
     }
@@ -2115,6 +2116,29 @@ impl Record {
                     return Err(TraceError::NYIBC);
                 }
             }
+            Recff::ToString => {
+                if nargs != 1 {
+                    return Err(TraceError::NYIBC);
+                }
+                let arg0 = self.base_ref(a + 2);
+                if tref_isnum(arg0) || tref_isint(arg0) {
+                    // tostring(number): exact decimal via a runtime helper
+                    // (the interpreter formats with the same routine).
+                    let r = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_STR),
+                        tref_ref(arg0),
+                        IRCALL_TOSTR_NUM,
+                    ));
+                    res[0] = r;
+                    nres = 1;
+                } else if tref_isstr(arg0) {
+                    // tostring of a string is the string itself.
+                    res[0] = arg0;
+                    nres = 1;
+                } else {
+                    return Err(TraceError::NYIBC); // Metatable __tostring path.
+                }
+            }
         }
         // Write the results; pad/discard per the call's wanted count.
         for i in 0..want as u32 {
@@ -2504,6 +2528,12 @@ impl Record {
                 }
                 // Continue tracing if the loop is not entered.
             }
+            BCOp::FORI => {
+                // Loop entry of an interpreted (non-JIT) loop: load the
+                // loop variables without incrementing, then continue into
+                // the body. The closing FORL forms the loop.
+                self.rec_for(l, base, pc, false)?;
+            }
             BCOp::JFORL => {
                 // D holds the trace number; recover the FORI position from
                 // the original FORL stored as the trace's start instruction.
@@ -2756,21 +2786,31 @@ impl Record {
             }
 
             BCOp::CAT => {
-                // Two-value concatenation via jit_cat helper.
-                // rb=first source, rc=second source (both already typed).
-                if !(tref_isstr(rb) || tref_isnum(rb)) || !(tref_isstr(rc) || tref_isnum(rc)) {
+                // CAT concatenates the register range B..C (Rbase mode), so
+                // load the operands here and chain 2-value jit_cat calls
+                // across the range; the result writes to register A.
+                let n = bc_c(ins) - bc_b(ins) + 1;
+                if n < 2 {
                     return Err(TraceError::NYIBC);
                 }
-                let carg = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CARG, irt_type(IRT_NIL)),
-                    tref_ref(rb),
-                    tref_ref(rc),
-                ));
-                result = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CALLL, IRT_STR),
-                    tref_ref(carg),
-                    IRCALL_CAT,
-                ));
+                let mut acc = self.getslot(l, base, bc_b(ins));
+                for i in (bc_b(ins) + 1)..=bc_c(ins) {
+                    let v = self.getslot(l, base, i);
+                    if !(tref_isstr(acc) || tref_isnum(acc)) || !(tref_isstr(v) || tref_isnum(v)) {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let carg = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CARG, irt_type(IRT_NIL)),
+                        tref_ref(acc),
+                        tref_ref(v),
+                    ));
+                    acc = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_STR),
+                        tref_ref(carg),
+                        IRCALL_CAT,
+                    ));
+                }
+                result = acc;
             }
 
             BCOp::FNEW => {
@@ -2857,12 +2897,13 @@ enum Recff {
     RawGet,
     RawSet,
     ToNumber,
+    ToString,
 }
 
 fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
     use crate::func::CFunction;
     use crate::stdlib::{base, bit, math, string, table};
-    let entries: [(CFunction, Recff); 31] = [
+    let entries: [(CFunction, Recff); 32] = [
         (math::floor, Recff::Floor),
         (math::ceil, Recff::Ceil),
         (math::sqrt, Recff::Sqrt),
@@ -2894,6 +2935,7 @@ fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
         (base::lib_rawget, Recff::RawGet),
         (base::lib_rawset, Recff::RawSet),
         (base::lib_tonumber, Recff::ToNumber),
+        (base::lib_tostring, Recff::ToString),
     ];
     entries
         .iter()
