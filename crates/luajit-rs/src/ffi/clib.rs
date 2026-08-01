@@ -78,7 +78,7 @@ pub fn resolve_symbol(name: &str) -> Option<usize> {
     }
     #[cfg(unix)]
     unsafe {
-        let p = dlsym(std::ptr::null_mut(), cname.as_ptr());
+        let p = dlsym(rtld_default(), cname.as_ptr());
         if !p.is_null() {
             return Some(p as usize);
         }
@@ -90,4 +90,19 @@ pub fn resolve_symbol(name: &str) -> Option<usize> {
 unsafe extern "C" {
     fn dlsym(handle: *mut std::ffi::c_void, name: *const std::ffi::c_char)
     -> *mut std::ffi::c_void;
+}
+
+/// `RTLD_DEFAULT`: 0 on Linux/FreeBSD, but `(void *)-2` on macOS — the
+/// loader treats 0 as an invalid handle there, so dlsym would fail to
+/// resolve any libc symbol (strlen, strchr, ...).
+#[cfg(unix)]
+fn rtld_default() -> *mut std::ffi::c_void {
+    #[cfg(target_os = "macos")]
+    {
+        -2isize as *mut std::ffi::c_void
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::ptr::null_mut()
+    }
 }
