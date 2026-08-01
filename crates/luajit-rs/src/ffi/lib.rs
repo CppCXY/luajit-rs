@@ -1250,6 +1250,9 @@ pub fn ffi_cast(l: &mut LuaState) -> LuaResult<i32> {
 /// as `re+imi`, pointers as addresses, structs/unions/arrays as
 /// `cdata<type>: 0x...`, and type values as `ctype<type>`.
 fn cdata_tostring(l: &mut LuaState) -> LuaResult<i32> {
+    // The type state is created lazily; ensure it exists before the
+    // formatting walks the ctype table.
+    cts_of(l);
     let v = arg(l, 0);
     let bytes = cdata_tostring_bytes(l, v);
     let sid = l.heap().intern(&bytes);
@@ -1274,21 +1277,21 @@ fn cdata_tostring_bytes(l: &LuaState, v: LuaValue) -> Vec<u8> {
     let raw = cts.raw(c.ctypeid);
     // Numeric cdata (incl. enums).
     if crate::ffi::ctype_isnum(raw.info) && !crate::ffi::ctype_iscomplex(raw.info) {
-        if let Some(n) = crate::stdlib::cdata_to_number(c) {
-            let s = crate::strfmt::g14(n);
-            let signed = (raw.info & crate::ffi::ctinfo::UNSIGNED) == 0 && raw.size == 8;
-            let unsigned = (raw.info & crate::ffi::ctinfo::UNSIGNED) != 0 && raw.size == 8;
-            if signed {
-                return format!("{}LL", s).into_bytes();
-            }
-            if unsigned {
-                // Print the full unsigned value (possibly > 2^53).
-                let mut buf = [0u8; 8];
-                buf[..c.data.len().min(8)].copy_from_slice(&c.data[..c.data.len().min(8)]);
-                let u = u64::from_le_bytes(buf);
+        let is_i64 = (raw.info & crate::ffi::ctinfo::UNSIGNED) == 0 && raw.size == 8;
+        let is_u64 = (raw.info & crate::ffi::ctinfo::UNSIGNED) != 0 && raw.size == 8;
+        if is_i64 || is_u64 {
+            // 64-bit integers print their exact decimal value.
+            let mut buf = [0u8; 8];
+            let n = c.data.len().min(8);
+            buf[..n].copy_from_slice(&c.data[..n]);
+            let u = u64::from_le_bytes(buf);
+            if is_u64 {
                 return format!("{}ULL", u).into_bytes();
             }
-            return s.into_bytes();
+            return format!("{}LL", u as i64).into_bytes();
+        }
+        if let Some(n) = crate::stdlib::cdata_to_number(c) {
+            return crate::strfmt::g14(n).into_bytes();
         }
     }
     // Complex values: `re+imi` (test: "12.5-753.125i", "-0-0i", "inf-infI").
