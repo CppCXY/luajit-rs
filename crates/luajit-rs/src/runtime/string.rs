@@ -152,6 +152,14 @@ impl Interner {
                 Slot::Occupied(p) => {
                     let ls = p.as_ref();
                     if ls.hash() == hash && ls.as_bytes() == s {
+                        // The string may carry a *previous* cycle's white
+                        // (e.g. it was interned by an earlier parse before a
+                        // GC sweep). A fresh object referencing it must not
+                        // have it swept out from under it before the current
+                        // cycle's marking reaches it, so mark eagerly.
+                        // Marking is conservative: a dead-but-marked string
+                        // is simply collected one cycle later.
+                        p.set_marked();
                         return ls.sid();
                     }
                 }
