@@ -257,6 +257,78 @@ pub fn err_bad_arg_type(
     err_bad_arg(l, n, func, expected, type_name(got))
 }
 
+/// Numeric cdata -> f64 (LuaJIT's `cdata_to_number` for bit ops and
+/// arithmetic fallbacks). Pointers/voids are not convertible.
+pub fn cdata_to_number(cd: &crate::runtime::cdata::CData) -> Option<f64> {
+    use crate::ffi::CTypeID;
+    let id = cd.ctypeid;
+    let d = &cd.data;
+    let v = match id {
+        id if id == CTypeID::Int8 as u32 => d.first().copied().unwrap_or(0) as i8 as f64,
+        id if id == CTypeID::UInt8 as u32 => d.first().copied().unwrap_or(0) as f64,
+        id if id == CTypeID::CChar as u32 => d.first().copied().unwrap_or(0) as i8 as f64,
+        id if id == CTypeID::Bool as u32 => {
+            if d.first().copied().unwrap_or(0) != 0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        id if id == CTypeID::Int16 as u32 => {
+            i16::from_le_bytes(d[..2].try_into().unwrap_or([0; 2])) as f64
+        }
+        id if id == CTypeID::UInt16 as u32 => {
+            u16::from_le_bytes(d[..2].try_into().unwrap_or([0; 2])) as f64
+        }
+        id if id == CTypeID::Int32 as u32 => {
+            i32::from_le_bytes(d[..4].try_into().unwrap_or([0; 4])) as f64
+        }
+        id if id == CTypeID::UInt32 as u32 => {
+            u32::from_le_bytes(d[..4].try_into().unwrap_or([0; 4])) as f64
+        }
+        id if id == CTypeID::Int64 as u32 => {
+            if d.len() >= 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&d[..8]);
+                i64::from_le_bytes(b) as f64
+            } else {
+                return None;
+            }
+        }
+        id if id == CTypeID::UInt64 as u32 => {
+            if d.len() >= 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&d[..8]);
+                u64::from_le_bytes(b) as f64
+            } else {
+                return None;
+            }
+        }
+        id if id == CTypeID::Float as u32 => {
+            f32::from_le_bytes(d[..4].try_into().unwrap_or([0; 4])) as f64
+        }
+        id if id == CTypeID::Double as u32 => {
+            f64::from_le_bytes(d[..8].try_into().unwrap_or([0; 8]))
+        }
+        _ => {
+            // Enum types and other table-defined numerics: interpret by
+            // payload size (enums are int-sized).
+            match d.len() {
+                1 => d.first().copied().unwrap_or(0) as i8 as f64,
+                2 => i16::from_le_bytes(d[..2].try_into().unwrap_or([0; 2])) as f64,
+                4 => i32::from_le_bytes(d[..4].try_into().unwrap_or([0; 4])) as f64,
+                8 => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&d[..8]);
+                    i64::from_le_bytes(b) as f64
+                }
+                _ => return None,
+            }
+        }
+    };
+    Some(v)
+}
+
 /// Install every standard library.
 pub fn open_libs(l: &mut LuaState) {
     base::open(l);

@@ -79,6 +79,8 @@ pub fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
         b"table"
     } else if v.is_func() {
         b"function"
+    } else if v.is_cdata() {
+        b"cdata"
     } else {
         b"userdata"
     };

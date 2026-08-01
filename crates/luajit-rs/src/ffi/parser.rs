@@ -478,7 +478,12 @@ impl<'a> Parser<'a> {
             while self.tok == Token::LBracket {
                 self.next(); // eat [
                 let mut array_num: u32 = 1;
-                if self.tok == Token::Integer {
+                if self.tok == Token::Question {
+                    // Variable-length array: size u32::MAX, resolved at
+                    // allocation time.
+                    array_num = u32::MAX;
+                    self.next();
+                } else if self.tok == Token::Integer {
                     if let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>() {
                         array_num = n.max(1);
                     }

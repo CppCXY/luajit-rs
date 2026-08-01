@@ -75,7 +75,13 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
     let val = arg(l, 0);
 
     if val.is_cdata() {
-        return Ok(val.as_cdata().unwrap().as_ref().ctypeid);
+        let cd = val.as_cdata().unwrap();
+        let c = cd.as_ref();
+        if c.ctypeid == crate::ffi::CTypeID::CTypeIDType as u32 && c.data.len() >= 4 {
+            // A ffi.typeof value: the type id lives in the payload.
+            return Ok(u32::from_le_bytes(c.data[..4].try_into().unwrap_or([0; 4])));
+        }
+        return Ok(c.ctypeid);
     }
 
     let sid = match val.as_string_id() {
@@ -98,8 +104,13 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
         let close = name.rfind(']').unwrap_or(name.len());
         let base = name[..bracket].trim().to_string();
         let inside = name[bracket + 1..close].trim();
-        let count: usize = inside.parse().unwrap_or(0);
-        (base, if count > 0 { count } else { 1 })
+        // 0 = variable-length array ("[?]").
+        let count: usize = if inside == "?" {
+            0
+        } else {
+            inside.parse().unwrap_or(1)
+        };
+        (base, count)
     } else {
         (name.clone(), 1)
     };
@@ -160,12 +171,17 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
 
 /// If `count > 1`, create or reuse an array `CType` wrapping the base type.
 fn wrap_array(l: &mut LuaState, base_id: u32, count: usize) -> LuaResult<u32> {
-    if count <= 1 {
+    if count == 1 {
         return Ok(base_id);
     }
     let cts = cts_of(l);
     let base_sz = cts.raw(base_id).size;
-    let total_sz = base_sz.saturating_mul(count as u32);
+    // count == 0 marks a variable-length array ("[?]").
+    let total_sz = if count == 0 {
+        u32::MAX
+    } else {
+        base_sz.saturating_mul(count as u32)
+    };
     // Search existing array types for a match.
     let info = ct_info(CT::Array, 0) | base_id;
     for i in 0..cts.top as usize {
@@ -256,11 +272,36 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
                     }
                 }
             }
-        } else if let Some(count) = v2.as_number() {
-            // Numeric argument: variable-length array.
-            let count = count as usize;
-            if count > 0 {
-                cd = CData::new(id, count);
+        } else if let Some(n) = v2.as_number() {
+            // A scalar type initializes its value; a variable-length
+            // array takes the element count; a fixed-size array is
+            // filled with the (byte) value.
+            let raw = cts_of(l).raw(id);
+            if crate::ffi::ctype_isarray(raw.info) {
+                if raw.size == u32::MAX {
+                    let elem_id = crate::ffi::ctype_cid(raw.info);
+                    let elem = cts_of(l).raw(elem_id).size as usize;
+                    let count = n as usize;
+                    if count > 0 {
+                        cd = CData::new(id, count * elem.max(1));
+                    }
+                } else {
+                    let mut d = vec![0u8; raw.size as usize];
+                    d.fill(n as u8);
+                    cd = CData {
+                        ctypeid: id,
+                        data: d.into_boxed_slice(),
+                    };
+                }
+            } else if crate::ffi::ctype_ispointer(raw.info) {
+                let count = n as usize;
+                if count > 0 {
+                    cd = CData::new(id, count);
+                }
+            } else {
+                let mut d = cd.data.to_vec();
+                write_scalar_value(&mut d, id, n);
+                cd.data = d.into_boxed_slice();
             }
         }
     }
@@ -270,10 +311,64 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
+/// Write a numeric scalar into a cdata byte buffer for the given type.
+fn write_scalar_value(data: &mut [u8], ctypeid: u32, n: f64) {
+    use crate::ffi::CTypeID;
+    let mut write = |off: usize, bytes: &[u8]| {
+        if off + bytes.len() <= data.len() {
+            data[off..off + bytes.len()].copy_from_slice(bytes);
+        }
+    };    match ctypeid {
+        id if id == CTypeID::Int8 as u32 => write(0, &(n as i8).to_le_bytes()),
+        id if id == CTypeID::UInt8 as u32 => write(0, &(n as u8).to_le_bytes()),
+        id if id == CTypeID::CChar as u32 => write(0, &(n as i8).to_le_bytes()),
+        id if id == CTypeID::Bool as u32 => write(0, &(n as u8).to_le_bytes()),
+        id if id == CTypeID::Int16 as u32 => write(0, &(n as i16).to_le_bytes()),
+        id if id == CTypeID::UInt16 as u32 => write(0, &(n as u16).to_le_bytes()),
+        id if id == CTypeID::Int32 as u32 => write(0, &(n as i32).to_le_bytes()),
+        id if id == CTypeID::UInt32 as u32 => write(0, &(n as u32).to_le_bytes()),
+        id if id == CTypeID::Int64 as u32 => write(0, &(n as i64).to_le_bytes()),
+        id if id == CTypeID::UInt64 as u32 => write(0, &(n as u64).to_le_bytes()),
+        id if id == CTypeID::Float as u32 => write(0, &(n as f32).to_le_bytes()),
+        id if id == CTypeID::Double as u32 => write(0, &n.to_le_bytes()),
+        _ => write(0, &(n as i32).to_le_bytes()),
+    }
+}
+
 pub fn ffi_sizeof(l: &mut LuaState) -> LuaResult<i32> {
+    let nargs = nargs(l);
+    if let Some(cd) = arg(l, 0).as_cdata() {
+        let c = cd.as_ref();
+        if c.ctypeid == crate::ffi::CTypeID::CTypeIDType as u32 && c.data.len() >= 4 {
+            // A ffi.typeof value: resolve the underlying type (a
+            // variable-length array takes an explicit count).
+            let id = u32::from_le_bytes(c.data[..4].try_into().unwrap_or([0; 4]));
+            let ct = cts_of(l).raw(id);
+            let (ct_size, ct_info) = (ct.size, ct.info);
+            if nargs > 1 && ct_size == u32::MAX {
+                let n = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+                let elem = cts_of(l).raw(ctype_cid(ct_info)).size as usize;
+                push(l, LuaValue::number((n * elem) as f64));
+            } else {
+                push(l, LuaValue::number(ct_size as f64));
+            }
+            return Ok(1);
+        }
+        // A cdata instance reports its own (allocated) size.
+        push(l, LuaValue::number(c.data.len() as f64));
+        return Ok(1);
+    }
     let id = check_ctype(l)?;
-    let sz = cts_of(l).raw(id).size;
-    push(l, LuaValue::number(sz as f64));
+    let ct = cts_of(l).raw(id);
+    let (ct_size, ct_info) = (ct.size, ct.info);
+    if nargs > 1 && ct_size == u32::MAX {
+        // Variable-length array: size = count * element size.
+        let n = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+        let elem = cts_of(l).raw(ctype_cid(ct_info)).size as usize;
+        push(l, LuaValue::number((n * elem) as f64));
+    } else {
+        push(l, LuaValue::number(ct_size as f64));
+    }
     Ok(1)
 }
 
@@ -307,28 +402,17 @@ pub fn ffi_string(l: &mut LuaState) -> LuaResult<i32> {
     let cd = arg(l, 0)
         .as_cdata()
         .ok_or_else(|| err_bad_arg(l, 1, "ffi.string", "cdata", ""))?;
-    let ptr = cd.as_ref().get_ptr() as *const u8;
+    let data = cd.as_ref().data.to_vec();
 
     let len = if nargs(l) > 1 {
         arg(l, 1).as_number().unwrap_or(0.0) as usize
-    } else if ptr.is_null() {
-        0
     } else {
-        let mut n = 0;
-        while n < 4096 && unsafe { *ptr.add(n) } != 0 {
-            n += 1;
-        }
-        n
+        // NUL-terminated scan over the payload.
+        data.iter().position(|&b| b == 0).unwrap_or(data.len())
     };
-
-    if ptr.is_null() || len == 0 {
-        push(l, LuaValue::NIL);
-        return Ok(1);
-    }
-
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let n = len.min(data.len());
     let h = l.heap();
-    let sid = h.strings.intern(bytes);
+    let sid = h.strings.intern(&data[..n]);
     push(l, h.str_value(sid));
     Ok(1)
 }
@@ -337,34 +421,57 @@ pub fn ffi_copy(l: &mut LuaState) -> LuaResult<i32> {
     let dst = arg(l, 0)
         .as_cdata()
         .ok_or_else(|| err_bad_arg(l, 1, "ffi.copy", "cdata", ""))?;
-    let src = arg(l, 1)
-        .as_cdata()
-        .ok_or_else(|| err_bad_arg(l, 2, "ffi.copy", "cdata", ""))?;
+    let src = arg(l, 1);
     let len = arg(l, 2).as_number().unwrap_or(0.0) as usize;
+    let dlen = dst.as_ref().data.len();
 
-    let dp = dst.as_ref().get_ptr() as *mut u8;
-    let sp = src.as_ref().get_ptr() as *const u8;
-    if !dp.is_null() && !sp.is_null() && len > 0 {
-        unsafe { std::ptr::copy_nonoverlapping(sp, dp, len) };
+    let mut d = dst.as_ref().data.to_vec();
+    let n = len.min(dlen);
+    if let Some(sc) = src.as_cdata() {
+        let n = n.min(sc.as_ref().data.len());
+        d[..n].copy_from_slice(&sc.as_ref().data[..n]);
+    } else if let Some(sid) = src.as_string_id() {
+        let bytes = l.heap().strings.get(sid);
+        let copy_n = if len == 0 {
+            // Copy the string plus its NUL terminator, bounded by the
+            // destination size.
+            bytes.len().min(dlen - 1).min(dlen)
+        } else {
+            n.min(bytes.len())
+        };
+        d[..copy_n].copy_from_slice(&bytes[..copy_n]);
+        if len == 0 && copy_n < dlen {
+            d[copy_n] = 0; // NUL terminator
+        }
+    } else {
+        return Err(err_bad_arg(l, 2, "ffi.copy", "cdata/string", ""));
     }
+    let ctypeid = dst.as_ref().ctypeid;
+    *dst.as_mut() = CData {
+        ctypeid,
+        data: d.into_boxed_slice(),
+    };
     Ok(0)
 }
 
 pub fn ffi_fill(l: &mut LuaState) -> LuaResult<i32> {
-    let dp = arg(l, 0)
+    let dst = arg(l, 0)
         .as_cdata()
-        .ok_or_else(|| err_bad_arg(l, 1, "ffi.fill", "cdata", ""))?
-        .as_ref()
-        .get_ptr() as *mut u8;
+        .ok_or_else(|| err_bad_arg(l, 1, "ffi.fill", "cdata", ""))?;
     let len = arg(l, 1).as_number().unwrap_or(0.0) as usize;
     let byte = if nargs(l) > 2 {
         arg(l, 2).as_number().map(|n| n as u8).unwrap_or(0)
     } else {
         0
     };
-    if !dp.is_null() && len > 0 {
-        unsafe { std::ptr::write_bytes(dp, byte, len) };
-    }
+    let mut d = dst.as_ref().data.to_vec();
+    let n = len.min(d.len());
+    d[..n].fill(byte);
+    let ctypeid = dst.as_ref().ctypeid;
+    *dst.as_mut() = CData {
+        ctypeid,
+        data: d.into_boxed_slice(),
+    };
     Ok(0)
 }
 
@@ -490,8 +597,19 @@ fn array_element(l: &mut LuaState, cd: GcPtr<CData>, idx: i32) -> LuaResult<i32>
         ctypeid: elem_typeid,
         data: elem_bytes.into_boxed_slice(),
     };
-    let p = l.global().heap.cdatas.alloc(sub);
-    push(l, LuaValue::cdata(p));
+    // Scalar elements read back as numbers (except 64-bit integers,
+    // which stay cdata to preserve precision).
+    if elem_typeid == crate::ffi::CTypeID::Int64 as u32
+        || elem_typeid == crate::ffi::CTypeID::UInt64 as u32
+    {
+        let p = l.global().heap.cdatas.alloc(sub);
+        push(l, LuaValue::cdata(p));
+    } else if let Some(n) = crate::stdlib::cdata_to_number(&sub) {
+        push(l, LuaValue::number(n));
+    } else {
+        let p = l.global().heap.cdatas.alloc(sub);
+        push(l, LuaValue::cdata(p));
+    }
     Ok(1)
 }
 
@@ -527,8 +645,9 @@ fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let Some((field_type_id, offset)) = field_offset(cts, target_id, &name) else {
-        push(l, LuaValue::NIL);
-        return Ok(1);
+        return Err(l.runtime_error(
+            format!("no member '{}' in cdata", name).as_bytes(),
+        ));
     };
 
     let field_ct = cts.raw(field_type_id);
@@ -569,6 +688,37 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
         return Err(l.runtime_error(b"ffi: no type state"));
     }
     let cts = l.global().cts.as_ref().unwrap();
+
+    // Numeric key → array element write.
+    if let Some(idx) = key.as_number() {
+        let ctypeid = cd.as_ref().ctypeid;
+        let raw_ct = cts.raw(ctypeid);
+        let elem_typeid = if ctype_ispointer(raw_ct.info) {
+            ctype_cid(raw_ct.info)
+        } else {
+            ctypeid
+        };
+        let elem_sz = cts.raw(elem_typeid).size as usize;
+        if elem_sz == 0 {
+            return Ok(0);
+        }
+        let offset = idx as i64 * elem_sz as i64;
+        if offset < 0 {
+            return Ok(0);
+        }
+        let mut data = cd.as_ref().data.to_vec();
+        let mut ebuf = vec![0u8; elem_sz];
+        write_scalar_value(&mut ebuf, elem_typeid, val.as_number().unwrap_or(0.0));
+        let off = offset as usize;
+        if off + elem_sz <= data.len() {
+            data[off..off + elem_sz].copy_from_slice(&ebuf);
+            *cd.as_mut() = CData {
+                ctypeid,
+                data: data.into_boxed_slice(),
+            };
+        }
+        return Ok(0);
+    }
 
     let name = match key.as_string_id() {
         Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
@@ -787,12 +937,13 @@ pub fn open(l: &mut LuaState) {
     let g: *mut GlobalState = l.global() as *mut GlobalState;
     let env = unsafe { (*g).globals };
 
-    // -- cdata metatable with __index / __newindex ----------------------------
-    let cdata_mt = unsafe { (*g).heap.alloc_table(LuaTable::new(0, 2)) };
+    // -- cdata metatable with __index / __newindex / __call -------------------
+    let cdata_mt = unsafe { (*g).heap.alloc_table(LuaTable::new(0, 3)) };
     {
         let g = unsafe { &mut *g };
         let index_k = g.mmname[MM::Index as usize];
         let newindex_k = g.mmname[MM::Newindex as usize];
+        let call_k = g.mmname[MM::Call as usize];
         let index_fn = g.heap.alloc_func(GcFunc::C(CClosure {
             f: cdata_index,
             env,
@@ -803,10 +954,17 @@ pub fn open(l: &mut LuaState) {
             env,
             upvals: vec![],
         }));
+        // Calling a type value allocates an instance (ffi.new).
+        let call_fn = g.heap.alloc_func(GcFunc::C(CClosure {
+            f: ffi_new,
+            env,
+            upvals: vec![],
+        }));
         cdata_mt.as_mut().set_str(index_k, LuaValue::func(index_fn));
         cdata_mt
             .as_mut()
             .set_str(newindex_k, LuaValue::func(newindex_fn));
+        cdata_mt.as_mut().set_str(call_k, LuaValue::func(call_fn));
         g.set_basemt(LJ_TCDATA, Some(cdata_mt));
     }
 

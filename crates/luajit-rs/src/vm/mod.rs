@@ -184,14 +184,10 @@ fn num2bit(n: f64) -> i32 {
 fn cdata_u64(v: LuaValue) -> Option<u64> {
     if let Some(cd) = v.as_cdata() {
         let cd = cd.as_ref();
-        if cd.data.len() >= 8 {
+        if cd.data.len() <= 8 {
             let mut buf = [0u8; 8];
-            buf.copy_from_slice(&cd.data[..8]);
+            buf[..cd.data.len()].copy_from_slice(&cd.data);
             Some(u64::from_le_bytes(buf))
-        } else if cd.data.len() == 4 {
-            let mut buf = [0u8; 4];
-            buf.copy_from_slice(&cd.data[..4]);
-            Some(u32::from_le_bytes(buf) as u64)
         } else {
             None
         }
@@ -3098,11 +3094,20 @@ fn val_eq(a: LuaValue, b: LuaValue) -> bool {
     if a.is_number() && b.is_number() {
         a.num() == b.num()
     } else if let (Some(ca), _) = (a.as_cdata(), b.is_number()) {
-        if b.is_number()
-            && let Some(bits) = cdata_u64(a)
-        {
-            let bv = num2bit(b.num()) as u64;
-            return bits == bv;
+        if b.is_number() {
+            // Numeric value match, or the raw low-32 pattern when the
+            // number only matches the truncated bits (unsigned small
+            // types compared against a large Lua number).
+            if let Some(cn) = crate::stdlib::cdata_to_number(ca.as_ref())
+                && cn == b.num()
+            {
+                return true;
+            }
+            if let Some(bits) = cdata_u64(a) {
+                let bv = num2bit(b.num()) as u64;
+                return bits == bv;
+            }
+            return false;
         }
         if let Some(cb) = b.as_cdata() {
             if ca.as_ref().ctypeid != cb.as_ref().ctypeid {
@@ -3112,9 +3117,17 @@ fn val_eq(a: LuaValue, b: LuaValue) -> bool {
         }
         a.to_bits() == b.to_bits()
     } else if a.is_number() && b.is_cdata() {
-        if let Some(bits) = cdata_u64(b) {
-            let av = num2bit(a.num()) as u64;
-            return bits == av;
+        if let Some(cb) = b.as_cdata() {
+            if let Some(cn) = crate::stdlib::cdata_to_number(cb.as_ref())
+                && cn == a.num()
+            {
+                return true;
+            }
+            if let Some(bits) = cdata_u64(b) {
+                let av = num2bit(a.num()) as u64;
+                return bits == av;
+            }
+            return false;
         }
         a.to_bits() == b.to_bits()
     } else {
