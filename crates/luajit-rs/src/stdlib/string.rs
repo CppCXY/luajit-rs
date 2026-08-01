@@ -354,15 +354,16 @@ fn str_dump(l: &mut LuaState) -> LuaResult<i32> {
     match fv.as_func() {
         Some(_gf) => {
             let g = l.global();
-            // Cache the function in a global table for loadstring round-trip.
+            // Cache the function in the registry table (GC-marked, and
+            // invisible to the global namespace) for loadstring round-trip.
             let cache_key = g.heap.intern(b"__LUARS_DUMP_CACHE");
             let key = g.heap.str_value(cache_key);
-            let globals = g.globals.as_mut();
-            let cache = match globals.get(key) {
+            let registry = g.registry.as_mut();
+            let cache = match registry.get(key) {
                 v if v.is_table() => v.as_table().unwrap(),
                 _ => {
                     let t = g.heap.alloc_table(LuaTable::new(0, 0));
-                    globals.set(key, LuaValue::table(t));
+                    registry.set(key, LuaValue::table(t));
                     t
                 }
             };

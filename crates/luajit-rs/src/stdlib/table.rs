@@ -218,7 +218,11 @@ fn tab_new(l: &mut LuaState) -> LuaResult<i32> {
 pub fn open(l: &mut LuaState) {
     lual_reg!(l, b"table", LibTarget::Global)
         .func(b"concat", tab_concat)
+        .func(b"foreach", tab_foreach)
+        .func(b"foreachi", tab_foreachi)
+        .func(b"getn", tab_getn)
         .func(b"insert", tab_insert)
+        .func(b"maxn", tab_maxn)
         .func(b"move", tab_move)
         .func(b"new", tab_new)
         .func(b"pack", tab_pack)
@@ -226,4 +230,82 @@ pub fn open(l: &mut LuaState) {
         .func(b"sort", tab_sort)
         .func(b"unpack", tab_unpack)
         .build();
+}
+
+fn tab_foreach(l: &mut LuaState) -> LuaResult<i32> {
+    let t = arg(l, 0);
+    let f = arg(l, 1);
+    let tab = match t.as_table() {
+        Some(t) => t,
+        None => return Err(err_bad_arg_type(l, 1, "foreach", "table", t)),
+    };
+    let mut k = LuaValue::NIL;
+    while let Some((nk, v)) = tab.as_ref().next(k) {
+        k = nk;
+        if crate::vm::execute(l, l.top + 2, 2, 1).is_err() {
+            break;
+        }
+        let r = l.stack[l.top + 2];
+        if r.is_nil() {
+            break;
+        }
+    }
+    push(l, LuaValue::NIL);
+    Ok(1)
+}
+
+fn tab_foreachi(l: &mut LuaState) -> LuaResult<i32> {
+    let t = arg(l, 0);
+    let f = arg(l, 1);
+    let tab = match t.as_table() {
+        Some(t) => t,
+        None => return Err(err_bad_arg_type(l, 1, "foreachi", "table", t)),
+    };
+    for i in 1..=tab.as_ref().len() {
+        let v = tab.as_ref().get_int(i as i32);
+        if v.is_nil() {
+            break;
+        }
+        let fs = l.top + 2;
+        l.stack_ensure(fs + 6);
+        l.stack[fs] = f;
+        l.stack[fs + 2] = LuaValue::number(i as f64);
+        l.stack[fs + 3] = v;
+        match crate::vm::execute(l, fs, 2, 1) {
+            Ok(1) if !l.stack[fs].is_nil() => {}
+            _ => break,
+        }
+    }
+    push(l, LuaValue::NIL);
+    Ok(1)
+}
+
+fn tab_getn(l: &mut LuaState) -> LuaResult<i32> {
+    let t = arg(l, 0);
+    match t.as_table() {
+        Some(t) => {
+            push(l, LuaValue::number(t.as_ref().len() as f64));
+            Ok(1)
+        }
+        None => Err(err_bad_arg_type(l, 1, "getn", "table", t)),
+    }
+}
+
+fn tab_maxn(l: &mut LuaState) -> LuaResult<i32> {
+    let t = arg(l, 0);
+    match t.as_table() {
+        Some(t) => {
+            let mut max: f64 = 0.0;
+            let mut k = LuaValue::NIL;
+            while let Some((nk, _)) = t.as_ref().next(k) {
+                k = nk;
+                if let Some(n) = k.as_number() {
+                    max = max.max(n);
+                }
+            }
+            push(l, LuaValue::number(max));
+            Ok(1)
+        }
+        None => Err(err_bad_arg_type(l, 1, "maxn", "table", t)),
+    }
 }

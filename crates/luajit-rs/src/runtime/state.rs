@@ -232,6 +232,10 @@ pub struct GlobalState {
     /// Per-ctype metatables registered by `ffi.metatype`, indexed by
     /// ctype id (each cdata's metatable lookup consults this first).
     pub ctype_mts: Vec<Option<GcPtr<LuaTable>>>,
+    /// `ffi.errno` state (the tests set/read it through FFI).
+    pub ffi_errno: i32,
+    /// The internal ipairs iterator closure (not exposed as a global).
+    pub ipairs_iter: LuaValue,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
     /// created, so the reported time is relative to process start (matches
     /// LuaJIT's `luaopen_os` time).  Stored as `f64` seconds from epoch
@@ -381,6 +385,11 @@ pub struct LuaState {
     /// was raised (set by lib_error, consumed by lib_xpcall's handler
     /// frame chain so debug walks see the raise-time frames below it).
     pub err_raise_slot: usize,
+    /// The (function bits, bytecode index) of the frame where the current
+    /// runtime error was raised — traceback uses it to report the error
+    /// line on the failed frame (the frame link alone only shows the
+    /// caller's call site).
+    pub err_raise_pc: Option<(u64, usize)>,
     /// While a metamethod invoked through the cold execute-recursion
     /// paths (e.g. `__concat`) is running, the (name, function bits) of
     /// the active metamethod — debug.getinfo uses it to report
@@ -435,6 +444,7 @@ impl LuaState {
             openuv: Vec::new(),
             errval: LuaValue::NIL,
             err_raise_slot: 0,
+            err_raise_pc: None,
             mmname: None,
             nyield: 0,
             status: if is_main {
@@ -615,6 +625,9 @@ impl LuaState {
                             None => self.debug_pc.saturating_sub(1),
                         }
                         .min(pt.lines.len().saturating_sub(1));
+                        // Remember the raise site so the traceback can
+                        // report the failed frame's error line.
+                        self.err_raise_pc = Some((func.to_bits(), pc));
                         let line = if pc < pt.lines.len() {
                             pt.lines[pc] as usize
                         } else {
@@ -713,6 +726,8 @@ impl Lua {
             jit: JitState::new(),
             cts: None,
             ctype_mts: Vec::new(),
+            ffi_errno: 0,
+            ipairs_iter: LuaValue::NIL,
             boot_time: boot,
             main: None,
         }));
@@ -764,8 +779,8 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
         if let Ok(idx) = idx_str.parse::<u32>() {
             let cache_key = g.heap.intern(b"__LUARS_DUMP_CACHE");
             let key = g.heap.str_value(cache_key);
-            let globals = g.globals.as_ref();
-            if let Some(fv) = globals.get(key).as_table()
+            let registry = g.registry.as_ref();
+            if let Some(fv) = registry.get(key).as_table()
                 && fv.as_ref().get_int(idx as i32).is_func()
             {
                 return Ok(fv.as_ref().get_int(idx as i32));

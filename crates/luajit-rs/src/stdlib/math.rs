@@ -349,6 +349,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"acos", acos)
         .func(b"asin", asin)
         .func(b"atan", math_atan2)
+        .func(b"atan2", math_atan2)
         .func(b"ceil", ceil)
         .func(b"cos", cos)
         .func(b"cosh", cosh)
@@ -358,7 +359,6 @@ pub fn open(l: &mut LuaState) {
         .func(b"fmod", math_fmod)
         .func(b"frexp", math_frexp)
         .func(b"ldexp", math_ldexp)
-        .func(b"log10", log10)
         .func(b"log", math_logx)
         .func(b"max", math_max)
         .func(b"min", math_min)
@@ -372,12 +372,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"sqrt", sqrt)
         .func(b"tan", tan)
         .func(b"tanh", tanh)
-        .func(b"tointeger", math_tointeger)
-        .func(b"type", math_type)
-        .func(b"ult", math_ult)
         .value(b"pi", LuaValue::number(std::f64::consts::PI))
         .value(b"huge", LuaValue::number(f64::INFINITY))
-        .value(b"maxinteger", LuaValue::number(i64::MAX as f64))
-        .value(b"mininteger", LuaValue::number(i64::MIN as f64))
         .build();
 }

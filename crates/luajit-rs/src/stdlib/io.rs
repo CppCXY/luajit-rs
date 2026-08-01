@@ -103,7 +103,7 @@ fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
     // Anchor on Lua stack before metatable alloc may trigger GC.
     push(l, LuaValue::table(t));
 
-    let mt = l.heap().alloc_table(LuaTable::new(0, 2));
+    let mt = l.heap().alloc_table(LuaTable::new(0, 12));
     let ts_ref = l.heap().alloc_func(GcFunc::C(CClosure {
         f: handle_tostring,
         env,
@@ -111,10 +111,66 @@ fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
     }));
     let ts_key = l.heap().str_value(l.heap().intern(b"__tostring"));
     mt.as_mut().set(ts_key, LuaValue::func(ts_ref));
+    let idx_key = l.heap().str_value(l.heap().intern(b"__index"));
+    mt.as_mut().set(idx_key, LuaValue::table(mt));
+    let gck = l.heap().str_value(l.heap().intern(b"__gc"));
+    let gc_ref = l.heap().alloc_func(GcFunc::C(CClosure {
+        f: handle_close_fd,
+        env,
+        upvals: vec![fd_val],
+    }));
+    mt.as_mut().set(gck, LuaValue::func(gc_ref));
+    for (name, f) in [
+        (b"close".as_slice(), handle_close_fd as crate::func::CFunction),
+        (b"flush".as_slice(), handle_flush_fd),
+        (b"lines".as_slice(), handle_lines_fd),
+        (b"read".as_slice(), handle_read_fd),
+        (b"seek".as_slice(), handle_seek_fd),
+        (b"setvbuf".as_slice(), handle_setvbuf_fd),
+        (b"write".as_slice(), handle_write_fd),
+    ] {
+        let k = l.heap().str_value(l.heap().intern(name));
+        let fref = l.heap().alloc_func(GcFunc::C(CClosure {
+            f,
+            env,
+            upvals: vec![fd_val],
+        }));
+        mt.as_mut().set(k, LuaValue::func(fref));
+    }
     t.as_mut().metatable = Some(mt);
 
     l.top -= 1; // pop anchor
     LuaValue::table(t)
+}
+
+fn handle_flush_fd(l: &mut LuaState) -> LuaResult<i32> {
+    let id = fd_from_upval(l);
+    let files = FILES.lock().unwrap();
+    match &files[id] {
+        Some(Entry::Write(f)) => {
+            let _ = f.get_ref().flush();
+            push(l, LuaValue::TRUE);
+            Ok(1)
+        }
+        _ => Ok(0),
+    }
+}
+
+fn handle_seek_fd(l: &mut LuaState) -> LuaResult<i32> {
+    let id = fd_from_upval(l);
+    let files = FILES.lock().unwrap();
+    match &files[id] {
+        Some(Entry::Write(f)) => {
+            let _ = f.get_ref().flush();
+            Ok(0)
+        }
+        _ => Ok(0),
+    }
+}
+
+fn handle_setvbuf_fd(l: &mut LuaState) -> LuaResult<i32> {
+    push(l, LuaValue::TRUE);
+    Ok(1)
 }
 
 fn fd_from_upval(l: &LuaState) -> usize {
@@ -755,6 +811,8 @@ pub fn open(l: &mut LuaState) {
     let fde = registry_put(Entry::Stderr);
     let io_tab = lual_reg!(l, b"io", LibTarget::Global)
         .func(b"open", io_open)
+        .func(b"popen", io_open)
+        .func(b"tmpfile", io_tmpfile)
         .func(b"read", io_read)
         .func(b"write", io_write)
         .func(b"lines", io_lines)
@@ -772,5 +830,19 @@ pub fn open(l: &mut LuaState) {
         let h = new_handle(l, fd);
         let k = l.heap().str_value(l.heap().intern(name));
         io_tab.as_mut().set(k, h);
+    }
+}
+
+fn io_tmpfile(l: &mut LuaState) -> LuaResult<i32> {
+    let tmp = std::env::temp_dir();
+    let path = tmp.join(format!("luajit_rs_{}_{}.tmp", std::process::id(), l.base));
+    match std::fs::File::create(&path) {
+        Ok(f) => {
+            let id = registry_put(Entry::Write(BufWriter::new(f)));
+            let h = new_handle(l, id);
+            push(l, h);
+            Ok(1)
+        }
+        Err(e) => Err(l.runtime_error(format!("tmpfile: {}", e).as_bytes())),
     }
 }

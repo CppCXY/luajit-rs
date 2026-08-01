@@ -340,7 +340,7 @@ pub fn open_libs(l: &mut LuaState) {
     jit::open(l);
     os::open(l);
     io::open(l);
-    package::open(l);
     debug::open(l);
+    package::open(l);
     ffi::open(l);
 }

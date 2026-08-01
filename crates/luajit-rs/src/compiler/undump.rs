@@ -59,7 +59,9 @@ fn read_kgc(r: &mut Reader, strs: &mut Interner) -> KGc {
         2 => KGc::Table(Box::new(LuaTable::new(0, 0))),
         3 => KGc::CData(Box::new(CData {
             ctypeid: 0,
-            data: Box::from([]),
+            data: Box::new([]),
+            base: None,
+            offset: 0,
         })),
         _ => panic!("bad kgc tag {tag}"),
     }

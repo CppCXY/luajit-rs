@@ -340,6 +340,12 @@ pub struct CTState {
     pub hash: [u16; CTHASH_SIZE],
     /// Typedef name → type ID index (for ffi.typeof/ffi.new name lookup).
     pub names: std::collections::HashMap<String, u32>,
+    /// Declared function name → C symbol to resolve (the `asm("name")`
+    /// override, falling back to the declared name itself).
+    pub symbols: std::collections::HashMap<String, String>,
+    /// Struct/union/enum tag → type ID (unifies forward declarations
+    /// with their later definitions).
+    pub tags: std::collections::HashMap<String, u32>,
     /// Struct field lookup: (struct_id, field_name) → (field_id, offset_info).
     /// offset_info stores the field's type_id (hi 16 bits) and byte offset (lo 16 bits).
     pub field_names: std::collections::HashMap<(u32, String), (u32, u32)>,
@@ -359,6 +365,8 @@ impl CTState {
             miscmap: 0,
             hash: [u16::MAX; CTHASH_SIZE],
             names: std::collections::HashMap::new(),
+            symbols: std::collections::HashMap::new(),
+            tags: std::collections::HashMap::new(),
             field_names: std::collections::HashMap::new(),
         };
         cts.init_predefined();

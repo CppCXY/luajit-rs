@@ -373,9 +373,8 @@ impl<'a> Parser<'a> {
     fn const_cdata(&mut self, e: &ExpDesc) -> u32 {
         let fs = self.cur_mut();
         let (ctypeid, size) = if e.aux == 2 {
-            // Imaginary literal: store as a complex double (2 x f64).
-            // We use a raw size-16 blob; the CT type is resolved at runtime.
-            (crate::ffi::CTypeID::Void as u32, 16u32)
+            // Imaginary literal: a complex double (2 x f64).
+            (crate::ffi::CTypeID::ComplexDouble as u32, 16u32)
         } else if e.aux == 1 {
             (crate::ffi::CTypeID::UInt64 as u32, 8u32)
         } else {

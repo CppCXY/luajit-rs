@@ -271,7 +271,7 @@ fn lib_ipairs(l: &mut LuaState) -> LuaResult<i32> {
     }
     let sid = l.heap().intern(b"__ipairs_iter");
     let key = l.heap().str_value(sid);
-    let iter = l.global().globals.as_ref().get(key);
+    let iter = l.global().ipairs_iter;
     pushv(l, &[iter, t, LuaValue::number(0.0)]);
     Ok(3)
 }
@@ -559,48 +559,61 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
             Ok(nret as i32 + 1)
         }
         Err(LuaError::Runtime) => {
+            // Capture the innermost surviving frame *before* restoring
+            // base: the error unwinds to it (call_c restores the caller's
+            // frame, a Lua frame keeps its own base).
+            let fail_base = l.base;
             // `execute` unwinds with `l.base` left at the callee frame:
             // restore it before writing the results (mirrors lib_pcall).
             l.base = saved_base;
+
             l.stack_ensure(l.base + 4);
             // Invoke the message handler with the error object; its
             // first result replaces the error (lj_ff_xpcall).
             if msgh.is_func() {
-                // Preserve the failed call's frame below the handler and
-                // chain the handler's frame link to it, so debug walks
-                // (e.g. getlocal levels) can see the failed frame. When
-                // the error was raised by `error()` from a nested call,
-                // chain to the raise-time frame (its slots survive the
-                // unwind) instead of the post-unwind base.
-                let fail_slot = if l.err_raise_slot >= 2 {
+                // Preserve the failed call's frame chain below the handler
+                // and chain the handler's frame link to it, so debug walks
+                // (e.g. getlocal levels, traceback) can see the failed
+                // frame. When the error was raised by `error()` from a
+                // nested call, chain to the raise-time frame (its slots
+                // survive the unwind) instead of the post-unwind base.
+                let (chain_base, fs) = if l.err_raise_slot >= 2 {
                     // The raise slot is the frame's args base; the chain
                     // expects the target frame's func slot (below it).
                     let s = l.err_raise_slot - 2;
                     l.err_raise_slot = 0;
-                    s
+                    let fail_framesize = l.stack[s]
+                        .as_func()
+                        .and_then(|f| match f.as_ref() {
+                            crate::func::GcFunc::Lua(cl) => {
+                                Some(cl.proto.as_ref().framesize as usize)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    (s + 2, s + 2 + fail_framesize)
                 } else {
-                    l.base
+                    // Place the handler above the failed frame's top so
+                    // its frame chain (metamethod continuation frames,
+                    // C frames) survives below the handler.
+                    (fail_base, l.top + 2)
                 };
-                let fail_framesize = l.stack[fail_slot]
-                    .as_func()
-                    .and_then(|f| match f.as_ref() {
-                        crate::func::GcFunc::Lua(cl) => Some(cl.proto.as_ref().framesize as usize),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let fs = fail_slot + 2 + fail_framesize;
                 l.stack_ensure(fs + 4);
                 l.stack[fs] = msgh;
                 l.stack[fs + 1] = LuaValue::NIL;
                 l.stack[fs + 2] = l.errval;
                 // Chain to the failed frame: the delta is the distance
                 // from the handler's base to the failed frame's base.
-                let delta = (fs + 2).saturating_sub(fail_slot + 2);
+                let delta = (fs + 2).saturating_sub(chain_base);
                 let link = ((delta as u64) << 3) | 1; // FRAME_C (vm/mod.rs)
+                // Point `l.base` at the failed frame: the handler's own
+                // C frame link (written by call_c) then references it, so
+                // traceback walks reach the failed frame (and any
+                // metamethod continuation frame above it) instead of
+                // jumping straight to the xpcall frame.
+                l.base = chain_base;
                 let hr = crate::vm::execute_link(l, fs, 1, 1, link);
-                if std::env::var("LUAJIT_RS_XPCDBG").is_ok() {
-                    eprintln!("xpcall handler result: {:?} errval={:?}", hr, l.errval);
-                }
+
                 if let Ok(n) = hr
                     && n >= 1
                 {
@@ -881,6 +894,70 @@ fn lib_loadfile(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
+fn lib_unpack(l: &mut LuaState) -> LuaResult<i32> {
+    let t = arg(l, 0);
+    let i = arg(l, 1).as_number().unwrap_or(1.0) as usize;
+    let j = arg(l, 2)
+        .as_number()
+        .map(|n| n as usize)
+        .unwrap_or(usize::MAX);
+    match t.as_table() {
+        Some(tab) => {
+            let n = tab.as_ref().len() as usize;
+            let hi = j.min(n);
+            let mut out = Vec::new();
+            for k in i..=hi {
+                out.push(tab.as_ref().get_int(k as i32));
+            }
+            pushv(l, &out);
+            Ok(out.len() as i32)
+        }
+        None => Err(err_bad_arg_type(l, 1, "unpack", "table", t)),
+    }
+}
+
+fn lib_module(l: &mut LuaState) -> LuaResult<i32> {
+    let name = arg(l, 0);
+    let modt = l.heap().alloc_table(LuaTable::new(0, 4));
+    let g = l.global();
+    let env = g.globals;
+    let name_v = name;
+    let k = l.heap().str_value(l.heap().intern(b"_M"));
+    modt.as_mut().set(k, name_v);
+    let k = l.heap().str_value(l.heap().intern(b"_NAME"));
+    modt.as_mut().set(k, name_v);
+    let k = l.heap().str_value(l.heap().intern(b"_PACKAGE"));
+    modt.as_mut().set(k, l.heap().str_value(l.heap().intern(b"")));
+    push(l, LuaValue::table(modt));
+    Ok(1)
+}
+
+/// `dofile([filename])` — load and run a file.
+fn lib_dofile(l: &mut LuaState) -> LuaResult<i32> {
+    let filename = match arg(l, 0).as_string() {
+        Some(s) => s.as_ref().as_bytes().to_vec(),
+        None => return Err(err_bad_arg_type(l, 1, "dofile", "string", arg(l, 0))),
+    };
+    let chunkname = std::str::from_utf8(&filename)
+        .unwrap_or("=(dofile)")
+        .to_string();
+    let path = String::from_utf8_lossy(&filename);
+    let code = std::fs::read(path.as_ref())
+        .map_err(|e| l.runtime_error(format!("cannot open {}: {}", path, e).as_bytes()))?;
+    let v = crate::state::load(l, code, &chunkname).map_err(|e| l.runtime_error(e.as_bytes()))?;
+    let fs = l.top + 4;
+    l.stack_ensure(fs + 4);
+    l.stack[fs] = v;
+    let n = crate::vm::execute(l, fs, 0, -1)?;
+    l.stack_ensure(l.base + n);
+    for i in 0..n {
+        l.stack[l.base + i] = l.stack[fs + i];
+    }
+    l.top = l.base + n;
+    l.base = l.base;
+    Ok(n as i32)
+}
+
 fn lib_newproxy(l: &mut LuaState) -> LuaResult<i32> {
     let arg = arg(l, 0);
     let data: Box<[u8]> = vec![0u8; 1].into_boxed_slice();
@@ -920,6 +997,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"pairs", lib_pairs)
         .func(b"ipairs", lib_ipairs)
         .func(b"__ipairs_iter", lib_ipairs_iter)
+        .func(b"dofile", lib_dofile)
         .func(b"setmetatable", lib_setmetatable)
         .func(b"assert", lib_assert)
         .func(b"collectgarbage", lib_collectgarbage)
@@ -937,8 +1015,19 @@ pub fn open(l: &mut LuaState) {
         .func(b"loadstring", lib_loadstring)
         .func(b"load", lib_load)
         .func(b"loadfile", lib_loadfile)
+        .func(b"unpack", lib_unpack)
+        .func(b"module", lib_module)
         .func(b"newproxy", lib_newproxy)
         .build();
+
+    // The internal ipairs iterator stays off the global namespace; the
+    // registry table keeps it reachable for the GC.
+    let iter_sid = l.heap().intern(b"__ipairs_iter");
+    let iter_key = l.heap().str_value(iter_sid);
+    let iter_fn = l.global().globals.as_ref().get(iter_key);
+    l.global().ipairs_iter = iter_fn;
+    l.global().registry.as_mut().set(iter_key, iter_fn);
+    l.global().globals.as_mut().set(iter_key, LuaValue::NIL);
 
     let gsid = l.heap().intern(b"_G");
     let key = l.heap().str_value(gsid);

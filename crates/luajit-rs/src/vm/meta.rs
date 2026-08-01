@@ -188,23 +188,22 @@ impl Interp {
         {
             let g = self.l().global();
             if let Some(cts) = &g.cts {
-                let a = c1.as_ref();
-                let b = c2.as_ref();
-                if a.ctypeid == b.ctypeid && a.data.len() <= 8 && b.data.len() <= 8 {
-                    let mut buf1 = [0u8; 8];
-                    buf1[..a.data.len()].copy_from_slice(&a.data);
-                    let mut buf2 = [0u8; 8];
-                    buf2[..b.data.len()].copy_from_slice(&b.data);
-                    let diff = i64::from_le_bytes(buf1).wrapping_sub(i64::from_le_bytes(buf2));
-                    let raw = cts.raw(a.ctypeid);
+                if c1.as_ref().ctypeid == c2.as_ref().ctypeid {
+                    let raw = cts.raw(c1.as_ref().ctypeid);
                     use crate::ffi::{ctype_cid, ctype_isarray, ctype_ispointer};
-                    let elem_sz = if ctype_isarray(raw.info) || ctype_ispointer(raw.info) {
-                        cts.raw(ctype_cid(raw.info)).size as i64
-                    } else {
-                        1
-                    };
-                    if elem_sz != 0 {
-                        return Ok(Some(LuaValue::number((diff / elem_sz) as f64)));
+                    if ctype_isarray(raw.info) || ctype_ispointer(raw.info) {
+                        // Same storage → plain element difference of the
+                        // alias offsets.
+                        let (o1, s1) = crate::runtime::cdata::resolve_ptr(c1);
+                        let (o2, s2) = crate::runtime::cdata::resolve_ptr(c2);
+                        if s1 == s2 {
+                            let elem_sz = cts.raw(ctype_cid(raw.info)).size as i64;
+                            if elem_sz != 0 {
+                                return Ok(Some(LuaValue::number(
+                                    ((o1 - o2) / elem_sz) as f64,
+                                )));
+                            }
+                        }
                     }
                 }
             }
@@ -339,8 +338,9 @@ impl Interp {
     /// raw-equal. Returns `Some(is_equal)` or `None` for Lua continuation.
     /// `ne` is 0 for ISEQV, 1 for ISNEV (selects Condt/Condf).
     /// `cdata +/- number`: step by the element size of an array/pointer
-    /// cdata; the result keeps the same payload type with the data
-    /// shifted, so subsequent indexing/pointer math stays consistent.
+    /// cdata. The result *aliases* the original storage (base + byte
+    /// offset), so writes through the pointer land in the original object
+    /// and pointer difference / comparisons resolve consistently.
     fn pointer_arith(
         &self,
         cd: crate::gc::GcPtr<crate::runtime::cdata::CData>,
@@ -360,18 +360,21 @@ impl Interp {
         if !add {
             delta = -delta;
         }
-        // The payload is a byte buffer (arrays) or a pointer-sized value:
-        // shift an 8-byte window by the byte delta.
-        let sz = c.data.len();
-        let mut data = c.data.to_vec();
-        if sz <= 8 {
-            let mut buf = [0u8; 8];
-            buf[..sz].copy_from_slice(&data);
-            let v = i64::from_le_bytes(buf);
-            let nv = v.wrapping_add(delta);
-            buf.copy_from_slice(&nv.to_le_bytes());
-            data = buf[..sz].to_vec();
-        }
+        // The alias chain: this cdata's own base/offset, else itself.
+        let (base_off, root) = {
+            let mut cur = cd;
+            let mut off = 0i64;
+            loop {
+                let c = cur.as_ref();
+                if let Some(b) = c.base {
+                    off += c.offset;
+                    cur = b;
+                } else {
+                    break;
+                }
+            }
+            (off, cur)
+        };
         let p = self
             .l()
             .global()
@@ -379,7 +382,9 @@ impl Interp {
             .cdatas
             .alloc(crate::runtime::cdata::CData {
                 ctypeid: c.ctypeid,
-                data: data.into_boxed_slice(),
+                data: Box::new([]),
+                base: Some(root),
+                offset: base_off + delta,
             });
         Some(LuaValue::cdata(p))
     }
@@ -624,9 +629,6 @@ pub(super) fn meta_call(l: &mut LuaState, func_slot: usize, nargs: usize) -> Lua
     // its own __call, a primitive with a call metatable, ...). Resolve
     // the chain to the first function, like LuaJIT's repeated dispatch.
     let Some(mo) = resolve_callable(l, f) else {
-        if std::env::var("LUAJIT_RS_DBGDBG").is_ok() {
-            eprintln!("meta_call resolve failed: f={:?} bits={:#x}", f, f.to_bits());
-        }
         return Err(l.runtime_error(b"attempt to call a non-function value"));
     };
     for i in (0..nargs).rev() {

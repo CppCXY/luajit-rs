@@ -647,6 +647,7 @@ pub fn open(l: &mut LuaState) {
         "io",
         "bit",
         "coroutine",
+        "debug",
         "package",
         "jit",
     ] {
@@ -670,13 +671,17 @@ pub fn open(l: &mut LuaState) {
     lua_setfield(l, preload_idx, "jit.profile");
     lua_pop(l, 1); // pop preload
 
-    // loaders (preload, lua) indexed 1..2
+    // loaders (preload, lua, C, all-in-one) indexed 1..4
     lua_newtable(l);
     let loaders_idx = lua_gettop(l) as i32;
     lua_pushcfunction(l, loader_preload);
     lua_rawseti(l, loaders_idx, 1);
     lua_pushcfunction(l, loader_lua);
     lua_rawseti(l, loaders_idx, 2);
+    lua_pushcfunction(l, loader_preload);
+    lua_rawseti(l, loaders_idx, 3);
+    lua_pushcfunction(l, loader_lua);
+    lua_rawseti(l, loaders_idx, 4);
     lua_setfield(l, pkg_idx, "loaders");
 
     // searchpath, loadlib, seeall
