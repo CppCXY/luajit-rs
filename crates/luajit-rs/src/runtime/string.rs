@@ -1,8 +1,47 @@
-use ahash::RandomState;
-
 use crate::runtime::gc::{GcObjectKind, GcPtr, Pool};
 
 pub type StrId = u32;
+
+// -- String hashing (FNV-1a 64) -------------------------------------------
+//
+// Every interned string is hashed; concat-heavy workloads hash the whole
+// accumulated string each iteration (measured: ~70% of intern time for
+// `s = s .. x` loops). FNV-1a is a pure stream hash, so a concatenation
+// `s .. x` can continue from the stored state of `s` and hash only the
+// appended bytes — O(1) amortized per iteration instead of O(len(s)).
+// The hash value is fully deterministic (no random seed), so an
+// incrementally computed hash always matches a full re-hash of the same
+// bytes.
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Full FNV-1a 64 state for `s`.
+pub fn fnv1a_state(s: &[u8]) -> u64 {
+    let mut h = FNV_OFFSET;
+    for &b in s {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Continue an FNV-1a 64 stream with `s` (used for incremental concat).
+#[inline]
+pub fn fnv1a_cont(state: u64, s: &[u8]) -> u64 {
+    let mut h = state;
+    for &b in s {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Fold a 64-bit FNV state into the 32-bit interned hash.
+#[inline]
+pub fn fnv1a_fold(state: u64) -> u32 {
+    (state as u32) ^ ((state >> 32) as u32)
+}
 
 const INLINE_CAP: usize = 40;
 
@@ -80,7 +119,6 @@ pub struct Interner {
     by_id: Vec<Option<crate::gc::GcPtr<LuaString>>>,
     free_ids: Vec<StrId>,
     pool: crate::gc::Pool<LuaString>,
-    hasher: RandomState,
     bytes: usize,
     /// Pre-interned "" — always available, never collected.
     empty_sid: StrId,
@@ -95,12 +133,6 @@ impl Interner {
             by_id: Vec::new(),
             free_ids: Vec::new(),
             pool: Pool::new(GcObjectKind::String),
-            hasher: RandomState::with_seeds(
-                0x243f_6a88_85a3_08d3,
-                0x1319_8a2e_0370_7344,
-                0xa409_3822_299f_31d0,
-                0x082e_fa98_ec4e_6c89,
-            ),
             bytes: 0,
             empty_sid: 0,
         };
@@ -126,14 +158,14 @@ impl Interner {
 
     pub fn intern(&mut self, s: &[u8]) -> StrId {
         // Compute hash once — consistent between lookup and insert.
-        let hash = if s.len() <= 7 {
-            let mut packed = [0u8; 8];
-            packed[..s.len()].copy_from_slice(s);
-            let key = u64::from_le_bytes(packed) | ((s.len() as u64) << 56);
-            (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as u32
-        } else {
-            self.hasher.hash_one(s) as u32
-        };
+        let state = fnv1a_state(s);
+        let hash = fnv1a_fold(state);
+        self.intern_with_hash(s, hash)
+    }
+
+    /// Intern with a precomputed (possibly incrementally continued) FNV
+    /// hash. The caller must guarantee `hash` equals `fnv1a_fold(fnv1a_state(s))`.
+    pub fn intern_with_hash(&mut self, s: &[u8], hash: u32) -> StrId {
         // Single probe: find existing entry or insertion slot.
         let mask = self.slots.len() - 1;
         let mut idx = (hash as usize) & mask;

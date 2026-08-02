@@ -504,8 +504,31 @@ impl Interp {
                         buf.extend_from_slice(s.as_bytes());
                     }
                 }
-                let sid = self.l().heap().intern(&buf);
+                // Incremental FNV-1a for the common `s = s .. x` shape:
+                // when the segment is exactly (previous result, x),
+                // continue the stored stream state over x only.
+                let heap = self.l().heap();
+                let (state, hash) = if top == o + 1 {
+                    if let Some(sid) = self.at(o).as_string_id()
+                        && heap.cat_hash.is_some_and(|(id, _)| id == sid)
+                    {
+                        let st = heap.cat_hash.unwrap().1;
+                        let st2 = crate::runtime::string::fnv1a_cont(
+                            st,
+                            buf.split_at(self.l().str_static(sid).len()).1,
+                        );
+                        (st2, crate::runtime::string::fnv1a_fold(st2))
+                    } else {
+                        let st = crate::runtime::string::fnv1a_state(&buf);
+                        (st, crate::runtime::string::fnv1a_fold(st))
+                    }
+                } else {
+                    let st = crate::runtime::string::fnv1a_state(&buf);
+                    (st, crate::runtime::string::fnv1a_fold(st))
+                };
+                let sid = heap.intern_with_hash(&buf, hash);
                 let v = self.l().heap().str_value(sid);
+                self.l().heap().cat_hash = Some((sid, state));
                 self.set_at(o, v);
                 top = o;
             } else {

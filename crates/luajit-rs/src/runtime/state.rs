@@ -60,6 +60,14 @@ pub struct GcHeap {
     pub current_white: u8,
     /// When true, the collector will not auto-start from boundaries.
     pub gc_stopped: bool,
+    /// Incremental FNV hash state for the concatenation fast path: the
+    /// string id of the last result produced by the concat helpers
+    /// (`jit_cat` / `meta_cat`) and the FNV-1a stream state at its end.
+    /// A subsequent `s .. x` continues from this state instead of
+    /// re-hashing all of `s` — O(1) per iteration for `s = s .. x` loops
+    /// (string ids are never recycled, so the id uniquely identifies the
+    /// bytes).
+    pub cat_hash: Option<(u32, u64)>,
 }
 
 impl Default for GcHeap {
@@ -86,6 +94,7 @@ impl Default for GcHeap {
             gc_step_size: gc::GC_STEP_SIZE,
             current_white: 0,
             gc_stopped: false,
+            cat_hash: None,
         }
     }
 }
@@ -179,6 +188,19 @@ impl GcHeap {
     pub fn intern(&mut self, s: &[u8]) -> StrId {
         let prev_bytes = self.strings.bytes();
         let sid = self.strings.intern(s);
+        let new_bytes = self.strings.bytes();
+        if new_bytes > prev_bytes {
+            let sz = new_bytes - prev_bytes;
+            self.account_alloc(sz);
+            gc::gc_step(self, sz);
+        }
+        sid
+    }
+
+    /// Intern with a precomputed FNV hash (incremental concat fast path).
+    pub fn intern_with_hash(&mut self, s: &[u8], hash: u32) -> StrId {
+        let prev_bytes = self.strings.bytes();
+        let sid = self.strings.intern_with_hash(s, hash);
         let new_bytes = self.strings.bytes();
         if new_bytes > prev_bytes {
             let sz = new_bytes - prev_bytes;

@@ -1044,7 +1044,35 @@ pub extern "C" fn jit_cat(a_bits: u64, b_bits: u64) -> u64 {
         Some(s) => buf.extend_from_slice(s.as_ref().as_bytes()),
         None => buf.extend_from_slice(crate::strfmt::g14(b.num()).as_bytes()),
     }
-    jit_intern(&buf)
+    // Incremental FNV-1a: if `a` is the previous concat result, continue
+    // its stream state over just the appended bytes (O(1) per iteration
+    // for `s = s .. x` loops; the hash always equals a full re-hash).
+    let bbytes = &buf[alen..];
+    let heap = jit_heap();
+    let (state, hash) = {
+        let h = &mut *heap;
+        match h.cat_hash {
+            Some((id, st)) if a.as_string_id() == Some(id) => {
+                let st2 = crate::runtime::string::fnv1a_cont(st, bbytes);
+                (st2, crate::runtime::string::fnv1a_fold(st2))
+            }
+            _ => {
+                let st = crate::runtime::string::fnv1a_state(&buf);
+                (st, crate::runtime::string::fnv1a_fold(st))
+            }
+        }
+    };
+    let before = heap.strings.bytes();
+    let sid = heap.strings.intern_with_hash(&buf, hash);
+    let grown = heap.strings.bytes() - before;
+    if grown > 0 {
+        heap.table_extra += grown;
+    }
+    {
+        let h = &mut *heap;
+        h.cat_hash = Some((sid, state));
+    }
+    heap.str_value(sid).to_bits()
 }
 
 /// Upvalue write: store `val_bits` into the cell at `cell_ptr`.
