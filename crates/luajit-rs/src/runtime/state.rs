@@ -68,6 +68,13 @@ pub struct GcHeap {
     /// (string ids are never recycled, so the id uniquely identifies the
     /// bytes).
     pub cat_hash: Option<(u32, u64)>,
+    /// String-buffer slot for the trace-side concat fast path (lj_buf):
+    /// `s = s .. x` loops accumulate into this buffer and intern once at
+    /// exit instead of every iteration.
+    pub cat_buf: Vec<u8>,
+    /// The stack slot (relative to a trace's base) holding the buffer —
+    /// exits flush `cat_buf` back into it. `u32::MAX` when inactive.
+    pub cat_buf_slot: u32,
 }
 
 impl Default for GcHeap {
@@ -95,6 +102,8 @@ impl Default for GcHeap {
             current_white: 0,
             gc_stopped: false,
             cat_hash: None,
+            cat_buf: Vec::new(),
+            cat_buf_slot: u32::MAX,
         }
     }
 }

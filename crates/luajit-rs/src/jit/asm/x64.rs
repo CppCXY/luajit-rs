@@ -487,6 +487,12 @@ impl<'a> Asm<'a> {
                 IROp::GCSTEP => self.asm_gcstep(&ins),
                 IROp::POW => self.asm_pow(&ins)?,
                 IROp::TOBIT => self.asm_tobit(&ins)?,
+                // lj_buf ops run on the portable executor (the buffer
+                // lives in the heap; machine-code support would need
+                // inline append + exit flush plumbing).
+                IROp::BUFHDR | IROp::BUFPUT | IROp::BUFSTR => {
+                    return Err(TraceError::NYIIR);
+                }
                 IROp::BAND
                 | IROp::BOR
                 | IROp::BXOR

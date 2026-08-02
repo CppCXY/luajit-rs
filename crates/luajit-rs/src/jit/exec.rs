@@ -363,6 +363,47 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let v = LuaValue::from_bits(val(env, carg.op2 as IRRef));
                     unsafe { *t.as_ref().aptr.add(ki as usize) = v };
                 }
+                IROp::BUFHDR => {
+                    // lj_buf: idempotent materialization — the first pass
+                    // copies the source string into the heap buffer; when
+                    // the operand is already the buffer marker (later loop
+                    // iterations), keep accumulating.
+                    let v = LuaValue::from_bits(val(env, ins.op1 as IRRef));
+                    let heap = jit_heap();
+                    if v.to_bits() == BUF_MARK {
+                        // Already a buffer.
+                    } else if let Some(sid) = v.as_string_id() {
+                        heap.cat_buf.clear();
+                        heap.cat_buf.extend_from_slice(heap.strings.get(sid));
+                    } else if v.is_number() {
+                        heap.cat_buf.clear();
+                        heap.cat_buf
+                            .extend_from_slice(crate::strfmt::g14(v.num()).as_bytes());
+                    } else {
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
+                    }
+                    env[(r - REF_BIAS) as usize] = BUF_MARK;
+                }
+                IROp::BUFPUT => {
+                    let v = LuaValue::from_bits(val(env, ins.op2 as IRRef));
+                    let heap = jit_heap();
+                    if let Some(sid) = v.as_string_id() {
+                        heap.cat_buf.extend_from_slice(heap.strings.get(sid));
+                    } else if v.is_number() {
+                        heap.cat_buf
+                            .extend_from_slice(crate::strfmt::g14(v.num()).as_bytes());
+                    } else {
+                        return exit_snapshot(l, base, cbase, tr, env, snapidx);
+                    }
+                    env[(r - REF_BIAS) as usize] = BUF_MARK;
+                }
+                IROp::BUFSTR => {
+                    // Flush the accumulated buffer to a real string.
+                    let heap = jit_heap();
+                    let buf = std::mem::take(&mut heap.cat_buf);
+                    let bits = intern_heap_bytes(heap, &buf);
+                    env[(r - REF_BIAS) as usize] = bits;
+                }
                 IROp::GCSTEP => {
                     // GC-debt guard: leave the trace when a collection
                     // is due (the boundary check then collects).
@@ -729,6 +770,16 @@ fn restore_snapshot(l: &mut LuaState, base: usize, tr: &GCtrace, env: &[u64], sn
         let s = snap_slot(sn) as usize;
         debug_assert!(s != 1, "the root frame link is never restored");
         let bits = read_ref(&tr.ir, env, snap_ref(sn));
+        // lj_buf: a slot still holding the buffer marker must be flushed
+        // to its interned string before the interpreter resumes.
+        let bits = if bits == BUF_MARK {
+            let heap = jit_heap();
+            let buf = std::mem::take(&mut heap.cat_buf);
+            let v = intern_heap_bytes(heap, &buf);
+            v
+        } else {
+            bits
+        };
         l.stack[base + s - 2] = LuaValue::from_bits(bits);
     }
 }
@@ -874,6 +925,24 @@ pub(crate) fn jit_heap() -> &'static mut GcHeap {
             .as_mut()
             .expect("JIT_HEAP not set")
     }
+}
+
+/// Marker stored in trace env slots that hold an lj_buf buffer instead
+/// of a real string. All-ones (LJ_TNIL's bit pattern) can never be the
+/// concatenation source slot's value: the recorder only enters the buffer
+/// path for string sources.
+pub const BUF_MARK: u64 = u64::MAX;
+
+/// Intern `bytes` into the bound heap, tracking the growth as GC debt
+/// (same accounting as `jit_intern`).
+fn intern_heap_bytes(heap: &mut GcHeap, bytes: &[u8]) -> u64 {
+    let before = heap.strings.bytes();
+    let sid = heap.strings.intern(bytes);
+    let grown = heap.strings.bytes() - before;
+    if grown > 0 {
+        heap.table_extra += grown;
+    }
+    heap.str_value(sid).to_bits()
 }
 
 /// Intern `bytes` in the bound heap, tracking the growth as GC debt.

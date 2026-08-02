@@ -430,35 +430,35 @@ fn str_dump(l: &mut LuaState) -> LuaResult<i32> {
 
 fn str_format(l: &mut LuaState) -> LuaResult<i32> {
     let fmt = match arg(l, 0).as_string_id() {
-        Some(sid) => l.str_static(sid).to_vec(),
+        Some(sid) => l.str_static(sid),
         None => {
             return Err(err_bad_arg_type(l, 1, "string.format", "string", arg(l, 0)));
         }
     };
     let n = lua_gettop(l);
-    enum Owned {
-        Num(f64),
-        Str(Vec<u8>),
+    // Borrow string arguments (zero-copy); only non-string values are
+    // materialized, and their buffers are pinned in `owned`.
+    let mut owned: Vec<Vec<u8>> = Vec::new();
+    for i in 1..n {
+        let v = arg(l, i);
+        if !v.as_number().is_some() && !v.is_string() {
+            owned.push(tostring_bytes(l, v));
+        }
     }
-    let mut owned = Vec::with_capacity(n.saturating_sub(1));
+    let mut oi = 0;
+    let mut args: Vec<crate::strfmt::FmtArg> = Vec::with_capacity(n.saturating_sub(1));
     for i in 1..n {
         let v = arg(l, i);
         if let Some(n) = v.as_number() {
-            owned.push(Owned::Num(n));
+            args.push(crate::strfmt::FmtArg::Num(n));
         } else if let Some(sid) = v.as_string_id() {
-            owned.push(Owned::Str(l.heap().strings.get(sid).to_vec()));
+            args.push(crate::strfmt::FmtArg::Str(l.str_static(sid)));
         } else {
-            owned.push(Owned::Str(tostring_bytes(l, v)));
+            args.push(crate::strfmt::FmtArg::Str(&owned[oi]));
+            oi += 1;
         }
     }
-    let args: Vec<crate::strfmt::FmtArg> = owned
-        .iter()
-        .map(|o| match o {
-            Owned::Num(n) => crate::strfmt::FmtArg::Num(*n),
-            Owned::Str(s) => crate::strfmt::FmtArg::Str(s),
-        })
-        .collect();
-    match crate::strfmt::format(&fmt, &args) {
+    match crate::strfmt::format(fmt, &args) {
         Ok(bytes) => {
             let sid = l.heap().intern(&bytes);
             push(l, l.heap().str_value(sid));

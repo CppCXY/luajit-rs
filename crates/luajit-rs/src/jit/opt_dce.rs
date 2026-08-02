@@ -17,6 +17,12 @@ fn is_uset(ir: &IRIns) -> bool {
     ir.op() == IROp::CALLL && ir.op2 as u32 == super::record::IRCALL_USET
 }
 
+/// lj_buf ops mutate the shared heap buffer even though their mode bits
+/// classify them as weak: they must survive DCE.
+fn is_bufop(ir: &IRIns) -> bool {
+    matches!(ir.op(), IROp::BUFHDR | IROp::BUFPUT | IROp::BUFSTR)
+}
+
 /// `dce_marksnap`: mark all instructions referenced by snapshots.
 fn dce_marksnap(t: &mut GCtrace) {
     for i in 0..t.snapmap.len() {
@@ -40,7 +46,7 @@ fn dce_propagate(t: &mut GCtrace) {
         if ir.is_marked() {
             t.ir.ir_mut(ins).clear_mark();
             pchain[op] = ins as IRRef1;
-        } else if !ir.sideeff() && !is_uset(&ir) {
+        } else if !ir.sideeff() && !is_uset(&ir) && !is_bufop(&ir) {
             // Reroute the original instruction chain and NOP it out.
             if pchain[op] == 0 {
                 t.ir.chain[op] = ir.prev;

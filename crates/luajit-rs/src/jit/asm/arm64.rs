@@ -1698,6 +1698,10 @@ impl<'a> Asm<'a> {
                 IROp::CARG => {}
                 IROp::HSTORE => self.asm_hstore(&ins),
                 IROp::CALLL => self.asm_calll(&ins)?,
+                // lj_buf ops run on the portable executor only.
+                IROp::BUFHDR | IROp::BUFPUT | IROp::BUFSTR => {
+                    return Err(TraceError::NYIIR);
+                }
                 IROp::TNEW => {
                     self.helper_call(exec::jit_tnew as *const () as usize as u64, &[]);
                     self.ff_result(&ins)?;

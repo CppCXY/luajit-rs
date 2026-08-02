@@ -16,12 +16,38 @@ pub type StrId = u32;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// Full FNV-1a 64 state for `s`.
+/// One FNV-1a step.
+#[inline(always)]
+fn fnv_step(h: u64, b: u8) -> u64 {
+    (h ^ b as u64).wrapping_mul(FNV_PRIME)
+}
+
+/// 8-step unrolled FNV-1a (the multiplicative chain is inherently
+/// serial; unrolling removes the loop overhead per byte).
+#[inline(always)]
+fn fnv_8(h: u64, s: &[u8]) -> u64 {
+    debug_assert!(s.len() >= 8);
+    let h = fnv_step(h, s[0]);
+    let h = fnv_step(h, s[1]);
+    let h = fnv_step(h, s[2]);
+    let h = fnv_step(h, s[3]);
+    let h = fnv_step(h, s[4]);
+    let h = fnv_step(h, s[5]);
+    let h = fnv_step(h, s[6]);
+    fnv_step(h, s[7])
+}
+
+/// Full FNV-1a 64 state for `s` (8-byte unrolled main loop).
 pub fn fnv1a_state(s: &[u8]) -> u64 {
     let mut h = FNV_OFFSET;
-    for &b in s {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
+    let mut i = 0;
+    while i + 8 <= s.len() {
+        h = fnv_8(h, &s[i..i + 8]);
+        i += 8;
+    }
+    while i < s.len() {
+        h = fnv_step(h, s[i]);
+        i += 1;
     }
     h
 }
@@ -30,9 +56,14 @@ pub fn fnv1a_state(s: &[u8]) -> u64 {
 #[inline]
 pub fn fnv1a_cont(state: u64, s: &[u8]) -> u64 {
     let mut h = state;
-    for &b in s {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
+    let mut i = 0;
+    while i + 8 <= s.len() {
+        h = fnv_8(h, &s[i..i + 8]);
+        i += 8;
+    }
+    while i < s.len() {
+        h = fnv_step(h, s[i]);
+        i += 1;
     }
     h
 }

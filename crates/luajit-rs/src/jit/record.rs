@@ -172,6 +172,9 @@ pub struct Record {
     pub tailcalled: i32,
     /// The proto being recorded (single-frame traces: always startpt).
     pub pt: GcPtr<Proto>,
+    /// Stack slot holding an lj_buf buffer marker (the `s` of `s = s .. x`);
+    /// exits flush `cat_buf` into it. `u32::MAX` when inactive.
+    pub cat_slot: u32,
     /// Current bytecode index, updated as recording progresses (J->pc).
     pub pc: usize,
 }
@@ -229,6 +232,7 @@ impl Record {
             tailcalled: 0,
             pt,
             pc,
+            cat_slot: u32::MAX,
         })
     }
 
@@ -1388,6 +1392,47 @@ impl Record {
     }
 
     // -- Table indexing (lj_record_idx, coarse helper-based form) -------------
+
+    /// lj_buf escape check: does the bytecode range of the current loop
+    /// read `slot` anywhere outside a CAT (and outside the writes that
+    /// define it)? Static scan of the recorded loop body — a slot used
+    /// by any other instruction cannot be kept as a buffer.
+    fn cat_slot_clean(&self, pt: &crate::proto::Proto, slot: u32, pc: usize) -> bool {
+        let (lo, hi) = if self.bc_extent != !0usize {
+            (self.bc_min, self.bc_min + self.bc_extent)
+        } else {
+            return false;
+        };
+        for p in lo..hi {
+            if p == pc {
+                continue; // The CAT itself reads the slot.
+            }
+            let ins = pt.bc[p];
+            let op = crate::bc::bc_op(ins);
+            use crate::bc::BCMode;
+            let rb = crate::bc::bc_b(ins) as u32;
+            let rc = crate::bc::bc_c(ins) as u32;
+            let mb = crate::bc::bcmode_b(op);
+            let mc = crate::bc::bcmode_c(op);
+            let reads = match mb {
+                m if m == BCMode::Var as u32 => rb == slot,
+                m if m == BCMode::Rbase as u32 => slot >= rb && slot <= rc,
+                _ => false,
+            } || match mc {
+                m if m == BCMode::Var as u32 => rc == slot,
+                m if m == BCMode::Rbase as u32 => slot >= rb && slot <= rc,
+                _ => false,
+            };
+            if reads && op != BCOp::MOV {
+                // MOV copies the source to a scratch register whose own
+                // reads are the trace's business, not the buffer slot's.
+                // Any other read (including another CAT — the buffer
+                // marker would leak into it) escapes.
+                return false;
+            }
+        }
+        true
+    }
 
     /// Guard `tab.metatable == nil` (FLOAD IRFL_TAB_META).
     fn meta_guard(&mut self, tab: TRef) {
@@ -2866,25 +2911,93 @@ impl Record {
                 if n < 2 {
                     return Err(TraceError::NYIBC);
                 }
-                let mut acc = self.getslot(l, base, bc_b(ins));
-                for i in (bc_b(ins) + 1)..=bc_c(ins) {
-                    let v = self.getslot(l, base, i);
-                    if !(tref_isstr(acc) || tref_isnum(acc)) || !(tref_isstr(v) || tref_isnum(v)) {
-                        return Err(TraceError::NYIBC);
+                // lj_buf fast path: `s = s .. x` (2-value CAT, result
+                // written back over the source) whose source slot never
+                // escapes the loop — accumulate into a buffer and intern
+                // once at exit instead of every iteration. The BUF op is
+                // idempotent (copies only the first iteration), so no
+                // special loop peeling is needed.
+                if n == 2
+                    && bc_a(ins) != bc_b(ins)
+                    && self.cat_slot == u32::MAX
+                    && self.cat_slot_clean(pt.as_ref(), bc_a(ins), pc)
+                    && {
+                        // The range's first operand is the source slot's
+                        // value (possibly copied by a MOV alias); the
+                        // appended operand must not be the source itself
+                        // (`s = s .. s` would read the buffer marker).
+                        let sa = self.base_ref(bc_a(ins));
+                        let sb = self.getslot(l, base, bc_b(ins));
+                        let sc = self.getslot(l, base, bc_c(ins));
+                        tref_ref(sa) != 0
+                            && tref_ref(sa) == tref_ref(sb)
+                            && tref_ref(sb) != tref_ref(sc)
                     }
-                    let carg = self.cur.ir.emit_ins(IRIns::new(
-                        irt(IROp::CARG, irt_type(IRT_NIL)),
-                        tref_ref(acc),
-                        tref_ref(v),
-                    ));
-                    acc = self.cur.ir.emit_ins(IRIns::new(
-                        irt(IROp::CALLL, IRT_STR),
-                        tref_ref(carg),
-                        IRCALL_CAT,
-                    ));
-                    self.rec_gcstep(l);
+                {
+                    let s = self.getslot(l, base, bc_b(ins));
+                    let x = self.getslot(l, base, bc_c(ins));
+                    if (tref_isstr(s) || tref_isnum(s)) && (tref_isstr(x) || tref_isnum(x)) {
+                        let b = self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::BUFHDR, IRT_STR),
+                            tref_ref(s),
+                            0,
+                        ));
+                        self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::BUFPUT, IRT_STR),
+                            tref_ref(b),
+                            tref_ref(x),
+                        ));
+                        self.rec_gcstep(l);
+                        result = b;
+                        // The slot holds a buffer marker (BUFHDR ref), not a
+                        // real string; exits flush it.
+                        self.cat_slot = bc_a(ins);
+                    } else {
+                        let mut acc = self.getslot(l, base, bc_b(ins));
+                        for i in (bc_b(ins) + 1)..=bc_c(ins) {
+                            let v = self.getslot(l, base, i);
+                            if !(tref_isstr(acc) || tref_isnum(acc))
+                                || !(tref_isstr(v) || tref_isnum(v))
+                            {
+                                return Err(TraceError::NYIBC);
+                            }
+                            let carg = self.cur.ir.emit_ins(IRIns::new(
+                                irt(IROp::CARG, irt_type(IRT_NIL)),
+                                tref_ref(acc),
+                                tref_ref(v),
+                            ));
+                            acc = self.cur.ir.emit_ins(IRIns::new(
+                                irt(IROp::CALLL, IRT_STR),
+                                tref_ref(carg),
+                                IRCALL_CAT,
+                            ));
+                            self.rec_gcstep(l);
+                        }
+                        result = acc;
+                    }
+                } else {
+                    let mut acc = self.getslot(l, base, bc_b(ins));
+                    for i in (bc_b(ins) + 1)..=bc_c(ins) {
+                        let v = self.getslot(l, base, i);
+                        if !(tref_isstr(acc) || tref_isnum(acc))
+                            || !(tref_isstr(v) || tref_isnum(v))
+                        {
+                            return Err(TraceError::NYIBC);
+                        }
+                        let carg = self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::CARG, irt_type(IRT_NIL)),
+                            tref_ref(acc),
+                            tref_ref(v),
+                        ));
+                        acc = self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::CALLL, IRT_STR),
+                            tref_ref(carg),
+                            IRCALL_CAT,
+                        ));
+                        self.rec_gcstep(l);
+                    }
+                    result = acc;
                 }
-                result = acc;
             }
 
             BCOp::FNEW => {

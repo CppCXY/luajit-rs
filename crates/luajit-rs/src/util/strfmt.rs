@@ -155,6 +155,138 @@ pub enum FmtArg<'a> {
     Str(&'a [u8]),
 }
 
+/// Parsed flags/width/precision of one conversion spec.
+#[derive(Clone, Copy, Default)]
+struct Spec {
+    left: bool,
+    zero: bool,
+    space: bool,
+    plus: bool,
+    hash: bool,
+    width: Option<usize>,
+    prec: Option<usize>,
+}
+
+/// Parse a spec from raw bytes (no UTF-8 round trip).
+fn parse_spec_bytes(fmt: &[u8], mut i: usize, end: usize) -> Spec {
+    let mut s = Spec::default();
+    while i < end && matches!(fmt[i], b'-' | b'+' | b' ' | b'#' | b'0') {
+        match fmt[i] {
+            b'-' => s.left = true,
+            b'+' => s.plus = true,
+            b' ' => s.space = true,
+            b'#' => s.hash = true,
+            _ => s.zero = true,
+        }
+        i += 1;
+    }
+    let ws = i;
+    while i < end && fmt[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > ws {
+        s.width = std::str::from_utf8(&fmt[ws..i])
+            .ok()
+            .and_then(|x| x.parse().ok());
+    }
+    if i < end && fmt[i] == b'.' {
+        i += 1;
+        let ps = i;
+        while i < end && fmt[i].is_ascii_digit() {
+            i += 1;
+        }
+        s.prec = std::str::from_utf8(&fmt[ps..i])
+            .ok()
+            .and_then(|x| x.parse().ok());
+    }
+    s
+}
+
+/// Append `body` (display digits, no sign) to `out` with the sign and
+/// the spec's padding rules — a single pass, no intermediate strings.
+/// `zero_with_prec` allows zero-padding alongside a precision (floats:
+/// `%010.5g`); integers keep the old rule where precision wins.
+fn push_padded(out: &mut Vec<u8>, s: &Spec, body: &[u8], sign: u8, zero_with_prec: bool) {
+    let total = (sign != 0) as usize + body.len();
+    let w = s.width.unwrap_or(0);
+    if s.zero && !s.left && (zero_with_prec || s.prec.is_none()) && w > total {
+        if sign != 0 {
+            out.push(sign);
+        }
+        out.resize(out.len() + (w - total), b'0');
+        out.extend_from_slice(body);
+        return;
+    }
+    let padn = w.saturating_sub(total);
+    if s.left {
+        if sign != 0 {
+            out.push(sign);
+        }
+        out.extend_from_slice(body);
+        out.resize(out.len() + padn, b' ');
+    } else {
+        out.resize(out.len() + padn, b' ');
+        if sign != 0 {
+            out.push(sign);
+        }
+        out.extend_from_slice(body);
+    }
+}
+
+/// i64 -> decimal digits into `buf` (returns the digit slice). Uses
+/// truncating division: `div_euclid` never reaches 0 for negatives
+/// (`-1.div_euclid(10) == -1`).
+fn itoa(mut n: i64, buf: &mut [u8; 32]) -> &[u8] {
+    let mut i = buf.len();
+    if n == 0 {
+        buf[31] = b'0';
+        return &buf[31..];
+    }
+    while n != 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10).unsigned_abs() as u8;
+        n /= 10;
+    }
+    &buf[i..]
+}
+
+/// u64 -> hex digits into `buf`.
+fn utohex(mut n: u64, buf: &mut [u8; 32], upper: bool) -> &[u8] {
+    let mut i = buf.len();
+    if n == 0 {
+        buf[31] = b'0';
+        return &buf[31..];
+    }
+    while n != 0 {
+        i -= 1;
+        let d = (n & 0xF) as u8;
+        buf[i] = if d < 10 {
+            b'0' + d
+        } else if upper {
+            b'A' + d - 10
+        } else {
+            b'a' + d - 10
+        };
+        n >>= 4;
+    }
+    &buf[i..]
+}
+
+/// u64 -> octal digits into `buf`.
+fn utooct(mut n: u64, buf: &mut [u8; 32]) -> &[u8] {
+    let mut i = buf.len();
+    if n == 0 {
+        buf[31] = b'0';
+        return &buf[31..];
+    }
+    while n != 0 {
+        i -= 1;
+        buf[i] = b'0' + (n & 7) as u8;
+        n >>= 3;
+    }
+    &buf[i..]
+}
+
 /// A minimal `string.format`, covering the conversions used so far:
 /// `%%`, `%d/%i/%u`, `%c`, `%x/%X`, `%o`, `%f/%F`, `%e/%E`, `%g/%G`, `%s`,
 /// with optional flags, width and precision. Returns an error message on a
@@ -196,7 +328,7 @@ pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
             return Err("invalid conversion to 'format'".into());
         }
         let conv = fmt[i];
-        let spec = std::str::from_utf8(&fmt[start..i]).map_err(|_| "invalid format".to_string())?;
+        let spec = parse_spec_bytes(fmt, start, i);
         i += 1;
 
         let next_num = |ai: &mut usize| -> Result<f64, String> {
@@ -216,11 +348,24 @@ pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
         match conv {
             b'd' | b'i' => {
                 let n = next_num(&mut ai)? as i64;
-                out.extend_from_slice(pad_int(spec, &n.to_string(), n < 0).as_bytes());
+                let mut buf = [0u8; 32];
+                let digits = itoa(n, &mut buf);
+                let sign = if n < 0 {
+                    b'-'
+                } else if spec.plus {
+                    b'+'
+                } else if spec.space {
+                    b' '
+                } else {
+                    0
+                };
+                push_padded(&mut out, &spec, digits, sign, false);
             }
             b'u' => {
                 let n = next_num(&mut ai)? as i64 as u64;
-                out.extend_from_slice(pad_int(spec, &n.to_string(), false).as_bytes());
+                let mut buf = [0u8; 32];
+                let digits = itoa(n as i64, &mut buf);
+                push_padded(&mut out, &spec, digits, 0, false);
             }
             b'c' => {
                 let n = next_num(&mut ai)? as i64 as u8;
@@ -228,43 +373,69 @@ pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
             }
             b'x' => {
                 let n = next_num(&mut ai)? as i64 as u64;
-                out.extend_from_slice(pad_int(spec, &format!("{:x}", n), false).as_bytes());
+                let mut buf = [0u8; 32];
+                let digits = utohex(n, &mut buf, false);
+                push_padded(&mut out, &spec, digits, 0, false);
             }
             b'X' => {
                 let n = next_num(&mut ai)? as i64 as u64;
-                out.extend_from_slice(pad_int(spec, &format!("{:X}", n), false).as_bytes());
+                let mut buf = [0u8; 32];
+                let digits = utohex(n, &mut buf, true);
+                push_padded(&mut out, &spec, digits, 0, false);
             }
             b'o' => {
                 let n = next_num(&mut ai)? as i64 as u64;
-                out.extend_from_slice(pad_int(spec, &format!("{:o}", n), false).as_bytes());
+                let mut buf = [0u8; 32];
+                let digits = utooct(n, &mut buf);
+                push_padded(&mut out, &spec, digits, 0, false);
             }
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
                 let n = next_num(&mut ai)?;
-                out.extend_from_slice(fmt_float(spec, conv, n).as_bytes());
+                let body = fmt_float_body(&spec, conv, n);
+                let sign = if n.is_sign_negative() {
+                    b'-'
+                } else if spec.plus {
+                    b'+'
+                } else if spec.space {
+                    b' '
+                } else {
+                    0
+                };
+                push_padded(&mut out, &spec, body.as_bytes(), sign, true);
             }
             b'a' | b'A' => {
                 let n = next_num(&mut ai)?;
-                let (left, _zero, space, width, prec) = parse_spec(spec);
-                let plus = spec.as_bytes().contains(&b'+');
-                let prec = prec.unwrap_or(13);
+                let prec = spec.prec.unwrap_or(13);
                 let mut s = fmt_a(n, prec, conv == b'A');
-                if n.is_sign_positive() && plus {
+                if n.is_sign_positive() && spec.plus {
                     s.insert(0, '+');
-                } else if n.is_sign_positive() && space && !s.starts_with(' ') {
+                } else if n.is_sign_positive() && spec.space && !s.starts_with(' ') {
                     s.insert(0, ' ');
                 }
-                out.extend_from_slice(&pad(s.into_bytes(), width, left));
+                out.extend_from_slice(&pad(s.into_bytes(), spec.width, spec.left));
             }
             b's' => {
                 let a = args
                     .get(ai)
                     .ok_or_else(|| "bad argument to 'format'".to_string())?;
                 ai += 1;
-                let s: Vec<u8> = match a {
-                    FmtArg::Str(s) => s.to_vec(),
-                    FmtArg::Num(n) => g14(*n).into_bytes(),
+                let body: &[u8] = match a {
+                    FmtArg::Str(s) => s,
+                    FmtArg::Num(n) => {
+                        let t = g14(*n);
+                        out.extend_from_slice(t.as_bytes());
+                        &[]
+                    }
                 };
-                out.extend_from_slice(&pad_str(spec, &s));
+                if !body.is_empty() {
+                    // Precision truncates; otherwise write through with
+                    // the padding rules (no intermediate clone).
+                    let body = match spec.prec {
+                        Some(p) if p < body.len() => &body[..p],
+                        _ => body,
+                    };
+                    push_padded(&mut out, &spec, body, 0, false);
+                }
             }
             b'q' => {
                 let a = args
@@ -294,45 +465,6 @@ pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn parse_spec(spec: &str) -> (bool, bool, bool, Option<usize>, Option<usize>) {
-    let b = spec.as_bytes();
-    let mut i = 0;
-    let mut left = false;
-    let mut zero = false;
-    let mut space = false;
-    while i < b.len() && matches!(b[i], b'-' | b'+' | b' ' | b'#' | b'0') {
-        if b[i] == b'-' {
-            left = true;
-        }
-        if b[i] == b'0' {
-            zero = true;
-        }
-        if b[i] == b' ' {
-            space = true;
-        }
-        i += 1;
-    }
-    let ws = i;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    let width = if i > ws {
-        spec[ws..i].parse().ok()
-    } else {
-        None
-    };
-    let mut prec = None;
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        let ps = i;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        prec = Some(spec[ps..i].parse().unwrap_or(0));
-    }
-    (left, zero, space, width, prec)
-}
-
 fn pad(s: Vec<u8>, width: Option<usize>, left: bool) -> Vec<u8> {
     match width {
         Some(w) if s.len() < w => {
@@ -351,56 +483,10 @@ fn pad(s: Vec<u8>, width: Option<usize>, left: bool) -> Vec<u8> {
     }
 }
 
-fn pad_int(spec: &str, digits: &str, negative: bool) -> String {
-    let (left, zero, space, width, prec) = parse_spec(spec);
-    let mut body = digits.trim_start_matches('-').to_string();
-    if let Some(p) = prec {
-        while body.len() < p {
-            body.insert(0, '0');
-        }
-    }
-    let sign = if negative {
-        "-"
-    } else if space {
-        " "
-    } else {
-        ""
-    };
-    if zero
-        && !left
-        && prec.is_none()
-        && let Some(w) = width
-    {
-        let total = sign.len() + body.len();
-        if total < w {
-            let mut s = String::new();
-            s.push_str(sign);
-            for _ in 0..(w - total) {
-                s.push('0');
-            }
-            s.push_str(&body);
-            return s;
-        }
-    }
-    let s = format!("{}{}", sign, body).into_bytes();
-    String::from_utf8(pad(s, width, left)).unwrap()
-}
-
-fn pad_str(spec: &str, s: &[u8]) -> Vec<u8> {
-    let (left, _zero, _space, width, prec) = parse_spec(spec);
-    let s = match prec {
-        Some(p) if p < s.len() => &s[..p],
-        _ => s,
-    };
-    pad(s.to_vec(), width, left)
-}
-
-fn fmt_float(spec: &str, conv: u8, n: f64) -> String {
-    let (left, zero, space, width, prec) = parse_spec(spec);
-    let hash = spec.as_bytes().contains(&b'#');
-    let plus = spec.as_bytes().contains(&b'+');
-    let p = prec.unwrap_or(6);
-    let mut body = match conv {
+fn fmt_float_body(spec: &Spec, conv: u8, n: f64) -> String {
+    let hash = spec.hash;
+    let p = spec.prec.unwrap_or(6);
+    match conv {
         b'f' | b'F' => {
             let s = format!("{:.*}", p, n.abs());
             if hash && !s.contains('.') {
@@ -411,37 +497,15 @@ fn fmt_float(spec: &str, conv: u8, n: f64) -> String {
         }
         b'e' | b'E' => fmt_e(n.abs(), p, conv == b'E', hash),
         b'g' | b'G' => {
-            let s = fmt_g(n.abs(), if prec.is_some() { p.max(1) } else { 6 }, hash);
+            let s = fmt_g(
+                n.abs(),
+                if spec.prec.is_some() { p.max(1) } else { 6 },
+                hash,
+            );
             if conv == b'G' { s.to_uppercase() } else { s }
         }
         _ => unreachable!(),
-    };
-    let sign = if n.is_sign_negative() {
-        "-"
-    } else if plus {
-        "+"
-    } else if space {
-        " "
-    } else {
-        ""
-    };
-    if zero
-        && !left
-        && let Some(w) = width
-    {
-        let total = sign.len() + body.len();
-        if total < w {
-            let mut s = String::new();
-            s.push_str(sign);
-            for _ in 0..(w - total) {
-                s.push('0');
-            }
-            s.push_str(&body);
-            return s;
-        }
     }
-    body.insert_str(0, sign);
-    String::from_utf8(pad(body.into_bytes(), width, left)).unwrap()
 }
 
 fn fmt_e(n: f64, prec: usize, upper: bool, hash: bool) -> String {
