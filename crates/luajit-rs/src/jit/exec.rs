@@ -877,7 +877,34 @@ pub extern "C" fn jit_tnextk(tab_bits: u64, key_bits: u64) -> u64 {
     let t = LuaValue::from_bits(tab_bits)
         .as_table()
         .expect("NEXTK on a non-table");
-    match t.as_ref().next(LuaValue::from_bits(key_bits)) {
+    let key = LuaValue::from_bits(key_bits);
+    let tab = t.as_ref();
+    // Integer-key fast path: resume the array scan right after `key`
+    // without the full key_index dispatch (the common pairs-over-array
+    // shape; the key is a loop-carried integer PHI).
+    if let Some(k) = key.as_int32_exact()
+        && k >= 0
+        && (k as u32) < tab.asize
+    {
+        let mut i = k as u32 + 1;
+        while i < tab.asize {
+            let v = tab.array[i as usize];
+            if !v.is_nil() {
+                return LuaValue::number(i as f64).to_bits();
+            }
+            i += 1;
+        }
+        let mut idx = i - tab.asize;
+        while tab.has_hpart() && idx <= tab.hmask {
+            let nd = tab.node_slot(idx);
+            if !nd.val.is_nil() {
+                return nd.key.to_bits();
+            }
+            idx += 1;
+        }
+        return LuaValue::NIL.to_bits();
+    }
+    match tab.next(key) {
         Some((k, _)) => k.to_bits(),
         None => LuaValue::NIL.to_bits(),
     }

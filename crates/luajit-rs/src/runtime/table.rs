@@ -15,8 +15,8 @@ const NIL_NODE: u32 = u32::MAX;
 /// the exact algorithm but stays memory-safe.
 #[derive(Clone, Copy)]
 pub(crate) struct Node {
-    val: LuaValue,
-    key: LuaValue,
+    pub(crate) val: LuaValue,
+    pub(crate) key: LuaValue,
     next: u32,
 }
 
@@ -55,7 +55,7 @@ fn fls(x: u32) -> u32 {
 #[repr(C)]
 pub struct LuaTable {
     /// Array part. Slot `i` holds the value for integer key `i`.
-    array: Vec<LuaValue>,
+    pub(crate) array: Vec<LuaValue>,
     /// Hash part; length is `hmask + 1` (or `1` when empty).
     node: Vec<Node>,
     /// JIT mirror of `array.as_ptr()` (the machine code cannot see into
@@ -65,7 +65,7 @@ pub struct LuaTable {
     /// (pub(crate): the JIT's inlined array path reads this field at a
     /// fixed offset.)
     pub(crate) asize: u32,
-    hmask: u32,
+    pub(crate) hmask: u32,
     /// Top of the free-node search (index just past the last free node).
     freetop: u32,
     /// Negative metamethod cache (LuaJIT's `GCtab.nomm`): bit `mm` set means
@@ -129,7 +129,7 @@ impl LuaTable {
     /// when the table has no hash part. This avoids allocating a Vec
     /// holding a copy of the EMPTY node.
     #[inline]
-    fn node_slot(&self, idx: u32) -> &Node {
+    pub(crate) fn node_slot(&self, idx: u32) -> &Node {
         if self.hmask > 0 {
             &self.node[idx as usize]
         } else {
@@ -181,7 +181,7 @@ impl LuaTable {
         self.freetop = hsize;
     }
 
-    fn has_hpart(&self) -> bool {
+    pub(crate) fn has_hpart(&self) -> bool {
         self.hmask != 0
     }
 
