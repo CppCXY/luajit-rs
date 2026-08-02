@@ -6,7 +6,7 @@ use crate::bc::{bc_a, bc_b, bc_c, bc_d};
 use crate::lex::*;
 use crate::proto::{
     KGc, PROTO_BITOP, PROTO_CHILD, PROTO_FFI, PROTO_FIXUP_RETURN, PROTO_HAS_RETURN,
-    PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto,
+    PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, PROTO_VARARG_NEEDSARG, Proto,
 };
 use crate::table::LuaTable;
 use crate::value::LuaValue;
@@ -2036,7 +2036,12 @@ impl<'a> Parser<'a> {
                     nparams += 1;
                 } else if self.ls.tok == Tok::Dots {
                     self.ls.next();
-                    self.cur_mut().flags |= PROTO_VARARG;
+                    self.cur_mut().flags |= PROTO_VARARG | PROTO_VARARG_NEEDSARG;
+                    // Lua 5.1 LUA_COMPAT_VARARG: declare the implicit
+                    // `arg` local (its value is built by the VM when the
+                    // body never uses `...` itself).
+                    self.var_new_lit(nparams, b"arg");
+                    nparams += 1;
                     break;
                 } else {
                     self.err_syntax("<name> or '...' expected");
@@ -2061,7 +2066,9 @@ impl<'a> Parser<'a> {
         };
         let fs = self.cur_mut();
         fs.linedefined = line;
-        fs.numparams = nparams as u8;
+        // The implicit `arg` local occupies one register; it is not a
+        // fixed parameter.
+        fs.numparams = nparams.saturating_sub((fs.flags & PROTO_VARARG != 0) as BCReg) as u8;
         fs.bcbase = pbcbase + ppc as usize;
         self.bcemit_ad(BCOp::FUNCF, 0, 0);
     }
@@ -2317,6 +2324,9 @@ impl<'a> Parser<'a> {
                 if (self.cur().flags & PROTO_VARARG) == 0 {
                     self.err_syntax("cannot use '...' outside a vararg function");
                 }
+                // 5.1: using `...` in the body disables the implicit `arg`
+                // table (lparser.c primaryexp TK_DOTS).
+                self.cur_mut().flags &= !PROTO_VARARG_NEEDSARG;
                 self.bcreg_reserve(1);
                 let base = self.cur().freereg - 1;
                 let numparams = self.cur().numparams as u32;

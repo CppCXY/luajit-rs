@@ -26,7 +26,7 @@ use crate::err::{LuaError, LuaResult};
 use crate::func::{GcFunc, LuaClosure, Upval};
 use crate::gc::GcPtr;
 use crate::jit::{HOTCOUNT_CALL, HOTCOUNT_LOOP, rec_abort_error, rec_ins, trace_exec, trace_hot};
-use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto};
+use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, PROTO_VARARG_NEEDSARG, Proto};
 use crate::runtime::gc::barrier_back;
 use crate::runtime::meta::MM;
 use crate::state::{LuaState, Suspend};
@@ -52,17 +52,29 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
         }
         let saved_top = l.top;
         let saved_base = l.base;
-        l.stack_ensure(saved_top + 3 + STACK_SAFETY);
-        l.stack[saved_top] = mo;
-        l.stack[saved_top + 1] = LuaValue::NIL;
-        l.stack[saved_top + 2] = o.value();
-        match execute(l, saved_top, 1, -1) {
+        // The finalizer frame must sit above the interpreter's live
+        // frame area: `top` lags below the frame (framesize slots), and
+        // the finalizer's result would overwrite the registers the
+        // dispatch loop is about to use (same rule as call_hook).
+        let base_slot = l.frame_top.max(l.top);
+        l.stack_ensure(base_slot + 3 + STACK_SAFETY);
+        l.stack[base_slot] = mo;
+        l.stack[base_slot + 1] = LuaValue::NIL;
+        l.stack[base_slot + 2] = o.value();
+        match execute(l, base_slot, 1, -1) {
             Ok(_) => l.top = saved_top,
             Err(e) => {
                 l.top = saved_top;
                 return Err(e);
             }
         }
+        // The finalizer's argument sits above the live frame and would
+        // otherwise be marked (and keep the userdata, its metatable and
+        // everything reachable through them alive) every cycle, delaying
+        // the two-cycle weak-table removal indefinitely.
+        l.stack[base_slot] = LuaValue::NIL;
+        l.stack[base_slot + 1] = LuaValue::NIL;
+        l.stack[base_slot + 2] = LuaValue::NIL;
         // execute runs a Lua frame through Interp, which mutates
         // l.base; restore it so a C function that triggered the
         // finalizer (collectgarbage) still pushes results correctly.
@@ -385,18 +397,18 @@ fn execute_inner_link(
     if let GcFunc::C(cc) = gf.as_ref() {
         return call_c(l, cc.f, func_slot, nargs, want);
     }
+    let saved_base = l.base;
+    let saved_top = l.top;
     let mut vm = Interp::new(l);
     let link = link.unwrap_or_else(|| (((want + 1) as u64) << 3) | FRAME_C);
-    if std::env::var("LUARS_FNDBG").is_ok() {
-        let pt = if let GcFunc::Lua(c) = gf.as_ref() {
-            Some(c.proto.as_ref().bc.len())
-        } else {
-            None
-        };
-        eprintln!("FNDBG enter_lua gf=proto_len={:?} fs={} na={} want={} base={} top={}", pt, func_slot, nargs, want, l.base, l.top);
-    }
     vm.enter_lua(gf, func_slot, nargs, link);
-    vm.run()
+    let r = vm.run();
+    // The interpreter mutates l.base/l.top for the callee frame; restore
+    // them so the calling C function's results land at `func_slot`
+    // (call_c's args_base convention).
+    l.base = saved_base;
+    l.top = saved_top;
+    r
 }
 
 /// Call a C function with `nargs` args at `func_slot + 2`, moving up to
@@ -657,6 +669,24 @@ impl Interp {
             let delta = (newbase - callbase) as u64;
             self.set_at(newbase - 1, LuaValue::from_bits((delta << 3) | FRAME_VARG));
             self.base = newbase;
+            // Lua 5.1 LUA_COMPAT_VARARG: build the implicit `arg` local
+            // ({varargs..., n = count}) unless the body uses `...` itself.
+            if (pt.flags & PROTO_VARARG_NEEDSARG) != 0 {
+                let l = self.l();
+                let nvar = nargs.saturating_sub(numparams);
+                let tab = l
+                    .heap()
+                    .alloc_table(crate::table::LuaTable::new(nvar as u32, 1));
+                for i in 0..nvar {
+                    tab.as_mut()
+                        .set_int(i as i32 + 1, self.at(callbase + numparams + i));
+                }
+                let nsid = l.heap().intern(b"n");
+                tab.as_mut().set(l.heap().str_value(nsid), LuaValue::number(nvar as f64));
+                self.set_at(newbase + numparams, LuaValue::table(tab));
+            } else {
+                self.set_at(newbase + numparams, LuaValue::NIL);
+            }
         } else {
             for i in nargs..numparams {
                 self.set_at(callbase + i, LuaValue::NIL);
@@ -1223,16 +1253,15 @@ impl Interp {
                 sync!();
                 let ins_hook = unsafe { *ip };
                 let is_skip = matches!(bc_op(ins_hook), BCOp::KNIL | BCOp::LOOP);
-                if is_skip {
-                    continue;
-                }
-                let pt = self.proto();
-                let pc = unsafe { ip.offset_from(self.bcp) as usize };
-                let pc = pc.min(pt.lines.len().saturating_sub(1));
-                let ln = pt.lines[pc] as u32;
-                if hook_check(self.l(), ln)? {
-                    resync!();
-                    bp = unsafe { self.sp.add(self.base) };
+                if !is_skip {
+                    let pt = self.proto();
+                    let pc = unsafe { ip.offset_from(self.bcp) as usize };
+                    let pc = pc.min(pt.lines.len().saturating_sub(1));
+                    let ln = pt.lines[pc] as u32;
+                    if hook_check(self.l(), ln)? {
+                        resync!();
+                        bp = unsafe { self.sp.add(self.base) };
+                    }
                 }
             }
             let ins = unsafe { *ip };

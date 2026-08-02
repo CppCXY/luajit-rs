@@ -68,7 +68,7 @@ fn read_kgc(r: &mut Reader, strs: &mut Interner) -> KGc {
 }
 
 fn read_proto(r: &mut Reader, strs: &mut Interner) -> Proto {
-    let flags = r.read_u8();
+    let flags = r.read_u16();
     let numparams = r.read_u8();
     let framesize = r.read_u8();
     let bc_len = r.read_u32() as usize;

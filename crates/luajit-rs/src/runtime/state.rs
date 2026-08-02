@@ -868,7 +868,9 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
         proto.source = Some(source_sid);
     }
     let proto_ref = register_proto(&mut g.heap, proto);
-    let env = g.globals;
+    // The loaded chunk inherits the *thread* environment (5.1: lua_load
+    // sets the closure's env to L->env, which setfenv(0) can change).
+    let env = l.thread_env;
     let fref = g.heap.alloc_func(GcFunc::Lua(LuaClosure {
         proto: proto_ref,
         env,

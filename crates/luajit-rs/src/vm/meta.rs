@@ -276,7 +276,10 @@ impl Interp {
                 let mm = if (op & 2) != 0 { MM::Le } else { MM::Lt };
                 let g = self.l().global();
                 let mo = meta_lookup(g, o1, mm);
-                if mo.is_nil() {
+                // LuaJIT lj_meta_comp: both operands must carry the
+                // *same* metamethod, otherwise the order errors.
+                let mo2 = meta_lookup(g, o2, mm);
+                if mo.is_nil() || !obj_equal(mo, mo2) {
                     if (op & 2) != 0 {
                         // MM_le not found: retry with MM_lt, swapped
                         // (i.e. `not (o2 < o1)`).
@@ -503,6 +506,14 @@ impl Interp {
                         let s = crate::strfmt::g14(v.num());
                         buf.extend_from_slice(s.as_bytes());
                     }
+                }
+                // LuaJIT's lj_str_new: strings longer than LJ_MAX_STR are
+                // rejected with "string length overflow" (the concat would
+                // otherwise allocate gigabytes before failing elsewhere).
+                if buf.len() > 0xfffffe00 {
+                    return Err(self
+                        .l()
+                        .runtime_error(b"string length overflow"));
                 }
                 // Incremental FNV-1a for the common `s = s .. x` shape:
                 // when the segment is exactly (previous result, x),

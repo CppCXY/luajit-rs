@@ -200,8 +200,10 @@ fn lib_resume(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn lib_yield(l: &mut LuaState) -> LuaResult<i32> {
+    // LuaJIT allows yielding on the main thread: the yield acts as if it
+    // returned the (empty) resume values and execution continues.
     if l.is_main() {
-        return Err(l.runtime_error(b"attempt to yield from outside a coroutine"));
+        return Ok(0);
     }
     if !l.is_yieldable() {
         return Err(l.runtime_error(b"attempt to yield across C-call boundary"));

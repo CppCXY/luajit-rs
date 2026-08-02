@@ -24,7 +24,8 @@ pub fn tab_concat(l: &mut LuaState) -> LuaResult<i32> {
         None => Vec::new(),
     };
     let mut i = arg(l, 2).as_number().map_or(1.0, |n| n.max(1.0)) as usize;
-    let j = arg(l, 3).as_number().map(|n| n.max(1.0) as usize);
+    // j: keep the raw value — 0 (or j < i) means an empty range.
+    let j = arg(l, 3).as_number().map(|n| n.max(0.0) as usize);
 
     let tab = t.as_ref();
     let mut out = Vec::new();
@@ -262,24 +263,38 @@ pub fn open(l: &mut LuaState) {
 
 fn tab_foreach(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
-    let _f = arg(l, 1);
+    let f = arg(l, 1);
     let tab = match t.as_table() {
         Some(t) => t,
         None => return Err(err_bad_arg_type(l, 1, "foreach", "table", t)),
     };
+    let obase = l.base;
+    let otop = l.top;
     let mut k = LuaValue::NIL;
-    while let Some((nk, _v)) = tab.as_ref().next(k) {
+    while let Some((nk, v)) = tab.as_ref().next(k) {
         k = nk;
-        if crate::vm::execute(l, l.top + 2, 2, 1).is_err() {
-            break;
-        }
-        let r = l.stack[l.top + 2];
-        if r.is_nil() {
-            break;
+        let fs = l.top + 2;
+        l.stack_ensure(fs + 6);
+        l.stack[fs] = f;
+        l.stack[fs + 2] = nk;
+        l.stack[fs + 3] = v;
+        match crate::vm::execute(l, fs, 2, 1) {
+            Ok(_) => {
+                let r = l.stack[fs];
+                l.top = otop;
+                l.base = obase;
+                if !r.is_nil() {
+                    push(l, r);
+                    return Ok(1);
+                }
+            }
+            _ => {
+                l.top = otop;
+                l.base = obase;
+            }
         }
     }
-    push(l, LuaValue::NIL);
-    Ok(1)
+    Ok(0)
 }
 
 fn tab_foreachi(l: &mut LuaState) -> LuaResult<i32> {
@@ -289,6 +304,8 @@ fn tab_foreachi(l: &mut LuaState) -> LuaResult<i32> {
         Some(t) => t,
         None => return Err(err_bad_arg_type(l, 1, "foreachi", "table", t)),
     };
+    let obase = l.base;
+    let otop = l.top;
     for i in 1..=tab.as_ref().len() {
         let v = tab.as_ref().get_int(i as i32);
         if v.is_nil() {
@@ -300,12 +317,22 @@ fn tab_foreachi(l: &mut LuaState) -> LuaResult<i32> {
         l.stack[fs + 2] = LuaValue::number(i as f64);
         l.stack[fs + 3] = v;
         match crate::vm::execute(l, fs, 2, 1) {
-            Ok(1) if !l.stack[fs].is_nil() => {}
-            _ => break,
+            Ok(_) => {
+                let r = l.stack[fs];
+                l.top = otop;
+                l.base = obase;
+                if !r.is_nil() {
+                    push(l, r);
+                    return Ok(1);
+                }
+            }
+            _ => {
+                l.top = otop;
+                l.base = obase;
+            }
         }
     }
-    push(l, LuaValue::NIL);
-    Ok(1)
+    Ok(0)
 }
 
 fn tab_getn(l: &mut LuaState) -> LuaResult<i32> {

@@ -46,7 +46,7 @@ pub(crate) struct FuncState {
     pub bcbase: usize,
     /// Base of the variable stack for this function.
     pub vbase: usize,
-    pub flags: u8,
+    pub flags: u16,
     pub numparams: u8,
     pub framesize: u8,
     pub nuv: u8,

@@ -85,19 +85,17 @@ fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, Stri
     if (link & FRAME_TYPE_MASK) != 0 || link == 0 {
         return None; // FRAME_LUA only.
     }
+    // A small link is a caller-base encoding (host-fabricated frames),
+    // not a return PC; nothing to infer from.
+    if ((link >> 3) as usize) < l.stack.len() {
+        return None;
+    }
     let ret_ip = link as *const BCIns;
+    if (ret_ip as usize) < 0x10000 {
+        return None;
+    }
     let call_ins = unsafe { *ret_ip.sub(1) };
     let op = bc_op(call_ins);
-    if std::env::var("LUARS_NAMEDBG").is_ok() {
-        eprintln!(
-            "NAMEDBG slot={} link={:#x} op={:?} a={} base_calc={}",
-            slot,
-            link,
-            op,
-            bc_a(call_ins),
-            slot.saturating_sub(2 + bc_a(call_ins) as usize)
-        );
-    }
     if !matches!(
         op,
         BCOp::CALL | BCOp::CALLT | BCOp::CALLM | BCOp::CALLMT | BCOp::ITERC | BCOp::ITERN
@@ -119,38 +117,56 @@ fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, Stri
         return None;
     }
     let call_pc = (pc - 1) as u32;
-    // The compiler may move the callee to a fresh register right before
-    // the CALL (e.g. MOV r, local); resolve through it.
-    let mut callee_reg = callee_reg;
-    if call_pc > 0 {
-        let prev = pt.bc[(call_pc - 1) as usize];
-        if bc_op(prev) == BCOp::MOV && bc_a(prev) == callee_reg {
-            callee_reg = bc_b(prev);
-        }
-    }
-    // LuaJIT's lj_debug_funcname: inspect the instruction right before
-    // the CALL (following one MOV), then fall back to local variables.
+    // LuaJIT's lj_debug_slotname: scan backward from the CALL, following
+    // MOVs that move the callee into the slot. Instructions whose base
+    // range *covers* the slot (constants, arithmetic results) terminate
+    // the scan; other instructions are skipped.
     let mut k = call_pc;
-    for _ in 0..2 {
+    let mut slot = callee_reg;
+    loop {
         if k == 0 {
             break;
         }
         k -= 1;
         let ins = pt.bc[k as usize];
-        match bc_op(ins) {
-            BCOp::GGET if bc_a(ins) == callee_reg => {
+        let op = bc_op(ins);
+        let ra = bc_a(ins);
+        if crate::bc::bcmode_a(op) as u8 == crate::bc::BCMode::Base as u8 {
+            if slot >= ra && (op != BCOp::KNIL || slot <= bc_d(ins)) {
+                break;
+            }
+            continue;
+        }
+        if ra != slot {
+            continue;
+        }
+        match op {
+            BCOp::MOV => {
+                slot = bc_b(ins);
+            }
+            BCOp::GGET => {
                 let name = kgc_str(l, &pt.kgc, bc_d(ins) as usize)?;
                 return Some(("global", name));
             }
-            BCOp::TGETS if bc_a(ins) == callee_reg => {
+            BCOp::TGETS => {
                 let name = kgc_str(l, &pt.kgc, bc_d(ins) as usize)?;
                 return Some(("field", name));
             }
-            BCOp::TGETV if bc_a(ins) == callee_reg => {
+            BCOp::TGETV => {
                 return Some(("method", "?".to_string()));
             }
-            BCOp::MOV if bc_a(ins) == callee_reg => {
-                callee_reg = bc_b(ins);
+            BCOp::UGET => {
+                // Named upvalue: the proto's upvalue table carries names.
+                let idx = bc_d(ins) as usize;
+                let name = pt
+                    .uvnames
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| "(*upvalue)".to_string());
+                return Some(("upvalue", name));
+            }
+            BCOp::FNEW => {
+                return Some(("", "anonymous".to_string()));
             }
             _ => break,
         }
@@ -178,6 +194,75 @@ fn kgc_str(l: &LuaState, kgc: &[crate::proto::KGc], idx: usize) -> Option<String
         Some(crate::proto::KGc::Str(sid)) => Some(String::from_utf8_lossy(l.str_static(*sid)).into_owned()),
         _ => None,
     }
+}
+
+/// Infer a C function's name from its call site when the frame link is a
+/// caller-base encoding (host-fabricated frame): decode the caller base,
+/// then look at the instruction at `debug_pc` (the call site).
+fn c_frame_name(l: &LuaState, slot: usize) -> Option<(&'static str, String)> {
+    use crate::bc::{bc_a, bc_c, bc_d, bc_op};
+    if slot < 2 {
+        return None;
+    }
+    let link = l.stack[slot - 1].to_bits();
+    if (link & FRAME_TYPE_MASK) != 0 || link == 0 {
+        return None;
+    }
+    let caller_base = (link >> 3) as usize;
+    if caller_base < 2 || caller_base >= l.stack.len() {
+        return None;
+    }
+    let fv = l.stack[caller_base - 2].as_func()?;
+    let crate::func::GcFunc::Lua(cl) = fv.as_ref() else {
+        return None;
+    };
+    let pt = cl.proto.as_ref();
+    // debug_pc points past the current instruction; the call site is at
+    // pc-1. Scan back a few instructions for the GGET/TGETS that
+    // produced the callee.
+    let call_pc = l.debug_pc.saturating_sub(1).min(pt.bc.len().saturating_sub(1));
+    let call_ins = pt.bc[call_pc];
+    if std::env::var("LUARS_TBDGB").is_ok() {
+        eprintln!(
+            "TBDGB caller_base={} debug_pc={} call_pc={} op={:?} bc_len={}",
+            caller_base,
+            l.debug_pc,
+            call_pc,
+            bc_op(call_ins),
+            pt.bc.len()
+        );
+    }
+    let callee_reg = bc_a(call_ins);
+    let mut k = call_pc;
+    for _ in 0..4 {
+        if k == 0 {
+            break;
+        }
+        k -= 1;
+        let ins = pt.bc[k];
+        if std::env::var("LUARS_TBDGB").is_ok() {
+            eprintln!(
+                "TBDGB scan k={} op={:?} a={} d={} want_reg={}",
+                k,
+                bc_op(ins),
+                bc_a(ins),
+                bc_d(ins),
+                callee_reg
+            );
+        }
+        match bc_op(ins) {
+            crate::bc::BCOp::TGETS if bc_a(ins) == callee_reg => {
+                let name = kgc_str(l, &pt.kgc, bc_c(ins) as usize)?;
+                return Some(("field", name));
+            }
+            crate::bc::BCOp::GGET if bc_a(ins) == callee_reg => {
+                let name = kgc_str(l, &pt.kgc, bc_d(ins) as usize)?;
+                return Some(("global", name));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Fill `name`/`namewhat` for a frame (`getinfo(level)`): metamethod
@@ -301,6 +386,18 @@ fn walk_frames(l: &LuaState, mut level: i32) -> Option<(usize, GcPtr<crate::func
         }
     }
     None
+}
+
+/// The Lua function at debug stack `level` (0 or 1 = the caller of the
+/// current C function), or `None` when out of range.
+pub(crate) fn frame_func(l: &LuaState, level: i32) -> Option<GcPtr<GcFunc>> {
+    walk_frames(l, level).map(|(_slot, f)| f)
+}
+
+/// The Lua function that called the currently running C function
+/// (`module` semantics), or `None` when the caller is not a Lua function.
+pub(crate) fn caller_lua_func(l: &LuaState) -> Option<GcPtr<GcFunc>> {
+    walk_frames(l, 0).map(|(_slot, f)| f)
 }
 
 /// The metamethod name of a frame, when it is one: mmcall frames carry
@@ -655,15 +752,18 @@ fn walk_next(l: &LuaState, mut slot: usize, mut cur_link: u64) -> Option<usize> 
 // ── debug.traceback ─────────────────────────────────────────────────────────
 
 fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
-    let msg = if nargs(l) > 0 {
-        if let Some(sid) = arg(l, 0).as_string_id() {
-            String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned()
-        } else {
-            String::new()
-        }
+    let first = if nargs(l) > 0 { arg(l, 0) } else { LuaValue::NIL };
+    // LuaJIT: a non-string, non-thread first argument is returned as-is.
+    let msg = if first.is_string() {
+        let sid = first.as_string_id().unwrap();
+        String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned()
     } else {
         String::new()
     };
+    if !first.is_string() && !first.is_nil() && !first.is_thread() {
+        push(l, first);
+        return Ok(1);
+    }
 
     let mut trace = if msg.is_empty() {
         "stack traceback:\n".to_string()
@@ -671,19 +771,23 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
         format!("{}\nstack traceback:\n", msg)
     };
 
+    // luaL_traceback starts at `level`: 0 includes the traceback call
+    // itself, 1 (the default) skips it.
+    let level = arg(l, 1).as_number().unwrap_or(1.0) as usize;
     let mut slot = l.base;
-    let mut first = true;
-    let mut first_lua = true;
-    // luaL_traceback starts at level 1: the traceback handler's own frame
-    // (the frame executing right now) is skipped.
-    if slot >= 2 {
+    let mut skipped = 0usize;
+    while skipped < level && slot >= 2 {
         let link = l.stack[slot - 1].to_bits();
         if let Some(next) = walk_next(l, slot, link) {
             slot = next;
         } else {
             slot = 0;
+            break;
         }
+        skipped += 1;
     }
+    let mut first = true;
+    let mut first_lua = true;
     for _ in 0..64 {
         if slot < 2 {
             break;
@@ -770,7 +874,15 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
                     first_lua = false;
                 }
                 GcFunc::C(_) => {
-                    trace.push_str("\t[C]: in function\n");
+                    // LuaJIT prints the function name when it can infer
+                    // it from the call site ("in function 'traceback'").
+                    if let Some((_nw, name)) = funcname_from_caller(l, orig_slot)
+                        .or_else(|| c_frame_name(l, orig_slot))
+                    {
+                        trace.push_str(&format!("\t[C]: in function '{}'\n", name));
+                    } else {
+                        trace.push_str("\t[C]: in function\n");
+                    }
                     first = false;
                 }
             }

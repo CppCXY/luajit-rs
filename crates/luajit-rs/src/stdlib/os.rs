@@ -375,12 +375,19 @@ fn os_rename(l: &mut LuaState) -> LuaResult<i32> {
 
 fn os_setlocale(l: &mut LuaState) -> LuaResult<i32> {
     let locale = match arg(l, 0).as_string_id() {
-        Some(sid) => String::from_utf8_lossy(l.str_static(sid)),
-        None => "C".to_string().into(),
+        Some(sid) => String::from_utf8_lossy(l.str_static(sid)).into_owned(),
+        None => "C".to_string(),
     };
-    let sid = l.heap().intern(locale.as_bytes());
-    push(l, l.heap().str_value(sid));
-    Ok(1)
+    // Only the "C"/"POSIX" locale is actually supported; anything else
+    // returns nil (the locale is not available), like the C setlocale.
+    if locale == "C" || locale == "POSIX" || locale.is_empty() {
+        let sid = l.heap().intern(b"C");
+        push(l, l.heap().str_value(sid));
+        Ok(1)
+    } else {
+        push(l, LuaValue::NIL);
+        Ok(1)
+    }
 }
 
 fn os_tmpname(l: &mut LuaState) -> LuaResult<i32> {

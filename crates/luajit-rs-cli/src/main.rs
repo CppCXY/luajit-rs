@@ -387,6 +387,18 @@ fn handle_script(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
 }
 
 fn main() {
+    // Deep Lua recursion through C boundaries (e.g. gsub callbacks) walks
+    // the Rust stack; give the VM a generous stack instead of the OS
+    // default.
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(run_main)
+        .expect("spawn main thread")
+        .join()
+        .expect("main thread panicked");
+}
+
+fn run_main() {
     #[cfg(windows)]
     install_crash_handler();
     let args: Vec<String> = std::env::args().collect();

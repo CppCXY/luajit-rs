@@ -357,6 +357,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"exp", exp)
         .func(b"floor", floor)
         .func(b"fmod", math_fmod)
+        .func(b"mod", math_fmod)
         .func(b"frexp", math_frexp)
         .func(b"ldexp", math_ldexp)
         .func(b"log", math_logx)

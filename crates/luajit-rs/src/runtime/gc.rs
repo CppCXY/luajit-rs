@@ -671,26 +671,22 @@ pub enum Gray {
 /// point (after the sweep, so every object the finalizer may touch is
 /// still alive).
 pub enum Finalizable {
-    Table(GcPtr<LuaTable>),
     UData(GcPtr<GcUserData>),
 }
 
 impl Finalizable {
     pub fn value(&self) -> LuaValue {
         match self {
-            Finalizable::Table(t) => LuaValue::table(*t),
             Finalizable::UData(u) => LuaValue::userdata(*u),
         }
     }
     pub fn metatable(&self) -> Option<GcPtr<LuaTable>> {
         match self {
-            Finalizable::Table(t) => t.as_ref().metatable,
             Finalizable::UData(u) => u.as_ref().metatable,
         }
     }
     pub fn mark_finalized(&self, current_white: u8) {
         match self {
-            Finalizable::Table(t) => gc_header(t.0).make_dead_next(current_white),
             Finalizable::UData(u) => gc_header(u.0).make_dead_next(current_white),
         }
     }
@@ -1343,6 +1339,10 @@ fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
     // [u, p1, ..., p10]. run_finalizers pops from the end, so the newest
     // object is finalized first — LuaJIT's mmudata LIFO, which the gc.lua
     // suite depends on (a[o] == 10-s).
+    //
+    // LuaJIT's gc_separateudata only separates userdata and threads —
+    // tables with a __gc metatable are never finalized (the metatable
+    // itself stays alive while its userdata is pending finalization).
     let mut out = Vec::new();
     for i in 0..heap.userdatas.objects.len() {
         let u = heap.userdatas.objects[i];
@@ -1354,15 +1354,6 @@ fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
             h.make_undead();
             h.set_finalized();
             out.push(Finalizable::UData(GcPtr(u)));
-        }
-    }
-    for i in 0..heap.tables.objects.len() {
-        let t = heap.tables.objects[i];
-        let h = gc_header(t);
-        if !h.marked.get() && !h.is_finalized() && has_gc_meta(unsafe { t.as_ref() }.metatable) {
-            h.make_undead();
-            h.set_finalized();
-            out.push(Finalizable::Table(GcPtr(t)));
         }
     }
     out

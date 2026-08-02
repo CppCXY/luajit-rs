@@ -91,7 +91,24 @@ pub fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
 
 pub fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
     let v = arg(l, 0);
-    let bytes = tostring_meta(l, v)?;
+    // Lua 5.1 luaB_tostring: the __tostring result is returned verbatim
+    // (even nil); only when there is no metamethod is the raw fallback used.
+    let mo = crate::meta::meta_lookup(l.global(), v, crate::meta::MM::Tostring);
+    if !mo.is_nil() {
+        let saved_top = l.top;
+        let saved_base = l.base;
+        let fs = l.top + 16;
+        l.stack_ensure(fs + 4);
+        l.stack[fs] = mo;
+        l.stack[fs + 2] = v;
+        crate::vm::execute(l, fs, 1, 1)?;
+        let r = l.stack[fs];
+        l.top = saved_top;
+        l.base = saved_base;
+        push(l, r);
+        return Ok(1);
+    }
+    let bytes = crate::stdlib::tostring_bytes(l, v);
     let sid = l.heap().intern(&bytes);
     push(l, l.heap().str_value(sid));
     Ok(1)
@@ -156,12 +173,23 @@ fn lib_select(l: &mut LuaState) -> LuaResult<i32> {
         push(l, LuaValue::number((n - 1) as f64));
         return Ok(1);
     }
-    let k = match first.as_number() {
-        Some(k) if k >= 1.0 => k as usize,
+    // 5.1 luaB_select: negative i counts from the end (i = n + i), then
+    // clamps to [1, n] (select(10000, ...) yields nothing, no error).
+    let mut k = match first.as_number() {
+        Some(k) if k >= 1.0 => k as isize,
+        Some(k) if k < 0.0 => n as isize + k as isize,
         _ => {
             return Err(err_bad_arg_type(l, 1, "select", "number or '#'", arg(l, 0)));
         }
     };
+    if k > n as isize {
+        k = n as isize;
+    }
+    if k < 1 {
+        return Err(l.runtime_error(b"bad argument #1 to 'select' (index out of range)"));
+    }
+    let k = k as usize;
+    // Args are 0-based on the stack; the value args sit at 1..n.
     let mut cnt = 0;
     l.stack_ensure(l.base + n.saturating_sub(k));
     for i in k..n {
@@ -180,10 +208,9 @@ pub fn lib_next(l: &mut LuaState) -> LuaResult<i32> {
         Some(t) => t,
         None => return Err(err_bad_arg_type(l, 1, "next", "table", arg(l, 0))),
     };
-    // Lua 5.1: a non-nil key must actually be in the table.
-    if !k.is_nil() && tab.as_ref().get(k).is_nil() {
-        return Err(l.runtime_error(b"invalid key to 'next'"));
-    }
+    // Lua 5.1 allows deleting the current key during traversal (the node
+    // stays, only the value is nil); the strict "invalid key" check would
+    // break such loops.
     match tab.as_ref().next(k) {
         Some((nk, nv)) => {
             pushv(l, &[nk, nv]);
@@ -352,7 +379,10 @@ fn assert_where(l: &LuaState) -> String {
         return String::new();
     };
     let pt = cl.proto.as_ref();
-    let pc = l.debug_pc.min(pt.lines.len().saturating_sub(1));
+    let pc = l
+        .debug_pc
+        .saturating_sub(1)
+        .min(pt.lines.len().saturating_sub(1));
     let line = pt.lines[pc];
     let src = pt
         .source
@@ -727,7 +757,23 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
         t.get().thread_env = tab;
         push(l, o);
     } else if o.is_number() {
-        return Err(l.runtime_error(b"setfenv: numeric level not supported"));
+        let level = o.as_number().unwrap() as i32;
+        if level == 0 {
+            // setfenv(0, t): the environment of the running thread.
+            l.thread_env = tab;
+            push(l, LuaValue::TRUE);
+        } else if let Some(func) = crate::stdlib::debug::frame_func(l, level) {
+            match func.as_mut() {
+                crate::func::GcFunc::Lua(c) => c.env = tab,
+                crate::func::GcFunc::C(c) => c.env = tab,
+            }
+            // Lua 5.1's luaB_setfenv returns the function at the level.
+            push(l, LuaValue::func(func));
+        } else {
+            return Err(
+                l.runtime_error(b"`setfenv' cannot change environment of given object")
+            );
+        }
     } else {
         return Err(err_bad_arg_type(
             l,
@@ -750,6 +796,14 @@ fn lib_getfenv(l: &mut LuaState) -> LuaResult<i32> {
         },
         // getfenv(0): the environment of the running thread.
         _ if o.as_number() == Some(0.0) => l.thread_env,
+        // getfenv(n): the environment of the function at debug level n.
+        _ if o.is_number() => match crate::stdlib::debug::frame_func(l, o.as_number().unwrap() as i32) {
+            Some(f) => match f.as_ref() {
+                crate::func::GcFunc::Lua(c) => c.env,
+                crate::func::GcFunc::C(c) => c.env,
+            },
+            None => l.global().globals,
+        },
         _ => l.global().globals,
     };
     push(l, LuaValue::table(env));
@@ -795,9 +849,15 @@ fn call_reader(l: &mut LuaState, reader: LuaValue) -> Result<Vec<u8>, Vec<u8>> {
             }
         }
         Err(_e) => {
+            // Preserve the reader's error message (error("hhi") → "hhi").
+            let msg = if let Some(sid) = l.errval.as_string_id() {
+                l.str_static(sid).to_vec()
+            } else {
+                crate::stdlib::tostring_bytes(l, l.errval)
+            };
             l.top = saved_top;
             l.base = saved_base;
-            Err(b"reader function error".to_vec())
+            Err(msg)
         }
     }
 }
