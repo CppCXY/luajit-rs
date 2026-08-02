@@ -2129,6 +2129,7 @@ impl Record {
                         tref_ref(arg0),
                         IRCALL_TOSTR_NUM,
                     ));
+                    self.rec_gcstep(l);
                     res[0] = r;
                     nres = 1;
                 } else if tref_isstr(arg0) {
@@ -2809,6 +2810,7 @@ impl Record {
                         tref_ref(carg),
                         IRCALL_CAT,
                     ));
+                    self.rec_gcstep(l);
                 }
                 result = acc;
             }

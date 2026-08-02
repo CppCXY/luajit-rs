@@ -2616,7 +2616,21 @@ impl Interp {
         if paused {
             crate::gc::start_gc_cycle(g);
         }
-        crate::gc::gc_step(&mut g.heap, step_size);
+        // On-trace string allocation outruns the incremental collector:
+        // a single small step never catches the growing pool, the sweep
+        // lags forever and the debt threshold inflates with the garbage
+        // (measured: the strings benchmark held 1.5 GB of dead strings
+        // and never collected). Drive the cycle to completion at the
+        // boundary (bounded per call so a huge live table's mark phase
+        // is amortized over several exits instead of one long stop).
+        let mut steps = 0;
+        loop {
+            crate::gc::gc_step(&mut g.heap, step_size);
+            steps += 1;
+            if g.heap.gc_state == crate::runtime::gc::GcState::Pause || steps >= 512 {
+                break;
+            }
+        }
         Ok(())
     }
 

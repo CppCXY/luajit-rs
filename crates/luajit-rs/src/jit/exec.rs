@@ -1025,16 +1025,24 @@ pub extern "C" fn jit_tconcat(tab_bits: u64, sep_bits: u64) -> u64 {
 pub extern "C" fn jit_cat(a_bits: u64, b_bits: u64) -> u64 {
     let a = LuaValue::from_bits(a_bits);
     let b = LuaValue::from_bits(b_bits);
-    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    let alen = match a.as_string() {
+        Some(s) => s.as_ref().len(),
+        None if a.is_number() => crate::strfmt::g14(a.num()).len(),
+        _ => return LuaValue::NIL.to_bits(),
+    };
+    let blen = match b.as_string() {
+        Some(s) => s.as_ref().len(),
+        None if b.is_number() => crate::strfmt::g14(b.num()).len(),
+        _ => return LuaValue::NIL.to_bits(),
+    };
+    let mut buf: Vec<u8> = Vec::with_capacity(alen + blen);
     match a.as_string() {
         Some(s) => buf.extend_from_slice(s.as_ref().as_bytes()),
-        None if a.is_number() => buf.extend_from_slice(crate::strfmt::g14(a.num()).as_bytes()),
-        _ => return LuaValue::NIL.to_bits(),
+        None => buf.extend_from_slice(crate::strfmt::g14(a.num()).as_bytes()),
     }
     match b.as_string() {
         Some(s) => buf.extend_from_slice(s.as_ref().as_bytes()),
-        None if b.is_number() => buf.extend_from_slice(crate::strfmt::g14(b.num()).as_bytes()),
-        _ => return LuaValue::NIL.to_bits(),
+        None => buf.extend_from_slice(crate::strfmt::g14(b.num()).as_bytes()),
     }
     jit_intern(&buf)
 }
