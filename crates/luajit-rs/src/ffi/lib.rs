@@ -27,6 +27,187 @@ fn cts_of(l: &mut LuaState) -> &mut CTState {
     l.global().cts.get_or_insert_with(CTState::new)
 }
 
+/// The declared parameter types of a function ctype (the sib field chain
+/// of the CT_Func entry). Empty when `fid` is not a function type.
+pub(crate) fn ccall_param_types(cts: &CTState, fid: u32) -> Vec<u32> {
+    let mut types = Vec::new();
+    let raw = cts.raw(fid);
+    if raw.info >> 28 == CT::Func as u32 {
+        let mut cur = raw.sib as u32;
+        while cur != 0 {
+            let f = cts.tab.get(cur as usize);
+            if let Some(f) = f {
+                types.push(f.info & 0xFFFF);
+                cur = f.sib as u32;
+            } else {
+                break;
+            }
+        }
+    }
+    types
+}
+
+/// The return type of a function ctype (the low 16 bits of its info).
+fn ccall_ret_type(cts: &CTState, fid: u32) -> u32 {
+    let raw = cts.raw(fid);
+    if raw.info >> 28 == CT::Func as u32 {
+        raw.info & 0xFFFF
+    } else {
+        CTypeID::Void as u32
+    }
+}
+
+/// Is `ctypeid` (a base type id in the low 16 bits of a field/ret info)
+/// a floating-point type? These are passed/returned in FP registers, so
+/// the i64 slot holds the bit pattern, not the numeric value.
+pub(crate) fn ctype_is_fp(cts: &CTState, ctypeid: u32) -> bool {
+    let raw = cts.raw(ctypeid & 0xFFFF);
+    let info = raw.info;
+    let ct = info >> 28;
+    if ct == CT::Num as u32 {
+        info & crate::ffi::ctinfo::FP != 0
+    } else if ct == CT::Array as u32 && crate::ffi::ctype_iscomplex(info) {
+        // Complex float/double: the element type id sits in the cid.
+        ctype_is_fp(cts, info & crate::ffi::ctinfo::MASK_CID)
+    } else {
+        false
+    }
+}
+
+/// Encode the return type and the first two parameter types of a cdef
+/// function into a 16-bit code the trace helper can marshal against
+/// without touching the CTState:
+///
+/// ```text
+/// bits 0..1   return kind: 0 = integer/unknown, 1 = FP
+/// bits 2..5   param0 kind: 2 = integer, 1 = FP, 3 = pointer, 0 = unknown
+/// bits 6..9   param1 kind (same encoding)
+/// ```
+pub(crate) fn ffi_type_code(cts: &CTState, fid: u32) -> u64 {
+    let ret_kind = if ctype_is_fp(cts, ccall_ret_type(cts, fid)) {
+        1u64
+    } else {
+        0
+    };
+    let mut code = ret_kind;
+    for (i, p) in ccall_param_types(cts, fid).iter().take(2).enumerate() {
+        let raw = cts.raw(*p & 0xFFFF);
+        let ct = raw.info >> 28;
+        let kind = if ct == CT::Ptr as u32 || ct == CT::Func as u32 {
+            3u64
+        } else if ctype_is_fp(cts, *p & 0xFFFF) {
+            1
+        } else {
+            2
+        };
+        code |= kind << (2 + i * 4);
+    }
+    code
+}
+
+fn ffi_param_kind(type_code: u64, i: usize) -> u64 {
+    (type_code >> (2 + i * 4)) & 0xF
+}
+
+/// Call the C function at `addr` with a signature chosen from the encoded
+/// parameter/return kinds. The old fixed 6×i64 convention cannot carry
+/// doubles (FP args live in XMM registers), so common shapes get their
+/// real signatures; unknown declarations fall back to 6×i64 (the
+/// pre-declaration behavior). Pointer args ride in integer slots on
+/// every supported ABI.
+fn ffi_call_dispatch(addr: usize, type_code: u64, cargs: [i64; 2]) -> u64 {
+    let ret_fp = type_code & 1 != 0;
+    let p0 = ffi_param_kind(type_code, 0);
+    let p1 = ffi_param_kind(type_code, 1);
+    match (ret_fp, p0, p1) {
+        (true, 1, 0) => {
+            type F = unsafe extern "system" fn(f64) -> f64;
+            let f: F = unsafe { std::mem::transmute(addr) };
+            let r = unsafe { f(f64::from_bits(cargs[0] as u64)) };
+            LuaValue::number_raw(r).to_bits()
+        }
+        (true, 1, 1) => {
+            type F = unsafe extern "system" fn(f64, f64) -> f64;
+            let f: F = unsafe { std::mem::transmute(addr) };
+            let r = unsafe {
+                f(
+                    f64::from_bits(cargs[0] as u64),
+                    f64::from_bits(cargs[1] as u64),
+                )
+            };
+            LuaValue::number_raw(r).to_bits()
+        }
+        (false, 2, 0) | (false, 3, 0) => {
+            type F = unsafe extern "system" fn(i64) -> i64;
+            let f: F = unsafe { std::mem::transmute(addr) };
+            let r = unsafe { f(cargs[0]) };
+            LuaValue::number(r as f64).to_bits()
+        }
+        (false, 2, 2) => {
+            type F = unsafe extern "system" fn(i64, i64) -> i64;
+            let f: F = unsafe { std::mem::transmute(addr) };
+            let r = unsafe { f(cargs[0], cargs[1]) };
+            LuaValue::number(r as f64).to_bits()
+        }
+        _ => {
+            type CFn = unsafe extern "system" fn(i64, i64, i64, i64, i64, i64) -> i64;
+            let f: CFn = unsafe { std::mem::transmute(addr) };
+            let ret = unsafe { f(cargs[0], cargs[1], 0, 0, 0, 0) };
+            if ret_fp {
+                LuaValue::number_raw(f64::from_bits(ret as u64)).to_bits()
+            } else {
+                LuaValue::number(ret as f64).to_bits()
+            }
+        }
+    }
+}
+
+/// Trace-side FFI call (architecture-independent): up to two arguments,
+/// marshalled per the `ffi_type_code` encoding; the result is the
+/// LuaValue bits of the return value. Unsupported argument shapes return
+/// NIL so the recording guard exits to the interpreter (which raises or
+/// falls back). Uses the fixed 6×i64 calling convention of the
+/// interpreter's call_c.
+pub extern "C" fn jit_ffi_call(addr_bits: u64, type_bits: u64, a1_bits: u64, a2_bits: u64) -> u64 {
+    let addr = f64::from_bits(addr_bits) as usize;
+    let type_code = f64::from_bits(type_bits) as u64;
+    let a1 = LuaValue::from_bits(a1_bits);
+    let a2 = LuaValue::from_bits(a2_bits);
+    let marshal = |v: LuaValue, kind: u64| -> Option<i64> {
+        match kind {
+            1 => v.as_number().map(|n| n.to_bits() as i64),
+            3 => {
+                if let Some(cd) = v.as_cdata() {
+                    Some(cd.as_ref().data.as_ptr() as i64)
+                } else if v.is_nil() {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                if let Some(n) = v.as_number() {
+                    Some(n as i64)
+                } else if v.is_nil() {
+                    // Undeclared/extra argument: pass zero (the call
+                    // declares fewer parameters than provided).
+                    Some(0)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    let mut cargs: [i64; 2] = [0; 2];
+    for (i, v) in [a1, a2].iter().enumerate() {
+        match marshal(*v, ffi_param_kind(type_code, i)) {
+            Some(x) => cargs[i] = x,
+            None => return LuaValue::NIL.to_bits(),
+        }
+    }
+    ffi_call_dispatch(addr, type_code, cargs)
+}
+
 /// Known C type names → predefined type IDs.
 pub(crate) fn quick_type_id(name: &str) -> Option<u32> {
     Some(match name {
@@ -1940,33 +2121,15 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
 /// When the symbol was declared in a cdef (upvalue 1 = ctypeid), validate
 /// each argument against the declared parameter types first (lj_cconv: a
 /// plain number cannot convert to a pointer type without a cast).
-fn call_c(l: &mut LuaState) -> LuaResult<i32> {
+pub(crate) fn call_c(l: &mut LuaState) -> LuaResult<i32> {
     let addr = l.upvalue(0).as_number().unwrap() as usize;
     let narg = l.top - l.base;
     let decl_id = l.upvalue(1).as_number().map(|n| n as u32);
 
     // Collect the declared parameter types: the func's field chain.
-    let param_types: Vec<u32> = if let Some(fid) = decl_id {
-        let mut types = Vec::new();
-        let cts = l.global().cts.as_ref().unwrap();
-        let raw = cts.raw(fid);
-
-        if raw.info >> 28 == CT::Func as u32 {
-            let mut cur = raw.sib as u32;
-            while cur != 0 {
-                let f = cts.tab.get(cur as usize);
-                if let Some(f) = f {
-                    types.push(f.info & 0xFFFF);
-                    cur = f.sib as u32;
-                } else {
-                    break;
-                }
-            }
-        }
-        types
-    } else {
-        Vec::new()
-    };
+    let param_types: Vec<u32> = decl_id
+        .map(|fid| ccall_param_types(l.global().cts.as_ref().unwrap(), fid))
+        .unwrap_or_default();
 
     // Marshal each Lua argument to an i64 slot.
     let mut cstrs: Vec<CString> = Vec::new();
@@ -2016,7 +2179,12 @@ fn call_c(l: &mut LuaState) -> LuaResult<i32> {
                 continue;
             }
             if let Some(n) = a.as_number() {
-                cargs.push(n as i64);
+                let cts = l.global().cts.as_ref().unwrap();
+                cargs.push(if ctype_is_fp(cts, ptype) {
+                    n.to_bits() as i64
+                } else {
+                    n as i64
+                });
                 continue;
             }
             if a.is_nil() {
@@ -2043,12 +2211,17 @@ fn call_c(l: &mut LuaState) -> LuaResult<i32> {
         }
     }
 
-    type CFn = unsafe extern "system" fn(i64, i64, i64, i64, i64, i64) -> i64;
-    let f: CFn = unsafe { std::mem::transmute(addr) };
-    let pad = |i: usize| if i < cargs.len() { cargs[i] } else { 0 };
-    let ret = unsafe { f(pad(0), pad(1), pad(2), pad(3), pad(4), pad(5)) };
-
-    push(l, LuaValue::number(ret as f64));
+    let cts = l.global().cts.as_ref().unwrap();
+    let type_code = decl_id.map(|fid| ffi_type_code(cts, fid)).unwrap_or(0);
+    let v = LuaValue::from_bits(ffi_call_dispatch(
+        addr,
+        type_code,
+        [
+            cargs.first().copied().unwrap_or(0),
+            cargs.get(1).copied().unwrap_or(0),
+        ],
+    ));
+    push(l, v);
     Ok(1)
 }
 

@@ -449,14 +449,13 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         let arch = js.arch;
         opt_narrow::opt_narrow(&mut trace.ir);
         opt_sink::opt_sink(&mut trace);
+        #[cfg(not(target_arch = "wasm32"))]
+        let cell_addrs = (js.stack_end_cell_addr(), js.exit_base_cell_addr());
+        #[cfg(target_arch = "wasm32")]
+        let cell_addrs = (0u64, 0u64);
         if !js.no_asm
-            && let Ok((mc, inner, tails)) = asm::assemble(
-                &trace,
-                link_target,
-                arch,
-                js.stack_end_cell_addr(),
-                js.exit_base_cell_addr(),
-            )
+            && let Ok((mc, inner, tails)) =
+                asm::assemble(&trace, link_target, arch, cell_addrs.0, cell_addrs.1)
         {
             if js.trace_dump {
                 eprintln!(

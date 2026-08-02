@@ -425,15 +425,27 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                             debug_assert_eq!(cargj.op(), IROp::CARG);
                             let cargi = *ir.ir(cargj.op1 as IRRef);
                             debug_assert_eq!(cargi.op(), IROp::CARG);
-                            let (x, y, z) = (
-                                val(env, cargi.op1 as IRRef),
-                                val(env, cargi.op2 as IRRef),
-                                val(env, cargj.op2 as IRRef),
-                            );
-                            match idx {
-                                record::IRCALL_STR_SUB => jit_str_sub(x, y, z),
-                                record::IRCALL_VARG => jit_varg(x, y, z),
-                                _ => unreachable!("bad IRCALL index"),
+                            if idx == record::IRCALL_FFI {
+                                let cargh = *ir.ir(cargi.op1 as IRRef);
+                                debug_assert_eq!(cargh.op(), IROp::CARG);
+                                let (a, b, c, d) = (
+                                    val(env, cargh.op1 as IRRef),
+                                    val(env, cargh.op2 as IRRef),
+                                    val(env, cargi.op2 as IRRef),
+                                    val(env, cargj.op2 as IRRef),
+                                );
+                                crate::ffi::lib::jit_ffi_call(a, b, c, d)
+                            } else {
+                                let (x, y, z) = (
+                                    val(env, cargi.op1 as IRRef),
+                                    val(env, cargi.op2 as IRRef),
+                                    val(env, cargj.op2 as IRRef),
+                                );
+                                match idx {
+                                    record::IRCALL_STR_SUB => jit_str_sub(x, y, z),
+                                    record::IRCALL_VARG => jit_varg(x, y, z),
+                                    _ => unreachable!("bad IRCALL index"),
+                                }
                             }
                         }
                     };
@@ -855,7 +867,7 @@ fn str_bytes(bits: u64) -> &'static [u8] {
 /// The heap bound by `trace_exec` (for allocating helpers).
 /// Prefer `jit_heap_from_env` for portable-executor callers that have
 /// the env buffer; this fallback reads the thread-local (machine-code path).
-fn jit_heap() -> &'static mut GcHeap {
+pub(crate) fn jit_heap() -> &'static mut GcHeap {
     unsafe {
         JIT_HEAP
             .with(|c| c.get())

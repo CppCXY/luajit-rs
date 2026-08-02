@@ -1063,7 +1063,7 @@ impl<'a> Asm<'a> {
                 self.steal_quiet(rg);
             }
         }
-        debug_assert!(args.len() <= 3);
+        debug_assert!(args.len() <= 4);
         for (n, &r) in args.iter().enumerate() {
             self.gpr_load_ref(n as u8, r);
         }
@@ -1178,6 +1178,7 @@ impl<'a> Asm<'a> {
             rec::IRCALL_CAT => exec::jit_cat as *const () as u64,
             rec::IRCALL_USET => exec::jit_uset as *const () as u64,
             rec::IRCALL_TOSTR_NUM => exec::jit_tostr_num as *const () as u64,
+            rec::IRCALL_FFI => crate::ffi::lib::jit_ffi_call as *const () as u64,
             _ => return Err(TraceError::NYIIR),
         };
         match rec::ircall_arity(idx) {
@@ -1192,10 +1193,24 @@ impl<'a> Asm<'a> {
                 debug_assert_eq!(cargj.op(), IROp::CARG);
                 let cargi = *self.tr.ir.ir(cargj.op1 as IRRef);
                 debug_assert_eq!(cargi.op(), IROp::CARG);
-                self.helper_call(
-                    addr,
-                    &[cargi.op1 as IRRef, cargi.op2 as IRRef, cargj.op2 as IRRef],
-                );
+                if rec::ircall_arity(idx) == 4 {
+                    let cargh = *self.tr.ir.ir(cargi.op1 as IRRef);
+                    debug_assert_eq!(cargh.op(), IROp::CARG);
+                    self.helper_call(
+                        addr,
+                        &[
+                            cargh.op1 as IRRef,
+                            cargh.op2 as IRRef,
+                            cargi.op2 as IRRef,
+                            cargj.op2 as IRRef,
+                        ],
+                    );
+                } else {
+                    self.helper_call(
+                        addr,
+                        &[cargi.op1 as IRRef, cargi.op2 as IRRef, cargj.op2 as IRRef],
+                    );
+                }
             }
         }
         self.ff_result(ins)

@@ -14,7 +14,7 @@
 //! Reference: LuaJIT/src/lj_ctype.h, lj_cdata.h, lj_cparse.h
 
 mod clib;
-mod lib;
+pub(crate) mod lib;
 mod parser;
 
 pub use lib::open;

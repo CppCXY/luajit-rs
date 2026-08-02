@@ -28,7 +28,7 @@
 //!   from the hot path for good.
 
 mod asm;
-mod exec;
+pub(crate) mod exec;
 #[allow(unused)]
 mod ir;
 mod mcode;

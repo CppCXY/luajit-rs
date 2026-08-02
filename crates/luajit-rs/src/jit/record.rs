@@ -63,13 +63,15 @@ pub const IRCALL_CAT: u32 = 9;
 pub const IRCALL_USET: u32 = 10;
 pub const IRCALL_VARG: u32 = 11;
 pub const IRCALL_TOSTR_NUM: u32 = 12;
+pub const IRCALL_FFI: u32 = 13;
 
 /// Argument count of an IRCALL: 1 = op1 is the argument, 2 = op1 is a
-/// CARG pair, 3 = op1 is CARG(CARG(a, b), c).
+/// CARG pair, 3 = op1 is CARG(CARG(a, b), c), 4 = one more level.
 pub fn ircall_arity(idx: u32) -> u32 {
     match idx {
         IRCALL_STR_LEN | IRCALL_STR_CHAR | IRCALL_TAB_LEN | IRCALL_TOSTR_NUM => 1,
         IRCALL_STR_SUB | IRCALL_VARG => 3,
+        IRCALL_FFI => 4,
         _ => 2,
     }
 }
@@ -2140,6 +2142,76 @@ impl Record {
                     return Err(TraceError::NYIBC); // Metatable __tostring path.
                 }
             }
+            Recff::FFICall => {
+                // `ffi.C.sym` calls: the wrapper closure's upvalues hold
+                // the resolved symbol address (u0) and the cdef type id
+                // (u1, when declared). Record as a 4-argument helper so
+                // the portable executor (wasm) and the native backends
+                // share one code path. Unsupported argument shapes fail
+                // the helper's type guard and exit to the interpreter.
+                if nargs < 1 || nargs > 2 {
+                    return Err(TraceError::NYIBC);
+                }
+                let crate::func::GcFunc::C(cc) = fv.as_func().unwrap().as_ref() else {
+                    unreachable!()
+                };
+                let addr = cc
+                    .upvals
+                    .first()
+                    .map(|uv| uv.as_number().unwrap_or(0.0))
+                    .unwrap_or(0.0);
+                // Encode the declared parameter/return kinds into a
+                // constant so the helper needs no CTState access (the
+                // architecture-independent marshal path stays self
+                // contained — wasm included).
+                let type_code = cc
+                    .upvals
+                    .get(1)
+                    .and_then(|uv| uv.as_number())
+                    .and_then(|d| {
+                        let g = l.global();
+                        g.cts
+                            .as_ref()
+                            .map(|cts| crate::ffi::lib::ffi_type_code(cts, d as u32) as f64)
+                    })
+                    .unwrap_or(0.0);
+                let kaddr = self.cur.ir.knum(addr);
+                let ktype = self.cur.ir.knum(type_code);
+                let a0 = self.base_ref(a + 2);
+                let a1 = if nargs == 2 {
+                    self.base_ref(a + 3)
+                } else {
+                    TREF_NIL
+                };
+                if tref_isnil(a0) || (nargs == 2 && tref_isnil(a1)) {
+                    return Err(TraceError::NYIBC);
+                }
+                let c1 = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(kaddr),
+                    tref_ref(ktype),
+                ));
+                let c2 = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(c1),
+                    tref_ref(a0),
+                ));
+                let c3 = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(c2),
+                    tref_ref(a1),
+                ));
+                // Guarded result: an unsupported argument shape makes the
+                // helper return NIL and the guard exits to the interpreter.
+                let r = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_GUARD | IRT_NUM),
+                    tref_ref(c3),
+                    IRCALL_FFI,
+                ));
+                self.rec_gcstep(l);
+                res[0] = r;
+                nres = 1;
+            }
         }
         // Write the results; pad/discard per the call's wanted count.
         for i in 0..want as u32 {
@@ -2901,12 +2973,18 @@ enum Recff {
     RawSet,
     ToNumber,
     ToString,
+    /// `ffi.C` symbol call wrapper (call_c): the address and cdef
+    /// declaration id live in the closure's upvalues; the call is
+    /// recorded as a 4-argument helper (architecture-independent, so
+    /// the portable executor — wasm included — executes it too).
+    FFICall,
 }
 
 fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
     use crate::func::CFunction;
     use crate::stdlib::{base, bit, math, string, table};
-    let entries: [(CFunction, Recff); 32] = [
+    let entries: [(CFunction, Recff); 33] = [
+        (crate::ffi::lib::call_c, Recff::FFICall),
         (math::floor, Recff::Floor),
         (math::ceil, Recff::Ceil),
         (math::sqrt, Recff::Sqrt),
