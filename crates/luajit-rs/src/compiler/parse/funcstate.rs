@@ -10,6 +10,10 @@ pub(crate) struct FuncScope {
     pub vstart: u32,
     pub nactvar: u8,
     pub flags: u8,
+    /// Highest `freereg` reached while inside this scope; the block
+    /// epilogue clears [nactvar, max_freereg) so stale temporaries never
+    /// get rooted by a GC stack mark.
+    pub max_freereg: BCReg,
 }
 
 /// Per-function compiler state, corresponding to LuaJIT's `FuncState`.

@@ -81,8 +81,9 @@ fn read_proto(r: &mut Reader, strs: &mut Interner) -> Proto {
     let numline = r.read_u32();
     let has_source = r.read_u8();
     let source = if has_source != 0 {
-        let sid: u32 = r.read_u32();
-        Some(sid)
+        let len = r.read_u32() as usize;
+        let bytes = r.read_bytes(len);
+        Some(strs.intern(bytes))
     } else {
         None
     };

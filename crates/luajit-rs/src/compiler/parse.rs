@@ -540,6 +540,14 @@ impl<'a> Parser<'a> {
     fn bcreg_reserve(&mut self, n: BCReg) {
         self.bcreg_bump(n);
         self.cur_mut().freereg += n;
+        let freg = self.cur().freereg;
+        for s in self.cur_mut().scopes.iter_mut().rev() {
+            if freg > s.max_freereg {
+                s.max_freereg = freg;
+            } else {
+                break;
+            }
+        }
     }
 
     fn bcreg_free(&mut self, reg: BCReg) {
@@ -670,11 +678,16 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        self.bcemit(if n == 1 {
+        let pc = self.bcemit(if n == 1 {
             bcins_ad(BCOp::KPRI, from, VKNil as u32)
         } else {
             bcins_ad(BCOp::KNIL, from, from + n - 1)
         });
+        // Synthetic nil-initialization (e.g. `local a` with no value):
+        // Lua 5.1 emits nothing here, so give it no source line — a
+        // debug line hook must not fire for it.
+        let base = self.cur().bcbase;
+        self.bcstack[base + pc as usize].line = 0;
     }
 
     fn expr_toreg_nobranch(&mut self, e: &mut ExpDesc, reg: BCReg) {
@@ -1610,19 +1623,32 @@ impl<'a> Parser<'a> {
             vstart,
             nactvar,
             flags,
+            max_freereg: fs.freereg,
         });
         debug_assert!(self.cur().freereg == self.cur().nactvar);
     }
 
     fn fscope_end(&mut self) {
         let mut bl = self.cur_mut().scopes.pop().unwrap();
-        self.var_remove(bl.nactvar as u32);
+        let from = bl.nactvar as u32;
+        self.var_remove(from);
         let nactvar = self.cur().nactvar;
-        self.cur_mut().freereg = nactvar;
-        debug_assert!(bl.nactvar as u32 == self.cur().nactvar);
         if (bl.flags & (FSCOPE_UPVAL | FSCOPE_NOCLOSE)) == FSCOPE_UPVAL {
             self.bcemit_aj(BCOp::UCLO, bl.nactvar as u32, 0);
         }
+        // Stale temporaries in [nactvar, max_freereg) keep their values
+        // after registers are freed; a later GC roots the whole stack and
+        // would mark them, breaking weak tables (loop temporaries such as
+        // `a[newproxy(u)]` cascade through the shared metatable and mark
+        // every weak-table key). Clear the block's temp range on exit,
+        // *after* UCLO so closed upvalues keep their values.
+        let max_fr = bl.max_freereg as u32;
+        if max_fr > nactvar {
+            self.cur_mut().freereg = nactvar;
+            self.bcemit_ad(BCOp::KNIL, nactvar, (max_fr - 1) as u32);
+        }
+        self.cur_mut().freereg = nactvar;
+        debug_assert!(bl.nactvar as u32 == self.cur().nactvar);
         debug_assert!((bl.flags & (FSCOPE_LOOP | FSCOPE_CONT)) != (FSCOPE_LOOP | FSCOPE_CONT));
         if (bl.flags & (FSCOPE_LOOP | FSCOPE_BREAK)) == (FSCOPE_LOOP | FSCOPE_BREAK) {
             bl.flags &= !FSCOPE_BREAK;
@@ -3106,6 +3132,11 @@ impl<'a> Parser<'a> {
         let mut islast = false;
         self.synlevel_begin();
         while !islast && !parse_isend(self.ls.tok) {
+            // A statement's instructions carry the line of its first
+            // token (Lua 5.1 semantics): after a `;` the lexer's
+            // lastline still points at the previous statement, so sync
+            // it with the upcoming statement's opening token.
+            self.ls.lastline = self.ls.linenumber;
             islast = self.parse_stmt();
             while self.ls.tok == Tok::Char(b';') {
                 self.ls.next();

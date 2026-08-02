@@ -19,7 +19,8 @@ use luajit_rs::internal::state::{Lua, load};
 use luajit_rs::internal::table::LuaTable;
 use luajit_rs::{
     LuaError, LuaState, LuaValue, internal, lua_error_message, lua_getglobal, lua_gettop,
-    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadstring, lual_openlibs,
+    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadfile, lual_loadstring,
+    lual_openlibs,
 };
 
 const LUA_PROMPT: &str = "> ";
@@ -217,19 +218,9 @@ fn dotty(ll: &mut LuaState) -> i32 {
 
 fn dofile(lua: &mut Lua, name: &str, script_args: &[String]) -> i32 {
     let ll = lua.main();
-    let src = match std::fs::read(name) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("luajit-rs: cannot open {name}: {e}");
-            return 1;
-        }
-    };
     lua_settop(ll, 0);
-    if lual_loadstring(ll, &src).is_err() {
-        eprintln!(
-            "luajit-rs: compile error in {name}: {}",
-            String::from_utf8_lossy(&src)
-        );
+    if lual_loadfile(ll, name).is_err() {
+        eprintln!("luajit-rs: {}", error_msg(ll));
         return 1;
     }
     for a in script_args {

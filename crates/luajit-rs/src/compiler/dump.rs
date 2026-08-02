@@ -34,7 +34,7 @@ impl Writer {
     }
 }
 
-fn write_kgc(w: &mut Writer, kgc: &KGc) {
+fn write_kgc(w: &mut Writer, kgc: &KGc, strs: &Interner) {
     match kgc {
         KGc::Str(sid) => {
             w.w_u8(0);
@@ -42,11 +42,11 @@ fn write_kgc(w: &mut Writer, kgc: &KGc) {
         }
         KGc::Proto(child) => {
             w.w_u8(1);
-            write_proto(w, child);
+            write_proto(w, child, strs);
         }
         KGc::ProtoRef(r) => {
             w.w_u8(1);
-            write_proto(w, r.as_ref());
+            write_proto(w, r.as_ref(), strs);
         }
         KGc::Table(_) | KGc::TableRef(_) => {
             w.w_u8(2);
@@ -57,7 +57,7 @@ fn write_kgc(w: &mut Writer, kgc: &KGc) {
     }
 }
 
-fn write_proto(w: &mut Writer, pt: &Proto) {
+fn write_proto(w: &mut Writer, pt: &Proto, strs: &Interner) {
     w.w_u8(pt.flags);
     w.w_u8(pt.numparams);
     w.w_u8(pt.framesize);
@@ -71,7 +71,9 @@ fn write_proto(w: &mut Writer, pt: &Proto) {
     w.w_u32(pt.numline);
     if let Some(sid) = pt.source {
         w.w_u8(1);
-        w.w_u32(sid);
+        let b = strs.get(sid);
+        w.w_u32(b.len() as u32);
+        w.w_bytes(b);
     } else {
         w.w_u8(0);
     }
@@ -97,16 +99,16 @@ fn write_proto(w: &mut Writer, pt: &Proto) {
         w.w_bytes(b);
     }
     for kgc in &pt.kgc {
-        write_kgc(w, kgc);
+        write_kgc(w, kgc, strs);
     }
 }
 
-pub fn dump(pt: &Proto, _strs: &Interner, _chunk: &str, out: &mut Vec<u8>) {
+pub fn dump(pt: &Proto, strs: &Interner, _chunk: &str, out: &mut Vec<u8>) {
     let mut w = Writer::new();
     w.w_bytes(MAGIC);
     w.w_u8(VERSION);
     let flags: u8 = 0;
     w.w_u8(flags);
-    write_proto(&mut w, pt);
+    write_proto(&mut w, pt, strs);
     *out = w.out;
 }

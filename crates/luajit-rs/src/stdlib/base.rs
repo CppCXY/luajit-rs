@@ -312,15 +312,66 @@ fn lib_assert(l: &mut LuaState) -> LuaResult<i32> {
         Ok(n as i32)
     } else {
         let msg = arg(l, 1);
-        if msg.is_nil() {
-            // LuaJIT: no location prefix for the bare message.
-            l.errval = l.heap().str_value(l.heap().intern(b"assertion failed!"));
-            Err(LuaError::Runtime)
+        // luaL_where(1): the direct caller's location. A C caller (e.g.
+        // pcall) has no source line, so the message stays bare.
+        let loc = assert_where(l);
+        let full = if let Some(sid) = msg.as_string_id() {
+            format!(
+                "{}{}",
+                loc,
+                String::from_utf8_lossy(l.str_static(sid))
+            )
         } else {
-            l.errval = msg;
-            Err(LuaError::Runtime)
-        }
+            format!("{}assertion failed!", loc)
+        };
+        l.errval = l
+            .heap()
+            .str_value(l.heap().intern(full.as_bytes()));
+        Err(LuaError::Runtime)
     }
+}
+
+/// `luaL_where(L, 1)`: "file:line: " of the direct caller; empty when the
+/// caller is a C function (pcall, the library itself, ...).
+fn assert_where(l: &LuaState) -> String {
+    if l.base < 2 {
+        return String::new();
+    }
+    let link = l.stack[l.base - 1].to_bits();
+    if (link & crate::vm::FRAME_TYPE_MASK) != 0 || link == 0 {
+        return String::new();
+    }
+    let caller_base = (link >> 3) as usize;
+    if caller_base < 2 || caller_base >= l.stack.len() {
+        return String::new();
+    }
+    let Some(fv) = l.stack[caller_base - 2].as_func() else {
+        return String::new();
+    };
+    let crate::func::GcFunc::Lua(cl) = fv.as_ref() else {
+        return String::new();
+    };
+    let pt = cl.proto.as_ref();
+    let pc = l.debug_pc.min(pt.lines.len().saturating_sub(1));
+    let line = pt.lines[pc];
+    let src = pt
+        .source
+        .and_then(|sid| {
+            l.heap().strings.try_lookup(sid)?;
+            let b = l.heap().strings.get(sid);
+            if b.starts_with(b"@") || b.starts_with(b"=") {
+                Some(&b[1..])
+            } else {
+                Some(b)
+            }
+        })
+        .unwrap_or(b"?")
+        .to_vec();
+    format!(
+        "{}:{}: ",
+        String::from_utf8_lossy(&src),
+        line
+    )
 }
 
 fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
@@ -852,16 +903,44 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
             return Err(err_bad_arg_type(l, 1, "loadstring", "string", arg(l, 0)));
         }
     };
+    // Lua 5.1's luaL_loadbuffer: no explicit name (or a nil one) means
+    // the chunk name is the source itself; luaO_chunkid handles newlines
+    // and truncation.
+    let default_name = || {
+        String::from_utf8_lossy(v.as_string().unwrap().as_ref().as_bytes()).into_owned()
+    };
     let chunkname = if nargs(l) >= 2 {
         let nv = arg(l, 1);
         if let Some(s) = nv.as_string() {
             String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned()
+        } else if nv.is_nil() {
+            default_name()
         } else {
             "=(loadstring)".to_string()
         }
     } else {
-        "=(loadstring)".to_string()
+        default_name()
     };
+    let chunkname = if chunkname.starts_with('@') || chunkname.starts_with('=') {
+        chunkname
+    } else {
+        // Lua 5.1's luaO_chunkid: `[string "..."]` — a source with a
+        // newline (or longer than 45 chars) is truncated: the tail of
+        // its first line (up to 45 chars) plus trailing "...".
+        let len = chunkname.find(['\n', '\r']).unwrap_or(chunkname.len());
+        if len == chunkname.len() && chunkname.len() <= 45 {
+            format!("[string \"{}\"]", chunkname)
+        } else {
+            let start = len.saturating_sub(45);
+            format!("[string \"{}...\"]", &chunkname[start..len])
+        }
+    };
+    if std::env::var("LUARS_SRCDBG").is_ok() {
+        eprintln!("SRCDBG chunkname={:?}", chunkname);
+    }
+    if std::env::var("LUARS_SRCDBG").is_ok() {
+        eprintln!("SRCDBG chunkname={:?}", chunkname);
+    }
     match crate::state::load(l, code, &chunkname) {
         Ok(v) => {
             push(l, v);
@@ -885,9 +964,10 @@ fn lib_loadfile(l: &mut LuaState) -> LuaResult<i32> {
         Some(s) => s.as_ref().as_bytes().to_vec(),
         None => return Err(err_bad_arg_type(l, 1, "loadfile", "string", arg(l, 0))),
     };
-    let chunkname = std::str::from_utf8(&filename)
-        .unwrap_or("=(loadfile)")
-        .to_string();
+    let chunkname = format!(
+        "@{}",
+        std::str::from_utf8(&filename).unwrap_or("=(loadfile)")
+    );
     let path = String::from_utf8_lossy(&filename);
     match std::fs::read(path.as_ref()) {
         Ok(code) => match crate::state::load(l, code, &chunkname) {

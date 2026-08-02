@@ -445,6 +445,18 @@ pub struct LuaState {
     /// The environment table of this (possibly coroutine) thread
     /// (`debug.setfenv` on a thread; `getfenv(0)` reports it).
     pub thread_env: GcPtr<LuaTable>,
+    /// Debug hook function (debug.sethook); nil when inactive.
+    pub hook: LuaValue,
+    /// Hook mask: bit0 = line, bit1 = call, bit2 = return, bit3 = count.
+    pub hookmask: u8,
+    /// Instruction counter for the count hook (remaining until trigger).
+    pub hookcount: i32,
+    /// Original count interval for the count hook (reset target).
+    pub hook_count_reset: i32,
+    /// Last line reported by the line hook (avoid repeats on same line).
+    pub hook_line: u32,
+    /// Set while a hook is running (hooks don't re-enter themselves).
+    pub hook_active: bool,
 }
 
 impl LuaState {
@@ -489,6 +501,12 @@ impl LuaState {
             debug_pc: 0,
             debug_chunkname: Vec::new(),
             thread_env: g.get_ref().globals,
+            hook: LuaValue::NIL,
+            hookmask: 0,
+            hookcount: 0,
+            hook_count_reset: 0,
+            hook_line: 0,
+            hook_active: false,
         }
     }
 
@@ -843,7 +861,9 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
     };
 
     debug_assert!(proto.uv.is_empty(), "main chunk must have no upvalues");
-    if !chunkname.is_empty() && !chunkname.starts_with('=') {
+    // Every chunk carries a source name (Lua 5.1: `luaO_chunkid`), even
+    // "=literal" names; the display layers strip the '@'/'=' prefix.
+    if !chunkname.is_empty() {
         let source_sid = g.heap.strings.intern(chunkname.as_bytes());
         proto.source = Some(source_sid);
     }

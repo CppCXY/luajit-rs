@@ -57,7 +57,7 @@ pub struct LuaTable {
     /// Array part. Slot `i` holds the value for integer key `i`.
     pub(crate) array: Vec<LuaValue>,
     /// Hash part; length is `hmask + 1` (or `1` when empty).
-    node: Vec<Node>,
+    pub(crate) node: Vec<Node>,
     /// JIT mirror of `array.as_ptr()` (the machine code cannot see into
     /// `Vec`); kept in sync by `sync_aptr` at every reallocation point.
     pub(crate) aptr: *mut LuaValue,
@@ -281,10 +281,10 @@ impl LuaTable {
     /// value is about to be collected. The value slot is cleared (the dead
     /// key stays in the node, per LuaJIT's dead-key policy). Strings are
     /// never weak references: they are marked and kept.
-    pub(crate) fn clear_weak_entries(&mut self, mode: u8) {
+    pub(crate) fn clear_weak_entries(&mut self, mode: u8, cw: u8) {
         if mode & gc::WEAKVAL != 0 {
             for tv in self.array.iter_mut() {
-                if gc::may_clear(*tv, true) {
+                if gc::may_clear(*tv, true, cw) {
                     *tv = LuaValue::NIL;
                 }
             }
@@ -294,7 +294,7 @@ impl LuaTable {
                 if n.val.is_nil() {
                     continue;
                 }
-                if gc::may_clear(n.key, false) || gc::may_clear(n.val, true) {
+                if gc::may_clear(n.key, false, cw) || gc::may_clear(n.val, true, cw) {
                     n.val = LuaValue::NIL;
                 }
             }

@@ -77,7 +77,7 @@ fn cont_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
 /// the caller's return PC, the CALL instruction before it holds the
 /// callee register, and the local variable debug info maps it to a name.
 fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, String)> {
-    use crate::bc::{BCIns, BCOp, bc_a, bc_b, bc_op};
+    use crate::bc::{BCIns, BCOp, bc_a, bc_b, bc_d, bc_op};
     if slot < 2 {
         return None;
     }
@@ -88,6 +88,16 @@ fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, Stri
     let ret_ip = link as *const BCIns;
     let call_ins = unsafe { *ret_ip.sub(1) };
     let op = bc_op(call_ins);
+    if std::env::var("LUARS_NAMEDBG").is_ok() {
+        eprintln!(
+            "NAMEDBG slot={} link={:#x} op={:?} a={} base_calc={}",
+            slot,
+            link,
+            op,
+            bc_a(call_ins),
+            slot.saturating_sub(2 + bc_a(call_ins) as usize)
+        );
+    }
     if !matches!(
         op,
         BCOp::CALL | BCOp::CALLT | BCOp::CALLM | BCOp::CALLMT | BCOp::ITERC | BCOp::ITERN
@@ -118,14 +128,85 @@ fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, Stri
             callee_reg = bc_b(prev);
         }
     }
+    // LuaJIT's lj_debug_funcname: inspect the instruction right before
+    // the CALL (following one MOV), then fall back to local variables.
+    let mut k = call_pc;
+    for _ in 0..2 {
+        if k == 0 {
+            break;
+        }
+        k -= 1;
+        let ins = pt.bc[k as usize];
+        match bc_op(ins) {
+            BCOp::GGET if bc_a(ins) == callee_reg => {
+                let name = kgc_str(l, &pt.kgc, bc_d(ins) as usize)?;
+                return Some(("global", name));
+            }
+            BCOp::TGETS if bc_a(ins) == callee_reg => {
+                let name = kgc_str(l, &pt.kgc, bc_d(ins) as usize)?;
+                return Some(("field", name));
+            }
+            BCOp::TGETV if bc_a(ins) == callee_reg => {
+                return Some(("method", "?".to_string()));
+            }
+            BCOp::MOV if bc_a(ins) == callee_reg => {
+                callee_reg = bc_b(ins);
+            }
+            _ => break,
+        }
+    }
+    // The callee is a local variable: pick the variable whose lifetime
+    // contains the call and starts latest (nearest definition).
+    let mut best: Option<(usize, &str, String)> = None;
     for (reg, spc, epc, name) in &pt.varnames {
         let end = if *epc == 0 { pt.bc.len() as u32 } else { *epc };
         if *reg as u32 == callee_reg && *spc <= call_pc && call_pc <= end {
-            return Some(("local", name.clone()));
+            let spc = *spc as usize;
+            if best.as_ref().is_none_or(|b| spc > b.0) {
+                best = Some((spc, "local", name.clone()));
+            }
         }
     }
-    // The callee is not a local variable (e.g. a GGET result).
+    if let Some((_, w, n)) = best {
+        return Some((w, n));
+    }
     None
+}
+
+fn kgc_str(l: &LuaState, kgc: &[crate::proto::KGc], idx: usize) -> Option<String> {
+    match kgc.get(idx) {
+        Some(crate::proto::KGc::Str(sid)) => Some(String::from_utf8_lossy(l.str_static(*sid)).into_owned()),
+        _ => None,
+    }
+}
+
+/// Fill `name`/`namewhat` for a frame (`getinfo(level)`): metamethod
+/// continuations first, then the call-site inference.
+fn name_from_level(l: &mut LuaState, slot: usize, t: GcPtr<LuaTable>) {
+    let link = l.stack[slot - 1].to_bits();
+    if (link & FRAME_TYPE_MASK) == 2 {
+        if let Some(name) = cont_mm_name(l, slot) {
+            t.as_mut().set_str(str_val(l, "name"), str_val(l, name));
+            t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
+        } else {
+            t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
+            t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
+        }
+    } else if let Some((name, fbits)) = l.mmname {
+        if l.stack[slot - 2].to_bits() == fbits {
+            t.as_mut().set_str(str_val(l, "name"), str_val(l, name));
+            t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
+        } else {
+            t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
+            t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
+        }
+    } else if let Some((namewhat, name)) = funcname_from_caller(l, slot) {
+        t.as_mut().set_str(str_val(l, "name"), str_val(l, &name));
+        t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, namewhat));
+    } else {
+        t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
+        t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
+    }
 }
 
 fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
@@ -256,6 +337,7 @@ fn str_val(l: &mut LuaState, s: &str) -> LuaValue {
 // Flags for what-to-return:
 const WHAT_S: u8 = 1; // source, short_src, linedefined, lastlinedefined, what
 const WHAT_L: u8 = 2; // currentline
+const WHAT_ACTIVELINES: u8 = 0x20; // activelines ('L')
 const WHAT_N: u8 = 4; // name, namewhat
 const WHAT_U: u8 = 8; // nup, nparams, isvararg
 const WHAT_F: u8 = 16; // func
@@ -266,6 +348,7 @@ fn parse_what(what: &str) -> u8 {
         match c {
             'S' => flags |= WHAT_S,
             'l' => flags |= WHAT_L,
+            'L' => flags |= WHAT_ACTIVELINES,
             'n' => flags |= WHAT_N,
             'u' => flags |= WHAT_U,
             'f' => flags |= WHAT_F,
@@ -273,7 +356,8 @@ fn parse_what(what: &str) -> u8 {
         }
     }
     if flags == 0 {
-        flags = WHAT_S | WHAT_N | WHAT_L | WHAT_U;
+        // Lua 5.1's lua_getinfo: an empty `what` means "nlSfu".
+        flags = WHAT_S | WHAT_N | WHAT_L | WHAT_U | WHAT_F;
     }
     flags
 }
@@ -327,11 +411,14 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
                     .unwrap_or_else(|| "=?".to_string());
 
                 let short_src = if src.starts_with('@') || src.starts_with('=') {
-                    src[1..]
-                        .rsplit(&['\\', '/'][..])
-                        .next()
-                        .unwrap_or(&src[1..])
-                        .to_string()
+                    // Lua 5.1's luaO_chunkid for file names: truncate with
+                    // a leading "..." keeping the tail (LUA_IDSIZE-3).
+                    let name = &src[1..];
+                    if name.len() > 37 {
+                        format!("...{}", &name[name.len() - 37..])
+                    } else {
+                        name.to_string()
+                    }
                 } else {
                     src.rsplit(&['\\', '/'][..])
                         .next()
@@ -348,7 +435,7 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
                 );
                 t.as_mut().set_str(
                     str_val(l, "lastlinedefined"),
-                    LuaValue::number((pt.firstline + pt.numline - 1) as f64),
+                    LuaValue::number((pt.firstline + pt.numline) as f64),
                 );
                 t.as_mut().set_str(
                     str_val(l, "what"),
@@ -378,6 +465,22 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
                 t.as_mut()
                     .set_str(str_val(l, "currentline"), LuaValue::number(cur_line));
             }
+            if flags & WHAT_ACTIVELINES != 0 {
+                // Lua 5.1's "L": a table mapping every line with code to
+                // true (debug.getinfo(..., "L")).
+                let al = l.heap().alloc_table(LuaTable::new(0, 0));
+                let mut seen: Vec<u16> = Vec::new();
+                for (i, &ln) in pt.lines.iter().enumerate() {
+                    let ln = ln as i32;
+                    // Skip the FUNCF header line: Lua 5.1's activelines
+                    // only covers actual code lines.
+                    if i > 0 && ln > 0 && !seen.contains(&(ln as u16)) {
+                        seen.push(ln as u16);
+                        al.as_mut().set_int(ln, LuaValue::TRUE);
+                    }
+                }
+                t.as_mut().set_str(str_val(l, "activelines"), LuaValue::table(al));
+            }
             if flags & WHAT_U != 0 {
                 t.as_mut()
                     .set_str(str_val(l, "nups"), LuaValue::number(cl.upvals.len() as f64));
@@ -389,39 +492,19 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
                 );
             }
             if flags & WHAT_F != 0 {
-                t.as_mut().set_str(str_val(l, "func"), l.stack[slot - 2]);
+                let f = if let Some(fv) = first.as_func() {
+                    fv
+                } else {
+                    l.stack[slot - 2].as_func().expect("Lua frame func")
+                };
+                t.as_mut().set_str(str_val(l, "func"), LuaValue::func(f));
             }
             if flags & WHAT_N != 0 {
-                // Metamethod continuation frames report the metamethod
-                // name (e.g. "__index"), like LuaJIT's lj_debug_funcname.
-                // FRAME_CONT == 2 (vm/mod.rs).
-                let link = l.stack[slot - 1].to_bits();
-                if (link & FRAME_TYPE_MASK) == 2 {
-                    if let Some(name) = cont_mm_name(l, slot) {
-                        t.as_mut().set_str(str_val(l, "name"), str_val(l, name));
-                        t.as_mut()
-                            .set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
-                    } else {
-                        t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
-                        t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
-                    }
-                } else if let Some((name, fbits)) = l.mmname {
-                    // Metamethods invoked through the execute-recursion
-                    // paths (e.g. __concat) expose their name this way.
-                    if l.stack[slot - 2].to_bits() == fbits {
-                        t.as_mut().set_str(str_val(l, "name"), str_val(l, name));
-                        t.as_mut()
-                            .set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
-                    } else {
-                        t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
-                        t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
-                    }
-                } else if let Some((namewhat, name)) = funcname_from_caller(l, slot) {
-                    t.as_mut().set_str(str_val(l, "name"), str_val(l, &name));
-                    t.as_mut()
-                        .set_str(str_val(l, "namewhat"), str_val(l, namewhat));
+                // A function argument has no call context: Lua 5.1's
+                // lua_getinfo leaves the name empty for `getinfo(f)`.
+                if !first.is_func() {
+                    name_from_level(l, slot, t);
                 } else {
-                    // Try to find name from caller
                     t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
                     t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
                 }
@@ -450,7 +533,10 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
                 t.as_mut().set_str(str_val(l, "isvararg"), LuaValue::FALSE);
             }
             if flags & WHAT_F != 0 {
-                t.as_mut().set_str(str_val(l, "func"), l.stack[slot - 2]);
+                let f = first
+                    .as_func()
+                    .unwrap_or_else(|| l.stack[slot - 2].as_func().unwrap());
+                t.as_mut().set_str(str_val(l, "func"), LuaValue::func(f));
             }
             if flags & WHAT_N != 0 {
                 t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
@@ -706,12 +792,149 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
 
 // ── debug.gethook / sethook (stubs) ─────────────────────────────────────────
 
-fn lib_gethook(_l: &mut LuaState) -> LuaResult<i32> {
+fn lib_gethook(l: &mut LuaState) -> LuaResult<i32> {
+    // debug.gethook([thread]) — thread form unsupported: use the main thread.
+    let n = nargs(l);
+    let thread = if n > 0 && arg(l, 0).is_thread() {
+        arg(l, 0)
+    } else {
+        LuaValue::NIL
+    };
+    let st = if thread.is_thread() {
+        thread.as_thread().map(|t| unsafe { t.as_ref() })
+    } else {
+        None
+    };
+    let hook = st.map(|s| s.hook).unwrap_or_else(|| l.hook);
+    let mask = st.map(|s| s.hookmask).unwrap_or(l.hookmask);
+    let count = st
+        .map(|s| s.hook_count_reset)
+        .unwrap_or(l.hook_count_reset);
+    l.stack_ensure(l.base + 3);
+    l.stack[l.base] = hook;
+    let mut m = String::new();
+    if mask & crate::vm::HOOKMASK_CALL != 0 {
+        m.push('c');
+    }
+    if mask & crate::vm::HOOKMASK_RET != 0 {
+        m.push('r');
+    }
+    if mask & crate::vm::HOOKMASK_LINE != 0 {
+        m.push('l');
+    }
+    l.stack[l.base + 1] = l.heap().str_value(l.heap().intern(m.as_bytes()));
+    l.stack[l.base + 2] = LuaValue::number(count as f64);
+    l.top = l.base + 3;
+    Ok(3)
+}
+
+fn lib_sethook(l: &mut LuaState) -> LuaResult<i32> {
+    let n = nargs(l);
+    // debug.sethook(hook, mask[, count]) or sethook([thread,] hook, mask[, count])
+    let mut idx = 0usize;
+    let mut target: Option<GcPtr<crate::state::LuaState>> = None;
+    if n > 0 && arg(l, 0).is_thread() {
+        target = arg(l, 0).as_thread();
+        idx = 1;
+    }
+    let hook = arg(l, idx);
+    let mask = if n > idx + 1 {
+        arg(l, idx + 1)
+            .as_string_id()
+            .map(|sid| String::from_utf8_lossy(l.str_static(sid)).into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let count = if n > idx + 2 {
+        arg(l, idx + 2).as_number().unwrap_or(0.0) as i32
+    } else {
+        0
+    };
+    let mut hm = 0u8;
+    for c in mask.chars() {
+        match c {
+            'l' => hm |= crate::vm::HOOKMASK_LINE,
+            'c' => hm |= crate::vm::HOOKMASK_CALL,
+            'r' => hm |= crate::vm::HOOKMASK_RET,
+            _ => {}
+        }
+    }
+    if hm == 0 && count > 0 {
+        hm |= crate::vm::HOOKMASK_COUNT;
+    }
+    // Lua 5.1: the line hook doesn't fire for the line the hook was
+    // installed on; seed hook_line with the caller's current line.
+    let cur_line = caller_line(l).unwrap_or(0);
+    if let Some(t) = target {
+        let t = unsafe { t.as_mut() };
+        t.hook = if hook.is_nil() { LuaValue::NIL } else { hook };
+        t.hookmask = hm;
+        t.hookcount = count;
+        t.hook_count_reset = count;
+        t.hook_line = cur_line;
+    } else {
+        l.hook = if hook.is_nil() { LuaValue::NIL } else { hook };
+        l.hookmask = hm;
+        l.hookcount = count;
+        l.hook_count_reset = count;
+        l.hook_line = cur_line;
+    }
     Ok(0)
 }
 
-fn lib_sethook(_l: &mut LuaState) -> LuaResult<i32> {
-    Ok(0)
+/// The caller's current source line (for sethook's initial hook_line).
+fn caller_line(l: &LuaState) -> Option<u32> {
+    use crate::bc::bc_op;
+    if l.base < 2 {
+        return None;
+    }
+    let link = l.stack[l.base - 1].to_bits();
+    if (link & FRAME_TYPE_MASK) != 0 || link == 0 {
+        return None;
+    }
+    let caller_base = if ((link >> 3) as usize) < l.stack.len() {
+        // C-call frame: the link encodes the caller's base.
+        (link >> 3) as usize
+    } else {
+        // Lua frame: the link is the caller's return PC.
+        let ret_ip = link as *const crate::bc::BCIns;
+        if (ret_ip as usize) < 0x10000 {
+            return None;
+        }
+        let call_ins = unsafe { *ret_ip.sub(1) };
+        if !matches!(
+            bc_op(call_ins),
+            crate::bc::BCOp::CALL
+                | crate::bc::BCOp::CALLT
+                | crate::bc::BCOp::CALLM
+                | crate::bc::BCOp::CALLMT
+        ) {
+            return None;
+        }
+        let a = crate::bc::bc_a(call_ins) as usize;
+        let base = l.base.saturating_sub(2 + a);
+        if base < 2 {
+            return None;
+        }
+        let pt = l.stack[base - 2].as_func()?;
+        let pt = match pt.as_ref() {
+            crate::func::GcFunc::Lua(cl) => cl.proto.as_ref(),
+            _ => return None,
+        };
+        let pc = unsafe { ret_ip.offset_from(pt.bc.as_ptr()) } as usize;
+        return Some(pt.lines[pc.saturating_sub(1).min(pt.lines.len().saturating_sub(1))] as u32);
+    };
+    if caller_base < 2 {
+        return None;
+    }
+    let pt = l.stack[caller_base - 2].as_func()?;
+    let pt = match pt.as_ref() {
+        crate::func::GcFunc::Lua(cl) => cl.proto.as_ref(),
+        _ => return None,
+    };
+    let pc = l.debug_pc.min(pt.lines.len().saturating_sub(1));
+    Some(pt.lines[pc] as u32)
 }
 
 fn lib_getupvalue(l: &mut LuaState) -> LuaResult<i32> {
@@ -804,6 +1027,19 @@ fn lib_setupvalue(l: &mut LuaState) -> LuaResult<i32> {
 fn lib_getlocal(l: &mut LuaState) -> LuaResult<i32> {
     let level = arg(l, 0).as_number().unwrap_or(0.0) as i32;
     let local = arg(l, 1).as_number().unwrap_or(0.0) as usize;
+    if level == 0 {
+        // Lua 5.1: level 0 names the current C frame's temporary
+        // registers ("(*temporary)"); slot n is base + n - 1.
+        let idx = l.base + local - 1;
+        if local == 0 || idx >= l.top || idx >= l.stack.len() {
+            push(l, LuaValue::NIL);
+            return Ok(1);
+        }
+        let val = l.stack[idx];
+        let name_v = str_val(l, "(*temporary)");
+        pushv(l, &[name_v, val]);
+        return Ok(2);
+    }
     let (slot, gf) = match walk_frames(l, level) {
         Some(s) => s,
         None => {
@@ -811,25 +1047,24 @@ fn lib_getlocal(l: &mut LuaState) -> LuaResult<i32> {
             return Ok(1);
         }
     };
+    // The frame's current pc: for the current frame it is the
+    // interpreter's debug_pc; for a caller frame it is decoded from the
+    // *previous* frame's link (which points at the caller's return PC).
+    let prev_slot = if level == 1 {
+        None
+    } else {
+        walk_frames(l, level - 1).map(|(s, _)| s)
+    };
     match gf.as_ref() {
         GcFunc::Lua(cl) => {
             let pt = cl.proto.as_ref();
-            let nlocals = pt.framesize as usize - 1;
-            if local < 1 || local > nlocals {
-                push(l, LuaValue::NIL);
-                return Ok(1);
-            }
-            let idx = slot + local - 1;
-            // The variable name comes from the proto's debug info.
-            let name = pt
-                .varnames
-                .iter()
-                .find(|(reg, spc, epc, _)| {
-                    let end = if *epc == 0 { pt.bc.len() as u32 } else { *epc };
-                    *reg as usize == local - 1 && *spc <= end
-                })
-                .map(|(_, _, _, n)| n.clone())
-                .unwrap_or_default();
+            let (name, idx) = match frame_local(l, slot, pt, local, prev_slot) {
+                Some(x) => x,
+                None => {
+                    push(l, LuaValue::NIL);
+                    return Ok(1);
+                }
+            };
             let val = if idx < l.stack.len() {
                 l.stack[idx]
             } else {
@@ -846,6 +1081,84 @@ fn lib_getlocal(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
+/// Resolve the `n`-th *active* local of the frame at `slot` (Lua 5.1's
+/// `luaF_getlocalname`: locals are numbered in declaration order among
+/// those visible at the frame's current pc).
+fn frame_local(
+    l: &LuaState,
+    slot: usize,
+    pt: &crate::proto::Proto,
+    n: usize,
+    prev_slot: Option<usize>,
+) -> Option<(String, usize)> {
+    let pc = match prev_slot {
+        None => l.debug_pc.min(pt.lines.len().saturating_sub(1)) as u32,
+        Some(ps) => frame_pc(l, ps, pt)?,
+    };
+    let mut seen = 0usize;
+    // Lua 5.1 numbers the vararg parameter ("...") as the first local of
+    // a vararg function.
+    let vararg_offset = if pt.flags & crate::proto::PROTO_VARARG != 0 {
+        1
+    } else {
+        0
+    };
+    for (reg, spc, epc, name) in &pt.varnames {
+        let end = if *epc == 0 { pt.bc.len() as u32 } else { *epc };
+        if *spc <= pc && pc < end {
+            seen += 1;
+            if seen + vararg_offset == n {
+                return Some((name.clone(), slot + *reg as usize));
+            }
+        }
+    }
+    // Lua 5.1 falls back to the raw register: "(*temporary)" if the slot
+    // lies within the frame's parameter area (lua_getlocal's temporary
+    // handling: `n < ci->base - ci->func`).
+    let raw = slot + n - 1 - vararg_offset;
+    let limit = slot + 1 + pt.numparams as usize;
+    if raw >= slot && raw < limit {
+        return Some(("(*temporary)".to_string(), raw));
+    }
+    None
+}
+
+/// The current bytecode position of the frame at `slot` (pc-1 of its
+/// return PC, falling back to the call site).
+fn frame_pc(l: &LuaState, slot: usize, pt: &crate::proto::Proto) -> Option<u32> {
+    use crate::bc::bc_op;
+    if slot < 2 {
+        return None;
+    }
+    let link = l.stack[slot - 1].to_bits();
+    if (link & FRAME_TYPE_MASK) != 0 || link == 0 {
+        return None;
+    }
+    if ((link >> 3) as usize) < l.stack.len() {
+        // Base-encoded link: the frame is a host-fabricated one; use the
+        // interpreter's current pc.
+        let pc = l.debug_pc.min(pt.lines.len().saturating_sub(1));
+        return Some(pc as u32);
+    }
+    let ret_ip = link as *const crate::bc::BCIns;
+    if (ret_ip as usize) < 0x10000 {
+        return None;
+    }
+    let call_ins = unsafe { *ret_ip.sub(1) };
+    if !matches!(
+        bc_op(call_ins),
+        crate::bc::BCOp::CALL
+            | crate::bc::BCOp::CALLT
+            | crate::bc::BCOp::CALLM
+            | crate::bc::BCOp::CALLMT
+            | crate::bc::BCOp::ITERC
+    ) {
+        return None;
+    }
+    let off = unsafe { ret_ip.offset_from(pt.bc.as_ptr()) } as usize;
+    Some(off.saturating_sub(1) as u32)
+}
+
 fn lib_setlocal(l: &mut LuaState) -> LuaResult<i32> {
     let level = arg(l, 0).as_number().unwrap_or(0.0) as i32;
     let local = arg(l, 1).as_number().unwrap_or(0.0) as usize;
@@ -857,19 +1170,30 @@ fn lib_setlocal(l: &mut LuaState) -> LuaResult<i32> {
             return Ok(1);
         }
     };
+    let prev_slot = if level == 1 {
+        None
+    } else {
+        walk_frames(l, level - 1).map(|(s, _)| s)
+    };
     match gf.as_ref() {
         GcFunc::Lua(cl) => {
             let pt = cl.proto.as_ref();
-            let nlocals = pt.framesize as usize - 1;
-            if local < 1 || local > nlocals {
-                push(l, LuaValue::NIL);
-                return Ok(1);
-            }
-            let idx = slot + local - 1;
-            push(l, l.heap().str_value(l.heap().intern(b"")));
+            let (_name, idx) = match frame_local(l, slot, pt, local, prev_slot) {
+                Some(x) => x,
+                None => {
+                    push(l, LuaValue::NIL);
+                    return Ok(1);
+                }
+            };
+            let old = if idx < l.stack.len() {
+                l.stack[idx]
+            } else {
+                LuaValue::NIL
+            };
             if idx < l.stack.len() {
                 l.stack[idx] = val;
             }
+            push(l, old);
             Ok(1)
         }
         GcFunc::C(_) => {

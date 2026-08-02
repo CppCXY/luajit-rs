@@ -51,6 +51,7 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
             continue;
         }
         let saved_top = l.top;
+        let saved_base = l.base;
         l.stack_ensure(saved_top + 3 + STACK_SAFETY);
         l.stack[saved_top] = mo;
         l.stack[saved_top + 1] = LuaValue::NIL;
@@ -62,7 +63,78 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
                 return Err(e);
             }
         }
+        // execute runs a Lua frame through Interp, which mutates
+        // l.base; restore it so a C function that triggered the
+        // finalizer (collectgarbage) still pushes results correctly.
+        l.base = saved_base;
     }
+}
+
+/// Invoke the debug hook (`debug.sethook`) with `(event[, line])`.
+/// The hook runs on a scratch area above `top`; the stack is restored
+/// afterwards. Hooks don't re-enter themselves.
+pub fn call_hook(l: &mut LuaState, event: &str, line: Option<i32>) -> LuaResult<()> {
+    if l.hook.is_nil() || l.hook_active {
+        return Ok(());
+    }
+    let f = l.hook;
+    let saved_base = l.base;
+    let saved_top = l.top;
+    let saved_active = l.hook_active;
+    l.hook_active = true;
+    let ev = l.heap().str_value(l.heap().intern(event.as_bytes()));
+    // Place the hook frame above the interpreter's live frame area:
+    // l.top may lag below the frame (framesize slots), and the hook must
+    // not overwrite the registers the dispatch loop is about to use.
+    let base_slot = l.frame_top.max(l.top);
+    l.stack_ensure(base_slot + 4 + STACK_SAFETY);
+    l.stack[base_slot] = f;
+    l.stack[base_slot + 1] = LuaValue::NIL;
+    l.stack[base_slot + 2] = ev;
+    let nargs = if let Some(ln) = line {
+        l.stack[base_slot + 3] = LuaValue::number(ln as f64);
+        2
+    } else {
+        1
+    };
+    // Chain the hook frame to the interpreter frame (base-encoded link)
+    // so debug.getinfo / getlocal from inside the hook can walk back.
+    let link = ((saved_base as u64) << 3) | FRAME_LUA;
+    let r = execute_link(l, base_slot, nargs, -1, link);
+    l.base = saved_base;
+    l.top = saved_top;
+    l.hook_active = saved_active;
+    r.map(|_| ())
+}
+
+/// Hook mask bits (debug.sethook mask string).
+pub const HOOKMASK_LINE: u8 = 0x01;
+pub const HOOKMASK_CALL: u8 = 0x02;
+pub const HOOKMASK_RET: u8 = 0x04;
+pub const HOOKMASK_COUNT: u8 = 0x08;
+
+/// Check line/count hooks at an instruction boundary. Returns `true` if a
+/// hook ran (the caller must resync its base/ip pointers).
+pub fn hook_check(l: &mut LuaState, line: u32) -> LuaResult<bool> {
+    let mask = l.hookmask;
+    if mask == 0 || l.hook_active {
+        return Ok(false);
+    }
+    let mut ran = false;
+    if mask & HOOKMASK_COUNT != 0 {
+        l.hookcount -= 1;
+        if l.hookcount <= 0 {
+            l.hookcount = l.hook_count_reset;
+            call_hook(l, "count", None)?;
+            ran = true;
+        }
+    }
+    if mask & HOOKMASK_LINE != 0 && line != 0 && line != l.hook_line {
+        l.hook_line = line;
+        call_hook(l, "line", Some(line as i32))?;
+        ran = true;
+    }
+    Ok(ran)
 }
 
 /// Frame type markers kept in the low bits of the frame-link slot at
@@ -315,6 +387,14 @@ fn execute_inner_link(
     }
     let mut vm = Interp::new(l);
     let link = link.unwrap_or_else(|| (((want + 1) as u64) << 3) | FRAME_C);
+    if std::env::var("LUARS_FNDBG").is_ok() {
+        let pt = if let GcFunc::Lua(c) = gf.as_ref() {
+            Some(c.proto.as_ref().bc.len())
+        } else {
+            None
+        };
+        eprintln!("FNDBG enter_lua gf=proto_len={:?} fs={} na={} want={} base={} top={}", pt, func_slot, nargs, want, l.base, l.top);
+    }
     vm.enter_lua(gf, func_slot, nargs, link);
     vm.run()
 }
@@ -449,6 +529,10 @@ struct Interp {
     knp: *const f64,
     ksp: *const LuaValue,
     multres: usize,
+    /// Saved `hook_line` values for pending Lua frames: pushed on call,
+    /// popped on return, so a line hook doesn't fire on the caller's
+    /// resumption line (Lua 5.1 semantics).
+    hook_lines: Vec<u32>,
 }
 
 impl Interp {
@@ -464,6 +548,7 @@ impl Interp {
             knp: std::ptr::null(),
             ksp: std::ptr::null(),
             multres: 0,
+            hook_lines: Vec::new(),
         }
     }
 
@@ -942,6 +1027,97 @@ impl Interp {
                     if cond {
                         jump!(jmp);
                     }
+                } else if let Some(x) = cdata_u64(self.l(), xv) {
+                    if yv.is_number() {
+                        // cdata vs Lua number (e.g. `m1 < 0` with int64
+                        // cdata): compare as the cdata's signedness.
+                        let x_is_ull = cdata_is_ull(xv);
+                        let yf = yv.num();
+                        let y = (yf as i64) as u64;
+                        let cond = if x_is_ull {
+                            let yn = y as i64;
+                            match $op {
+                                0 => yn < 0 || x < y,
+                                1 => !(yn < 0 || x < y),
+                                2 => yn < 0 || x <= y,
+                                3 => !(yn < 0 || x <= y),
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            match $op {
+                                0 => (x as i64) < (y as i64),
+                                1 => !((x as i64) < (y as i64)),
+                                2 => (x as i64) <= (y as i64),
+                                3 => !((x as i64) <= (y as i64)),
+                                _ => unreachable!(),
+                            }
+                        };
+                        let jmp = unsafe { *ip };
+                        ip = unsafe { ip.add(1) };
+                        if cond {
+                            jump!(jmp);
+                        }
+                    } else {
+                        sync!();
+                        match self.meta_comp(xv, yv, $op)? {
+                            Some(cond) => {
+                                let jmp = unsafe { *ip };
+                                ip = unsafe { ip.add(1) };
+                                if cond {
+                                    jump!(jmp);
+                                }
+                            }
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
+                    }
+                } else if let Some(y) = cdata_u64(self.l(), yv) {
+                    if xv.is_number() {
+                        // Lua number vs cdata.
+                        let y_is_ull = cdata_is_ull(yv);
+                        let xf = xv.num();
+                        let x = (xf as i64) as u64;
+                        let cond = if y_is_ull {
+                            let xn = x as i64;
+                            match $op {
+                                0 => xn < 0 || x < y,
+                                1 => !(xn < 0 || x < y),
+                                2 => xn < 0 || x <= y,
+                                3 => !(xn < 0 || x <= y),
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            match $op {
+                                0 => (x as i64) < (y as i64),
+                                1 => !((x as i64) < (y as i64)),
+                                2 => (x as i64) <= (y as i64),
+                                3 => !((x as i64) <= (y as i64)),
+                                _ => unreachable!(),
+                            }
+                        };
+                        let jmp = unsafe { *ip };
+                        ip = unsafe { ip.add(1) };
+                        if cond {
+                            jump!(jmp);
+                        }
+                    } else {
+                        sync!();
+                        match self.meta_comp(xv, yv, $op)? {
+                            Some(cond) => {
+                                let jmp = unsafe { *ip };
+                                ip = unsafe { ip.add(1) };
+                                if cond {
+                                    jump!(jmp);
+                                }
+                            }
+                            None => {
+                                resync!();
+                                continue;
+                            }
+                        }
+                    }
                 } else if let (Some(xa), Some(ya)) =
                     (cdata_ptr_addr(self.l(), xv), cdata_ptr_addr(self.l(), yv))
                 {
@@ -1001,6 +1177,12 @@ impl Interp {
                     let nv = LuaValue::number_raw(ni);
                     setreg!($a + FORL_IDX, nv);
                     setreg!($a + FORL_EXT, nv);
+                    // Force a line event on the loop body's first
+                    // instruction of every iteration (Lua 5.1 semantics:
+                    // each iteration fires, even on the same source line).
+                    if self.l().hookmask & HOOKMASK_LINE != 0 {
+                        self.l().hook_line = 0;
+                    }
                     jump!($ins);
                 }
             }};
@@ -1026,6 +1208,32 @@ impl Interp {
                     return Ok(Flow::Rec); // Recording ended: switch modes.
                 }
                 resync!();
+            }
+            // Debug hooks (debug.sethook): line and count events. KNIL
+            // (register clearing) and LOOP (repeat-loop header) are
+            // compiler-injected with no line of their own — skip them
+            // entirely (no line or count event). A hook call runs
+            // arbitrary Lua through the interpreter, which would clobber
+            // an in-progress trace recording — abort it first.
+            if self.l().hookmask != 0 && !self.l().hook_active {
+                if REC {
+                    crate::jit::rec_abort_error(self.l().global());
+                    return Ok(Flow::Rec);
+                }
+                sync!();
+                let ins_hook = unsafe { *ip };
+                let is_skip = matches!(bc_op(ins_hook), BCOp::KNIL | BCOp::LOOP);
+                if is_skip {
+                    continue;
+                }
+                let pt = self.proto();
+                let pc = unsafe { ip.offset_from(self.bcp) as usize };
+                let pc = pc.min(pt.lines.len().saturating_sub(1));
+                let ln = pt.lines[pc] as u32;
+                if hook_check(self.l(), ln)? {
+                    resync!();
+                    bp = unsafe { self.sp.add(self.base) };
+                }
             }
             let ins = unsafe { *ip };
             ip = unsafe { ip.add(1) };
@@ -1846,6 +2054,14 @@ impl Interp {
 
                 // -- Calls / returns --
                 BCOp::CALL => {
+                    // "call" hook event (not for tail calls).
+                    if self.l().hookmask & HOOKMASK_CALL != 0 && !self.l().hook_active {
+                        sync!();
+                        call_hook(self.l(), "call", None)?;
+                        self.sp = self.l().stack.as_mut_ptr();
+                        resync!();
+                        bp = unsafe { self.sp.add(self.base) };
+                    }
                     // Fast path (LuaJIT's ins_call): a Lua callee switches
                     // frames right here — one store for the frame link, no
                     // sync round-trip. C callees and vararg protos go slow.
@@ -2009,7 +2225,16 @@ impl Interp {
                     resync!();
                 }
                 BCOp::RET0 => {
+                    if self.l().hookmask & HOOKMASK_RET != 0 && !self.l().hook_active {
+                        sync!();
+                        call_hook(self.l(), "return", None)?;
+                        resync!();
+                        bp = unsafe { self.sp.add(self.base) };
+                    }
                     if let Some(want) = self.ret_fast(bp) {
+                        if !self.hook_lines.is_empty() {
+                            let _ = self.hook_lines.pop();
+                        }
                         let jmp = unsafe { (*bp.sub(1)).to_bits() } as *const BCIns;
                         let call_ins = unsafe { *jmp.sub(1) };
                         let dst = unsafe { bp.sub(2) };
@@ -2020,6 +2245,15 @@ impl Interp {
                         bp = unsafe { dst.sub(bc_a(call_ins) as usize) };
                         ip = jmp;
                         self.reload_at(bp);
+                        // Skip a line event on the caller's resumption
+                        // line (Lua 5.1: the caller's line was already
+                        // reported before the call).
+                        if self.l().hookmask & HOOKMASK_LINE != 0 {
+                            let pt = self.proto();
+                            let pc = unsafe { ip.offset_from(self.bcp) as usize };
+                            let pc = pc.min(pt.lines.len().saturating_sub(1));
+                            self.l().hook_line = pt.lines[pc] as u32;
+                        }
                         self.l().top = if want >= 0 {
                             unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
                         } else {
@@ -2034,7 +2268,16 @@ impl Interp {
                     resync!();
                 }
                 BCOp::RET1 => {
+                    if self.l().hookmask & HOOKMASK_RET != 0 && !self.l().hook_active {
+                        sync!();
+                        call_hook(self.l(), "return", None)?;
+                        resync!();
+                        bp = unsafe { self.sp.add(self.base) };
+                    }
                     if let Some(want) = self.ret_fast(bp) {
+                        if !self.hook_lines.is_empty() {
+                            let _ = self.hook_lines.pop();
+                        }
                         let jmp = unsafe { (*bp.sub(1)).to_bits() } as *const BCIns;
                         let call_ins = unsafe { *jmp.sub(1) };
                         let dst = unsafe { bp.sub(2) };
@@ -2046,6 +2289,12 @@ impl Interp {
                         bp = unsafe { dst.sub(bc_a(call_ins) as usize) };
                         ip = jmp;
                         self.reload_at(bp);
+                        if self.l().hookmask & HOOKMASK_LINE != 0 {
+                            let pt = self.proto();
+                            let pc = unsafe { ip.offset_from(self.bcp) as usize };
+                            let pc = pc.min(pt.lines.len().saturating_sub(1));
+                            self.l().hook_line = pt.lines[pc] as u32;
+                        }
                         self.l().top = if want >= 0 {
                             unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
                         } else {
@@ -2061,7 +2310,16 @@ impl Interp {
                 }
                 BCOp::RET => {
                     let n = bc_d(ins) as usize - 1;
+                    if self.l().hookmask & HOOKMASK_RET != 0 && !self.l().hook_active {
+                        sync!();
+                        call_hook(self.l(), "return", None)?;
+                        resync!();
+                        bp = unsafe { self.sp.add(self.base) };
+                    }
                     if let Some((wbp, want, ret_ip, ca)) = self.ret_fast_n(bp) {
+                        if !self.hook_lines.is_empty() {
+                            self.l().hook_line = self.hook_lines.pop().unwrap();
+                        }
                         let wbp = wbp as *mut LuaValue;
                         let src = unsafe { bp.add(a as usize) };
                         let dst = unsafe { wbp.sub(2) };
@@ -2091,6 +2349,9 @@ impl Interp {
                 BCOp::RETM => {
                     let n = self.multres + bc_d(ins) as usize;
                     if let Some((wbp, want, ret_ip, ca)) = self.ret_fast_n(bp) {
+                        if !self.hook_lines.is_empty() {
+                            self.l().hook_line = self.hook_lines.pop().unwrap();
+                        }
                         let wbp = wbp as *mut LuaValue;
                         let src = unsafe { bp.add(a as usize) };
                         let dst = unsafe { wbp.sub(2) };
@@ -2205,6 +2466,12 @@ impl Interp {
                             return Ok(Flow::Rec);
                         }
                         resync!();
+                    }
+                    // Every iteration re-enters the loop body: force a
+                    // line event on its first instruction (Lua 5.1 fires
+                    // one per iteration, even on the same source line).
+                    if self.l().hookmask & HOOKMASK_LINE != 0 {
+                        self.l().hook_line = 0;
                     }
                     forl_body!(ins, a);
                 }
@@ -2700,6 +2967,9 @@ impl Interp {
                 // CALL/CALLM/ITERC instruction at `pc[-1]` on return.
                 let link = unsafe { self.bcp.add(self.pc) } as u64;
                 debug_assert!((link & FRAME_TYPE_MASK) == FRAME_LUA);
+                if self.l().hookmask != 0 {
+                    self.hook_lines.push(self.l().hook_line);
+                }
                 self.enter_lua(gf, func_slot, nargs, link);
                 Ok(())
             }
@@ -2995,7 +3265,14 @@ impl Interp {
             return Some(got);
         }
 
-        // FRAME_LUA: the link is the return PC.
+        if ((link >> 3) as usize) < self.l().stack.len() {
+            // Base-encoded link (host-fabricated frame: C call, debug
+            // hook): return to the caller without touching the
+            // interpreter state — this run ends here.
+            self.l().top = dst + n;
+            return Some(n);
+        }
+        // FRAME_LUA: the link is the caller's return PC.
         let ret_ip = link as *const BCIns;
         let call_ins = unsafe { *ret_ip.sub(1) };
         let caller_base = dst - bc_a(call_ins) as usize;
@@ -3003,10 +3280,19 @@ impl Interp {
         // Callee frame extent (before reload switches proto to the caller).
         let callee_top = dst + 2 + self.proto().framesize as usize;
 
+        if !self.hook_lines.is_empty() {
+            let _ = self.hook_lines.pop();
+        }
         self.base = caller_base;
         let cl = self.at(caller_base - 2).as_func().unwrap();
         self.reload(cl);
         self.pc = unsafe { ret_ip.offset_from(self.bcp) as usize };
+        // No line event on the caller's resumption line.
+        if self.l().hookmask & HOOKMASK_LINE != 0 {
+            let pt = self.proto();
+            let pc = self.pc.min(pt.lines.len().saturating_sub(1));
+            self.l().hook_line = pt.lines[pc] as u32;
+        }
 
         let keep = dst
             + if want >= 0 {

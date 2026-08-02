@@ -1289,7 +1289,7 @@ pub(crate) fn account_thread(th: &LuaState) -> usize {
 /// object that was not marked this cycle (`is_white`) is cleared.
 /// Finalized userdata is additionally dropped from *value* positions
 /// (LuaJIT: `isfinalized(udata) && val`).
-pub(crate) fn may_clear(v: LuaValue, is_val: bool) -> bool {
+pub(crate) fn may_clear(v: LuaValue, is_val: bool, cw: u8) -> bool {
     match v.itype() {
         LJ_TSTR => {
             if let Some(p) = v.as_string() {
@@ -1300,9 +1300,18 @@ pub(crate) fn may_clear(v: LuaValue, is_val: bool) -> bool {
         LJ_TTAB => v.as_table().is_some_and(|p| p.is_white()),
         LJ_TFUNC => v.as_func().is_some_and(|p| p.is_white()),
         LJ_TTHREAD => v.as_thread().is_some_and(|p| p.is_white()),
-        LJ_TUDATA => v
-            .as_userdata()
-            .is_some_and(|p| p.is_white() || (is_val && p.is_finalized())),
+        LJ_TUDATA => v.as_userdata().is_some_and(|p| {
+            // Keys: cleared only when dead (other-white) — a finalized
+            // key survives the cycle its finalizer ran in, then dies the
+            // next ("finalized keys are removed in two cycles"). Values:
+            // dead or already finalized.
+            let h = gc_header(p.0);
+            if is_val {
+                h.is_dead(cw) || h.is_finalized()
+            } else {
+                h.is_dead(cw)
+            }
+        }),
         LJ_TCDATA => v.as_cdata().is_some_and(|p| p.is_white()),
         _ => false,
     }
@@ -1314,7 +1323,7 @@ pub(crate) fn may_clear(v: LuaValue, is_val: bool) -> bool {
 fn clear_weak(heap: &mut GcHeap) {
     let weak = std::mem::take(&mut heap.gc_weak);
     for (t, mode) in weak {
-        t.as_mut().clear_weak_entries(mode);
+        t.as_mut().clear_weak_entries(mode, heap.current_white);
     }
 }
 
@@ -1338,7 +1347,7 @@ fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
     for i in 0..heap.userdatas.objects.len() {
         let u = heap.userdatas.objects[i];
         let h = gc_header(u);
-        if h.is_white() && !h.is_finalized() && has_gc_meta(unsafe { u.as_ref() }.metatable) {
+        if !h.marked.get() && !h.is_finalized() && has_gc_meta(unsafe { u.as_ref() }.metatable) {
             // LuaJIT's gc_separateudata: mark FINALIZED right here so the
             // atomic-phase clear_weak drops finalized userdata from weak
             // *value* positions (gc_mayclear's `isfinalized && val`).
@@ -1350,7 +1359,7 @@ fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
     for i in 0..heap.tables.objects.len() {
         let t = heap.tables.objects[i];
         let h = gc_header(t);
-        if h.is_white() && !h.is_finalized() && has_gc_meta(unsafe { t.as_ref() }.metatable) {
+        if !h.marked.get() && !h.is_finalized() && has_gc_meta(unsafe { t.as_ref() }.metatable) {
             h.make_undead();
             h.set_finalized();
             out.push(Finalizable::Table(GcPtr(t)));

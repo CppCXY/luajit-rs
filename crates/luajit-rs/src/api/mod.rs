@@ -93,9 +93,17 @@ pub fn lual_loadfile(l: &mut LuaState, path: &str) -> LuaResult<()> {
                 return Err(LuaError::Runtime);
             }
         };
-        match lual_loadstring(l, &src) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e),
+        // Lua convention: the chunkname of a file load is "@path", so
+        // error messages report the real source instead of "=?".
+        match crate::state::load(l, src, &format!("@{path}")) {
+            Ok(f) => {
+                lua_pushraw(l, f);
+                Ok(())
+            }
+            Err(msg) => {
+                lua_pushstring(l, msg.as_bytes());
+                Err(LuaError::Runtime)
+            }
         }
     }
 }
