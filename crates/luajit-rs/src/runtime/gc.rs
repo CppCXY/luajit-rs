@@ -836,7 +836,11 @@ impl<'g> Marker<'g> {
                     t.gc_traverse(|v| this.mark_value(v));
                 }
                 KGc::TableRef(t) => {
-                    t.as_ref().gc_traverse(|v| this.mark_value(v));
+                    // The template table is a heap object referenced by
+                    // the prototype: it must be marked (and grayed for
+                    // its contents), or the pool reclaims it while the
+                    // proto's kgc still points at it.
+                    this.mark_table(*t);
                 }
                 KGc::Proto(_) | KGc::CData(_) => {}
             }
@@ -906,12 +910,11 @@ impl<'g> Marker<'g> {
                             l.frame_top
                         );
                     }
-                    // lj_gc_step_fixtop: mark up to the allocating
-                    // instruction's live top (`gc_collect` lowered `top`
-                    // to the current instruction's register extent).
-                    // Dead temp slots above it must not keep weak-table
-                    // values alive across a collection.
-                    let mark_to = l.top;
+                    // lj_gc_step_fixtop: mark the whole current frame (`top`
+                    // may be lowered to a C-call result area); stale slots
+                    // inside the frame are kept alive rather than freed out
+                    // from under us.
+                    let mark_to = l.top.max(l.frame_top);
                     for i in 0..mark_to {
                         if std::env::var("LUARS_DBGGC2").is_ok() && l.stack[i].as_table().is_some()
                         {
@@ -932,8 +935,10 @@ impl<'g> Marker<'g> {
                     }
                     if self.atomic {
                         // lj_gc_step_fixtop: never clear slots below the
-                        // current instruction's live top.
-                        let clear_from = l.top;
+                        // current instruction's live top (or the frame
+                        // extent, which protects live temporaries above a
+                        // transiently lowered top).
+                        let clear_from = l.top.max(l.frame_top);
                         for s in l.stack[clear_from..].iter_mut() {
                             *s = LuaValue::NIL;
                         }
@@ -1015,7 +1020,9 @@ impl<'g> Marker<'g> {
                                 t.gc_traverse(|v| self.mark_value(v));
                             }
                             KGc::TableRef(t) => {
-                                t.as_ref().gc_traverse(|v| self.mark_value(v));
+                                // Same as mark_kgc_slice: the template
+                                // table itself must survive.
+                                self.mark_table(*t);
                             }
                             _ => {}
                         }
@@ -1024,9 +1031,9 @@ impl<'g> Marker<'g> {
                 Gray::Thread(th) => {
                     th.set_marked();
                     let l = th.as_mut();
-                    // lj_gc_step_fixtop: mark up to the allocating
-                    // instruction's live top (see the propagate arm above).
-                    let mark_to = l.top;
+                    // lj_gc_step_fixtop: mark the whole current frame (see
+                    // the propagate arm above).
+                    let mark_to = l.top.max(l.frame_top);
                     for i in 0..mark_to {
                         if std::env::var("LUARS_DBGGC2").is_ok() && l.stack[i].as_table().is_some()
                         {
@@ -1047,8 +1054,10 @@ impl<'g> Marker<'g> {
                     }
                     if self.atomic {
                         // lj_gc_step_fixtop: never clear slots below the
-                        // current instruction's live top.
-                        let clear_from = l.top;
+                        // current instruction's live top (or the frame
+                        // extent, which protects live temporaries above a
+                        // transiently lowered top).
+                        let clear_from = l.top.max(l.frame_top);
                         for s in l.stack[clear_from..].iter_mut() {
                             *s = LuaValue::NIL;
                         }

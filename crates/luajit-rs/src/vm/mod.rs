@@ -1835,6 +1835,10 @@ impl Interp {
                 BCOp::CAT => {
                     sync!();
                     let r = self.op_cat(a, bc_b(ins), bc_c(ins))?;
+                    // op_cat may run a nested execute (__concat /
+                    // __tostring), which can reallocate the stack: rebuild
+                    // the fast register window before writing the result.
+                    resync!();
                     fr.set(a, r);
                 }
 
@@ -2951,12 +2955,12 @@ impl Interp {
                 }
             }
         }
-        // lj_gc_step_fixtop: fix the stack top to the allocating
-        // instruction's live register extent. Higher (dead) temp slots
-        // are not marked, so values only referenced from them (e.g. a
-        // weak-table value read into a now-dead condition register) get
-        // collected and the weak entry is cleared.
-        l.top = need;
+        // lj_gc_step_fixtop: the marker must see every live object, and
+        // the atomic clear must not touch live registers. The frame
+        // extends to `frame_top`; C-call results transiently lower `top`
+        // while frame temporaries above it are still live, so never drop
+        // below the frame extent.
+        l.top = l.top.max(l.frame_top).max(need);
         let step_size = l.global().heap.gc_step_size;
         let paused = l.global().heap.gc_state == crate::runtime::gc::GcState::Pause;
         let stopped = l.global().heap.gc_stopped;
@@ -3504,10 +3508,14 @@ impl Interp {
             };
             // Clear the C frame's dead slots above the results so stale
             // references never reach the next cycle (the atomic clear is
-            // bounded by frame_top to protect live Lua locals).
+            // bounded by frame_top to protect live Lua locals). Never go
+            // below the callee's base (dst+2): slots dst..dst+2 belong to
+            // the caller (the func slot and the first argument positions
+            // are the caller's registers).
             let top_now = self.l().top;
             let keep = (dst + got).min(top_now);
-            for s in self.l().stack[keep..top_now].iter_mut() {
+            let clear_from = (dst + 2).max(keep).min(top_now);
+            for s in self.l().stack[clear_from..top_now].iter_mut() {
                 *s = LuaValue::NIL;
             }
             self.l().top = dst + got;
@@ -3525,9 +3533,20 @@ impl Interp {
         let ret_ip = link as *const BCIns;
         let call_ins = unsafe { *ret_ip.sub(1) };
         if std::env::var("LUARS_DBGCO").is_ok() {
+            let pt = self.proto();
+            let src = pt
+                .source
+                .map(|s| self.l().heap().strings.get(s).to_vec())
+                .unwrap_or_default();
             eprintln!(
-                "DO_RETURN FRAME_LUA link={:#x} call_ins={:#x} dst={} base={} bcp={:p}",
-                link, call_ins, dst, base, self.bcp
+                "DO_RETURN FRAME_LUA link={:#x} call_ins={:#x} dst={} base={} bcp={:p} src={:?} pc_ret={}",
+                link,
+                call_ins,
+                dst,
+                base,
+                self.bcp,
+                String::from_utf8_lossy(&src),
+                unsafe { ret_ip.offset_from(self.bcp) }
             );
         }
         let caller_base = dst - bc_a(call_ins) as usize;
@@ -3567,18 +3586,23 @@ impl Interp {
                 n
             };
         // Clear the callee frame's dead slots above the results (stale
-        // references must not survive into the next GC cycle).
-        let hi = callee_top.max(keep);
+        // references must not survive into the next GC cycle). Never go
+        // below the callee's base (dst+2): with 0/1 results `keep` sits in
+        // the caller's register area, which may still hold live values
+        // (e.g. the pre-loaded callee/args of an enclosing call).
+        let clear_from = (dst + 2).max(keep);
+        let hi = callee_top.max(clear_from);
         if std::env::var("LUARS_DBGCO").is_ok() {
             eprintln!(
-                "DO_RETURN-CLEAR l={:#x} keep={} hi={} addr={:p}",
+                "DO_RETURN-CLEAR l={:#x} keep={} hi={} clear_from={} addr={:p}",
                 self.l as *const LuaState as u64,
                 keep,
                 hi,
-                unsafe { self.sp.add(keep) }
+                clear_from,
+                unsafe { self.sp.add(clear_from) }
             );
         }
-        for s in self.l().stack[keep..hi].iter_mut() {
+        for s in self.l().stack[clear_from..hi].iter_mut() {
             *s = LuaValue::NIL;
         }
         self.l().top = keep;

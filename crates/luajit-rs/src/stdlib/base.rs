@@ -235,20 +235,16 @@ fn lib_pairs(l: &mut LuaState) -> LuaResult<i32> {
     let mo = crate::meta::meta_lookup(l.global(), t, crate::meta::MM::Pairs);
     if !mo.is_nil() {
         let obase = l.base;
-        let _saved_top = l.top;
         let fs = l.top + 16;
         l.stack_ensure(fs + 4);
         l.stack[fs] = mo;
         l.stack[fs + 2] = t;
         crate::vm::execute(l, fs, 1, 3)?;
-        let n = (l.top - fs).min(3);
+        // execute restores the caller's top; the three results (padded
+        // with nil) are always at fs..fs+3.
         l.stack_ensure(obase + 3);
         for i in 0..3 {
-            l.stack[obase + i] = if i < n {
-                l.stack[fs + i]
-            } else {
-                LuaValue::NIL
-            };
+            l.stack[obase + i] = l.stack[fs + i];
         }
         l.top = obase + 3;
         l.base = obase;
@@ -291,14 +287,11 @@ fn lib_ipairs(l: &mut LuaState) -> LuaResult<i32> {
         l.stack[fs] = mo;
         l.stack[fs + 2] = t;
         crate::vm::execute(l, fs, 1, 3)?;
-        let n = (l.top - fs).min(3);
+        // execute restores the caller's top; the three results (padded
+        // with nil) are always at fs..fs+3.
         l.stack_ensure(obase + 3);
         for i in 0..3 {
-            l.stack[obase + i] = if i < n {
-                l.stack[fs + i]
-            } else {
-                LuaValue::NIL
-            };
+            l.stack[obase + i] = l.stack[fs + i];
         }
         l.top = obase + 3;
         l.base = obase;

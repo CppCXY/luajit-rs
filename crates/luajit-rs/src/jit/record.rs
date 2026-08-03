@@ -2821,7 +2821,7 @@ impl Record {
                 let frame0 = base - (self.baseslot - 2);
                 if ptr >= sp && ptr < sp + l.stack.len() * 8 && (ptr - sp).is_multiple_of(8) {
                     let idx = (ptr - sp) / 8;
-                    let abs = idx - frame0 + 2;
+                    let abs = idx.saturating_sub(frame0).saturating_add(2);
                     if (2..MAX_JSLOTS).contains(&abs) {
                         self.slot[abs] = 0;
                     }
