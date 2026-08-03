@@ -1645,7 +1645,7 @@ impl<'a> Parser<'a> {
         let max_fr = bl.max_freereg;
         if max_fr > nactvar {
             self.cur_mut().freereg = nactvar;
-            self.bcemit_ad(BCOp::KNIL, nactvar, (max_fr - 1));
+            self.bcemit_ad(BCOp::KNIL, nactvar, max_fr - 1);
         }
         self.cur_mut().freereg = nactvar;
         debug_assert!(bl.nactvar as u32 == self.cur().nactvar);

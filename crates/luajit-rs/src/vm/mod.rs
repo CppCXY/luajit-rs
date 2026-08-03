@@ -17,7 +17,7 @@
 //! * Lua->Lua calls do not recurse in Rust: `CALL` pushes a `Frame` and keeps
 //!   looping; `RET` pops one. Only tail calls and re-entrant C calls recurse.
 
-use crate::bc::*;
+use crate::{bc::*, jit};
 
 pub mod meta;
 
@@ -340,6 +340,33 @@ fn cdata_is_ull(v: LuaValue) -> bool {
     }
 }
 
+/// Unsigned 64-bit comparison by opcode ordinal (ISLT=0, ISGE=1, ISLE=2,
+/// ISGT=3). `op` 1/3 are the unordered negations (`!` of the ordered one).
+#[inline(always)]
+fn cmp_u(op: u32, x: u64, y: u64) -> bool {
+    match op {
+        0 => x < y,
+        1 => !(x < y),
+        2 => x <= y,
+        3 => !(x <= y),
+        _ => unreachable!(),
+    }
+}
+
+/// Signed 64-bit comparison, same opcode encoding as `cmp_u`.
+#[inline(always)]
+fn cmp_s(op: u32, x: u64, y: u64) -> bool {
+    let x = x as i64;
+    let y = y as i64;
+    match op {
+        0 => x < y,
+        1 => !(x < y),
+        2 => x <= y,
+        3 => !(x <= y),
+        _ => unreachable!(),
+    }
+}
+
 fn try_cdata_binop(
     l: &mut LuaState,
     xv: LuaValue,
@@ -530,6 +557,72 @@ enum Flow {
     Rec,
 }
 
+/// The interpreter's register window over the Lua stack: `(sp, base)`
+/// standing for LuaJIT's BASE pointer (`sp + base`). A value type, so the
+/// dispatch loop keeps it in registers; recreate it from the interpreter
+/// fields after any `stack_ensure` (the stack Vec may reallocate, which
+/// is also why it cannot be a borrow).
+///
+/// All raw-pointer access to the stack is confined to this type — the
+/// opcode arms and the rest of the VM never touch `sp` directly. `reg`/
+/// `set` are relative to the frame base (bytecode registers), `at_abs`/
+/// `set_abs` are absolute stack indices.
+#[derive(Clone, Copy)]
+struct Frame {
+    sp: *mut LuaValue,
+    base: usize,
+}
+
+impl Frame {
+    #[inline(always)]
+    fn new(sp: *mut LuaValue, base: usize) -> Frame {
+        Frame { sp, base }
+    }
+
+    /// Read bytecode register `i` (relative to the frame base).
+    #[inline(always)]
+    fn reg(self, i: u32) -> LuaValue {
+        unsafe { *self.sp.add(self.base + i as usize) }
+    }
+
+    /// Write bytecode register `i`.
+    #[inline(always)]
+    fn set(self, i: u32, v: LuaValue) {
+        unsafe { *self.sp.add(self.base + i as usize) = v }
+    }
+
+    /// The current frame base as an absolute stack index (LuaJIT's BASE).
+    #[inline(always)]
+    fn cur_base(self) -> usize {
+        self.base
+    }
+
+    /// Write the stack slot at absolute index `abs`.
+    #[inline(always)]
+    fn set_abs(self, abs: usize, v: LuaValue) {
+        unsafe { *self.sp.add(abs) = v }
+    }
+
+    /// The frame-base pointer (LuaJIT's BASE). Only valid as long as the
+    /// window is not moved; use `at_abs`/`set_abs` otherwise.
+    #[inline(always)]
+    fn bp(self) -> *mut LuaValue {
+        unsafe { self.sp.add(self.base) }
+    }
+
+    /// The frame-link word at `base - 1`.
+    #[inline(always)]
+    fn frame_link(self) -> u64 {
+        unsafe { *self.sp.add(self.base - 1) }.to_bits()
+    }
+
+    /// Write the callee slot at `base - 2` (FR2 func slot).
+    #[inline(always)]
+    fn set_func(self, v: LuaValue) {
+        unsafe { *self.sp.add(self.base - 2) = v }
+    }
+}
+
 /// Interpreter context. The per-instruction hot state is *not* kept here; it
 /// lives in locals inside `run` and is synced to these fields only around
 /// calls and returns.
@@ -607,6 +700,13 @@ impl Interp {
         let v = unsafe { *self.ksp.add(d as usize) };
         debug_assert!(v.is_string());
         v
+    }
+
+    /// A number constant (`kslot!`): raw f64 load from the resolved KBASE
+    /// table, no NaN-boxing canonicalization.
+    #[inline(always)]
+    fn knum(&self, d: u32) -> LuaValue {
+        LuaValue::number_raw(unsafe { *self.knp.add(d as usize) })
     }
 
     /// Compute the stack slots needed for a Lua call frame at `func_slot`.
@@ -718,12 +818,9 @@ impl Interp {
     }
 
     /// Generalised fast-return: walk the VARG chain inline and return the
-    /// real frame's bp, along with `(want, ret_ip, caller_a)`.
+    /// real frame's base offset, along with `(want, ret_ip, caller_a)`.
     #[inline(always)]
-    fn ret_fast_n(
-        &self,
-        mut bp: *const LuaValue,
-    ) -> Option<(*const LuaValue, i32, *const BCIns, i32)> {
+    fn ret_fast_n(&self, mut bp: *const LuaValue) -> Option<(usize, i32, *const BCIns, i32)> {
         let mut link = unsafe { (*bp.sub(1)).to_bits() };
         while (link & FRAME_TYPE_MASK) == FRAME_VARG {
             let sz = (link >> 3) as usize;
@@ -738,7 +835,8 @@ impl Interp {
             let call_ins = unsafe { *ret_ip.sub(1) };
             let want = bc_b(call_ins) as i32 - 1;
             let caller_a = bc_a(call_ins) as i32;
-            Some((bp, want, ret_ip, caller_a))
+            let base = unsafe { bp.offset_from(self.sp) } as usize;
+            Some((base, want, ret_ip, caller_a))
         } else {
             None
         }
@@ -759,11 +857,20 @@ impl Interp {
         }
     }
 
-    /// Reload the interpreter for the closure owning the frame at `bp`.
+    /// Reload the interpreter for the closure owning the frame at `fr`'s
+    /// base.
     #[inline(always)]
-    fn reload_at(&mut self, bp: *const LuaValue) {
-        let cl = unsafe { *bp.sub(2) }.as_func().unwrap();
+    fn reload_at(&mut self, fr: Frame) {
+        let cl = unsafe { *fr.bp().sub(2) }.as_func().unwrap();
         self.reload(cl);
+    }
+
+    /// The CALL instruction that set up the frame whose return PC is
+    /// `ret_ip` (a FRAME_LUA link is the return PC; the CALL sits one
+    /// slot before it).
+    #[inline(always)]
+    fn ret_call_ins(&self, ret_ip: *const BCIns) -> BCIns {
+        unsafe { *ret_ip.sub(1) }
     }
 
     /// `mmcall` + FRAME_CONT (lj_meta.c's `mmcall` + `vm_call_dispatch_f`):
@@ -882,13 +989,135 @@ impl Interp {
         None
     }
 
-    /// The dispatch loop. The entire hot state is two locals — `bp` (the
-    /// current base as a pointer, LuaJIT's BASE) and `ip` (a walking
-    /// instruction pointer, LuaJIT's PC) — so both live in registers on
-    /// every dispatch. Everything else (`self.knp`, `self.multres`, ...)
-    /// is re-read from `self` in the arms that need it; keeping more locals
-    /// alive across the dispatch forces spills (measured: rustc packs the
-    /// extras into an XMM register and unpacks per instruction).
+    /// Numeric/cdata comparison fast lanes (`cmp_arm!`): returns
+    /// `Some(cond)` when the comparison can be decided without
+    /// metamethods, `None` when the operands need `__lt`/`__eq`&c (the
+    /// caller takes the slow path). `op` is the bytecode ordinal
+    /// (ISLT=0, ISGE=1, ISLE=2, ISGT=3); ISGE/ISGT are the *unordered*
+    /// comparisons (NaN compares true), since the parser emits them as
+    /// the negation of ISLT/ISLE — same as lj_meta_comp and rec_comp.
+    #[inline(always)]
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    fn cmp_fast(&self, op: u32, xv: LuaValue, yv: LuaValue) -> Option<bool> {
+        if xv.is_number() && yv.is_number() {
+            let x = xv.num();
+            let y = yv.num();
+            let cond = match op {
+                0 => x < y,
+                1 => !(x < y),
+                2 => x <= y,
+                3 => !(x <= y),
+                _ => unreachable!(),
+            };
+            return Some(cond);
+        }
+        if let (Some(x), Some(y)) = (cdata_u64(self.l(), xv), cdata_u64(self.l(), yv)) {
+            let x_is_ull = cdata_is_ull(xv);
+            let y_is_ull = cdata_is_ull(yv);
+            let cond = if x_is_ull == y_is_ull {
+                if x_is_ull {
+                    cmp_u(op, x, y)
+                } else {
+                    cmp_s(op, x, y)
+                }
+            } else if x_is_ull {
+                // x is unsigned, y is signed: compare after sign check.
+                if (y as i64) < 0 {
+                    match op {
+                        0 => false,
+                        1 => true,
+                        2 => false,
+                        3 => true,
+                        _ => unreachable!(),
+                    }
+                } else {
+                    cmp_u(op, x, y)
+                }
+            } else {
+                // x is signed, y is unsigned.
+                if (x as i64) < 0 {
+                    match op {
+                        0 => true,
+                        1 => false,
+                        2 => true,
+                        3 => false,
+                        _ => unreachable!(),
+                    }
+                } else {
+                    cmp_u(op, x, y)
+                }
+            };
+            return Some(cond);
+        }
+        if let Some(x) = cdata_u64(self.l(), xv) {
+            if !yv.is_number() {
+                return None;
+            }
+            // cdata vs Lua number (e.g. `m1 < 0` with int64 cdata):
+            // compare as the cdata's signedness.
+            let x_is_ull = cdata_is_ull(xv);
+            let yf = yv.num();
+            let y = (yf as i64) as u64;
+            let cond = if x_is_ull {
+                let yn = y as i64;
+                match op {
+                    0 => yn < 0 || x < y,
+                    1 => !(yn < 0 || x < y),
+                    2 => yn < 0 || x <= y,
+                    3 => !(yn < 0 || x <= y),
+                    _ => unreachable!(),
+                }
+            } else {
+                cmp_s(op, x, y)
+            };
+            return Some(cond);
+        }
+        if let Some(y) = cdata_u64(self.l(), yv) {
+            if !xv.is_number() {
+                return None;
+            }
+            // Lua number vs cdata.
+            let y_is_ull = cdata_is_ull(yv);
+            let xf = xv.num();
+            let x = (xf as i64) as u64;
+            let cond = if y_is_ull {
+                let xn = x as i64;
+                match op {
+                    0 => xn < 0 || x < y,
+                    1 => !(xn < 0 || x < y),
+                    2 => xn < 0 || x <= y,
+                    3 => !(xn < 0 || x <= y),
+                    _ => unreachable!(),
+                }
+            } else {
+                cmp_s(op, x, y)
+            };
+            return Some(cond);
+        }
+        if let (Some(xa), Some(ya)) = (cdata_ptr_addr(self.l(), xv), cdata_ptr_addr(self.l(), yv)) {
+            // Pointer comparison: address order (root, offset).
+            let x = (xa.0 as i128) << 64 | xa.1 as i128;
+            let y = (ya.0 as i128) << 64 | ya.1 as i128;
+            let cond = match op {
+                0 => x < y,
+                1 => !(x < y),
+                2 => x <= y,
+                3 => !(x <= y),
+                _ => unreachable!(),
+            };
+            return Some(cond);
+        }
+        None
+    }
+
+    /// The dispatch loop. The entire hot state is two locals — `fr` (the
+    /// register window, LuaJIT's BASE kept as a `Frame`) and `ip` (a
+    /// walking instruction pointer, LuaJIT's PC) — so both live in
+    /// registers on every dispatch. Everything else (`self.knp`,
+    /// `self.multres`, ...) is re-read from `self` in the arms that need
+    /// it; keeping more locals alive across the dispatch forces spills
+    /// (measured: rustc packs the extras into an XMM register and unpacks
+    /// per instruction).
     /// `sync!`/`resync!` bridge to the fields around calls and returns.
     ///
     /// `run` is the mode trampoline: it re-enters `dispatch` whenever the
@@ -919,30 +1148,8 @@ impl Interp {
     }
 
     fn dispatch<const REC: bool>(&mut self) -> LuaResult<Flow> {
-        let mut bp = unsafe { self.sp.add(self.base) };
+        let mut fr = Frame::new(self.sp, self.base);
         let mut ip = unsafe { self.bcp.add(self.pc) };
-
-        macro_rules! cur_base {
-            () => {
-                unsafe { bp.offset_from(self.sp) as usize }
-            };
-        }
-        macro_rules! reg {
-            ($i:expr) => {
-                unsafe { *bp.add(($i) as usize) }
-            };
-        }
-        macro_rules! setreg {
-            ($i:expr, $v:expr) => {{
-                let v = $v;
-                unsafe { *bp.add(($i) as usize) = v }
-            }};
-        }
-        macro_rules! kslot {
-            ($d:expr) => {
-                LuaValue::number_raw(unsafe { *self.knp.add(($d) as usize) })
-            };
-        }
         macro_rules! jump {
             ($ins:expr) => {
                 ip = unsafe { ip.offset(bc_j($ins) as isize) }
@@ -950,7 +1157,7 @@ impl Interp {
         }
         macro_rules! sync {
             () => {{
-                self.base = cur_base!();
+                self.base = fr.cur_base();
                 self.pc = unsafe { ip.offset_from(self.bcp) as usize };
                 let l = self.l();
                 l.debug_pc = self.pc;
@@ -959,7 +1166,7 @@ impl Interp {
         }
         macro_rules! resync {
             () => {{
-                bp = unsafe { self.sp.add(self.base) };
+                fr = Frame::new(self.sp, self.base);
                 #[allow(unused_assignments)]
                 {
                     ip = unsafe { self.bcp.add(self.pc) };
@@ -971,214 +1178,21 @@ impl Interp {
         // encoding. ISGE/ISGT are the *unordered* comparisons (NaN takes
         // the jump), because the parser emits them as the negation of
         // ISLT/ISLE — same as the dasc VMs and rec_comp.
-        macro_rules! cmp {
+        //
+        // The numeric/cdata fast lanes live in `Interp::cmp_fast` (an
+        // `#[inline(always)]` method, inlined at every call site); only
+        // the metamethod fallback is a macro, because it must sync the
+        // locals and `continue` the dispatch loop.
+        macro_rules! cmp_arm {
             ($op:expr, $xv:expr, $yv:expr) => {{
                 let xv = $xv;
                 let yv = $yv;
-                if xv.is_number() && yv.is_number() {
-                    let x = xv.num();
-                    let y = yv.num();
-                    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-                    let cond = match $op {
-                        0 => x < y,
-                        1 => !(x < y),
-                        2 => x <= y,
-                        3 => !(x <= y),
-                        _ => unreachable!(),
-                    };
-                    let jmp = unsafe { *ip };
-                    ip = unsafe { ip.add(1) };
-                    if cond {
-                        jump!(jmp);
-                    }
-                } else if let (Some(x), Some(y)) =
-                    (cdata_u64(self.l(), xv), cdata_u64(self.l(), yv))
-                {
-                    let x_is_ull = cdata_is_ull(xv);
-                    let y_is_ull = cdata_is_ull(yv);
-                    let cond = if x_is_ull == y_is_ull {
-                        if x_is_ull {
-                            match $op {
-                                0 => x < y,
-                                1 => !(x < y),
-                                2 => x <= y,
-                                3 => !(x <= y),
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            match $op {
-                                0 => (x as i64) < (y as i64),
-                                1 => !((x as i64) < (y as i64)),
-                                2 => (x as i64) <= (y as i64),
-                                3 => !((x as i64) <= (y as i64)),
-                                _ => unreachable!(),
-                            }
-                        }
-                    } else if x_is_ull {
-                        // x is unsigned, y is signed: compare after sign check
-                        let y_s = y as i64;
-                        if y_s < 0 {
-                            match $op {
-                                0 => false,
-                                1 => true,
-                                2 => false,
-                                3 => true,
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            match $op {
-                                0 => x < y,
-                                1 => !(x < y),
-                                2 => x <= y,
-                                3 => !(x <= y),
-                                _ => unreachable!(),
-                            }
-                        }
-                    } else {
-                        // x is signed, y is unsigned
-                        let x_s = x as i64;
-                        if x_s < 0 {
-                            match $op {
-                                0 => true,
-                                1 => false,
-                                2 => true,
-                                3 => false,
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            match $op {
-                                0 => x < y,
-                                1 => !(x < y),
-                                2 => x <= y,
-                                3 => !(x <= y),
-                                _ => unreachable!(),
-                            }
-                        }
-                    };
-                    let jmp = unsafe { *ip };
-                    ip = unsafe { ip.add(1) };
-                    if cond {
-                        jump!(jmp);
-                    }
-                } else if let Some(x) = cdata_u64(self.l(), xv) {
-                    if yv.is_number() {
-                        // cdata vs Lua number (e.g. `m1 < 0` with int64
-                        // cdata): compare as the cdata's signedness.
-                        let x_is_ull = cdata_is_ull(xv);
-                        let yf = yv.num();
-                        let y = (yf as i64) as u64;
-                        let cond = if x_is_ull {
-                            let yn = y as i64;
-                            match $op {
-                                0 => yn < 0 || x < y,
-                                1 => !(yn < 0 || x < y),
-                                2 => yn < 0 || x <= y,
-                                3 => !(yn < 0 || x <= y),
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            match $op {
-                                0 => (x as i64) < (y as i64),
-                                1 => !((x as i64) < (y as i64)),
-                                2 => (x as i64) <= (y as i64),
-                                3 => !((x as i64) <= (y as i64)),
-                                _ => unreachable!(),
-                            }
-                        };
-                        let jmp = unsafe { *ip };
-                        ip = unsafe { ip.add(1) };
-                        if cond {
-                            jump!(jmp);
-                        }
-                    } else {
-                        sync!();
-                        match self.meta_comp(xv, yv, $op)? {
-                            Some(cond) => {
-                                let jmp = unsafe { *ip };
-                                ip = unsafe { ip.add(1) };
-                                if cond {
-                                    jump!(jmp);
-                                }
-                            }
-                            None => {
-                                resync!();
-                                continue;
-                            }
-                        }
-                    }
-                } else if let Some(y) = cdata_u64(self.l(), yv) {
-                    if xv.is_number() {
-                        // Lua number vs cdata.
-                        let y_is_ull = cdata_is_ull(yv);
-                        let xf = xv.num();
-                        let x = (xf as i64) as u64;
-                        let cond = if y_is_ull {
-                            let xn = x as i64;
-                            match $op {
-                                0 => xn < 0 || x < y,
-                                1 => !(xn < 0 || x < y),
-                                2 => xn < 0 || x <= y,
-                                3 => !(xn < 0 || x <= y),
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            match $op {
-                                0 => (x as i64) < (y as i64),
-                                1 => !((x as i64) < (y as i64)),
-                                2 => (x as i64) <= (y as i64),
-                                3 => !((x as i64) <= (y as i64)),
-                                _ => unreachable!(),
-                            }
-                        };
-                        let jmp = unsafe { *ip };
-                        ip = unsafe { ip.add(1) };
-                        if cond {
-                            jump!(jmp);
-                        }
-                    } else {
-                        sync!();
-                        match self.meta_comp(xv, yv, $op)? {
-                            Some(cond) => {
-                                let jmp = unsafe { *ip };
-                                ip = unsafe { ip.add(1) };
-                                if cond {
-                                    jump!(jmp);
-                                }
-                            }
-                            None => {
-                                resync!();
-                                continue;
-                            }
-                        }
-                    }
-                } else if let (Some(xa), Some(ya)) =
-                    (cdata_ptr_addr(self.l(), xv), cdata_ptr_addr(self.l(), yv))
-                {
-                    // Pointer comparison: address order (root, offset).
-                    let x = (xa.0 as i128) << 64 | xa.1 as i128;
-                    let y = (ya.0 as i128) << 64 | ya.1 as i128;
-                    let cond = match $op {
-                        0 => x < y,
-                        1 => !(x < y),
-                        2 => x <= y,
-                        3 => !(x <= y),
-                        _ => unreachable!(),
-                    };
-                    let jmp = unsafe { *ip };
-                    ip = unsafe { ip.add(1) };
-                    if cond {
-                        jump!(jmp);
-                    }
+                if let Some(cond) = self.cmp_fast($op, xv, yv) {
+                    branch!(cond);
                 } else {
                     sync!();
                     match self.meta_comp(xv, yv, $op)? {
-                        Some(cond) => {
-                            let jmp = unsafe { *ip };
-                            ip = unsafe { ip.add(1) };
-                            if cond {
-                                jump!(jmp);
-                            }
-                        }
+                        Some(cond) => branch!(cond),
                         None => {
                             resync!();
                             continue;
@@ -1201,15 +1215,15 @@ impl Interp {
         // hot instruction itself runs before the trace entry).
         macro_rules! forl_body {
             ($ins:expr, $a:expr) => {{
-                let i = reg!($a + FORL_IDX).num();
-                let s = reg!($a + FORL_STOP).num();
-                let st = reg!($a + FORL_STEP).num();
+                let i = fr.reg($a + FORL_IDX).num();
+                let s = fr.reg($a + FORL_STOP).num();
+                let st = fr.reg($a + FORL_STEP).num();
                 let ni = i + st;
                 let cont = if st >= 0.0 { ni <= s } else { ni >= s };
                 if cont {
                     let nv = LuaValue::number_raw(ni);
-                    setreg!($a + FORL_IDX, nv);
-                    setreg!($a + FORL_EXT, nv);
+                    fr.set($a + FORL_IDX, nv);
+                    fr.set($a + FORL_EXT, nv);
                     // Force a line event on the loop body's first
                     // instruction of every iteration (Lua 5.1 semantics:
                     // each iteration fires, even on the same source line).
@@ -1222,9 +1236,9 @@ impl Interp {
         }
         macro_rules! iterl_body {
             ($ins:expr, $a:expr) => {{
-                let first = reg!($a);
+                let first = fr.reg($a);
                 if !first.is_nil() {
-                    setreg!($a - 1, first);
+                    fr.set($a - 1, first);
                     jump!($ins);
                 }
             }};
@@ -1250,7 +1264,7 @@ impl Interp {
             // an in-progress trace recording — abort it first.
             if self.l().hookmask != 0 && !self.l().hook_active {
                 if REC {
-                    crate::jit::rec_abort_error(self.l().global());
+                    jit::rec_abort_error(self.l().global());
                     return Ok(Flow::Rec);
                 }
                 sync!();
@@ -1263,7 +1277,6 @@ impl Interp {
                     let ln = pt.lines[pc];
                     if hook_check(self.l(), ln)? {
                         resync!();
-                        bp = unsafe { self.sp.add(self.base) };
                     }
                 }
             }
@@ -1274,13 +1287,13 @@ impl Interp {
             let a = bc_a(ins);
             match bc_op(ins) {
                 // -- Comparisons (ORDER matters; see bc.rs) --
-                BCOp::ISLT => cmp!(0u32, reg!(a), reg!(bc_d(ins))),
-                BCOp::ISGE => cmp!(1u32, reg!(a), reg!(bc_d(ins))),
-                BCOp::ISLE => cmp!(2u32, reg!(a), reg!(bc_d(ins))),
-                BCOp::ISGT => cmp!(3u32, reg!(a), reg!(bc_d(ins))),
+                BCOp::ISLT => cmp_arm!(0, fr.reg(a), fr.reg(bc_d(ins))),
+                BCOp::ISGE => cmp_arm!(1, fr.reg(a), fr.reg(bc_d(ins))),
+                BCOp::ISLE => cmp_arm!(2, fr.reg(a), fr.reg(bc_d(ins))),
+                BCOp::ISGT => cmp_arm!(3, fr.reg(a), fr.reg(bc_d(ins))),
                 BCOp::ISEQV => {
-                    let x = reg!(a);
-                    let y = reg!(bc_d(ins));
+                    let x = fr.reg(a);
+                    let y = fr.reg(bc_d(ins));
                     let cond = val_eq(self.l(), x, y);
                     if cond {
                         branch!(true);
@@ -1298,8 +1311,8 @@ impl Interp {
                     }
                 }
                 BCOp::ISNEV => {
-                    let x = reg!(a);
-                    let y = reg!(bc_d(ins));
+                    let x = fr.reg(a);
+                    let y = fr.reg(bc_d(ins));
                     let cond = val_eq(self.l(), x, y);
                     if cond {
                         branch!(false);
@@ -1317,23 +1330,23 @@ impl Interp {
                     }
                 }
                 BCOp::ISEQS => {
-                    let cond = val_eq(self.l(), reg!(a), self.kstr_at(bc_d(ins)));
+                    let cond = val_eq(self.l(), fr.reg(a), self.kstr_at(bc_d(ins)));
                     branch!(cond);
                 }
                 BCOp::ISNES => {
-                    let cond = !val_eq(self.l(), reg!(a), self.kstr_at(bc_d(ins)));
+                    let cond = !val_eq(self.l(), fr.reg(a), self.kstr_at(bc_d(ins)));
                     branch!(cond);
                 }
                 BCOp::ISEQN => {
-                    let cond = val_eq(self.l(), reg!(a), kslot!(bc_d(ins)));
+                    let cond = val_eq(self.l(), fr.reg(a), self.knum(bc_d(ins)));
                     branch!(cond);
                 }
                 BCOp::ISNEN => {
-                    let cond = !val_eq(self.l(), reg!(a), kslot!(bc_d(ins)));
+                    let cond = !val_eq(self.l(), fr.reg(a), self.knum(bc_d(ins)));
                     branch!(cond);
                 }
                 BCOp::ISEQP => {
-                    let v = reg!(a);
+                    let v = fr.reg(a);
                     let cond = if bc_d(ins) == 0 {
                         v.is_nil() || is_cdata_null(v)
                     } else {
@@ -1342,7 +1355,7 @@ impl Interp {
                     branch!(cond);
                 }
                 BCOp::ISNEP => {
-                    let v = reg!(a);
+                    let v = fr.reg(a);
                     let cond = if bc_d(ins) == 0 {
                         // Primitive 0 = nil; for ?? operator also treat NULL cdata as nil.
                         !v.is_nil() && !is_cdata_null(v)
@@ -1352,45 +1365,45 @@ impl Interp {
                     branch!(cond);
                 }
                 BCOp::ISTC => {
-                    let d = reg!(bc_d(ins));
+                    let d = fr.reg(bc_d(ins));
                     let cond = d.is_truthy();
                     if cond {
-                        setreg!(a, d);
+                        fr.set(a, d);
                     }
                     branch!(cond);
                 }
                 BCOp::ISFC => {
-                    let d = reg!(bc_d(ins));
+                    let d = fr.reg(bc_d(ins));
                     let cond = !d.is_truthy();
                     if cond {
-                        setreg!(a, d);
+                        fr.set(a, d);
                     }
                     branch!(cond);
                 }
                 BCOp::IST => {
-                    let cond = reg!(bc_d(ins)).is_truthy();
+                    let cond = fr.reg(bc_d(ins)).is_truthy();
                     branch!(cond);
                 }
                 BCOp::ISF => {
-                    let cond = !reg!(bc_d(ins)).is_truthy();
+                    let cond = !fr.reg(bc_d(ins)).is_truthy();
                     branch!(cond);
                 }
 
                 // -- Unary and move --
-                BCOp::MOV => setreg!(a, reg!(bc_d(ins))),
-                BCOp::NOT => setreg!(a, LuaValue::boolean(!reg!(bc_d(ins)).is_truthy())),
+                BCOp::MOV => fr.set(a, fr.reg(bc_d(ins))),
+                BCOp::NOT => fr.set(a, LuaValue::boolean(!fr.reg(bc_d(ins)).is_truthy())),
                 BCOp::UNM => {
-                    let v = reg!(bc_d(ins));
+                    let v = fr.reg(bc_d(ins));
                     if let Some(bits) = cdata_u64(self.l(), v) {
                         let is_ull = cdata_is_ull(v);
                         let r = make_cdata_result(self.l(), (!bits).wrapping_add(1), is_ull);
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else if v.is_number() {
-                        setreg!(a, LuaValue::number_raw(-v.num()));
+                        fr.set(a, LuaValue::number_raw(-v.num()));
                     } else {
                         sync!();
                         match self.meta_arith(MM::Unm, v, v, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1399,19 +1412,19 @@ impl Interp {
                     }
                 }
                 BCOp::LEN => {
-                    let v = reg!(bc_d(ins));
+                    let v = fr.reg(bc_d(ins));
                     if let Some(sid) = v.as_string_id() {
                         let n = self.l().heap().strings.get(sid).len();
-                        setreg!(a, LuaValue::number(n as f64));
+                        fr.set(a, LuaValue::number(n as f64));
                     } else if let Some(t) = v.as_table()
                         && !crate::meta::meta_fast(self.l().global(), t.as_ref().metatable, MM::Len)
                             .is_some()
                     {
-                        setreg!(a, LuaValue::number(t.as_ref().len() as f64));
+                        fr.set(a, LuaValue::number(t.as_ref().len() as f64));
                     } else {
                         sync!();
                         match self.meta_len(v, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1422,18 +1435,18 @@ impl Interp {
 
                 // -- Arithmetic --
                 BCOp::ADDVV => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
-                        setreg!(a, LuaValue::number_raw(xv.num() + yv.num()));
+                        fr.set(a, LuaValue::number_raw(xv.num() + yv.num()));
                     } else if let Some(r) =
                         try_cdata_binop(self.l(), xv, yv, |x, y| x.wrapping_add(y))
                     {
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else {
                         sync!();
                         match self.meta_arith(MM::Add, xv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1442,18 +1455,18 @@ impl Interp {
                     }
                 }
                 BCOp::SUBVV => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
-                        setreg!(a, LuaValue::number_raw(xv.num() - yv.num()));
+                        fr.set(a, LuaValue::number_raw(xv.num() - yv.num()));
                     } else if let Some(r) =
                         try_cdata_binop(self.l(), xv, yv, |x, y| x.wrapping_sub(y))
                     {
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else {
                         sync!();
                         match self.meta_arith(MM::Sub, xv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1462,18 +1475,18 @@ impl Interp {
                     }
                 }
                 BCOp::MULVV => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
-                        setreg!(a, LuaValue::number_raw(xv.num() * yv.num()));
+                        fr.set(a, LuaValue::number_raw(xv.num() * yv.num()));
                     } else if let Some(r) =
                         try_cdata_binop(self.l(), xv, yv, |x, y| x.wrapping_mul(y))
                     {
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else {
                         sync!();
                         match self.meta_arith(MM::Mul, xv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1482,16 +1495,16 @@ impl Interp {
                     }
                 }
                 BCOp::DIVVV => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
-                        setreg!(a, LuaValue::number_raw(xv.num() / yv.num()));
+                        fr.set(a, LuaValue::number_raw(xv.num() / yv.num()));
                     } else if let Some(r) = try_cdata_binop(self.l(), xv, yv, |x, y| x / y) {
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else {
                         sync!();
                         match self.meta_arith(MM::Div, xv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1500,18 +1513,18 @@ impl Interp {
                     }
                 }
                 BCOp::MODVV => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
                         let x = xv.num();
                         let y = yv.num();
-                        setreg!(a, LuaValue::number_raw(x - (x / y).floor() * y));
+                        fr.set(a, LuaValue::number_raw(x - (x / y).floor() * y));
                     } else if let Some(r) = try_cdata_binop(self.l(), xv, yv, |x, y| x % y) {
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else {
                         sync!();
                         match self.meta_arith(MM::Mod, xv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1520,19 +1533,19 @@ impl Interp {
                     }
                 }
                 BCOp::ADDVN => {
-                    let xv = reg!(bc_b(ins));
+                    let xv = fr.reg(bc_b(ins));
                     if xv.is_number() {
                         let x = xv.num();
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
-                        setreg!(a, LuaValue::number_raw(x + y));
+                        let y = self.knum(bc_c(ins)).num();
+                        fr.set(a, LuaValue::number_raw(x + y));
                     } else if let Some(x_cd) = cdata_u64(self.l(), xv) {
                         let is_ull = cdata_is_ull(xv);
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
-                        setreg!(a, make_cdata_result(self.l(), x_cd.wrapping_add(y), is_ull));
+                        let y = self.knum(bc_c(ins)).num() as i64 as u64;
+                        fr.set(a, make_cdata_result(self.l(), x_cd.wrapping_add(y), is_ull));
                     } else {
                         sync!();
-                        match self.meta_arith(MM::Add, xv, kslot!(bc_c(ins)), a)? {
-                            Some(r) => setreg!(a, r),
+                        match self.meta_arith(MM::Add, xv, self.knum(bc_c(ins)), a)? {
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1541,19 +1554,19 @@ impl Interp {
                     }
                 }
                 BCOp::SUBVN => {
-                    let xv = reg!(bc_b(ins));
+                    let xv = fr.reg(bc_b(ins));
                     if xv.is_number() {
                         let x = xv.num();
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
-                        setreg!(a, LuaValue::number_raw(x - y));
+                        let y = self.knum(bc_c(ins)).num();
+                        fr.set(a, LuaValue::number_raw(x - y));
                     } else if let Some(x_cd) = cdata_u64(self.l(), xv) {
                         let is_ull = cdata_is_ull(xv);
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
-                        setreg!(a, make_cdata_result(self.l(), x_cd.wrapping_sub(y), is_ull));
+                        let y = self.knum(bc_c(ins)).num() as i64 as u64;
+                        fr.set(a, make_cdata_result(self.l(), x_cd.wrapping_sub(y), is_ull));
                     } else {
                         sync!();
-                        match self.meta_arith(MM::Sub, xv, kslot!(bc_c(ins)), a)? {
-                            Some(r) => setreg!(a, r),
+                        match self.meta_arith(MM::Sub, xv, self.knum(bc_c(ins)), a)? {
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1562,19 +1575,19 @@ impl Interp {
                     }
                 }
                 BCOp::MULVN => {
-                    let xv = reg!(bc_b(ins));
+                    let xv = fr.reg(bc_b(ins));
                     if xv.is_number() {
                         let x = xv.num();
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
-                        setreg!(a, LuaValue::number_raw(x * y));
+                        let y = self.knum(bc_c(ins)).num();
+                        fr.set(a, LuaValue::number_raw(x * y));
                     } else if let Some(x_cd) = cdata_u64(self.l(), xv) {
                         let is_ull = cdata_is_ull(xv);
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
-                        setreg!(a, make_cdata_result(self.l(), x_cd.wrapping_mul(y), is_ull));
+                        let y = self.knum(bc_c(ins)).num() as i64 as u64;
+                        fr.set(a, make_cdata_result(self.l(), x_cd.wrapping_mul(y), is_ull));
                     } else {
                         sync!();
-                        match self.meta_arith(MM::Mul, xv, kslot!(bc_c(ins)), a)? {
-                            Some(r) => setreg!(a, r),
+                        match self.meta_arith(MM::Mul, xv, self.knum(bc_c(ins)), a)? {
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1583,20 +1596,20 @@ impl Interp {
                     }
                 }
                 BCOp::DIVVN => {
-                    let xv = reg!(bc_b(ins));
+                    let xv = fr.reg(bc_b(ins));
                     if xv.is_number() {
                         let x = xv.num();
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
-                        setreg!(a, LuaValue::number_raw(x / y));
+                        let y = self.knum(bc_c(ins)).num();
+                        fr.set(a, LuaValue::number_raw(x / y));
                     } else if let Some(x_cd) = cdata_u64(self.l(), xv) {
                         let is_ull = cdata_is_ull(xv);
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
+                        let y = self.knum(bc_c(ins)).num() as i64 as u64;
                         let r = x_cd.checked_div(y).unwrap_or(0);
-                        setreg!(a, make_cdata_result(self.l(), r, is_ull));
+                        fr.set(a, make_cdata_result(self.l(), r, is_ull));
                     } else {
                         sync!();
-                        match self.meta_arith(MM::Div, xv, kslot!(bc_c(ins)), a)? {
-                            Some(r) => setreg!(a, r),
+                        match self.meta_arith(MM::Div, xv, self.knum(bc_c(ins)), a)? {
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1605,20 +1618,20 @@ impl Interp {
                     }
                 }
                 BCOp::MODVN => {
-                    let xv = reg!(bc_b(ins));
+                    let xv = fr.reg(bc_b(ins));
                     if xv.is_number() {
                         let x = xv.num();
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) };
-                        setreg!(a, LuaValue::number_raw(x - (x / y).floor() * y));
+                        let y = self.knum(bc_c(ins)).num();
+                        fr.set(a, LuaValue::number_raw(x - (x / y).floor() * y));
                     } else if let Some(x_cd) = cdata_u64(self.l(), xv) {
                         let is_ull = cdata_is_ull(xv);
-                        let y = unsafe { *self.knp.add(bc_c(ins) as usize) } as i64 as u64;
+                        let y = self.knum(bc_c(ins)).num() as i64 as u64;
                         let r = if y == 0 { 0 } else { x_cd % y };
-                        setreg!(a, make_cdata_result(self.l(), r, is_ull));
+                        fr.set(a, make_cdata_result(self.l(), r, is_ull));
                     } else {
                         sync!();
-                        match self.meta_arith(MM::Mod, xv, kslot!(bc_c(ins)), a)? {
-                            Some(r) => setreg!(a, r),
+                        match self.meta_arith(MM::Mod, xv, self.knum(bc_c(ins)), a)? {
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1627,19 +1640,19 @@ impl Interp {
                     }
                 }
                 BCOp::ADDNV => {
-                    let kv = kslot!(bc_c(ins));
-                    let yv = reg!(bc_b(ins));
+                    let kv = self.knum(bc_c(ins));
+                    let yv = fr.reg(bc_b(ins));
                     if yv.is_number() {
                         let y = yv.num();
-                        setreg!(a, LuaValue::number_raw(kv.num() + y));
+                        fr.set(a, LuaValue::number_raw(kv.num() + y));
                     } else if let Some(y_cd) = cdata_u64(self.l(), yv) {
                         let is_ull = cdata_is_ull(yv);
                         let x = kv.num() as i64 as u64;
-                        setreg!(a, make_cdata_result(self.l(), x.wrapping_add(y_cd), is_ull));
+                        fr.set(a, make_cdata_result(self.l(), x.wrapping_add(y_cd), is_ull));
                     } else {
                         sync!();
                         match self.meta_arith(MM::Add, kv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1648,19 +1661,19 @@ impl Interp {
                     }
                 }
                 BCOp::SUBNV => {
-                    let kv = kslot!(bc_c(ins));
-                    let yv = reg!(bc_b(ins));
+                    let kv = self.knum(bc_c(ins));
+                    let yv = fr.reg(bc_b(ins));
                     if yv.is_number() {
                         let y = yv.num();
-                        setreg!(a, LuaValue::number_raw(kv.num() - y));
+                        fr.set(a, LuaValue::number_raw(kv.num() - y));
                     } else if let Some(y_cd) = cdata_u64(self.l(), yv) {
                         let is_ull = cdata_is_ull(yv);
                         let x = kv.num() as i64 as u64;
-                        setreg!(a, make_cdata_result(self.l(), x.wrapping_sub(y_cd), is_ull));
+                        fr.set(a, make_cdata_result(self.l(), x.wrapping_sub(y_cd), is_ull));
                     } else {
                         sync!();
                         match self.meta_arith(MM::Sub, kv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1669,19 +1682,19 @@ impl Interp {
                     }
                 }
                 BCOp::MULNV => {
-                    let kv = kslot!(bc_c(ins));
-                    let yv = reg!(bc_b(ins));
+                    let kv = self.knum(bc_c(ins));
+                    let yv = fr.reg(bc_b(ins));
                     if yv.is_number() {
                         let y = yv.num();
-                        setreg!(a, LuaValue::number_raw(kv.num() * y));
+                        fr.set(a, LuaValue::number_raw(kv.num() * y));
                     } else if let Some(y_cd) = cdata_u64(self.l(), yv) {
                         let is_ull = cdata_is_ull(yv);
                         let x = kv.num() as i64 as u64;
-                        setreg!(a, make_cdata_result(self.l(), x.wrapping_mul(y_cd), is_ull));
+                        fr.set(a, make_cdata_result(self.l(), x.wrapping_mul(y_cd), is_ull));
                     } else {
                         sync!();
                         match self.meta_arith(MM::Mul, kv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1690,20 +1703,20 @@ impl Interp {
                     }
                 }
                 BCOp::DIVNV => {
-                    let kv = kslot!(bc_c(ins));
-                    let yv = reg!(bc_b(ins));
+                    let kv = self.knum(bc_c(ins));
+                    let yv = fr.reg(bc_b(ins));
                     if yv.is_number() {
                         let y = yv.num();
-                        setreg!(a, LuaValue::number_raw(kv.num() / y));
+                        fr.set(a, LuaValue::number_raw(kv.num() / y));
                     } else if let Some(y_cd) = cdata_u64(self.l(), yv) {
                         let is_ull = cdata_is_ull(yv);
                         let x = kv.num() as i64 as u64;
                         let r = x.checked_div(y_cd).unwrap_or(0);
-                        setreg!(a, make_cdata_result(self.l(), r, is_ull));
+                        fr.set(a, make_cdata_result(self.l(), r, is_ull));
                     } else {
                         sync!();
                         match self.meta_arith(MM::Div, kv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1712,21 +1725,21 @@ impl Interp {
                     }
                 }
                 BCOp::MODNV => {
-                    let kv = kslot!(bc_c(ins));
-                    let yv = reg!(bc_b(ins));
+                    let kv = self.knum(bc_c(ins));
+                    let yv = fr.reg(bc_b(ins));
                     if yv.is_number() {
                         let y = yv.num();
                         let x = kv.num();
-                        setreg!(a, LuaValue::number_raw(x - (x / y).floor() * y));
+                        fr.set(a, LuaValue::number_raw(x - (x / y).floor() * y));
                     } else if let Some(y_cd) = cdata_u64(self.l(), yv) {
                         let is_ull = cdata_is_ull(yv);
                         let x = kv.num() as i64 as u64;
                         let r = if y_cd == 0 { 0 } else { x % y_cd };
-                        setreg!(a, make_cdata_result(self.l(), r, is_ull));
+                        fr.set(a, make_cdata_result(self.l(), r, is_ull));
                     } else {
                         sync!();
                         match self.meta_arith(MM::Mod, kv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1735,18 +1748,18 @@ impl Interp {
                     }
                 }
                 BCOp::POW => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     if xv.is_number() && yv.is_number() {
-                        setreg!(a, LuaValue::number_raw(vm_pow(xv.num(), yv.num())));
+                        fr.set(a, LuaValue::number_raw(vm_pow(xv.num(), yv.num())));
                     } else if let Some(r) =
                         try_cdata_binop(self.l(), xv, yv, |x, y| (x as f64).powf(y as f64) as u64)
                     {
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else {
                         sync!();
                         match self.meta_arith(MM::Pow, xv, yv, a)? {
-                            Some(r) => setreg!(a, r),
+                            Some(r) => fr.set(a, r),
                             None => {
                                 resync!();
                                 continue;
@@ -1756,19 +1769,18 @@ impl Interp {
                 }
                 BCOp::CAT => {
                     sync!();
-                    self.gc_check()?;
-                    let r = self.meta_cat(bc_b(ins), bc_c(ins))?;
-                    setreg!(a, r);
+                    let r = self.op_cat(bc_b(ins), bc_c(ins))?;
+                    fr.set(a, r);
                 }
 
                 // -- Constants --
                 BCOp::KSTR => {
                     let v = self.kstr_at(bc_d(ins));
-                    setreg!(a, v);
+                    fr.set(a, v);
                 }
-                BCOp::KSHORT => setreg!(a, LuaValue::number(bc_d(ins) as i16 as f64)),
-                BCOp::KNUM => setreg!(a, kslot!(bc_d(ins))),
-                BCOp::KPRI => setreg!(a, PRI[bc_d(ins) as usize]),
+                BCOp::KSHORT => fr.set(a, LuaValue::number(bc_d(ins) as i16 as f64)),
+                BCOp::KNUM => fr.set(a, self.knum(bc_d(ins))),
+                BCOp::KPRI => fr.set(a, PRI[bc_d(ins) as usize]),
                 BCOp::KCDATA => {
                     let idx = bc_d(ins) as usize;
                     let proto = self.lua_cl().proto;
@@ -1789,22 +1801,22 @@ impl Interp {
                                 .runtime_error("KCDATA with non-CData kgc entry".as_bytes()));
                         }
                     };
-                    setreg!(a, cdata);
+                    fr.set(a, cdata);
                 }
                 BCOp::KNIL => {
                     for i in a..=bc_d(ins) {
-                        setreg!(i, LuaValue::NIL);
+                        fr.set(i, LuaValue::NIL);
                     }
                 }
 
                 // -- Upvalues --
                 BCOp::UGET => {
                     let uv = self.lua_cl().upvals[bc_d(ins) as usize];
-                    setreg!(a, self.upval_get(uv));
+                    fr.set(a, self.upval_get(uv));
                 }
                 BCOp::USETV => {
                     let uv = self.lua_cl().upvals[a as usize];
-                    let v = reg!(bc_d(ins));
+                    let v = fr.reg(bc_d(ins));
                     self.upval_set(uv, v);
                 }
                 BCOp::USETS => {
@@ -1814,7 +1826,7 @@ impl Interp {
                 }
                 BCOp::USETN => {
                     let uv = self.lua_cl().upvals[a as usize];
-                    self.upval_set(uv, kslot!(bc_d(ins)));
+                    self.upval_set(uv, self.knum(bc_d(ins)));
                 }
                 BCOp::USETP => {
                     let uv = self.lua_cl().upvals[a as usize];
@@ -1822,14 +1834,13 @@ impl Interp {
                 }
                 BCOp::UCLO => {
                     sync!();
-                    self.close_upvals(cur_base!() + a as usize);
+                    self.op_uclo(a);
                     jump!(ins);
                 }
                 BCOp::FNEW => {
                     sync!();
-                    self.gc_check()?;
-                    let v = self.new_closure(bc_d(ins));
-                    setreg!(a, v);
+                    let v = self.op_fnew(bc_d(ins))?;
+                    fr.set(a, v);
                 }
 
                 // -- Tables --
@@ -1841,29 +1852,23 @@ impl Interp {
                         self.gc_check()?;
                     }
                     let t = self.l().heap().alloc_table(LuaTable::new(0, 0));
-                    setreg!(a, LuaValue::table(t));
+                    fr.set(a, LuaValue::table(t));
                 }
                 BCOp::TDUP => {
                     sync!();
-                    self.gc_check()?;
-                    let templ = match &self.proto().kgc[bc_d(ins) as usize] {
-                        KGc::Table(t) => t.dup(),
-                        KGc::TableRef(t) => t.as_ref().dup(),
-                        _ => unreachable!("expected template table"),
-                    };
-                    let t = self.l().heap().alloc_table(templ);
-                    setreg!(a, LuaValue::table(t));
+                    let t = self.op_tdup(bc_d(ins))?;
+                    fr.set(a, t);
                 }
                 BCOp::GGET => {
                     let env = self.lua_cl().env;
                     let key = self.kstr_at(bc_d(ins));
                     let v = env.as_ref().get_str(key);
                     if !v.is_nil() || env.as_ref().metatable.is_none() {
-                        setreg!(a, v);
+                        fr.set(a, v);
                     } else {
                         sync!();
                         match self.meta_tget(LuaValue::table(env), key, a)? {
-                            Some(v) => setreg!(a, v),
+                            Some(v) => fr.set(a, v),
                             None => {
                                 resync!();
                                 continue;
@@ -1876,10 +1881,10 @@ impl Interp {
                     let key = self.kstr_at(bc_d(ins));
                     let mt = env.as_ref().metatable;
                     if mt.is_none() || !env.as_ref().get_str(key).is_nil() {
-                        env.as_mut().set_str(key, reg!(a));
+                        env.as_mut().set_str(key, fr.reg(a));
                     } else {
                         sync!();
-                        match self.meta_tset(LuaValue::table(env), key, reg!(a))? {
+                        match self.meta_tset(LuaValue::table(env), key, fr.reg(a))? {
                             Some(_) => {}
                             None => {
                                 resync!();
@@ -1889,8 +1894,8 @@ impl Interp {
                     }
                 }
                 BCOp::TGETV => {
-                    let t = reg!(bc_b(ins));
-                    let k = reg!(bc_c(ins));
+                    let t = fr.reg(bc_b(ins));
+                    let k = fr.reg(bc_c(ins));
                     if let Some(tab) = t.as_table() {
                         let v = if k.is_string() {
                             tab.as_ref().get_str(k)
@@ -1905,11 +1910,11 @@ impl Interp {
                             tab.as_ref().get(k)
                         };
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
-                            setreg!(a, v);
+                            fr.set(a, v);
                         } else {
                             sync!();
                             match self.meta_tget(t, k, a)? {
-                                Some(v) => setreg!(a, v),
+                                Some(v) => fr.set(a, v),
                                 None => {
                                     resync!();
                                     continue;
@@ -1919,7 +1924,7 @@ impl Interp {
                     } else {
                         sync!();
                         match self.meta_tget(t, k, a)? {
-                            Some(v) => setreg!(a, v),
+                            Some(v) => fr.set(a, v),
                             None => {
                                 resync!();
                                 continue;
@@ -1928,16 +1933,16 @@ impl Interp {
                     }
                 }
                 BCOp::TGETS => {
-                    let t = reg!(bc_b(ins));
+                    let t = fr.reg(bc_b(ins));
                     if let Some(tab) = t.as_table() {
                         let k = self.kstr_at(bc_c(ins));
                         let v = tab.as_ref().get_str(k);
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
-                            setreg!(a, v);
+                            fr.set(a, v);
                         } else {
                             sync!();
                             match self.meta_tget(t, k, a)? {
-                                Some(v) => setreg!(a, v),
+                                Some(v) => fr.set(a, v),
                                 None => {
                                     resync!();
                                     continue;
@@ -1947,7 +1952,7 @@ impl Interp {
                     } else {
                         sync!();
                         match self.meta_tget(t, self.kstr_at(bc_c(ins)), a)? {
-                            Some(v) => setreg!(a, v),
+                            Some(v) => fr.set(a, v),
                             None => {
                                 resync!();
                                 continue;
@@ -1956,16 +1961,16 @@ impl Interp {
                     }
                 }
                 BCOp::TGETB => {
-                    let t = reg!(bc_b(ins));
+                    let t = fr.reg(bc_b(ins));
                     if let Some(tab) = t.as_table() {
                         let k = bc_c(ins) as i32;
                         let v = tab.as_ref().get_int(k);
                         if !v.is_nil() || tab.as_ref().metatable.is_none() {
-                            setreg!(a, v);
+                            fr.set(a, v);
                         } else {
                             sync!();
                             match self.meta_tget(t, LuaValue::number(k as f64), a)? {
-                                Some(v) => setreg!(a, v),
+                                Some(v) => fr.set(a, v),
                                 None => {
                                     resync!();
                                     continue;
@@ -1975,7 +1980,7 @@ impl Interp {
                     } else {
                         sync!();
                         match self.meta_tget(t, LuaValue::number(bc_c(ins) as f64), a)? {
-                            Some(v) => setreg!(a, v),
+                            Some(v) => fr.set(a, v),
                             None => {
                                 resync!();
                                 continue;
@@ -1984,9 +1989,9 @@ impl Interp {
                     }
                 }
                 BCOp::TSETV => {
-                    let t = reg!(bc_b(ins));
-                    let k = reg!(bc_c(ins));
-                    let v = reg!(a);
+                    let t = fr.reg(bc_b(ins));
+                    let k = fr.reg(bc_c(ins));
+                    let v = fr.reg(a);
                     if let Some(tab) = t.as_table()
                         && tab.as_ref().metatable.is_none()
                     {
@@ -2018,8 +2023,8 @@ impl Interp {
                     }
                 }
                 BCOp::TSETS => {
-                    let t = reg!(bc_b(ins));
-                    let v = reg!(a);
+                    let t = fr.reg(bc_b(ins));
+                    let v = fr.reg(a);
                     if let Some(tab) = t.as_table()
                         && tab.as_ref().metatable.is_none()
                     {
@@ -2038,8 +2043,8 @@ impl Interp {
                     }
                 }
                 BCOp::TSETB => {
-                    let t = reg!(bc_b(ins));
-                    let v = reg!(a);
+                    let t = fr.reg(bc_b(ins));
+                    let v = fr.reg(a);
                     if let Some(tab) = t.as_table()
                         && tab.as_ref().metatable.is_none()
                     {
@@ -2059,10 +2064,9 @@ impl Interp {
                 BCOp::TSETM => {
                     // Inline the fast path: table at R[a-1], values at
                     // R[a..a+multres-1], base_key from constant table.
-                    let t = reg!(a as usize - 1);
+                    let t = fr.reg(a - 1);
                     if let Some(tab) = t.as_table() {
-                        let base_key =
-                            unsafe { *self.knp.add(bc_d(ins) as usize) } as i64 - (1i64 << 52);
+                        let base_key = self.knum(bc_d(ins)).num() as i64 - (1i64 << 52);
                         let mr = self.multres;
                         if mr > 0 && base_key == 1 {
                             let need = (base_key as u32).wrapping_add(mr as u32);
@@ -2070,7 +2074,7 @@ impl Interp {
                         }
                         for i in 0..mr {
                             let key = base_key + i as i64;
-                            let v = reg!(a as usize + i);
+                            let v = fr.reg(a + i as u32);
                             if key >= 0 && key <= i32::MAX as i64 {
                                 tab.as_mut().set_int(key as i32, v);
                             } else {
@@ -2092,12 +2096,11 @@ impl Interp {
                         call_hook(self.l(), "call", None)?;
                         self.sp = self.l().stack.as_mut_ptr();
                         resync!();
-                        bp = unsafe { self.sp.add(self.base) };
                     }
                     // Fast path (LuaJIT's ins_call): a Lua callee switches
                     // frames right here — one store for the frame link, no
                     // sync round-trip. C callees and vararg protos go slow.
-                    let f = reg!(a);
+                    let f = fr.reg(a);
                     if let Some(gf) = f.as_func()
                         && let GcFunc::Lua(cl) = gf.as_ref()
                     {
@@ -2106,25 +2109,28 @@ impl Interp {
                         if (pt.flags & PROTO_VARARG) == 0 {
                             let nargs = bc_c(ins) as usize - 1;
                             let fs = pt.framesize as usize;
-                            let need = cur_base!() + a as usize + 2 + fs + 8;
+                            let need = fr.cur_base() + a as usize + 2 + fs + 8;
                             if need > self.l().stack.len() {
                                 sync!();
                                 self.l().stack_ensure(need);
                                 self.sp = self.l().stack.as_mut_ptr();
                                 resync!();
                             }
-                            let newbp = unsafe { bp.add(a as usize + 2) };
-                            unsafe { *newbp.sub(1) = LuaValue::from_bits(ip as u64) };
+                            let newfr = Frame::new(self.sp, fr.cur_base() + a as usize + 2);
+                            newfr.set_abs(
+                                fr.cur_base() + a as usize + 1,
+                                LuaValue::from_bits(ip as u64),
+                            );
                             for i in nargs..pt.numparams as usize {
-                                unsafe { *newbp.add(i) = LuaValue::NIL };
+                                newfr.set(i as u32, LuaValue::NIL);
                             }
-                            bp = newbp;
+                            fr = newfr;
                             ip = unsafe { pt.bc.as_ptr().add(1) };
                             self.cl = gf;
                             self.bcp = pt.bc.as_ptr();
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
-                            self.l().top = cur_base!() + pt.framesize as usize;
+                            self.l().top = fr.cur_base() + pt.framesize as usize;
                             self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             // A compiled callee (JFUNCF): enter its trace
@@ -2137,8 +2143,8 @@ impl Interp {
                                 if r.baseslot != 2 {
                                     self.trace_exit_frame(r.baseslot);
                                 } else {
-                                    let bp2 = unsafe { self.sp.add(self.base) };
-                                    self.reload_at(bp2);
+                                    fr = Frame::new(self.sp, self.base);
+                                    self.reload_at(fr);
                                     self.l().top = self.base + self.proto().framesize as usize;
                                 }
                                 if self.rec_started() {
@@ -2179,17 +2185,17 @@ impl Interp {
                 BCOp::CALLT => {
                     // Fast path: Lua callee, no vararg frame on either side
                     // — reuse the frame in place (BC_CALLT's hot route).
-                    let f = reg!(a);
+                    let f = fr.reg(a);
                     if let Some(gf) = f.as_func()
                         && let GcFunc::Lua(cl) = gf.as_ref()
                     {
                         let pt = cl.proto.as_ref();
-                        let link = unsafe { (*bp.sub(1)).to_bits() };
+                        let link = fr.frame_link();
                         if (pt.flags & PROTO_VARARG) == 0 && (link & FRAME_TYPE_MASK) != FRAME_VARG
                         {
                             let nargs = bc_d(ins) as usize - 1;
 
-                            let fs_need = cur_base!()
+                            let fs_need = fr.cur_base()
                                 + a.max(nargs as u32) as usize
                                 + pt.framesize as usize
                                 + 8;
@@ -2199,25 +2205,24 @@ impl Interp {
                                 self.sp = self.l().stack.as_mut_ptr();
                                 resync!();
                             }
-                            let fs = unsafe { bp.add(a as usize) };
-                            unsafe { *bp.sub(2) = f };
+                            fr.set_func(f);
                             // Copy args down (dest [0,nargs) ⊂ src
                             // [2,nargs+2)): forward order is safe because
                             // each source slot is written only after being
                             // read (dest[i] = src[i+2]).
                             for i in 0..nargs {
-                                unsafe { *bp.add(i) = *fs.add(2 + i) };
+                                fr.set(i as u32, fr.reg(a + 2 + i as u32));
                             }
 
                             for i in nargs..pt.numparams as usize {
-                                unsafe { *bp.add(i) = LuaValue::NIL };
+                                fr.set(i as u32, LuaValue::NIL);
                             }
                             ip = unsafe { pt.bc.as_ptr().add(1) };
                             self.cl = gf;
                             self.bcp = pt.bc.as_ptr();
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
-                            self.l().top = cur_base!() + pt.framesize as usize;
+                            self.l().top = fr.cur_base() + pt.framesize as usize;
                             self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             if !REC && bc_op(head) == BCOp::JFUNCF {
@@ -2228,8 +2233,8 @@ impl Interp {
                                 if r.baseslot != 2 {
                                     self.trace_exit_frame(r.baseslot);
                                 } else {
-                                    let bp2 = unsafe { self.sp.add(self.base) };
-                                    self.reload_at(bp2);
+                                    fr = Frame::new(self.sp, self.base);
+                                    self.reload_at(fr);
                                     self.l().top = self.base + self.proto().framesize as usize;
                                 }
                                 if self.rec_started() {
@@ -2261,22 +2266,21 @@ impl Interp {
                         sync!();
                         call_hook(self.l(), "return", None)?;
                         resync!();
-                        bp = unsafe { self.sp.add(self.base) };
                     }
-                    if let Some(want) = self.ret_fast(bp) {
+                    if let Some(want) = self.ret_fast(fr.bp()) {
                         if !self.hook_lines.is_empty() {
                             let _ = self.hook_lines.pop();
                         }
-                        let jmp = unsafe { (*bp.sub(1)).to_bits() } as *const BCIns;
-                        let call_ins = unsafe { *jmp.sub(1) };
-                        let dst = unsafe { bp.sub(2) };
+                        let jmp = fr.frame_link() as *const BCIns;
+                        let call_ins = self.ret_call_ins(jmp);
+                        let dst = fr.cur_base() - 2;
                         for i in 0..want.max(0) as usize {
-                            unsafe { *dst.add(i) = LuaValue::NIL };
+                            fr.set_abs(dst + i, LuaValue::NIL);
                         }
                         self.multres = 0;
-                        bp = unsafe { dst.sub(bc_a(call_ins) as usize) };
+                        fr = Frame::new(self.sp, dst - bc_a(call_ins) as usize);
                         ip = jmp;
-                        self.reload_at(bp);
+                        self.reload_at(fr);
                         // Skip a line event on the caller's resumption
                         // line (Lua 5.1: the caller's line was already
                         // reported before the call).
@@ -2286,15 +2290,11 @@ impl Interp {
                             let pc = pc.min(pt.lines.len().saturating_sub(1));
                             self.l().hook_line = pt.lines[pc];
                         }
-                        self.l().top = if want >= 0 {
-                            unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
-                        } else {
-                            unsafe { dst.offset_from(self.sp) as usize }
-                        };
+                        self.l().top = dst + if want >= 0 { want as usize } else { 0 };
                         continue;
                     }
                     sync!();
-                    if let Some(n) = self.do_return(cur_base!(), 0) {
+                    if let Some(n) = self.do_return(fr.cur_base(), 0) {
                         return Ok(Flow::Ret(n));
                     }
                     resync!();
@@ -2304,38 +2304,33 @@ impl Interp {
                         sync!();
                         call_hook(self.l(), "return", None)?;
                         resync!();
-                        bp = unsafe { self.sp.add(self.base) };
                     }
-                    if let Some(want) = self.ret_fast(bp) {
+                    if let Some(want) = self.ret_fast(fr.bp()) {
                         if !self.hook_lines.is_empty() {
                             let _ = self.hook_lines.pop();
                         }
-                        let jmp = unsafe { (*bp.sub(1)).to_bits() } as *const BCIns;
-                        let call_ins = unsafe { *jmp.sub(1) };
-                        let dst = unsafe { bp.sub(2) };
-                        unsafe { *dst = *bp.add(a as usize) };
+                        let jmp = fr.frame_link() as *const BCIns;
+                        let call_ins = self.ret_call_ins(jmp);
+                        let dst = fr.cur_base() - 2;
+                        fr.set_abs(dst, fr.reg(a));
                         for i in 1..want.max(1) as usize {
-                            unsafe { *dst.add(i) = LuaValue::NIL };
+                            fr.set_abs(dst + i, LuaValue::NIL);
                         }
                         self.multres = 1;
-                        bp = unsafe { dst.sub(bc_a(call_ins) as usize) };
+                        fr = Frame::new(self.sp, dst - bc_a(call_ins) as usize);
                         ip = jmp;
-                        self.reload_at(bp);
+                        self.reload_at(fr);
                         if self.l().hookmask & HOOKMASK_LINE != 0 {
                             let pt = self.proto();
                             let pc = unsafe { ip.offset_from(self.bcp) as usize };
                             let pc = pc.min(pt.lines.len().saturating_sub(1));
                             self.l().hook_line = pt.lines[pc];
                         }
-                        self.l().top = if want >= 0 {
-                            unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
-                        } else {
-                            unsafe { dst.add(1).offset_from(self.sp) as usize }
-                        };
+                        self.l().top = dst + if want >= 0 { want as usize } else { 1 };
                         continue;
                     }
                     sync!();
-                    if let Some(n) = self.do_return(cur_base!() + a as usize, 1) {
+                    if let Some(n) = self.do_return(fr.cur_base() + a as usize, 1) {
                         return Ok(Flow::Ret(n));
                     }
                     resync!();
@@ -2346,66 +2341,58 @@ impl Interp {
                         sync!();
                         call_hook(self.l(), "return", None)?;
                         resync!();
-                        bp = unsafe { self.sp.add(self.base) };
                     }
-                    if let Some((wbp, want, ret_ip, ca)) = self.ret_fast_n(bp) {
+                    if let Some((wbase, want, ret_ip, ca)) = self.ret_fast_n(fr.bp()) {
                         if !self.hook_lines.is_empty() {
                             self.l().hook_line = self.hook_lines.pop().unwrap();
                         }
-                        let wbp = wbp as *mut LuaValue;
-                        let src = unsafe { bp.add(a as usize) };
-                        let dst = unsafe { wbp.sub(2) };
+                        if !self.hook_lines.is_empty() {
+                            self.l().hook_line = self.hook_lines.pop().unwrap();
+                        }
+                        let src = a;
+                        let dst = wbase - 2;
                         for i in 0..n {
-                            unsafe { *dst.add(i) = *src.add(i) };
+                            fr.set_abs(dst + i, fr.reg(src + i as u32));
                         }
                         for i in n..(want.max(0) as usize) {
-                            unsafe { *dst.add(i) = LuaValue::NIL };
+                            fr.set_abs(dst + i, LuaValue::NIL);
                         }
                         self.multres = n;
-                        bp = unsafe { dst.sub(ca as usize) };
+                        fr = Frame::new(self.sp, dst - ca as usize);
                         ip = ret_ip;
-                        self.reload_at(bp);
-                        self.l().top = if want >= 0 {
-                            unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
-                        } else {
-                            unsafe { dst.add(n).offset_from(self.sp) as usize }
-                        };
+                        self.reload_at(fr);
+                        self.l().top = dst + if want >= 0 { want as usize } else { n };
                         continue;
                     }
                     sync!();
-                    if let Some(n) = self.do_return(cur_base!() + a as usize, n) {
+                    if let Some(n) = self.do_return(fr.cur_base() + a as usize, n) {
                         return Ok(Flow::Ret(n));
                     }
                     resync!();
                 }
                 BCOp::RETM => {
                     let n = self.multres + bc_d(ins) as usize;
-                    if let Some((wbp, want, ret_ip, ca)) = self.ret_fast_n(bp) {
+                    if let Some((wbase, want, ret_ip, ca)) = self.ret_fast_n(fr.bp()) {
                         if !self.hook_lines.is_empty() {
                             self.l().hook_line = self.hook_lines.pop().unwrap();
                         }
-                        let wbp = wbp as *mut LuaValue;
-                        let src = unsafe { bp.add(a as usize) };
-                        let dst = unsafe { wbp.sub(2) };
+                        let src = a;
+                        let dst = wbase - 2;
                         for i in 0..n {
-                            unsafe { *dst.add(i) = *src.add(i) };
+                            fr.set_abs(dst + i, fr.reg(src + i as u32));
                         }
                         for i in n..(want.max(0) as usize) {
-                            unsafe { *dst.add(i) = LuaValue::NIL };
+                            fr.set_abs(dst + i, LuaValue::NIL);
                         }
                         self.multres = n;
-                        bp = unsafe { dst.sub(ca as usize) };
+                        fr = Frame::new(self.sp, dst - ca as usize);
                         ip = ret_ip;
-                        self.reload_at(bp);
-                        self.l().top = if want >= 0 {
-                            unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
-                        } else {
-                            unsafe { dst.add(n).offset_from(self.sp) as usize }
-                        };
+                        self.reload_at(fr);
+                        self.l().top = dst + if want >= 0 { want as usize } else { n };
                         continue;
                     }
                     sync!();
-                    if let Some(n) = self.do_return(cur_base!() + a as usize, n) {
+                    if let Some(n) = self.do_return(fr.cur_base() + a as usize, n) {
                         return Ok(Flow::Ret(n));
                     }
                     resync!();
@@ -2413,9 +2400,9 @@ impl Interp {
 
                 // -- Loops and branches --
                 BCOp::FORI => {
-                    let idx = reg!(a + FORL_IDX);
-                    let stop = reg!(a + FORL_STOP);
-                    let step = reg!(a + FORL_STEP);
+                    let idx = fr.reg(a + FORL_IDX);
+                    let stop = fr.reg(a + FORL_STOP);
+                    let step = fr.reg(a + FORL_STEP);
                     if let (Some(i), Some(s), Some(st)) = (
                         for_number(self.l(), idx),
                         for_number(self.l(), stop),
@@ -2423,10 +2410,10 @@ impl Interp {
                     ) {
                         // LuaJIT coerces strings to numbers and writes the
                         // converted values back for the loop comparisons.
-                        setreg!(a + FORL_IDX, LuaValue::number(i));
-                        setreg!(a + FORL_STOP, LuaValue::number(s));
-                        setreg!(a + FORL_STEP, LuaValue::number(st));
-                        setreg!(a + FORL_EXT, LuaValue::number_raw(i));
+                        fr.set(a + FORL_IDX, LuaValue::number(i));
+                        fr.set(a + FORL_STOP, LuaValue::number(s));
+                        fr.set(a + FORL_STEP, LuaValue::number(st));
+                        fr.set(a + FORL_EXT, LuaValue::number_raw(i));
                         let enter = if st >= 0.0 { i <= s } else { i >= s };
                         if !enter {
                             jump!(ins);
@@ -2441,18 +2428,18 @@ impl Interp {
                 BCOp::JFORI => {
                     // FORI semantics; on loop entry go straight into the
                     // trace whose number sits in the JFORL at the target.
-                    let idx = reg!(a + FORL_IDX);
-                    let stop = reg!(a + FORL_STOP);
-                    let step = reg!(a + FORL_STEP);
+                    let idx = fr.reg(a + FORL_IDX);
+                    let stop = fr.reg(a + FORL_STOP);
+                    let step = fr.reg(a + FORL_STEP);
                     if let (Some(i), Some(s), Some(st)) = (
                         for_number(self.l(), idx),
                         for_number(self.l(), stop),
                         for_number(self.l(), step),
                     ) {
-                        setreg!(a + FORL_IDX, LuaValue::number(i));
-                        setreg!(a + FORL_STOP, LuaValue::number(s));
-                        setreg!(a + FORL_STEP, LuaValue::number(st));
-                        setreg!(a + FORL_EXT, LuaValue::number_raw(i));
+                        fr.set(a + FORL_IDX, LuaValue::number(i));
+                        fr.set(a + FORL_STOP, LuaValue::number(s));
+                        fr.set(a + FORL_STEP, LuaValue::number(st));
+                        fr.set(a + FORL_EXT, LuaValue::number_raw(i));
                         let enter = if st >= 0.0 { i <= s } else { i >= s };
                         if enter {
                             sync!();
@@ -2510,15 +2497,15 @@ impl Interp {
                 BCOp::JFORL => {
                     // IFORL semantics; on loop-taken enter the compiled
                     // trace (the dasc VMs dispatch to BC_JLOOP).
-                    let i = reg!(a + FORL_IDX).num();
-                    let s = reg!(a + FORL_STOP).num();
-                    let st = reg!(a + FORL_STEP).num();
+                    let i = fr.reg(a + FORL_IDX).num();
+                    let s = fr.reg(a + FORL_STOP).num();
+                    let st = fr.reg(a + FORL_STEP).num();
                     let ni = i + st;
                     let cont = if st >= 0.0 { ni <= s } else { ni >= s };
                     if cont {
                         let nv = LuaValue::number_raw(ni);
-                        setreg!(a + FORL_IDX, nv);
-                        setreg!(a + FORL_EXT, nv);
+                        fr.set(a + FORL_IDX, nv);
+                        fr.set(a + FORL_EXT, nv);
                         sync!();
                         let r = trace_exec(self.l(), self.base, bc_d(ins));
                         self.sp = self.l().stack.as_mut_ptr();
@@ -2588,9 +2575,9 @@ impl Interp {
                 BCOp::JITERL => {
                     // ITERL semantics; on loop-back enter the compiled
                     // trace (D holds the trace number, not a jump).
-                    let first = reg!(a);
+                    let first = fr.reg(a);
                     if !first.is_nil() {
-                        setreg!(a - 1, first);
+                        fr.set(a - 1, first);
                         sync!();
                         let r = trace_exec(self.l(), self.base, bc_d(ins));
                         self.sp = self.l().stack.as_mut_ptr();
@@ -2606,55 +2593,21 @@ impl Interp {
                     }
                 }
                 BCOp::VARG => {
-                    let link = unsafe { (*bp.sub(1)).to_bits() };
-                    if link & FRAME_TYPE_MASK == FRAME_VARG {
-                        let delta = (link >> 3) as usize;
-                        if delta < 2 {
-                            self.multres = 0;
-                        } else {
-                            let numparams = self.proto().numparams as usize;
-                            let nvarg = (delta - 2).saturating_sub(numparams);
-                            let dst = a as usize;
-                            let need = cur_base!() + dst + nvarg + 8;
-                            if need > self.l().stack.len() {
-                                sync!();
-                                self.l().stack_ensure(need);
-                                self.sp = self.l().stack.as_mut_ptr();
-                                resync!();
-                            }
-                            let src = unsafe { bp.sub(delta).add(numparams) };
-                            if bc_b(ins) == 0 {
-                                for i in 0..nvarg {
-                                    unsafe { *bp.add(dst + i) = *src.add(i) };
-                                }
-                                self.multres = nvarg;
-                                self.l().top = cur_base!() + dst + nvarg;
-                            } else {
-                                let want = (bc_b(ins) - 1) as usize;
-                                for i in 0..want {
-                                    unsafe {
-                                        *bp.add(dst + i) = if i < nvarg {
-                                            *src.add(i)
-                                        } else {
-                                            LuaValue::NIL
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    sync!();
+                    self.op_varg(a, bc_b(ins));
+                    resync!();
                 }
 
                 // -- Bitwise ops (Lua 5.3+), lj_num2bit / lj_vm_tobit --
                 BCOp::BNOT => {
-                    let v = reg!(bc_d(ins));
+                    let v = fr.reg(bc_d(ins));
                     if let Some(bits) = cdata_u64(self.l(), v) {
                         let is_ull = cdata_is_ull(v);
                         let r = make_cdata_result(self.l(), !bits, is_ull);
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else if v.is_number() {
                         let n = num2bit(v.num());
-                        setreg!(a, LuaValue::number(!n as f64));
+                        fr.set(a, LuaValue::number(!n as f64));
                     } else {
                         sync!();
                         let l = self.l();
@@ -2663,8 +2616,8 @@ impl Interp {
                     }
                 }
                 BCOp::BAND => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     let x_cd = cdata_u64(self.l(), xv);
                     let y_cd = cdata_u64(self.l(), yv);
                     if x_cd.is_some() || y_cd.is_some() {
@@ -2672,11 +2625,11 @@ impl Interp {
                         let y = y_cd.unwrap_or_else(|| num2bit(yv.num()) as u64);
                         let is_ull = cdata_is_ull(xv) || cdata_is_ull(yv);
                         let r = make_cdata_result(self.l(), x & y, is_ull);
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else if xv.is_number() && yv.is_number() {
                         let x = num2bit(xv.num());
                         let y = num2bit(yv.num());
-                        setreg!(a, LuaValue::number((x & y) as f64));
+                        fr.set(a, LuaValue::number((x & y) as f64));
                     } else {
                         sync!();
                         let l = self.l();
@@ -2685,8 +2638,8 @@ impl Interp {
                     }
                 }
                 BCOp::BOR => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     let x_cd = cdata_u64(self.l(), xv);
                     let y_cd = cdata_u64(self.l(), yv);
                     if x_cd.is_some() || y_cd.is_some() {
@@ -2694,11 +2647,11 @@ impl Interp {
                         let y = y_cd.unwrap_or_else(|| num2bit(yv.num()) as u64);
                         let is_ull = cdata_is_ull(xv) || cdata_is_ull(yv);
                         let r = make_cdata_result(self.l(), x | y, is_ull);
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else if xv.is_number() && yv.is_number() {
                         let x = num2bit(xv.num());
                         let y = num2bit(yv.num());
-                        setreg!(a, LuaValue::number((x | y) as f64));
+                        fr.set(a, LuaValue::number((x | y) as f64));
                     } else {
                         sync!();
                         let l = self.l();
@@ -2707,8 +2660,8 @@ impl Interp {
                     }
                 }
                 BCOp::BXOR => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     let x_cd = cdata_u64(self.l(), xv);
                     let y_cd = cdata_u64(self.l(), yv);
                     if x_cd.is_some() || y_cd.is_some() {
@@ -2716,11 +2669,11 @@ impl Interp {
                         let y = y_cd.unwrap_or_else(|| num2bit(yv.num()) as u64);
                         let is_ull = cdata_is_ull(xv) || cdata_is_ull(yv);
                         let r = make_cdata_result(self.l(), x ^ y, is_ull);
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else if xv.is_number() && yv.is_number() {
                         let x = num2bit(xv.num());
                         let y = num2bit(yv.num());
-                        setreg!(a, LuaValue::number((x ^ y) as f64));
+                        fr.set(a, LuaValue::number((x ^ y) as f64));
                     } else {
                         sync!();
                         let l = self.l();
@@ -2729,20 +2682,20 @@ impl Interp {
                     }
                 }
                 BCOp::BSHL => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     let x_cd = cdata_u64(self.l(), xv);
                     let y_cd = cdata_u64(self.l(), yv);
                     if let Some(x) = x_cd {
                         let y = y_cd.unwrap_or_else(|| num2bit(yv.num()) as u64) & 63;
                         let is_ull = cdata_is_ull(xv);
                         let r = make_cdata_result(self.l(), x << y, is_ull);
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else if xv.is_number() && (yv.is_number() || y_cd.is_some()) {
                         let x = num2bit(xv.num());
                         let y = y_cd
                             .map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
-                        setreg!(a, LuaValue::number((x << y) as f64));
+                        fr.set(a, LuaValue::number((x << y) as f64));
                     } else {
                         sync!();
                         let l = self.l();
@@ -2751,20 +2704,20 @@ impl Interp {
                     }
                 }
                 BCOp::BSHR => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     let x_cd = cdata_u64(self.l(), xv);
                     let y_cd = cdata_u64(self.l(), yv);
                     if let Some(x) = x_cd {
                         let y = y_cd.unwrap_or_else(|| num2bit(yv.num()) as u64) & 63;
                         let is_ull = cdata_is_ull(xv);
                         let r = make_cdata_result(self.l(), x >> y, is_ull);
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else if xv.is_number() && (yv.is_number() || y_cd.is_some()) {
                         let x = num2bit(xv.num());
                         let y = y_cd
                             .map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
-                        setreg!(a, LuaValue::number((((x as u32) >> y) as i32) as f64));
+                        fr.set(a, LuaValue::number((((x as u32) >> y) as i32) as f64));
                     } else {
                         sync!();
                         let l = self.l();
@@ -2773,8 +2726,8 @@ impl Interp {
                     }
                 }
                 BCOp::BSAR => {
-                    let xv = reg!(bc_b(ins));
-                    let yv = reg!(bc_c(ins));
+                    let xv = fr.reg(bc_b(ins));
+                    let yv = fr.reg(bc_c(ins));
                     let x_cd = cdata_u64(self.l(), xv);
                     let y_cd = cdata_u64(self.l(), yv);
                     if let Some(x) = x_cd {
@@ -2782,12 +2735,12 @@ impl Interp {
                         let is_ull = cdata_is_ull(xv);
                         let x_signed = x as i64;
                         let r = make_cdata_result(self.l(), (x_signed >> y) as u64, is_ull);
-                        setreg!(a, r);
+                        fr.set(a, r);
                     } else if xv.is_number() && (yv.is_number() || y_cd.is_some()) {
                         let x = num2bit(xv.num());
                         let y = y_cd
                             .map_or_else(|| (num2bit(yv.num()) as u32) & 31, |v| (v as u32) & 31);
-                        setreg!(a, LuaValue::number((x >> y) as f64));
+                        fr.set(a, LuaValue::number((x >> y) as f64));
                     } else {
                         sync!();
                         let l = self.l();
@@ -2870,8 +2823,7 @@ impl Interp {
     #[cold]
     fn trace_exit_frame(&mut self, baseslot: usize) {
         self.base += baseslot - 2;
-        let bp = unsafe { self.sp.add(self.base) };
-        self.reload_at(bp);
+        self.reload_at(Frame::new(self.sp, self.base));
         self.l().top = self.base + self.proto().framesize as usize;
         self.l().frame_top = self.l().top;
     }
@@ -2933,6 +2885,90 @@ impl Interp {
         Ok(())
     }
 
+    // -- Cold opcode bodies ---------------------------------------------
+    // The interpreter arms for these opcodes are inherently cold (they
+    // allocate, re-enter the VM or walk frames), so their bodies live in
+    // `#[cold]` methods instead of being inlined into the dispatch. The
+    // caller is always synced (`sync!` before, `resync!` after).
+
+    /// BC_CAT: string concatenation through the `__concat` metamethod path.
+    #[cold]
+    fn op_cat(&mut self, b: u32, c: u32) -> LuaResult<LuaValue> {
+        self.gc_check()?;
+        self.meta_cat(b, c)
+    }
+
+    /// BC_TDUP: clone the template table in `kgc[d]`.
+    #[cold]
+    fn op_tdup(&mut self, d: u32) -> LuaResult<LuaValue> {
+        self.gc_check()?;
+        let templ = match &self.proto().kgc[d as usize] {
+            KGc::Table(t) => t.dup(),
+            KGc::TableRef(t) => t.as_ref().dup(),
+            _ => unreachable!("expected template table"),
+        };
+        Ok(LuaValue::table(self.l().heap().alloc_table(templ)))
+    }
+
+    /// BC_UCLO: close open upvalues at or above the register `a`.
+    #[cold]
+    fn op_uclo(&mut self, a: u32) {
+        self.close_upvals(self.base + a as usize);
+    }
+
+    /// BC_FNEW: allocate a new closure from the prototype in `kgc[d]`.
+    #[cold]
+    fn op_fnew(&mut self, d: u32) -> LuaResult<LuaValue> {
+        self.gc_check()?;
+        Ok(self.new_closure(d))
+    }
+
+    /// BC_VARG: copy the varargs into `a..`, per BC_VARG. The varargs sit
+    /// between the vararg frame and the frame below it; their extent is
+    /// recovered from the FRAME_VARG delta, LuaJIT-style.
+    #[cold]
+    fn op_varg(&mut self, a: u32, b: u32) {
+        let base = self.base;
+        let link = self.at(base - 1).to_bits();
+        if link & FRAME_TYPE_MASK != FRAME_VARG {
+            return;
+        }
+        let delta = (link >> 3) as usize;
+        if delta < 2 {
+            self.multres = 0;
+            return;
+        }
+        let numparams = self.proto().numparams as usize;
+        let nvarg = (delta - 2).saturating_sub(numparams);
+        let dst = a as usize;
+        let need = base + dst + nvarg + 8;
+        if need > self.l().stack.len() {
+            let l = self.l();
+            l.stack_ensure(need);
+            self.sp = l.stack.as_mut_ptr();
+        }
+        let src_base = base - delta + numparams;
+        if b == 0 {
+            for i in 0..nvarg {
+                self.set_at(base + dst + i, self.at(src_base + i));
+            }
+            self.multres = nvarg;
+            self.l().top = base + dst + nvarg;
+        } else {
+            let want = (b - 1) as usize;
+            for i in 0..want {
+                self.set_at(
+                    base + dst + i,
+                    if i < nvarg {
+                        self.at(src_base + i)
+                    } else {
+                        LuaValue::NIL
+                    },
+                );
+            }
+        }
+    }
+
     #[cold]
     #[allow(dead_code)]
     fn len_op(&self, v: LuaValue) -> LuaResult<LuaValue> {
@@ -2951,7 +2987,7 @@ impl Interp {
     #[cold]
     fn tsetm(&mut self, a: u32, d: u32) -> LuaResult<()> {
         let t = self.at(self.base + a as usize - 1);
-        let base_key = unsafe { *self.knp.add(d as usize) } as i64 - (1i64 << 52);
+        let base_key = self.knum(d).num() as i64 - (1i64 << 52);
         let tab = match t.as_table() {
             Some(t) => t,
             None => {

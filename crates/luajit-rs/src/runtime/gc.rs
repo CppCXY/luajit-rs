@@ -589,11 +589,6 @@ impl<T> GcPtr<T> {
         gc_header(self.0).is_white()
     }
 
-    /// `isfinalized`: the `__gc` finalizer already ran (see `Finalizable`).
-    pub(crate) fn is_finalized(self) -> bool {
-        gc_header(self.0).is_finalized()
-    }
-
     pub fn set_marked(self) {
         let h = gc_header(self.0);
         h.marked.set(true);
