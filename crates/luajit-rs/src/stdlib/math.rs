@@ -133,6 +133,9 @@ fn math_atan2(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn math_fmod(l: &mut LuaState) -> LuaResult<i32> {
+    if std::env::var("LUARS_DBGCO").is_ok() {
+        eprintln!("FMOD arg0={:#x} arg1={:#x}", arg(l, 0).to_bits(), arg(l, 1).to_bits());
+    }
     let x = match arg(l, 0).as_number() {
         Some(n) => n,
         None => return Err(err_bad_arg_type(l, 1, "math.fmod", "number", arg(l, 0))),

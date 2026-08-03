@@ -109,11 +109,16 @@ impl Default for GcHeap {
 }
 
 impl GcHeap {
-    /// Track an allocation and accumulate GC debt.
+    /// Track an allocation and accumulate GC debt. Every allocation
+    /// accrues debt unconditionally, so `lj_gc_check`'s `debt > step`
+    /// guard fires even while `live` is far below `threshold` (e.g. a
+    /// tight loop allocating only strings: without the unconditional
+    /// accrual the collector never wakes up and weak tables are never
+    /// cleared).
     fn account_alloc(&mut self, size: usize) {
+        self.debt += size;
         let live = self.total + self.strings.bytes() + self.table_extra;
         if live >= self.threshold {
-            self.debt += size;
             // Advance threshold proportionally (LuaJIT's GC_PAUSE: 200%).
             // This avoids re-triggering the GCSTEP guard on every allocation
             // while ensuring the next collection triggers at ~2x memory.

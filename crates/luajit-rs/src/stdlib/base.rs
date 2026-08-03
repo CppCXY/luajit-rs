@@ -81,6 +81,8 @@ pub fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
         b"function"
     } else if v.is_cdata() {
         b"cdata"
+    } else if v.is_thread() {
+        b"thread"
     } else {
         b"userdata"
     };

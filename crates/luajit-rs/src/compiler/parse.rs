@@ -279,10 +279,19 @@ pub struct Parser<'a> {
     level: u32,
     fr2: u32,
     fs: Vec<FuncState>,
+    /// Interned chunk source name, propagated to every proto so error
+    /// messages from nested functions report the real file (Lua's
+    /// `luaO_chunkid` behaviour).
+    chunk_sid: Option<StrId>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: Vec<u8>, chunkname: String, strs: &'a mut Interner) -> Parser<'a> {
+        let chunk_sid = if chunkname.is_empty() {
+            None
+        } else {
+            Some(strs.intern(chunkname.as_bytes()))
+        };
         Parser {
             ls: LexState::new(src, chunkname, strs),
             vstack: Vec::new(),
@@ -291,6 +300,7 @@ impl<'a> Parser<'a> {
             level: 0,
             fr2: 1,
             fs: Vec::new(),
+            chunk_sid,
         }
     }
 
@@ -1820,7 +1830,7 @@ impl<'a> Parser<'a> {
             numline,
             uvnames,
             varnames,
-            source: None,
+            source: fs.source,
         }
     }
 
@@ -1840,7 +1850,14 @@ impl<'a> Parser<'a> {
 
     fn fs_init(&mut self) {
         let vbase = self.vstack.len();
-        self.fs.push(FuncState::new(vbase));
+        // Nested functions inherit the chunk source; the outermost one
+        // gets it from the chunkname.
+        let source = if self.fs.is_empty() {
+            self.chunk_sid
+        } else {
+            self.cur().source
+        };
+        self.fs.push(FuncState::new(vbase, source));
     }
 
     // -- Expressions ---------------------------------------------------------
@@ -2430,12 +2447,33 @@ impl<'a> Parser<'a> {
     }
 
     fn expr_cond(&mut self) -> BCPos {
+        let freg = self.cur().freereg;
         let mut v = ExpDesc::init(VVoid, 0);
         self.expr(&mut v, 0);
         if v.k == VKNil {
             v.k = VKFalse;
         }
         self.bcemit_branch_t(&mut v);
+        // The condition's temp slots are dead after the branch. Clear
+        // them (and restore the register allocator) so a GC triggered
+        // later in the enclosing block cannot keep values alive through
+        // stale registers — e.g. a weak-table value read by the loop
+        // condition must not survive in a dead register slot and defeat
+        // weak-table clearing. Sits on the taken path, so loops re-run
+        // it every iteration.
+        let freereg = self.cur().freereg;
+        // The condition value itself lives in a register (`VNonReloc`)
+        // that `freereg` no longer accounts for, so extend the cleared
+        // range to cover it. Locals (VLocal) sit below `freg` and are
+        // skipped.
+        let mut to = freereg;
+        if v.k == VNonReloc {
+            to = to.max(v.info as u32 + 1);
+        }
+        if to > freg {
+            self.bcemit_nil(freg, to - freg);
+            self.cur_mut().freereg = freg;
+        }
         v.f
     }
 

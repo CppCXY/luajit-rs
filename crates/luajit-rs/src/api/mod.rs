@@ -101,6 +101,9 @@ pub fn lual_loadfile(l: &mut LuaState, path: &str) -> LuaResult<()> {
                 Ok(())
             }
             Err(msg) => {
+                if std::env::var("LUARS_DBGLOAD").is_ok() {
+                    eprintln!("DBGLOAD load failed: {:?}", msg);
+                }
                 lua_pushstring(l, msg.as_bytes());
                 Err(LuaError::Runtime)
             }

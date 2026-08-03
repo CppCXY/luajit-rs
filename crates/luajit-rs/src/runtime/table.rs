@@ -195,6 +195,14 @@ impl LuaTable {
     /// resolved in the atomic phase by `clear_weak_entries`).
     pub(crate) fn gc_traverse(&self, mut mark: impl FnMut(LuaValue)) -> u8 {
         let weak = self.weak_mode();
+        if std::env::var("LUARS_DBGGC3").is_ok() {
+            eprintln!(
+                "TRAVERSE {:#x} weak={:#x} hpart={}",
+                self as *const Self as usize,
+                weak,
+                self.has_hpart()
+            );
+        }
         if let Some(mt) = self.metatable {
             mark(LuaValue::table(mt));
         }
@@ -253,9 +261,14 @@ impl LuaTable {
                 }
             }
         }
+        if std::env::var("LUARS_DBGGC3").is_ok() && mode == 0 {
+            eprintln!(
+                "WEAKMODE_ZERO scan={:?}",
+                mt.as_ref().scan_str_key(b"__mode")
+            );
+        }
         mode
     }
-
     /// Scan the hash part for a string key (used for GC-time metatable
     /// lookups such as `__mode` / `__gc`, where no interner is available).
     /// The metatable is a strong table, so its string keys are alive and
@@ -282,10 +295,38 @@ impl LuaTable {
     /// key stays in the node, per LuaJIT's dead-key policy). Strings are
     /// never weak references: they are marked and kept.
     pub(crate) fn clear_weak_entries(&mut self, mode: u8, cw: u8) {
+        if std::env::var("LUARS_DBGGC").is_ok() {
+            eprintln!(
+                "CLEARWEAK mode={:#x} asize={} array[0]={:?}",
+                mode,
+                self.asize,
+                self.array.first().map(|v| v.itype())
+            );
+        }
         if mode & gc::WEAKVAL != 0 {
             for tv in self.array.iter_mut() {
                 if gc::may_clear(*tv, true, cw) {
                     *tv = LuaValue::NIL;
+                }
+            }
+        }
+        if std::env::var("LUARS_DBGGC").is_ok() {
+            for (i, tv) in self.array.iter().enumerate() {
+                if !tv.is_nil() {
+                    let (marked, bits) = if let Some(p) = tv.as_table() {
+                        p.mark_bits()
+                    } else {
+                        (false, 0)
+                    };
+                    eprintln!(
+                        "CLEARWEAKARR[{}] tv={:?} itype={} white={} marked={} bits={:#x}",
+                        i,
+                        tv,
+                        tv.itype(),
+                        gc::may_clear(*tv, true, cw),
+                        marked,
+                        bits
+                    );
                 }
             }
         }
