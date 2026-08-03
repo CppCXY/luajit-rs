@@ -77,7 +77,7 @@ fn cont_mm_name(l: &LuaState, slot: usize) -> Option<&'static str> {
 /// the caller's return PC, the CALL instruction before it holds the
 /// callee register, and the local variable debug info maps it to a name.
 fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, String)> {
-    use crate::bc::{BCIns, BCOp, bc_a, bc_b, bc_d, bc_op};
+    use crate::bc::{BCIns, BCOp, bc_a, bc_c, bc_d, bc_op};
     if slot < 2 {
         return None;
     }
@@ -142,14 +142,18 @@ fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, Stri
         }
         match op {
             BCOp::MOV => {
-                slot = bc_b(ins);
+                // This VM encodes MOV's source in D (bits 16-31), like the
+                // other A/D instructions (bcins_ad).
+                slot = bc_d(ins);
             }
             BCOp::GGET => {
                 let name = kgc_str(l, &pt.kgc, bc_d(ins) as usize)?;
                 return Some(("global", name));
             }
             BCOp::TGETS => {
-                let name = kgc_str(l, &pt.kgc, bc_d(ins) as usize)?;
+                // TGETS A B C: the key constant index is in C (bits
+                // 16-23), not D.
+                let name = kgc_str(l, &pt.kgc, bc_c(ins) as usize)?;
                 return Some(("field", name));
             }
             BCOp::TGETV => {
@@ -172,11 +176,12 @@ fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, Stri
         }
     }
     // The callee is a local variable: pick the variable whose lifetime
-    // contains the call and starts latest (nearest definition).
+    // contains the call and starts latest (nearest definition). Uses the
+    // register the scan resolved to (following MOVs), not the CALL's A.
     let mut best: Option<(usize, &str, String)> = None;
     for (reg, spc, epc, name) in &pt.varnames {
         let end = if *epc == 0 { pt.bc.len() as u32 } else { *epc };
-        if *reg as u32 == callee_reg && *spc <= call_pc && call_pc <= end {
+        if *reg as u32 == slot && *spc <= call_pc && call_pc <= end {
             let spc = *spc as usize;
             if best.as_ref().is_none_or(|b| spc > b.0) {
                 best = Some((spc, "local", name.clone()));
@@ -798,6 +803,18 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
             break;
         }
         skipped += 1;
+    }
+    // An error raised inside a metamethod or protected-call frame leaves
+    // that frame on the stack *above* the handler (no stack unwinding);
+    // start the walk at the recorded raise frame so it is still shown
+    // (LuaJIT: the raise frame is the first frame of the traceback).
+    if let Some(rslot) = l.err_trace_slot
+        && rslot >= 2
+        && rslot < l.stack.len()
+        && l.stack[rslot - 2].as_func().is_some()
+    {
+        slot = rslot;
+        l.err_trace_slot = None;
     }
     let mut first = true;
     let mut first_lua = true;

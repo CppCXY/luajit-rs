@@ -79,6 +79,7 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
     env[0] = heap_ptr as u64;
     JIT_HEAP.with(|c| c.set(heap_ptr));
     let hotexit = g.jit.param(JitParam::HotExit) as u8;
+    let tryside = g.jit.param(JitParam::TrySide) as u8;
     let mut current = traceno;
     // Current frame base: recursive traces (Uprec/Tailrec) and Root
     // links into call frames shift it as frames are pushed on trace.
@@ -224,14 +225,38 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             continue;
         }
         // Exit accounting (lj_trace_exit -> trace_hotside): count taken
-        // exits and start recording a side trace on a hot one.
+        // exits and start recording a side trace on a hot one. Guard
+        // exits (non-final snapshots, e.g. a closure-identity guard that
+        // fails on every pass because the closure is re-created each
+        // iteration) that burned `hotexit + tryside` attempts flush the
+        // trace and blacklist the loop start, so the loop runs
+        // interpreted instead of thrashing record/compile cycles. The
+        // loop-end fall-through (the final snapshot) is never flushed:
+        // its side traces stitch the continuation back to the loop.
+        let is_final_snap = exitno + 1 >= tr.snap.len();
         let snap = &mut tr.snap[exitno];
         if snap.count != SNAPCOUNT_DONE {
             snap.count += 1;
+            if std::env::var("LUARS_DBGEXIT").is_ok() && snap.count <= 16 {
+                eprintln!(
+                    "EXIT tr={} exitno={} final={} count={}",
+                    current,
+                    exitno,
+                    is_final_snap,
+                    snap.count
+                );
+            }
             if snap.count >= hotexit {
-                use crate::jit::trace;
-
-                trace::trace_hot_side(l, cbase, current, exitno);
+                if snap.count > hotexit + tryside && !is_final_snap {
+                    use crate::jit::trace;
+                    if std::env::var("LUARS_DBGEXIT").is_ok() {
+                        eprintln!("FLUSH tr={}", current);
+                    }
+                    trace::trace_flush_blacklist(l, current);
+                } else if snap.count <= hotexit + tryside {
+                    use crate::jit::trace;
+                    trace::trace_hot_side(l, cbase, current, exitno);
+                }
             }
         }
         break ExitResult {

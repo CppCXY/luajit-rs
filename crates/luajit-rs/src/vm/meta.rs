@@ -275,11 +275,14 @@ impl Interp {
             loop {
                 let mm = if (op & 2) != 0 { MM::Le } else { MM::Lt };
                 let g = self.l().global();
-                let mo = meta_lookup(g, o1, mm);
-                // LuaJIT lj_meta_comp: both operands must carry the
-                // *same* metamethod, otherwise the order errors.
-                let mo2 = meta_lookup(g, o2, mm);
-                if mo.is_nil() || !obj_equal(mo, mo2) {
+                // LuaJIT 2.1 (LJ_52) lj_meta_comp: the metamethod of the
+                // first operand wins; only when both lack it does the
+                // order error (mixed metamethods compare fine).
+                let mut mo = meta_lookup(g, o1, mm);
+                if mo.is_nil() {
+                    mo = meta_lookup(g, o2, mm);
+                }
+                if mo.is_nil() {
                     if (op & 2) != 0 {
                         // MM_le not found: retry with MM_lt, swapped
                         // (i.e. `not (o2 < o1)`).

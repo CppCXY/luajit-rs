@@ -210,12 +210,18 @@ fn loop_unroll(rec: &mut Record) -> Result<(), TraceError> {
         // Re-emit the substituted instruction to the FOLD/CSE pipeline.
         // SLOADs instead forward the recorder's current slot value (the
         // LJFOLD SLOAD -> fwd_sload rule): this is what turns stack slots
-        // into loop-carried SSA values.
+        // into loop-carried SSA values. A slot invalidated during
+        // recording (e.g. an upvalue write aliased it, USET) must NOT
+        // forward: re-emit a fresh SLOAD so the loop re-reads the slot.
         let t = ir.t();
         let r = if ir.op() == IROp::SLOAD {
             debug_assert!(ir.op2 as u32 & IRSLOAD_FRAME == 0);
             let tr = rec.slot[ir.op1 as usize];
-            if tr != 0 { tref_ref(tr) } else { ins }
+            if tr != 0 {
+                tref_ref(tr)
+            } else {
+                tref_ref(rec.cur.ir.emitir(ir.ot & !(IRT_ISPHI as u16), ir.op1 as IRRef, ir.op2 as IRRef)?)
+            }
         } else {
             tref_ref(rec.cur.ir.emitir(ir.ot & !(IRT_ISPHI as u16), op1, op2)?)
         };

@@ -421,6 +421,11 @@ pub struct LuaState {
     /// line on the failed frame (the frame link alone only shows the
     /// caller's call site).
     pub err_raise_pc: Option<(u64, usize)>,
+    /// The args-base slot of the frame where the current runtime error was
+    /// raised (alongside `err_raise_pc`). Errors in metamethod or
+    /// protected-call frames leave those frames on the stack above the
+    /// handler; traceback starts its walk here so they are still shown.
+    pub err_trace_slot: Option<usize>,
     /// While a metamethod invoked through the cold execute-recursion
     /// paths (e.g. `__concat`) is running, the (name, function bits) of
     /// the active metamethod — debug.getinfo uses it to report
@@ -488,6 +493,7 @@ impl LuaState {
             errval: LuaValue::NIL,
             err_raise_slot: 0,
             err_raise_pc: None,
+            err_trace_slot: None,
             mmname: None,
             nyield: 0,
             status: if is_main {
@@ -677,6 +683,7 @@ impl LuaState {
                         // Remember the raise site so the traceback can
                         // report the failed frame's error line.
                         self.err_raise_pc = Some((func.to_bits(), pc));
+                        self.err_trace_slot = Some(slot);
                         let line = if pc < pt.lines.len() {
                             pt.lines[pc] as usize
                         } else {

@@ -208,9 +208,13 @@ pub fn lib_next(l: &mut LuaState) -> LuaResult<i32> {
         Some(t) => t,
         None => return Err(err_bad_arg_type(l, 1, "next", "table", arg(l, 0))),
     };
-    // Lua 5.1 allows deleting the current key during traversal (the node
-    // stays, only the value is nil); the strict "invalid key" check would
-    // break such loops.
+    // LuaJIT's lj_tab_next raises for a key that is not (or no longer) a
+    // key of the table. A key deleted mid-traversal stays findable until
+    // a rehash reclaims its node, so the strict check does not break
+    // `for k in pairs(t) do t[k] = nil end` loops.
+    if !k.is_nil() && !tab.as_ref().is_valid_key(k) {
+        return Err(l.runtime_error(b"invalid key to 'next'"));
+    }
     match tab.as_ref().next(k) {
         Some((nk, nv)) => {
             pushv(l, &[nk, nv]);

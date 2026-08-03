@@ -86,7 +86,9 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
 
 /// Invoke the debug hook (`debug.sethook`) with `(event[, line])`.
 /// The hook runs on a scratch area above `top`; the stack is restored
-/// afterwards. Hooks don't re-enter themselves.
+/// afterwards. Hooks don't re-enter themselves. Cold: only ever reached
+/// when a hook is installed.
+#[cold]
 pub fn call_hook(l: &mut LuaState, event: &str, line: Option<i32>) -> LuaResult<()> {
     if l.hook.is_nil() || l.hook_active {
         return Ok(());
@@ -128,7 +130,10 @@ pub const HOOKMASK_RET: u8 = 0x04;
 pub const HOOKMASK_COUNT: u8 = 0x08;
 
 /// Check line/count hooks at an instruction boundary. Returns `true` if a
-/// hook ran (the caller must resync its base/ip pointers).
+/// hook ran (the caller must resync its base/ip pointers). The hookmask
+/// test itself is inline in the dispatch (two field loads); everything
+/// beyond it is cold.
+#[cold]
 pub fn hook_check(l: &mut LuaState, line: u32) -> LuaResult<bool> {
     let mask = l.hookmask;
     if mask == 0 || l.hook_active {
@@ -871,6 +876,17 @@ impl Interp {
     #[inline(always)]
     fn ret_call_ins(&self, ret_ip: *const BCIns) -> BCIns {
         unsafe { *ret_ip.sub(1) }
+    }
+
+    /// Run a "call"/"return" hook event from a dispatch arm (cold). The
+    /// caller must have synced the interpreter locals (`sync!`); the hook
+    /// may grow the stack, so `sp` is refreshed for the caller's
+    /// `resync!`.
+    #[cold]
+    fn hook_event(&mut self, event: &str) -> LuaResult<()> {
+        call_hook(self.l(), event, None)?;
+        self.sp = self.l().stack.as_mut_ptr();
+        Ok(())
     }
 
     /// `mmcall` + FRAME_CONT (lj_meta.c's `mmcall` + `vm_call_dispatch_f`):
@@ -2093,8 +2109,7 @@ impl Interp {
                     // "call" hook event (not for tail calls).
                     if self.l().hookmask & HOOKMASK_CALL != 0 && !self.l().hook_active {
                         sync!();
-                        call_hook(self.l(), "call", None)?;
-                        self.sp = self.l().stack.as_mut_ptr();
+                        self.hook_event("call")?;
                         resync!();
                     }
                     // Fast path (LuaJIT's ins_call): a Lua callee switches
@@ -2264,7 +2279,7 @@ impl Interp {
                 BCOp::RET0 => {
                     if self.l().hookmask & HOOKMASK_RET != 0 && !self.l().hook_active {
                         sync!();
-                        call_hook(self.l(), "return", None)?;
+                        self.hook_event("return")?;
                         resync!();
                     }
                     if let Some(want) = self.ret_fast(fr.bp()) {
@@ -2302,7 +2317,7 @@ impl Interp {
                 BCOp::RET1 => {
                     if self.l().hookmask & HOOKMASK_RET != 0 && !self.l().hook_active {
                         sync!();
-                        call_hook(self.l(), "return", None)?;
+                        self.hook_event("return")?;
                         resync!();
                     }
                     if let Some(want) = self.ret_fast(fr.bp()) {
@@ -2339,7 +2354,7 @@ impl Interp {
                     let n = bc_d(ins) as usize - 1;
                     if self.l().hookmask & HOOKMASK_RET != 0 && !self.l().hook_active {
                         sync!();
-                        call_hook(self.l(), "return", None)?;
+                        self.hook_event("return")?;
                         resync!();
                     }
                     if let Some((wbase, want, ret_ip, ca)) = self.ret_fast_n(fr.bp()) {

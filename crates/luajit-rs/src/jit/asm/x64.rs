@@ -649,6 +649,24 @@ impl<'a> Asm<'a> {
             self.code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
         }
 
+        if std::env::var("LUAJIT_RS_MCDUMP").is_ok() {
+            eprintln!(
+                "=== X64 MCODE tr={} inner={} len={} ===",
+                self.tr.traceno,
+                inner,
+                self.code.len()
+            );
+            for (i, b) in self.code.chunks(16).enumerate() {
+                eprintln!(
+                    "{:04x}: {}",
+                    i * 16,
+                    b.iter()
+                        .map(|x| format!("{x:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+        }
         let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
         area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code);
         if !area.protect_exec() {

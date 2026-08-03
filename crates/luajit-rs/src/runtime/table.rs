@@ -454,6 +454,12 @@ impl LuaTable {
         !0
     }
 
+    /// Whether `key` is a key of the table (or was, until a rehash
+    /// reclaimed its dead node). `lj_tab_keyindex != LJ_TNIL`.
+    pub(crate) fn is_valid_key(&self, key: LuaValue) -> bool {
+        self.key_index(key) != !0
+    }
+
     /// The next key/value pair after `key` (`lj_tab_next`). `nil` starts the
     /// traversal; `None` ends it.
     pub fn next(&self, key: LuaValue) -> Option<(LuaValue, LuaValue)> {
