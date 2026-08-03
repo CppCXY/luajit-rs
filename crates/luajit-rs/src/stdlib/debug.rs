@@ -191,7 +191,9 @@ fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, Stri
 
 fn kgc_str(l: &LuaState, kgc: &[crate::proto::KGc], idx: usize) -> Option<String> {
     match kgc.get(idx) {
-        Some(crate::proto::KGc::Str(sid)) => Some(String::from_utf8_lossy(l.str_static(*sid)).into_owned()),
+        Some(crate::proto::KGc::Str(sid)) => {
+            Some(String::from_utf8_lossy(l.str_static(*sid)).into_owned())
+        }
         _ => None,
     }
 }
@@ -220,7 +222,10 @@ fn c_frame_name(l: &LuaState, slot: usize) -> Option<(&'static str, String)> {
     // debug_pc points past the current instruction; the call site is at
     // pc-1. Scan back a few instructions for the GGET/TGETS that
     // produced the callee.
-    let call_pc = l.debug_pc.saturating_sub(1).min(pt.bc.len().saturating_sub(1));
+    let call_pc = l
+        .debug_pc
+        .saturating_sub(1)
+        .min(pt.bc.len().saturating_sub(1));
     let call_ins = pt.bc[call_pc];
     if std::env::var("LUARS_TBDGB").is_ok() {
         eprintln!(
@@ -272,7 +277,8 @@ fn name_from_level(l: &mut LuaState, slot: usize, t: GcPtr<LuaTable>) {
     if (link & FRAME_TYPE_MASK) == 2 {
         if let Some(name) = cont_mm_name(l, slot) {
             t.as_mut().set_str(str_val(l, "name"), str_val(l, name));
-            t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
+            t.as_mut()
+                .set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
         } else {
             t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
             t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
@@ -280,14 +286,16 @@ fn name_from_level(l: &mut LuaState, slot: usize, t: GcPtr<LuaTable>) {
     } else if let Some((name, fbits)) = l.mmname {
         if l.stack[slot - 2].to_bits() == fbits {
             t.as_mut().set_str(str_val(l, "name"), str_val(l, name));
-            t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
+            t.as_mut()
+                .set_str(str_val(l, "namewhat"), str_val(l, "metamethod"));
         } else {
             t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
             t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
         }
     } else if let Some((namewhat, name)) = funcname_from_caller(l, slot) {
         t.as_mut().set_str(str_val(l, "name"), str_val(l, &name));
-        t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, namewhat));
+        t.as_mut()
+            .set_str(str_val(l, "namewhat"), str_val(l, namewhat));
     } else {
         t.as_mut().set_str(str_val(l, "name"), LuaValue::NIL);
         t.as_mut().set_str(str_val(l, "namewhat"), str_val(l, ""));
@@ -576,7 +584,8 @@ fn lib_getinfo(l: &mut LuaState) -> LuaResult<i32> {
                         al.as_mut().set_int(ln, LuaValue::TRUE);
                     }
                 }
-                t.as_mut().set_str(str_val(l, "activelines"), LuaValue::table(al));
+                t.as_mut()
+                    .set_str(str_val(l, "activelines"), LuaValue::table(al));
             }
             if flags & WHAT_U != 0 {
                 t.as_mut()
@@ -752,7 +761,11 @@ fn walk_next(l: &LuaState, mut slot: usize, mut cur_link: u64) -> Option<usize> 
 // ── debug.traceback ─────────────────────────────────────────────────────────
 
 fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
-    let first = if nargs(l) > 0 { arg(l, 0) } else { LuaValue::NIL };
+    let first = if nargs(l) > 0 {
+        arg(l, 0)
+    } else {
+        LuaValue::NIL
+    };
     // LuaJIT: a non-string, non-thread first argument is returned as-is.
     let msg = if first.is_string() {
         let sid = first.as_string_id().unwrap();
@@ -876,8 +889,8 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
                 GcFunc::C(_) => {
                     // LuaJIT prints the function name when it can infer
                     // it from the call site ("in function 'traceback'").
-                    if let Some((_nw, name)) = funcname_from_caller(l, orig_slot)
-                        .or_else(|| c_frame_name(l, orig_slot))
+                    if let Some((_nw, name)) =
+                        funcname_from_caller(l, orig_slot).or_else(|| c_frame_name(l, orig_slot))
                     {
                         trace.push_str(&format!("\t[C]: in function '{}'\n", name));
                     } else {
@@ -913,15 +926,13 @@ fn lib_gethook(l: &mut LuaState) -> LuaResult<i32> {
         LuaValue::NIL
     };
     let st = if thread.is_thread() {
-        thread.as_thread().map(|t| unsafe { t.as_ref() })
+        thread.as_thread().map(|t| t.as_ref())
     } else {
         None
     };
     let hook = st.map(|s| s.hook).unwrap_or_else(|| l.hook);
     let mask = st.map(|s| s.hookmask).unwrap_or(l.hookmask);
-    let count = st
-        .map(|s| s.hook_count_reset)
-        .unwrap_or(l.hook_count_reset);
+    let count = st.map(|s| s.hook_count_reset).unwrap_or(l.hook_count_reset);
     l.stack_ensure(l.base + 3);
     l.stack[l.base] = hook;
     let mut m = String::new();
@@ -979,7 +990,7 @@ fn lib_sethook(l: &mut LuaState) -> LuaResult<i32> {
     // installed on; seed hook_line with the caller's current line.
     let cur_line = caller_line(l).unwrap_or(0);
     if let Some(t) = target {
-        let t = unsafe { t.as_mut() };
+        let t = t.as_mut();
         t.hook = if hook.is_nil() { LuaValue::NIL } else { hook };
         t.hookmask = hm;
         t.hookcount = count;

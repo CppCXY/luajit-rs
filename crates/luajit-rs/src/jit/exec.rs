@@ -20,7 +20,8 @@
 //! materialize the final snapshot into the Lua stack and restart from
 //! the top. A failing guard exits through its covering snapshot.
 
-use crate::jit::{ir, opt_fold, record};
+use crate::jit::opt::opt_fold;
+use crate::jit::{ir, record};
 use crate::runtime::func::{GcFunc, LuaClosure};
 use crate::runtime::gc::GcPtr;
 use crate::runtime::proto::Proto;
@@ -775,8 +776,8 @@ fn restore_snapshot(l: &mut LuaState, base: usize, tr: &GCtrace, env: &[u64], sn
         let bits = if bits == BUF_MARK {
             let heap = jit_heap();
             let buf = std::mem::take(&mut heap.cat_buf);
-            let v = intern_heap_bytes(heap, &buf);
-            v
+
+            intern_heap_bytes(heap, &buf)
         } else {
             bits
         };

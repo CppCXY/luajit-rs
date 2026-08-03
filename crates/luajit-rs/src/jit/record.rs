@@ -13,8 +13,9 @@
 
 use crate::bc::*;
 use crate::gc::GcPtr;
+use crate::jit::bc_addr;
 use crate::jit::exec::{self, jit_str_byte, jit_tget, jit_tnextk};
-use crate::jit::{bc_addr, opt_fold};
+use crate::jit::opt::opt_fold;
 use crate::meta::MM;
 use crate::proto::Proto;
 use crate::state::LuaState;
@@ -2194,7 +2195,7 @@ impl Record {
                 // the portable executor (wasm) and the native backends
                 // share one code path. Unsupported argument shapes fail
                 // the helper's type guard and exit to the interpreter.
-                if nargs < 1 || nargs > 2 {
+                if !(1..=2).contains(&nargs) {
                     return Err(TraceError::NYIBC);
                 }
                 let crate::func::GcFunc::C(cc) = fv.as_func().unwrap().as_ref() else {

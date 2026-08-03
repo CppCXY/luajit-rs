@@ -10,7 +10,7 @@
 //!
 //! Phase 2: narrow eligible instructions from IRT_NUM to IRT_INT.
 
-use super::ir::*;
+use super::super::ir::*;
 
 pub fn opt_narrow(buf: &mut IrBuf) {
     let nins = buf.nins();

@@ -7,14 +7,16 @@
 //! chains, so the FOLD/CSE engine never finds them during the subsequent
 //! copy-substitution.
 
-use super::GCtrace;
-use super::ir::*;
-use super::snap_ref;
+use crate::jit::record;
+
+use super::super::GCtrace;
+use super::super::ir::*;
+use super::super::snap_ref;
 
 /// The upvalue-write helper call must never be eliminated: it is the
 /// trace's only memory-write effect.
 fn is_uset(ir: &IRIns) -> bool {
-    ir.op() == IROp::CALLL && ir.op2 as u32 == super::record::IRCALL_USET
+    ir.op() == IROp::CALLL && ir.op2 as u32 == record::IRCALL_USET
 }
 
 /// lj_buf ops mutate the shared heap buffer even though their mode bits

@@ -511,9 +511,7 @@ impl Interp {
                 // rejected with "string length overflow" (the concat would
                 // otherwise allocate gigabytes before failing elsewhere).
                 if buf.len() > 0xfffffe00 {
-                    return Err(self
-                        .l()
-                        .runtime_error(b"string length overflow"));
+                    return Err(self.l().runtime_error(b"string length overflow"));
                 }
                 // Incremental FNV-1a for the common `s = s .. x` shape:
                 // when the segment is exactly (previous result, x),

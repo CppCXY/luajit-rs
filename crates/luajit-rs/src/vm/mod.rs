@@ -26,7 +26,9 @@ use crate::err::{LuaError, LuaResult};
 use crate::func::{GcFunc, LuaClosure, Upval};
 use crate::gc::GcPtr;
 use crate::jit::{HOTCOUNT_CALL, HOTCOUNT_LOOP, rec_abort_error, rec_ins, trace_exec, trace_hot};
-use crate::proto::{KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, PROTO_VARARG_NEEDSARG, Proto};
+use crate::proto::{
+    KGc, PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, PROTO_VARARG_NEEDSARG, Proto,
+};
 use crate::runtime::gc::barrier_back;
 use crate::runtime::meta::MM;
 use crate::state::{LuaState, Suspend};
@@ -682,7 +684,8 @@ impl Interp {
                         .set_int(i as i32 + 1, self.at(callbase + numparams + i));
                 }
                 let nsid = l.heap().intern(b"n");
-                tab.as_mut().set(l.heap().str_value(nsid), LuaValue::number(nvar as f64));
+                tab.as_mut()
+                    .set(l.heap().str_value(nsid), LuaValue::number(nvar as f64));
                 self.set_at(newbase + numparams, LuaValue::table(tab));
             } else {
                 self.set_at(newbase + numparams, LuaValue::NIL);
@@ -1257,7 +1260,7 @@ impl Interp {
                     let pt = self.proto();
                     let pc = unsafe { ip.offset_from(self.bcp) as usize };
                     let pc = pc.min(pt.lines.len().saturating_sub(1));
-                    let ln = pt.lines[pc] as u32;
+                    let ln = pt.lines[pc];
                     if hook_check(self.l(), ln)? {
                         resync!();
                         bp = unsafe { self.sp.add(self.base) };
@@ -2281,7 +2284,7 @@ impl Interp {
                             let pt = self.proto();
                             let pc = unsafe { ip.offset_from(self.bcp) as usize };
                             let pc = pc.min(pt.lines.len().saturating_sub(1));
-                            self.l().hook_line = pt.lines[pc] as u32;
+                            self.l().hook_line = pt.lines[pc];
                         }
                         self.l().top = if want >= 0 {
                             unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
@@ -2322,7 +2325,7 @@ impl Interp {
                             let pt = self.proto();
                             let pc = unsafe { ip.offset_from(self.bcp) as usize };
                             let pc = pc.min(pt.lines.len().saturating_sub(1));
-                            self.l().hook_line = pt.lines[pc] as u32;
+                            self.l().hook_line = pt.lines[pc];
                         }
                         self.l().top = if want >= 0 {
                             unsafe { dst.add(want as usize).offset_from(self.sp) as usize }
@@ -3320,7 +3323,7 @@ impl Interp {
         if self.l().hookmask & HOOKMASK_LINE != 0 {
             let pt = self.proto();
             let pc = self.pc.min(pt.lines.len().saturating_sub(1));
-            self.l().hook_line = pt.lines[pc] as u32;
+            self.l().hook_line = pt.lines[pc];
         }
 
         let keep = dst

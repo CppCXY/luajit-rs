@@ -114,7 +114,9 @@ fn findtable(
         match v.as_table() {
             Some(t) => cur = t,
             None if v.is_nil() => {
-                let t = l.heap().alloc_table(LuaTable::new(0, if more { 2 } else { 4 }));
+                let t = l
+                    .heap()
+                    .alloc_table(LuaTable::new(0, if more { 2 } else { 4 }));
                 cur.as_mut().set(k, LuaValue::table(t));
                 cur = t;
             }
@@ -369,7 +371,13 @@ fn lib_module(l: &mut LuaState) -> LuaResult<i32> {
         Some(t) => t,
         None => {
             let t = findtable(l, l.global().globals, &name).map_err(|_| {
-                l.runtime_error(format!("name conflict for module '{}'", String::from_utf8_lossy(&name)).as_bytes())
+                l.runtime_error(
+                    format!(
+                        "name conflict for module '{}'",
+                        String::from_utf8_lossy(&name)
+                    )
+                    .as_bytes(),
+                )
             })?;
             loaded.as_mut().set(name_v, LuaValue::table(t));
             t
@@ -393,9 +401,8 @@ fn lib_module(l: &mut LuaState) -> LuaResult<i32> {
 
     // setfenv: the module table becomes the calling function's
     // environment; error when the caller is not a Lua function.
-    let caller = crate::stdlib::debug::caller_lua_func(l).ok_or_else(|| {
-        l.runtime_error(b"`module` not called from a Lua function")
-    })?;
+    let caller = crate::stdlib::debug::caller_lua_func(l)
+        .ok_or_else(|| l.runtime_error(b"`module` not called from a Lua function"))?;
     match caller.as_mut() {
         crate::func::GcFunc::Lua(c) => c.env = tab,
         crate::func::GcFunc::C(_) => {
@@ -558,7 +565,8 @@ fn loader_c(l: &mut LuaState) -> LuaResult<i32> {
         None => {
             push(
                 l,
-                l.heap().str_value(l.heap().intern(tried.concat().as_bytes())),
+                l.heap()
+                    .str_value(l.heap().intern(tried.concat().as_bytes())),
             );
             Ok(1)
         }
@@ -596,7 +604,8 @@ fn loader_croot(l: &mut LuaState) -> LuaResult<i32> {
         None => {
             push(
                 l,
-                l.heap().str_value(l.heap().intern(tried.concat().as_bytes())),
+                l.heap()
+                    .str_value(l.heap().intern(tried.concat().as_bytes())),
             );
             Ok(1)
         }

@@ -19,8 +19,7 @@ use luajit_rs::internal::state::{Lua, load};
 use luajit_rs::internal::table::LuaTable;
 use luajit_rs::{
     LuaError, LuaState, LuaValue, internal, lua_error_message, lua_getglobal, lua_gettop,
-    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadfile, lual_loadstring,
-    lual_openlibs,
+    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadfile, lual_loadstring, lual_openlibs,
 };
 
 const LUA_PROMPT: &str = "> ";

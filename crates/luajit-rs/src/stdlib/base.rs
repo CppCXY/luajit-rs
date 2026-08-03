@@ -343,17 +343,11 @@ fn lib_assert(l: &mut LuaState) -> LuaResult<i32> {
         // pcall) has no source line, so the message stays bare.
         let loc = assert_where(l);
         let full = if let Some(sid) = msg.as_string_id() {
-            format!(
-                "{}{}",
-                loc,
-                String::from_utf8_lossy(l.str_static(sid))
-            )
+            format!("{}{}", loc, String::from_utf8_lossy(l.str_static(sid)))
         } else {
             format!("{}assertion failed!", loc)
         };
-        l.errval = l
-            .heap()
-            .str_value(l.heap().intern(full.as_bytes()));
+        l.errval = l.heap().str_value(l.heap().intern(full.as_bytes()));
         Err(LuaError::Runtime)
     }
 }
@@ -397,11 +391,7 @@ fn assert_where(l: &LuaState) -> String {
         })
         .unwrap_or(b"?")
         .to_vec();
-    format!(
-        "{}:{}: ",
-        String::from_utf8_lossy(&src),
-        line
-    )
+    format!("{}:{}: ", String::from_utf8_lossy(&src), line)
 }
 
 fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
@@ -770,9 +760,7 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
             // Lua 5.1's luaB_setfenv returns the function at the level.
             push(l, LuaValue::func(func));
         } else {
-            return Err(
-                l.runtime_error(b"`setfenv' cannot change environment of given object")
-            );
+            return Err(l.runtime_error(b"`setfenv' cannot change environment of given object"));
         }
     } else {
         return Err(err_bad_arg_type(
@@ -797,13 +785,15 @@ fn lib_getfenv(l: &mut LuaState) -> LuaResult<i32> {
         // getfenv(0): the environment of the running thread.
         _ if o.as_number() == Some(0.0) => l.thread_env,
         // getfenv(n): the environment of the function at debug level n.
-        _ if o.is_number() => match crate::stdlib::debug::frame_func(l, o.as_number().unwrap() as i32) {
-            Some(f) => match f.as_ref() {
-                crate::func::GcFunc::Lua(c) => c.env,
-                crate::func::GcFunc::C(c) => c.env,
-            },
-            None => l.global().globals,
-        },
+        _ if o.is_number() => {
+            match crate::stdlib::debug::frame_func(l, o.as_number().unwrap() as i32) {
+                Some(f) => match f.as_ref() {
+                    crate::func::GcFunc::Lua(c) => c.env,
+                    crate::func::GcFunc::C(c) => c.env,
+                },
+                None => l.global().globals,
+            }
+        }
         _ => l.global().globals,
     };
     push(l, LuaValue::table(env));
@@ -966,9 +956,8 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
     // Lua 5.1's luaL_loadbuffer: no explicit name (or a nil one) means
     // the chunk name is the source itself; luaO_chunkid handles newlines
     // and truncation.
-    let default_name = || {
-        String::from_utf8_lossy(v.as_string().unwrap().as_ref().as_bytes()).into_owned()
-    };
+    let default_name =
+        || String::from_utf8_lossy(v.as_string().unwrap().as_ref().as_bytes()).into_owned();
     let chunkname = if nargs(l) >= 2 {
         let nv = arg(l, 1);
         if let Some(s) = nv.as_string() {

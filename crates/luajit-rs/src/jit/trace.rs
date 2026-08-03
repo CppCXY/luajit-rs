@@ -13,10 +13,8 @@
 use crate::bc::{self, BCOp, bc_isret, bc_j, bc_op, setbc_d, setbc_op};
 use crate::gc::GcPtr;
 use crate::jit::ir::{self, IrBuf};
-use crate::jit::{
-    GCtrace, SNAP_NORESTORE, asm, opt_dce, opt_ivar, opt_loop, opt_narrow, opt_sink, record,
-    snap_ref, snap_slot,
-};
+use crate::jit::opt::{opt_dce, opt_ivar, opt_loop, opt_narrow, opt_sink};
+use crate::jit::{GCtrace, SNAP_NORESTORE, asm, record, snap_ref, snap_slot};
 use crate::proto::{PROTO_ILOOP, PROTO_NOJIT, Proto};
 use crate::state::{GlobalState, LuaState};
 

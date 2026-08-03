@@ -25,9 +25,9 @@
 //! changes are undone and the caller continues recording: unrolling via
 //! recording fixes many cases, e.g. a flipped boolean.
 
-use super::ir::*;
-use super::record::{IRSLOAD_FRAME, Record};
-use super::{SnapEntry, SnapShot, TraceError, snap_ref, snap_slot};
+use super::super::ir::*;
+use super::super::record::{IRSLOAD_FRAME, Record};
+use super::super::{SnapEntry, SnapShot, TraceError, snap_ref, snap_slot};
 
 /// Max. # of PHIs for a loop (LJ_MAX_PHI).
 pub const LJ_MAX_PHI: usize = 64;

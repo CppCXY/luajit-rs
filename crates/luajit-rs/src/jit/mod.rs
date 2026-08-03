@@ -32,13 +32,7 @@ pub(crate) mod exec;
 #[allow(unused)]
 mod ir;
 mod mcode;
-mod opt_dce;
-mod opt_fold;
-mod opt_ivar;
-mod opt_loop;
-mod opt_mem;
-mod opt_narrow;
-mod opt_sink;
+mod opt;
 mod record;
 mod trace;
 

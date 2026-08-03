@@ -319,7 +319,7 @@ fn gsub_fn(
             Ok(Some((m_start, m_end, caps))) => {
                 out.extend_from_slice(&s[pos..m_start]);
                 let mut args: Vec<LuaValue> = Vec::new();
-                if caps.len() == 0 {
+                if caps.is_empty() {
                     // No captures: the whole match is the single argument.
                     let sid = l.heap().intern(&s[m_start..m_end]);
                     args.push(l.heap().str_value(sid));
@@ -388,7 +388,7 @@ fn gsub_tab(
         match crate::stdlib::pattern::find(s, pat, pos) {
             Ok(Some((m_start, m_end, caps))) => {
                 out.extend_from_slice(&s[pos..m_start]);
-                let kval = if caps.len() > 0 {
+                let kval = if !caps.is_empty() {
                     match caps.get(0) {
                         Some(CaptureValue::Substring(cs, ce)) => {
                             let sid = l.heap().intern(&s[*cs..*ce]);

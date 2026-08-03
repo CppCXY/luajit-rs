@@ -1642,10 +1642,10 @@ impl<'a> Parser<'a> {
         // `a[newproxy(u)]` cascade through the shared metatable and mark
         // every weak-table key). Clear the block's temp range on exit,
         // *after* UCLO so closed upvalues keep their values.
-        let max_fr = bl.max_freereg as u32;
+        let max_fr = bl.max_freereg;
         if max_fr > nactvar {
             self.cur_mut().freereg = nactvar;
-            self.bcemit_ad(BCOp::KNIL, nactvar, (max_fr - 1) as u32);
+            self.bcemit_ad(BCOp::KNIL, nactvar, (max_fr - 1));
         }
         self.cur_mut().freereg = nactvar;
         debug_assert!(bl.nactvar as u32 == self.cur().nactvar);

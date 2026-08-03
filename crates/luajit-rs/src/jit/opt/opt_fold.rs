@@ -19,9 +19,10 @@
 //! DROPFOLD elides an always-true guard and FAILFOLD aborts the trace
 //! with `TraceError::GFAIL` (guard would always fail).
 
-use super::TraceError;
-use super::ir::*;
-use super::opt_mem;
+use crate::jit::opt::opt_mem;
+
+use super::super::TraceError;
+use super::super::ir::*;
 
 /// Terminal outcomes of one rule-matching pass.
 enum Step {
