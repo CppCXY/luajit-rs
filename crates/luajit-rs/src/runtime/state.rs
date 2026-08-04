@@ -118,6 +118,25 @@ impl GcHeap {
     fn account_alloc(&mut self, size: usize) {
         self.debt += size;
         let live = self.total + self.strings.bytes() + self.table_extra;
+        // Hard cap so a runaway allocator (an unbounded `__gc` finalizer
+        // chain, a leak) can't exhaust the host machine while debugging.
+        // Every GC allocation passes through here.
+        const MEM_LIMIT: usize = 500 * 1024 * 1024; // 500 MiB
+        if live > MEM_LIMIT {
+            eprintln!(
+                "luajit-rs: memory limit exceeded ({} bytes): total={} strings={} table_extra={} tables={} funcs={} protos={} udata={} upval={}",
+                live,
+                self.total,
+                self.strings.bytes(),
+                self.table_extra,
+                self.tables.len(),
+                self.funcs.len(),
+                self.protos.len(),
+                self.userdatas.len(),
+                self.upvals.len(),
+            );
+            std::process::exit(70);
+        }
         if live >= self.threshold {
             // Advance threshold proportionally (LuaJIT's GC_PAUSE: 200%).
             // This avoids re-triggering the GCSTEP guard on every allocation

@@ -416,9 +416,12 @@ impl LuaTable {
             return;
         }
         if k > 0 && (k as u32) < LJ_MAX_ASIZE {
-            self.reasize(k as u32);
-            self.array[k as usize] = v;
-            self.barrier();
+            // Do NOT grow the array part directly to cover `k`: a sparse
+            // large key (e.g. a[2^k] = true) would balloon the table to
+            // 2^k slots. Go through `set` -> `rehash`, which decides the
+            // array/hash split from the real density (`lj_tab_newkey`).
+            // Dense fills still grow the array on the 2^k boundaries.
+            self.set(LuaValue::number(k as f64), v);
             return;
         }
         self.set(LuaValue::number(k as f64), v);

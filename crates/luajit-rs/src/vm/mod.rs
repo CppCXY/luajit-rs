@@ -54,6 +54,7 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
         }
         let saved_top = l.top;
         let saved_base = l.base;
+        let saved_frame_top = l.frame_top;
         // The finalizer frame must sit above the interpreter's live
         // frame area: `top` lags below the frame (framesize slots), and
         // the finalizer's result would overwrite the registers the
@@ -64,9 +65,13 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
         l.stack[base_slot + 1] = LuaValue::NIL;
         l.stack[base_slot + 2] = o.value();
         match execute(l, base_slot, 1, -1) {
-            Ok(_) => l.top = saved_top,
+            Ok(_) => {
+                l.top = saved_top;
+                l.frame_top = saved_frame_top;
+            }
             Err(e) => {
                 l.top = saved_top;
+                l.frame_top = saved_frame_top;
                 return Err(e);
             }
         }
@@ -433,15 +438,20 @@ fn execute_inner_link(
     }
     let saved_base = l.base;
     let saved_top = l.top;
+    let saved_frame_top = l.frame_top;
     let mut vm = Interp::new(l);
     let link = link.unwrap_or_else(|| (((want + 1) as u64) << 3) | FRAME_C);
     vm.enter_lua(gf, func_slot, nargs, link);
     let r = vm.run();
-    // The interpreter mutates l.base/l.top for the callee frame; restore
-    // them so the calling C function's results land at `func_slot`
-    // (call_c's args_base convention).
+    // The interpreter mutates l.base/l.top (and l.frame_top) for the
+    // callee frame; restore them so the calling C function's results land
+    // at `func_slot` (call_c's args_base convention). Leaving `frame_top`
+    // at the callee's extent would make later incremental GC marks and
+    // finalizer placement (base_slot = max(top, frame_top)) overshoot the
+    // true frame, so live locals above the real frame get collected.
     l.base = saved_base;
     l.top = saved_top;
+    l.frame_top = saved_frame_top;
     r
 }
 
@@ -459,6 +469,7 @@ fn call_c(
     l.stack_ensure(args_base + nargs + 8);
     let saved_base = l.base;
     let saved_top = l.top;
+    let saved_frame_top = l.frame_top;
     // Set a frame link so error walkers can find the caller.
     l.stack[args_base - 1] = LuaValue::from_bits(((saved_base as u64) << 3) | FRAME_LUA);
     l.base = args_base;
@@ -528,11 +539,13 @@ fn call_c(
             l.top = (l.base + 8).max(func_slot + ny);
             l.base = saved_base;
             l.top = saved_top;
+            l.frame_top = saved_frame_top;
             return Err(LuaError::Yield);
         }
         Err(e) => {
             l.base = saved_base;
             l.top = saved_top;
+            l.frame_top = saved_frame_top;
             return Err(e);
         }
     };
@@ -542,6 +555,7 @@ fn call_c(
     }
     l.base = saved_base;
     l.top = saved_top;
+    l.frame_top = saved_frame_top;
     if want >= 0 {
         for i in n..(want as usize) {
             l.stack[func_slot + i] = LuaValue::NIL;
@@ -1878,7 +1892,10 @@ impl Interp {
                 BCOp::TNEW => {
                     // Inline: only sync when GC is due (cold path).
                     let g = self.l().global();
-                    if g.heap.should_collect() || g.heap.debt > 4096 {
+                    if g.heap.should_collect()
+                        || g.heap.debt > 4096
+                        || g.heap.gc_state == crate::runtime::gc::GcState::Finalize
+                    {
                         sync!();
                         self.gc_check(self.base + a as usize + 1)?;
                     }
@@ -2872,11 +2889,18 @@ impl Interp {
     #[inline]
     fn gc_check(&mut self, need: usize) -> LuaResult<()> {
         let g = self.l().global();
+        // Drain pending finalizers first: while the collector sits in
+        // `Finalize`, every `gc_step` is a no-op, so if we skipped this the
+        // heap would never be collected again — an allocation loop under a
+        // `__gc` finalizer chain leaks indefinitely (the `while gcinfo()`
+        // loop in gc.lua). Only the VM can run finalizers (they need a Lua
+        // frame), so this is the single funnel.
+        if g.heap.gc_state == crate::runtime::gc::GcState::Finalize {
+            run_finalizers(self.l())?;
+        }
+        let g = self.l().global();
         if g.heap.should_collect() || g.heap.debt > 4096 {
             self.gc_collect(need)?;
-        }
-        if self.l().global().heap.gc_state == crate::runtime::gc::GcState::Finalize {
-            run_finalizers(self.l())?;
         }
         Ok(())
     }
@@ -2911,7 +2935,10 @@ impl Interp {
         loop {
             crate::gc::gc_step(&mut g.heap, step_size);
             steps += 1;
-            if g.heap.gc_state == crate::runtime::gc::GcState::Pause || steps >= 512 {
+            if g.heap.gc_state == crate::runtime::gc::GcState::Pause
+                || g.heap.gc_state == crate::runtime::gc::GcState::Finalize
+                || steps >= 512
+            {
                 break;
             }
         }
