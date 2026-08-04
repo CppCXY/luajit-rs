@@ -55,13 +55,6 @@ pub(crate) fn do_resume(
     }
 
     let saved_cur = l.global().cur_l;
-    if std::env::var("LUARS_DBGCO").is_ok() && !l.is_main() {
-        eprintln!(
-            "DO_RESUME enter caller_top={} caller_s1={:#x}",
-            l.top,
-            l.stack[1].to_bits()
-        );
-    }
     l.global().cur_l = Some(co_ref);
     l.status = CoStatus::Normal;
     co.status = CoStatus::Running;
@@ -75,15 +68,7 @@ pub(crate) fn do_resume(
             for i in 0..nargs {
                 co.stack[2 + i] = l.stack[args_at + i];
             }
-            if std::env::var("LUARS_DBGCO").is_ok() {
-                eprintln!(
-                    "DO_RESUME START co={:#x} s0={:#x} s1={:#x} stk={:p}",
-                    co_ref.addr(),
-                    co.stack[0].to_bits(),
-                    co.stack[1].to_bits(),
-                    co.stack.as_ptr()
-                );
-            }            crate::vm::execute(co, 0, nargs, -1)
+            crate::vm::execute(co, 0, nargs, -1)
         }
         Suspend::Call {
             pc,
@@ -94,15 +79,6 @@ pub(crate) fn do_resume(
             protected,
             ..
         } => {
-            if std::env::var("LUARS_DBGCO").is_ok() {
-                eprintln!(
-                    "RESUME_CALL co={:#x} slot={} sbase={} top={}",
-                    co_ref.addr(),
-                    slot,
-                    base,
-                    co.top
-                );
-            }
             co.suspend = Suspend::Start;
             co.stack_ensure(slot + 2 + nargs);
             for i in 0..nargs {
@@ -136,18 +112,6 @@ pub(crate) fn do_resume(
         }
         Err(LuaError::Yield) => {
             co.status = CoStatus::Suspended;
-            if std::env::var("LUARS_DBGCO").is_ok() {
-                let mut s = String::new();
-                for k in 0..8 {
-                    s.push_str(&format!("[{}]={:#x} ", k, co.stack[k].to_bits()));
-                }
-                eprintln!(
-                    "DO_RESUME yield-out co={:#x} top={} {}",
-                    co_ref.addr(),
-                    co.top,
-                    s
-                );
-            }
             let ny = co.nyield as usize;
             let slot = match co.suspend {
                 Suspend::Call { slot, .. } | Suspend::Return { slot, .. } => slot,
@@ -312,17 +276,6 @@ fn lib_wrap(l: &mut LuaState) -> LuaResult<i32> {
         let co = co_ref.get();
         co.stack[0] = f;
         co.top = 1; // Protect the entry function from the GC's stack wipe.
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            eprintln!(
-                "WRAP_NEW co={:#x} f={:#x} caller={:#x} caller_stk={:p} base={} dpc={}",
-                co_ref.addr(),
-                co.stack[0].to_bits(),
-                l as *const LuaState as u64,
-                l.stack.as_ptr(),
-                l.base,
-                l.debug_pc
-            );
-        }
     }
 
     let env = l.global().globals;
@@ -343,16 +296,6 @@ fn wrap_call(l: &mut LuaState) -> LuaResult<i32> {
         Some(p) => p,
         None => return Err(l.runtime_error(b"coroutine.wrap: thread lost")),
     };
-    if std::env::var("LUARS_DBGCO").is_ok() {
-        let co = co_ref.get();
-        eprintln!(
-            "WRAP_CALL l={:#x} co={:#x} co_s1={:#x} co_top={}",
-            l as *const LuaState as u64,
-            co_ref.addr(),
-            co.stack[1].to_bits(),
-            co.top
-        );
-    }
     let n = nargs(l);
     let outcome = do_resume(l, co_ref, l.base, n)?;
     let co = co_ref.get();

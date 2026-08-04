@@ -469,22 +469,16 @@ impl JitState {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn stats_bump_impl(&mut self, key: String) {
-        if std::env::var("LUARS_JITDBG").is_ok() {
-            let mut found = false;
-            for (k, c) in self.stats.iter_mut() {
-                if *k == key {
-                    *c += 1;
-                    if *c == 1 {
-                        eprintln!("JITSTAT {key}");
-                    }
-                    found = true;
-                    break;
-                }
+        let mut found = false;
+        for (k, c) in self.stats.iter_mut() {
+            if *k == key {
+                *c += 1;
+                found = true;
+                break;
             }
-            if !found {
-                self.stats.push((key.clone(), 1));
-                eprintln!("JITSTAT {key}");
-            }
+        }
+        if !found {
+            self.stats.push((key, 1));
         }
     }
     #[cfg(not(target_arch = "wasm32"))]

@@ -2468,7 +2468,7 @@ impl<'a> Parser<'a> {
         // skipped.
         let mut to = freereg;
         if v.k == VNonReloc {
-            to = to.max(v.info as u32 + 1);
+            to = to.max(v.info + 1);
         }
         if to > freg {
             self.bcemit_nil(freg, to - freg);

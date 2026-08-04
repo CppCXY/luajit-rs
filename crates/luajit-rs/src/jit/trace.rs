@@ -384,16 +384,6 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             } else {
                 g.jit.err = e;
                 g.jit.state = TraceState::Err;
-                if std::env::var("LUARS_JITDBG").is_ok() && pc > 0 {
-                    let bc = &rec.pt.as_ref().bc;
-                    let lo = pc.saturating_sub(2);
-                    let hi = (pc + 1).min(bc.len());
-                    let desc = (lo..hi)
-                        .map(|i| format!("{i}:{:?}", bc_op(bc[i])))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    eprintln!("JITABORT {} at pc={} ({})", e.message(), pc, desc);
-                }
                 g.jit.stats_bump(e.message());
                 if pc < rec.pt.as_ref().bc.len() {
                     g.jit.stats_bump_site(
@@ -671,9 +661,6 @@ fn penalty_pc(js: &mut JitState, pt: GcPtr<Proto>, pc: usize, e: TraceError) {
             val = ((js.penalty[i].val as u32) << 1)
                 + (js.prng.u64() as u32 & ((1u32 << PENALTY_RNDBITS) - 1));
             if val > PENALTY_MAX {
-                if std::env::var("LUARS_DBGFLUSH").is_ok() {
-                    eprintln!("PENALTY-BLACKLIST pc={} op={:?}", pc, bc_op(pt.as_ref().bc[pc]));
-                }
                 blacklist_pc(pt, pc); // Blacklist it, if that didn't help.
                 return;
             }
@@ -744,15 +731,6 @@ pub fn trace_flush_blacklist(l: &mut LuaState, traceno: TraceNo) {
     if tr.root == 0 {
         let pt = tr.startpt;
         let pc = tr.startpc;
-        if std::env::var("LUARS_DBGFLUSH").is_ok() {
-            eprintln!(
-                "FLUSHDBG root={} startins={:?} startpc={} op_at_pc={:?}",
-                root,
-                bc_op(tr.startins),
-                pc,
-                bc_op(pt.as_ref().bc[pc])
-            );
-        }
         if bc_op(tr.startins) == BCOp::FORL {
             // Revert the FORI patch, too.
             let fori = (pc as i64 + bc_j(tr.startins)) as usize;

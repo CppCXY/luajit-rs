@@ -983,12 +983,6 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
             format!("[string \"{}...\"]", &chunkname[start..len])
         }
     };
-    if std::env::var("LUARS_SRCDBG").is_ok() {
-        eprintln!("SRCDBG chunkname={:?}", chunkname);
-    }
-    if std::env::var("LUARS_SRCDBG").is_ok() {
-        eprintln!("SRCDBG chunkname={:?}", chunkname);
-    }
     match crate::state::load(l, code, &chunkname) {
         Ok(v) => {
             push(l, v);

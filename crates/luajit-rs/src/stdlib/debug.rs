@@ -232,16 +232,6 @@ fn c_frame_name(l: &LuaState, slot: usize) -> Option<(&'static str, String)> {
         .saturating_sub(1)
         .min(pt.bc.len().saturating_sub(1));
     let call_ins = pt.bc[call_pc];
-    if std::env::var("LUARS_TBDGB").is_ok() {
-        eprintln!(
-            "TBDGB caller_base={} debug_pc={} call_pc={} op={:?} bc_len={}",
-            caller_base,
-            l.debug_pc,
-            call_pc,
-            bc_op(call_ins),
-            pt.bc.len()
-        );
-    }
     let callee_reg = bc_a(call_ins);
     let mut k = call_pc;
     for _ in 0..4 {
@@ -250,16 +240,6 @@ fn c_frame_name(l: &LuaState, slot: usize) -> Option<(&'static str, String)> {
         }
         k -= 1;
         let ins = pt.bc[k];
-        if std::env::var("LUARS_TBDGB").is_ok() {
-            eprintln!(
-                "TBDGB scan k={} op={:?} a={} d={} want_reg={}",
-                k,
-                bc_op(ins),
-                bc_a(ins),
-                bc_d(ins),
-                callee_reg
-            );
-        }
         match bc_op(ins) {
             crate::bc::BCOp::TGETS if bc_a(ins) == callee_reg => {
                 let name = kgc_str(l, &pt.kgc, bc_c(ins) as usize)?;

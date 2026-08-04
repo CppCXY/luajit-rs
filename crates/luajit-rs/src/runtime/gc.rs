@@ -508,8 +508,6 @@ impl<T> Pool<T> {
     /// Surviving objects get change_white() and marked.set(false).
     pub fn sweep_tricolor(&mut self, current_white: u8, mut on_free: impl FnMut(&T)) {
         let mut i = 0;
-        let mut freed = 0usize;
-        let mut kept = 0usize;
         while i < self.objects.len() {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
@@ -522,14 +520,12 @@ impl<T> Pool<T> {
             let was_marked = h.marked.get();
             let alive = was_marked || !h.is_dead(current_white);
             if alive {
-                kept += 1;
                 if was_marked {
                     h.change_white();
                 }
                 h.marked.set(false);
                 i += 1;
             } else {
-                freed += 1;
                 unsafe {
                     on_free(ptr.as_ref());
                 }
@@ -540,9 +536,6 @@ impl<T> Pool<T> {
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
             }
-        }
-        if std::env::var("LUARS_DBGGC").is_ok() {
-            eprintln!("SWEEPSTAT kept={kept} freed={freed} left={}", self.objects.len());
         }
         self.live = self.objects.len();
     }
@@ -612,13 +605,6 @@ impl<T> GcPtr<T> {
 
     #[track_caller]
     pub fn set_marked(self) {
-        if std::env::var("LUARS_DBGGC3").is_ok() {
-            eprintln!(
-                "SETMARKED {:p} caller={}",
-                self.0.as_ptr(),
-                std::panic::Location::caller()
-            );
-        }
         let h = gc_header(self.0);
         h.marked.set(true);
         // Also mark in tri-color bits (may crash if bits is at wrong offset)
@@ -731,13 +717,6 @@ struct Marker<'g> {
 impl<'g> Marker<'g> {
     #[track_caller]
     fn mark_value(&mut self, v: LuaValue) {
-        if std::env::var("LUARS_DBGGC2").is_ok() && v.as_table().is_some() {
-            eprintln!(
-                "MARKVAL table {:#x} caller={}",
-                v.as_table().unwrap().0.as_ptr() as usize,
-                std::panic::Location::caller()
-            );
-        }
         match v.itype() {
             LJ_TSTR => {
                 if let Some(p) = v.as_string() {
@@ -764,13 +743,6 @@ impl<'g> Marker<'g> {
                 if let Some(p) = v.as_thread()
                     && !p.is_marked()
                 {
-                    if std::env::var("LUARS_DBGGC2").is_ok() {
-                        eprintln!(
-                            "MARKTHREAD {:#x} caller={}",
-                            p.addr(),
-                            std::panic::Location::caller()
-                        );
-                    }
                     p.set_marked();
                     self.gray.push(Gray::Thread(p));
                 }
@@ -801,9 +773,6 @@ impl<'g> Marker<'g> {
         self.gray.push(Gray::Thread(th));
     }
     fn mark_table(&mut self, t: GcPtr<LuaTable>) {
-        if std::env::var("LUARS_DBGGC2").is_ok() {
-            eprintln!("MARKTABLE {:p}", t.0.as_ptr());
-        }
         if !t.is_marked() {
             t.set_marked();
             self.gray.push(Gray::Tab(t));
@@ -858,22 +827,6 @@ impl<'g> Marker<'g> {
                 Gray::Tab(t) => {
                     let mode = t.as_ref().gc_traverse(|v| self.mark_value(v));
                     self.collect_weak(t, mode);
-                    if std::env::var("LUARS_DBGGC").is_ok() && mode != 0 {
-                        eprintln!(
-                            "GCWEAK table {:p} mode={:#x} size={}",
-                            t.0.as_ptr(),
-                            mode,
-                            t.as_ref().len()
-                        );
-                    }
-                    if std::env::var("LUARS_DBGGC2").is_ok() {
-                        eprintln!(
-                            "GCTAB {:p} mode={:#x} size={}",
-                            t.0.as_ptr(),
-                            mode,
-                            t.as_ref().len()
-                        );
-                    }
                 }
                 Gray::Func(f) => match f.as_ref() {
                     GcFunc::Lua(c) => {
@@ -903,27 +856,12 @@ impl<'g> Marker<'g> {
                 }
                 Gray::Thread(th) => {
                     let l = th.as_mut();
-                    if std::env::var("LUARS_DBGGC2").is_ok() && !l.is_main() {
-                        eprintln!(
-                            "GC_MARK_THREAD top={} frame_top={}",
-                            l.top,
-                            l.frame_top
-                        );
-                    }
                     // lj_gc_step_fixtop: mark the whole current frame (`top`
                     // may be lowered to a C-call result area); stale slots
                     // inside the frame are kept alive rather than freed out
                     // from under us.
                     let mark_to = l.top.max(l.frame_top);
                     for i in 0..mark_to {
-                        if std::env::var("LUARS_DBGGC2").is_ok() && l.stack[i].as_table().is_some()
-                        {
-                            eprintln!(
-                                "STACKMARK slot={} table={:p}",
-                                i,
-                                l.stack[i].as_table().unwrap().0.as_ptr()
-                            );
-                        }
                         self.mark_value(l.stack[i]);
                     }
                     self.mark_value(l.errval);
@@ -973,14 +911,6 @@ impl<'g> Marker<'g> {
                     t.set_marked();
                     let mode = t.as_ref().gc_traverse(|v| self.mark_value(v));
                     self.collect_weak(t, mode);
-                    if std::env::var("LUARS_DBGGC").is_ok() && mode != 0 {
-                        eprintln!(
-                            "GCWEAK table {:p} mode={:#x} size={}",
-                            t.0.as_ptr(),
-                            mode,
-                            t.as_ref().len()
-                        );
-                    }
                 }
                 Gray::Func(f) => {
                     f.set_marked();
@@ -1035,14 +965,6 @@ impl<'g> Marker<'g> {
                     // the propagate arm above).
                     let mark_to = l.top.max(l.frame_top);
                     for i in 0..mark_to {
-                        if std::env::var("LUARS_DBGGC2").is_ok() && l.stack[i].as_table().is_some()
-                        {
-                            eprintln!(
-                                "STACKMARK slot={} table={:p}",
-                                i,
-                                l.stack[i].as_table().unwrap().0.as_ptr()
-                            );
-                        }
                         self.mark_value(l.stack[i]);
                     }
                     self.mark_value(l.errval);
@@ -1177,29 +1099,6 @@ pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
 /// Run one incremental GC step. Returns `true` when the cycle is complete
 /// (state is Pause).
 pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
-    if std::env::var("LUARS_DBGGC").is_ok() {
-        let (mut tabs, mut funcs, mut other) = (0u32, 0u32, 0u32);
-        for g in &heap.gc_gray {
-            match g {
-                Gray::Tab(_) => tabs += 1,
-                Gray::Func(_) => funcs += 1,
-                _ => other += 1,
-            }
-        }
-        eprintln!(
-            "GCSTEP state={} total={} strs={} strpool={} thresh={} debt={} gray={} (tab={} func={} other={})",
-            heap.gc_state as u8,
-            heap.total,
-            heap.strings.bytes(),
-            heap.strings.pool_len(),
-            heap.threshold,
-            heap.debt,
-            heap.gc_gray.len(),
-            tabs,
-            funcs,
-            other
-        );
-    }
     let step = heap.gc_step_size.max(size);
     match heap.gc_state {
         GcState::Pause => {
@@ -1315,19 +1214,6 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
 }
 
 fn sweep_one_pool(heap: &mut GcHeap) -> bool {
-    if std::env::var("LUARS_DBGGC").is_ok() {
-        let len = match heap.gc_sweep_pool {
-            0 => heap.strings.pool_len(),
-            1 => heap.tables.len(),
-            2 => heap.funcs.len(),
-            3 => heap.threads.len(),
-            4 => heap.upvals.len(),
-            5 => heap.protos.len(),
-            6 => heap.userdatas.len(),
-            _ => 0,
-        };
-        eprintln!("SWEEP pool={} before={}", heap.gc_sweep_pool, len);
-    }
     let done = match heap.gc_sweep_pool {
         0 => {
             heap.strings.sweep(heap.current_white);

@@ -455,9 +455,6 @@ fn call_c(
     want: i32,
 ) -> LuaResult<usize> {
     let args_base = func_slot + 2;
-    if std::env::var("LUARS_DBGCO").is_ok() && func_slot == 0 {
-        eprintln!("CALL_C func_slot=0 nargs={} want={}", nargs, want);
-    }
     // Ensure the stack can hold the args and results before touching it.
     l.stack_ensure(args_base + nargs + 8);
     let saved_base = l.base;
@@ -762,15 +759,6 @@ impl Interp {
         let callbase = func_slot + 2;
 
         self.set_at(callbase - 1, LuaValue::from_bits(link));
-        if std::env::var("LUARS_DBGCO").is_ok() && !self.l().is_main() {
-            eprintln!(
-                "ENTER_LUA l={:#x} func_slot={} callbase={} addr={:p}",
-                self.l as *const LuaState as u64,
-                func_slot,
-                callbase,
-                unsafe { self.sp.add(callbase - 1) }
-            );
-        }
 
         if (pt.flags & PROTO_VARARG) != 0 {
             // FUNCV: shift the fixed params up past the varargs and chain a
@@ -1320,15 +1308,6 @@ impl Interp {
                 }
             }
             let ins = unsafe { *ip };
-            if std::env::var("LUARS_DBGCO2").is_ok() && self.pc >= 4 && self.pc <= 8 {
-                eprintln!(
-                    "INS pc={} op={} a={} d={}",
-                    self.pc,
-                    bc_op(ins) as u32,
-                    bc_a(ins),
-                    bc_d(ins)
-                );
-            }
             ip = unsafe { ip.add(1) };
             // Always keep debug_pc current so error messages have source info.
             self.l().debug_pc = unsafe { ip.offset_from(self.bcp) as usize };
@@ -1395,14 +1374,6 @@ impl Interp {
                 }
                 BCOp::ISEQP => {
                     let v = fr.reg(a);
-                    if std::env::var("LUARS_DBGCO").is_ok() && bc_d(ins) == 0 {
-                        eprintln!(
-                            "ISEQP nil a={} v={:#x} base={}",
-                            a,
-                            v.to_bits(),
-                            fr.cur_base()
-                        );
-                    }
                     let cond = if bc_d(ins) == 0 {
                         v.is_nil() || is_cdata_null(v)
                     } else {
@@ -1412,15 +1383,6 @@ impl Interp {
                 }
                 BCOp::ISNEP => {
                     let v = fr.reg(a);
-                    if std::env::var("LUARS_DBGCO2").is_ok() && bc_d(ins) == 0 {
-                        eprintln!(
-                            "ISNEP a={} v={:#x} nil={} base={}",
-                            a,
-                            v.to_bits(),
-                            v.is_nil(),
-                            fr.cur_base()
-                        );
-                    }
                     let cond = if bc_d(ins) == 0 {
                         // Primitive 0 = nil; for ?? operator also treat NULL cdata as nil.
                         !v.is_nil() && !is_cdata_null(v)
@@ -2335,16 +2297,6 @@ impl Interp {
                         self.hook_event("return")?;
                         resync!();
                     }
-                    if std::env::var("LUARS_DBGCO").is_ok() && self.l().stack[fr.cur_base().saturating_sub(1)].to_bits() != 1 {
-                        eprintln!(
-                            "RET0-BAD base={} s1={:#x} top={} frame_top={} main={}",
-                            fr.cur_base(),
-                            self.l().stack[fr.cur_base().saturating_sub(1)].to_bits(),
-                            self.l().top,
-                            self.l().frame_top,
-                            self.l().is_main()
-                        );
-                    }
                     if let Some(want) = self.ret_fast(fr.bp()) {
                         if !self.hook_lines.is_empty() {
                             let _ = self.hook_lines.pop();
@@ -2675,7 +2627,6 @@ impl Interp {
                     self.op_varg(a, bc_b(ins));
                     resync!();
                 }
-
                 // -- Bitwise ops (Lua 5.3+), lj_num2bit / lj_vm_tobit --
                 BCOp::BNOT => {
                     let v = fr.reg(bc_d(ins));
@@ -2933,28 +2884,6 @@ impl Interp {
     #[cold]
     fn gc_collect(&mut self, need: usize) -> LuaResult<()> {
         let l = self.l();
-        if std::env::var("LUARS_DBGGC2").is_ok() {
-            for k in 4..8 {
-                let v = l.stack[k];
-                if let Some(t) = v.as_table() {
-                    let mut s = String::new();
-                    let t = t.as_ref();
-                    for i in 0..t.len().min(8) {
-                        s.push_str(&format!("[{}]={:#x} ", i, t.get_int(i as i32 + 1).to_bits()));
-                    }
-                    eprintln!(
-                        "GC_STACK l={:#x} [{}]=tab {:#x} mt={:#x} mode={} len={} {}",
-                        l as *const LuaState as u64,
-                        k,
-                        t as *const _ as u64,
-                        t.metatable.map(|m| m.addr()).unwrap_or(0),
-                        t.weak_mode(),
-                        t.len(),
-                        s
-                    );
-                }
-            }
-        }
         // lj_gc_step_fixtop: the marker must see every live object, and
         // the atomic clear must not touch live registers. The frame
         // extends to `frame_top`; C-call results transiently lower `top`
@@ -3156,15 +3085,6 @@ impl Interp {
                     for i in n..(want as usize) {
                         self.set_at(func_slot + i, LuaValue::NIL);
                     }
-                    if std::env::var("LUARS_DBGCO").is_ok() {
-                        eprintln!(
-                            "DO_CALL C want={} n={} func_slot={} slot={:#x}",
-                            want,
-                            n,
-                            func_slot,
-                            self.at(func_slot).to_bits()
-                        );
-                    }
                 } else {
                     self.multres = n;
                 }
@@ -3177,12 +3097,6 @@ impl Interp {
     /// capture the resume point. Yield values move to `func_slot`.
     #[cold]
     fn suspend_call(&mut self, func_slot: usize, want: i32) -> LuaError {
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            eprintln!(
-                "SUSPEND_CALL func_slot={} want={} base={} ny={}",
-                func_slot, want, self.base, self.l().nyield
-            );
-        }
         let ny = self.l().nyield as usize;
         // A yield through pcall/xpcall rewrote the suspend with the
         // protected flag and moved the yield values to *its* slot; the
@@ -3220,32 +3134,12 @@ impl Interp {
         };
         l.top = (self.base + self.proto().framesize as usize).max(func_slot + ny);
         l.base = self.base;
-        if std::env::var("LUARS_DBGCO").is_ok() && !l.is_main() {
-            eprintln!(
-                "SUSPEND_CALL done co={:p} s1={:#x} s0={:#x} top={}",
-                l as *const LuaState,
-                l.stack[1].to_bits(),
-                l.stack[0].to_bits(),
-                l.top
-            );
-        }
         LuaError::Yield
     }
 
     /// Same for a yield through a tail call (`return coroutine.yield(...)`).
     #[cold]
     fn suspend_return(&mut self, func_slot: usize) -> LuaError {
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            eprintln!(
-                "SUSPEND_RETURN func_slot={} base={} nyield={}",
-                func_slot, self.base, self.l().nyield
-            );
-            let mut s = String::new();
-            for i in (self.base - 4)..(self.base + 4) {
-                s.push_str(&format!("[{}]={:#x} ", i, self.l().stack[i].to_bits()));
-            }
-            eprintln!("  STACK {}", s);
-        }
         let ny = self.l().nyield as usize;
         for i in 0..ny {
             let v = self.at(func_slot + 2 + i);
@@ -3268,18 +3162,6 @@ impl Interp {
         nargs: usize,
     ) -> LuaResult<usize> {
         let args_base = func_slot + 2;
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            eprintln!(
-                "CALL_C_INLINE enter l={:#x} func_slot={} nargs={} base={} stk={:p} len={} cap={}",
-                self.l as *const LuaState as u64,
-                func_slot,
-                nargs,
-                self.base,
-                self.l().stack.as_ptr(),
-                self.l().stack.len(),
-                self.l().stack.capacity()
-            );
-        }
         // self.l() returns &mut LuaState, but we hold it as a raw pointer
         // so we can update self.sp mid-function if stack_ensure reallocs.
         let lp = self as *mut Interp;
@@ -3316,14 +3198,6 @@ impl Interp {
         let n = match r {
             Ok(nv) => nv as usize,
             Err(e) => {
-                if std::env::var("LUARS_DBGCO").is_ok() && !l.is_main() && e == LuaError::Yield {
-                    eprintln!(
-                        "CALL_C_INLINE err top={} saved_top={} s1={:#x}",
-                        l.top,
-                        saved_top,
-                        l.stack[1].to_bits()
-                    );
-                }
                 l.base = saved_base;
                 l.top = saved_top;
                 return Err(e);
@@ -3427,17 +3301,6 @@ impl Interp {
         // stack resize (push -> stack_ensure) inside a JIT helper or the
         // interpreter.  Re-read both from the canonical LuaState stack Vec.
         self.sp = self.l().stack.as_mut_ptr();
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            eprintln!(
-                "DO_RETURN l={:#x} src={} n={} base={} link={:#x} stk={:p}",
-                self.l as *const LuaState as u64,
-                src,
-                n,
-                self.base,
-                self.l().stack[self.base.saturating_sub(1)].to_bits(),
-                self.l().stack.as_ptr()
-            );
-        }
         if !self.l().openuv.is_empty() {
             self.close_upvals(self.base);
         }
@@ -3446,21 +3309,6 @@ impl Interp {
             return None;
         }
         let mut link = self.l().stack[base - 1].to_bits();
-        if std::env::var("LUARS_DBGCO").is_ok() && link == u64::MAX && !self.l().is_main() {
-            let mut s = String::new();
-            for k in 0..8 {
-                s.push_str(&format!("[{}]={:#x} ", k, self.l().stack[k].to_bits()));
-            }
-            eprintln!("DR-NIL base={} top={} pc={} {}", base, self.l().top, self.pc, s);
-        }
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            eprintln!(
-                "DO_RETURN base={} slot7={:#x} slot6={:#x}",
-                base,
-                self.l().stack[base - 1].to_bits(),
-                self.l().stack[base - 2].to_bits()
-            );
-        }
         // A NIL link means we cannot determine the caller. Bail out so the
         // interpreter can continue with the next opcode (a Lua-level error
         // will surface if the state is too corrupted).
@@ -3532,23 +3380,6 @@ impl Interp {
         // FRAME_LUA: the link is the caller's return PC.
         let ret_ip = link as *const BCIns;
         let call_ins = unsafe { *ret_ip.sub(1) };
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            let pt = self.proto();
-            let src = pt
-                .source
-                .map(|s| self.l().heap().strings.get(s).to_vec())
-                .unwrap_or_default();
-            eprintln!(
-                "DO_RETURN FRAME_LUA link={:#x} call_ins={:#x} dst={} base={} bcp={:p} src={:?} pc_ret={}",
-                link,
-                call_ins,
-                dst,
-                base,
-                self.bcp,
-                String::from_utf8_lossy(&src),
-                unsafe { ret_ip.offset_from(self.bcp) }
-            );
-        }
         let caller_base = dst - bc_a(call_ins) as usize;
         let want = bc_b(call_ins) as i32 - 1;
         // Callee frame extent (before reload switches proto to the caller).
@@ -3559,14 +3390,6 @@ impl Interp {
         }
         self.base = caller_base;
         let cl = self.at(caller_base - 2).as_func().unwrap();
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            eprintln!(
-                "DO_RETURN reload base={} cl={:#x} pc_off={}",
-                caller_base,
-                self.at(caller_base - 2).to_bits(),
-                unsafe { ret_ip.offset_from(self.bcp) }
-            );
-        }
         self.reload(cl);
         self.pc = unsafe { ret_ip.offset_from(self.bcp) as usize };
         // No line event on the caller's resumption line.
@@ -3592,16 +3415,6 @@ impl Interp {
         // (e.g. the pre-loaded callee/args of an enclosing call).
         let clear_from = (dst + 2).max(keep);
         let hi = callee_top.max(clear_from);
-        if std::env::var("LUARS_DBGCO").is_ok() {
-            eprintln!(
-                "DO_RETURN-CLEAR l={:#x} keep={} hi={} clear_from={} addr={:p}",
-                self.l as *const LuaState as u64,
-                keep,
-                hi,
-                clear_from,
-                unsafe { self.sp.add(clear_from) }
-            );
-        }
         for s in self.l().stack[clear_from..hi].iter_mut() {
             *s = LuaValue::NIL;
         }
@@ -3691,14 +3504,6 @@ impl Interp {
     fn close_upvals(&mut self, level: usize) {
         let level_ptr = unsafe { self.sp.add(level) } as *const LuaValue;
         let l = self.l();
-        if std::env::var("LUARS_DBGCO").is_ok() && !l.is_main() && !l.openuv.is_empty() {
-            eprintln!(
-                "CLOSE_UVALS level={} n={} s1={:#x}",
-                level,
-                l.openuv.len(),
-                l.stack[1].to_bits()
-            );
-        }
         let mut i = 0;
         while i < l.openuv.len() {
             let uv = l.openuv[i];
@@ -3888,17 +3693,6 @@ pub fn resume_continue(
         }
     }
     let mut vm = Interp::new(co);
-    if std::env::var("LUARS_DBGCO").is_ok() {
-        eprintln!(
-            "RESUME_CONT slot={} want={} nargs={} sbase={} s1={:#x} status={:?}",
-            slot,
-            want,
-            nargs,
-            sbase,
-            co.stack[1].to_bits(),
-            co.status
-        );
-    }
     if want < 0 {
         vm.multres = if protected { nargs + 1 } else { nargs };
     }
@@ -3906,21 +3700,6 @@ pub fn resume_continue(
     vm.cl = cl;
     vm.reload(cl);
     vm.pc = pc;
-    if std::env::var("LUARS_DBGCO").is_ok() {
-        let pt = match cl.as_ref() {
-            GcFunc::Lua(c) => c.proto.as_ref(),
-            _ => unreachable!(),
-        };
-        eprintln!(
-            "RESUME_CONT pc={} bc={:#x} op={}",
-            pc,
-            pt.bc.get(pc.min(pt.bc.len() - 1)).copied().unwrap_or(0),
-            pt.bc
-                .get(pc.min(pt.bc.len() - 1))
-                .map(|i| bc_op(*i) as u32)
-                .unwrap_or(0)
-        );
-    }
     let pt = match cl.as_ref() {
         GcFunc::Lua(c) => c.proto.as_ref(),
         _ => unreachable!(),
@@ -3943,9 +3722,6 @@ pub fn resume_finish(
     nargs: usize,
     sbase: usize,
 ) -> LuaResult<usize> {
-    if std::env::var("LUARS_DBGCO").is_ok() {
-        eprintln!("RESUME_FINISH slot={} nargs={} sbase={} len={}", slot, nargs, sbase, co.stack.len());
-    }
     co.c_depth += 1;
     let link = co.stack[slot + 1].to_bits();
     if (link & FRAME_TYPE_MASK) != FRAME_C && (link & FRAME_TYPE_MASK) != FRAME_LUA {
@@ -3955,16 +3731,6 @@ pub fn resume_finish(
         co.stack[slot + i] = co.stack[slot + 2 + i];
     }
     let mut vm = Interp::new(co);
-    if std::env::var("LUARS_DBGCO").is_ok() {
-        eprintln!(
-            "RESUME_FIN slot={} nargs={} sbase={} s1={:#x} status={:?}",
-            slot,
-            nargs,
-            sbase,
-            co.stack[1].to_bits(),
-            co.status
-        );
-    }
     vm.base = sbase;
     // The suspended tail-call frame is still the current function; load
     // its proto so `do_return` can compute the callee extent (its

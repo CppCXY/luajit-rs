@@ -237,21 +237,9 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
         let snap = &mut tr.snap[exitno];
         if snap.count != SNAPCOUNT_DONE {
             snap.count += 1;
-            if std::env::var("LUARS_DBGEXIT").is_ok() && snap.count <= 16 {
-                eprintln!(
-                    "EXIT tr={} exitno={} final={} count={}",
-                    current,
-                    exitno,
-                    is_final_snap,
-                    snap.count
-                );
-            }
             if snap.count >= hotexit {
                 if snap.count > hotexit + tryside && !is_final_snap {
                     use crate::jit::trace;
-                    if std::env::var("LUARS_DBGEXIT").is_ok() {
-                        eprintln!("FLUSH tr={}", current);
-                    }
                     trace::trace_flush_blacklist(l, current);
                 } else if snap.count <= hotexit + tryside {
                     use crate::jit::trace;

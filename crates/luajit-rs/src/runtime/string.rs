@@ -309,16 +309,6 @@ impl Interner {
         self.bytes
     }
 
-    #[cfg(debug_assertions)]
-    pub(crate) fn pool_len(&self) -> usize {
-        self.pool.object_count()
-    }
-
-    #[cfg(not(debug_assertions))]
-    pub(crate) fn pool_len(&self) -> usize {
-        self.pool.object_count()
-    }
-
     pub fn get_static(&self, id: StrId) -> &'static [u8] {
         unsafe { std::slice::from_raw_parts(self.get(id).as_ptr(), self.get(id).len()) }
     }
