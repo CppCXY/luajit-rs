@@ -65,9 +65,6 @@ impl GcHeader {
         self.bits.set(v);
     }
 
-    pub fn is_white(&self) -> bool {
-        (self.rb() & COLOR_MASK) != BIT_BLACK && (self.rb() & COLOR_MASK) != 0
-    }
     pub fn is_black(&self) -> bool {
         (self.rb() & BIT_BLACK) != 0
     }
@@ -476,6 +473,19 @@ impl<T> Pool<T> {
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.objects.iter().map(|nn| unsafe { nn.as_ref() })
     }
+    /// Clear the per-cycle `marked` flag on every object. The flag records
+    /// "marked in the current cycle"; without resetting it at a cycle
+    /// boundary, an object marked by an interrupted/incomplete cycle keeps
+    /// `marked == true` and is treated as live in the next cycle — weak
+    /// tables then fail to drop it, and the sweep retains it forever.
+    pub fn reset_marked(&mut self) {
+        for nn in &self.objects {
+            let h = gc_header(*nn);
+            if h.marked.get() {
+                h.marked.set(false);
+            }
+        }
+    }
     pub fn sweep(&mut self, mut on_free: impl FnMut(&T)) {
         // Old marked-only sweep (backward compat).
         let mut i = 0;
@@ -518,7 +528,12 @@ impl<T> Pool<T> {
             }
             let h = gc_header(ptr);
             let was_marked = h.marked.get();
-            let alive = was_marked || !h.is_dead(current_white);
+            // Alive = marked this cycle, or a non-dead color. `marked` is
+            // cleared at every cycle start, so `was_marked` only reflects
+            // this cycle's mark; objects a stale BLACK left by an
+            // interrupted earlier cycle are kept alive here (conservative),
+            // and weak tables drop them via `may_clear`'s `!is_marked`.
+            let alive = was_marked || (!h.is_dead(current_white) && !h.is_black());
             if alive {
                 if was_marked {
                     h.change_white();
@@ -593,14 +608,6 @@ impl<T> GcPtr<T> {
     pub(crate) fn mark_bits(self) -> (bool, u8) {
         let h = gc_header(self.0);
         (h.marked.get(), h.raw_bits())
-    }
-
-    /// `iswhite`: the object is not marked (carries any white bit). This is
-    /// what `gc_mayclear` tests: an entry whose key/value was not marked in
-    /// this cycle is dropped from a weak table, even if the object would
-    /// only be swept one cycle later.
-    pub(crate) fn is_white(self) -> bool {
-        gc_header(self.0).is_white()
     }
 
     #[track_caller]
@@ -1310,9 +1317,9 @@ pub(crate) fn may_clear(v: LuaValue, is_val: bool, cw: u8) -> bool {
             }
             false
         }
-        LJ_TTAB => v.as_table().is_some_and(|p| p.is_white()),
-        LJ_TFUNC => v.as_func().is_some_and(|p| p.is_white()),
-        LJ_TTHREAD => v.as_thread().is_some_and(|p| p.is_white()),
+        LJ_TTAB => v.as_table().is_some_and(|p| !p.is_marked()),
+        LJ_TFUNC => v.as_func().is_some_and(|p| !p.is_marked()),
+        LJ_TTHREAD => v.as_thread().is_some_and(|p| !p.is_marked()),
         LJ_TUDATA => v.as_userdata().is_some_and(|p| {
             // Keys: cleared only when dead (other-white) — a finalized
             // key survives the cycle its finalizer ran in, then dies the
@@ -1325,7 +1332,7 @@ pub(crate) fn may_clear(v: LuaValue, is_val: bool, cw: u8) -> bool {
                 h.is_dead(cw)
             }
         }),
-        LJ_TCDATA => v.as_cdata().is_some_and(|p| p.is_white()),
+        LJ_TCDATA => v.as_cdata().is_some_and(|p| !p.is_marked()),
         _ => false,
     }
 }
@@ -1431,6 +1438,18 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
     g.heap.threads.update_current_white(cw);
     g.heap.cdatas.update_current_white(cw);
     g.heap.userdatas.update_current_white(cw);
+    // The `marked` flag records "marked in the current cycle". An
+    // interrupted cycle (an allocation-driven step that stops mid-mark)
+    // leaves it set; without a reset here, those objects would count as
+    // live in this fresh cycle even though they are never re-marked —
+    // weak tables would keep them and the sweep would retain them.
+    g.heap.tables.reset_marked();
+    g.heap.funcs.reset_marked();
+    g.heap.threads.reset_marked();
+    g.heap.upvals.reset_marked();
+    g.heap.protos.reset_marked();
+    g.heap.userdatas.reset_marked();
+    g.heap.cdatas.reset_marked();
     g.heap.gc_state = GcState::Propagate;
     let mut m = Marker {
         gray: Vec::with_capacity(64),
