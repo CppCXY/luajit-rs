@@ -865,9 +865,6 @@ impl Interp {
     /// path: a plain Lua frame link and no open upvalues to close. Returns
     /// the caller's wanted result count (from the CALL instruction's B).
     #[inline(always)]
-    /// Reload the interpreter for the closure owning the frame at `fr`'s
-    /// base.
-    #[inline(always)]
     fn reload_at(&mut self, fr: Frame) {
         let cl = unsafe { *fr.bp().sub(2) }.as_func().unwrap();
         self.reload(cl);
@@ -2159,7 +2156,7 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = fr.cur_base() + pt.framesize as usize;
-                            self.l().frame_top = self.l().top;
+        self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             // A compiled callee (JFUNCF): enter its trace
                             // from the fresh frame.
@@ -2251,7 +2248,7 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = fr.cur_base() + pt.framesize as usize;
-                            self.l().frame_top = self.l().top;
+        self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             if !REC && bc_op(head) == BCOp::JFUNCF {
                                 sync!();
@@ -3385,9 +3382,21 @@ impl Interp {
         if ((link >> 3) as usize) < self.l().stack.len() {
             // Base-encoded link (host-fabricated frame: C call, debug
             // hook): return to the caller without touching the
-            // interpreter state — this run ends here.
-            self.l().top = dst + n;
-            return Some(n);
+            // interpreter state — this run ends here. Only C-call frames
+            // carry this encoding (`call_c`); a Lua frame's FRAME_LUA
+            // link is always the caller's return PC. The frame below the
+            // encoded base is the invoked C function, which tells the two
+            // apart reliably (a size heuristic misclassifies return PCs
+            // when the bytecode sits at a low heap address).
+            let link_base = (link >> 3) as usize;
+            let is_c_frame = link_base >= 2
+                && self.l().stack[link_base - 2]
+                    .as_func()
+                    .is_some_and(|f| matches!(f.as_ref(), GcFunc::C(_)));
+            if is_c_frame {
+                self.l().top = dst + n;
+                return Some(n);
+            }
         }
         // FRAME_LUA: the link is the caller's return PC.
         let ret_ip = link as *const BCIns;
@@ -3404,6 +3413,13 @@ impl Interp {
         let cl = self.at(caller_base - 2).as_func().unwrap();
         self.reload(cl);
         self.pc = unsafe { ret_ip.offset_from(self.bcp) as usize };
+        // Restore the caller's frame extent: the callee's CALL fast path
+        // set `frame_top` to the callee frame, and a callee returning
+        // through do_return (RET0/RET1 cold path, e.g. open upvalues)
+        // would otherwise leave it at the callee's (possibly smaller)
+        // extent, letting later GC marks/clears under-protect the
+        // caller's live registers.
+        self.l().frame_top = caller_base + self.proto().framesize as usize;
         // No line event on the caller's resumption line.
         if self.l().hookmask & HOOKMASK_LINE != 0 {
             let pt = self.proto();

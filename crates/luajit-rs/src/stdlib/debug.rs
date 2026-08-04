@@ -85,9 +85,14 @@ fn funcname_from_caller(l: &LuaState, slot: usize) -> Option<(&'static str, Stri
     if (link & FRAME_TYPE_MASK) != 0 || link == 0 {
         return None; // FRAME_LUA only.
     }
-    // A small link is a caller-base encoding (host-fabricated frames),
-    // not a return PC; nothing to infer from.
-    if ((link >> 3) as usize) < l.stack.len() {
+    // A caller-base encoding is fabricated by `call_c` on C-call frames;
+    // a Lua frame's link is always the caller's return PC.
+    let frame_is_c = l
+        .stack
+        .get(slot - 2)
+        .and_then(|v| v.as_func())
+        .is_some_and(|f| matches!(f.as_ref(), GcFunc::C(_)));
+    if frame_is_c {
         return None;
     }
     let ret_ip = link as *const BCIns;
@@ -350,7 +355,13 @@ fn walk_frames(l: &LuaState, mut level: i32) -> Option<(usize, GcPtr<crate::func
             // count as an extra (C-side) level.
             match ft {
                 0 /* FRAME_LUA */ if link != 0 => {
-                    if ((link >> 3) as usize) < l.stack.len() {
+                    // The link is either the caller's return PC (Lua-to-Lua
+                    // calls) or a caller-base encoding fabricated by
+                    // `call_c` for C-call frames. They are told apart by the
+                    // frame's own function: only C frames carry the base
+                    // encoding. (A size heuristic misclassifies return PCs
+                    // when the bytecode sits at a low heap address.)
+                    if matches!(fv.as_ref(), crate::func::GcFunc::C(_)) {
                         slot = (link >> 3) as usize;
                     } else {
                         let ret_ip = link as *const crate::bc::BCIns;
@@ -719,9 +730,16 @@ fn walk_next(l: &LuaState, mut slot: usize, mut cur_link: u64) -> Option<usize> 
         cur_link = l.stack[slot - 1].to_bits();
     }
     let frame_type = cur_link & FRAME_TYPE_MASK;
+    // A FRAME_LUA link is a caller-base encoding only on C-call frames
+    // (fabricated by `call_c`); Lua frames always carry a return PC.
+    let frame_is_c = l
+        .stack
+        .get(slot - 2)
+        .and_then(|v| v.as_func())
+        .is_some_and(|f| matches!(f.as_ref(), crate::func::GcFunc::C(_)));
     match frame_type {
         0 /* FRAME_LUA */ if cur_link != 0 => {
-            if ((cur_link >> 3) as usize) < l.stack.len() {
+            if frame_is_c {
                 Some((cur_link >> 3) as usize)
             } else {
                 let ret_ip = cur_link as *const crate::bc::BCIns;
