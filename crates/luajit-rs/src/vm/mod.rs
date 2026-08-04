@@ -865,31 +865,12 @@ impl Interp {
     /// path: a plain Lua frame link and no open upvalues to close. Returns
     /// the caller's wanted result count (from the CALL instruction's B).
     #[inline(always)]
-    fn ret_fast(&self, bp: *const LuaValue) -> Option<i32> {
-        let link = unsafe { (*bp.sub(1)).to_bits() };
-        if (link & FRAME_TYPE_MASK) == FRAME_LUA && self.l().openuv.is_empty() {
-            let ret_ip = link as *const BCIns;
-            let call_ins = unsafe { *ret_ip.sub(1) };
-            Some(bc_b(call_ins) as i32 - 1)
-        } else {
-            None
-        }
-    }
-
     /// Reload the interpreter for the closure owning the frame at `fr`'s
     /// base.
     #[inline(always)]
     fn reload_at(&mut self, fr: Frame) {
         let cl = unsafe { *fr.bp().sub(2) }.as_func().unwrap();
         self.reload(cl);
-    }
-
-    /// The CALL instruction that set up the frame whose return PC is
-    /// `ret_ip` (a FRAME_LUA link is the return PC; the CALL sits one
-    /// slot before it).
-    #[inline(always)]
-    fn ret_call_ins(&self, ret_ip: *const BCIns) -> BCIns {
-        unsafe { *ret_ip.sub(1) }
     }
 
     /// Run a "call"/"return" hook event from a dispatch arm (cold). The
@@ -2314,20 +2295,23 @@ impl Interp {
                         self.hook_event("return")?;
                         resync!();
                     }
-                    if let Some(want) = self.ret_fast(fr.bp()) {
+                    if let Some((wbase, want, ret_ip, ca)) = self.ret_fast_n(fr.bp()) {
                         if !self.hook_lines.is_empty() {
                             let _ = self.hook_lines.pop();
                         }
-                        let jmp = fr.frame_link() as *const BCIns;
-                        let call_ins = self.ret_call_ins(jmp);
-                        let dst = fr.cur_base() - 2;
+                        let dst = wbase - 2;
                         for i in 0..want.max(0) as usize {
                             fr.set_abs(dst + i, LuaValue::NIL);
                         }
                         self.multres = 0;
-                        fr = Frame::new(self.sp, dst - bc_a(call_ins) as usize);
-                        ip = jmp;
+                        fr = Frame::new(self.sp, dst - ca as usize);
+                        ip = ret_ip;
                         self.reload_at(fr);
+                        // The inlined CALL fast path set `frame_top` to the
+                        // callee frame; restore the caller's extent so later
+                        // GC marks see the real frame (a small callee like a
+                        // `return 1` closure would otherwise shrink it).
+                        self.l().frame_top = fr.cur_base() + self.proto().framesize as usize;
                         // Skip a line event on the caller's resumption
                         // line (Lua 5.1: the caller's line was already
                         // reported before the call).
@@ -2352,21 +2336,20 @@ impl Interp {
                         self.hook_event("return")?;
                         resync!();
                     }
-                    if let Some(want) = self.ret_fast(fr.bp()) {
+                    if let Some((wbase, want, ret_ip, ca)) = self.ret_fast_n(fr.bp()) {
                         if !self.hook_lines.is_empty() {
                             let _ = self.hook_lines.pop();
                         }
-                        let jmp = fr.frame_link() as *const BCIns;
-                        let call_ins = self.ret_call_ins(jmp);
-                        let dst = fr.cur_base() - 2;
+                        let dst = wbase - 2;
                         fr.set_abs(dst, fr.reg(a));
                         for i in 1..want.max(1) as usize {
                             fr.set_abs(dst + i, LuaValue::NIL);
                         }
                         self.multres = 1;
-                        fr = Frame::new(self.sp, dst - bc_a(call_ins) as usize);
-                        ip = jmp;
+                        fr = Frame::new(self.sp, dst - ca as usize);
+                        ip = ret_ip;
                         self.reload_at(fr);
+                        self.l().frame_top = fr.cur_base() + self.proto().framesize as usize;
                         if self.l().hookmask & HOOKMASK_LINE != 0 {
                             let pt = self.proto();
                             let pc = unsafe { ip.offset_from(self.bcp) as usize };
@@ -2408,6 +2391,7 @@ impl Interp {
                         fr = Frame::new(self.sp, dst - ca as usize);
                         ip = ret_ip;
                         self.reload_at(fr);
+                        self.l().frame_top = fr.cur_base() + self.proto().framesize as usize;
                         self.l().top = dst + if want >= 0 { want as usize } else { n };
                         continue;
                     }
@@ -2435,6 +2419,7 @@ impl Interp {
                         fr = Frame::new(self.sp, dst - ca as usize);
                         ip = ret_ip;
                         self.reload_at(fr);
+                        self.l().frame_top = fr.cur_base() + self.proto().framesize as usize;
                         self.l().top = dst + if want >= 0 { want as usize } else { n };
                         continue;
                     }
