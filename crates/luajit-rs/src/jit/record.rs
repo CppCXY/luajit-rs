@@ -2563,6 +2563,9 @@ impl Record {
             BCOp::KNIL => {
                 let mut s = bc_a(ins);
                 let last = bc_d(ins);
+                if last >= MAX_JSLOTS as u32 - self.baseslot as u32 {
+                    return Err(TraceError::STACKOV);
+                }
                 while s <= last {
                     self.set_base(s, TREF_NIL);
                     s += 1;

@@ -2467,7 +2467,7 @@ impl<'a> Parser<'a> {
         // range to cover it. Locals (VLocal) sit below `freg` and are
         // skipped.
         let mut to = freereg;
-        if v.k == VNonReloc {
+        if v.k == VNonReloc && v.info != NO_REG {
             to = to.max(v.info + 1);
         }
         if to > freg {

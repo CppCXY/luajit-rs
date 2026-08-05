@@ -92,6 +92,9 @@ pub fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
+    if crate::stdlib::nargs(l) < 1 {
+        return Err(l.runtime_error(b"bad argument #1 to 'tostring' (value expected)"));
+    }
     let v = arg(l, 0);
     // Lua 5.1 luaB_tostring: the __tostring result is returned verbatim
     // (even nil); only when there is no metamethod is the raw fallback used.
@@ -117,6 +120,9 @@ pub fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
+    if crate::stdlib::nargs(l) < 1 {
+        return Err(l.runtime_error(b"bad argument #1 to 'tonumber' (value expected)"));
+    }
     let v = arg(l, 0);
     let r = if nargs(l) > 1 {
         // tonumber(e, base): parse e (string or number) in the given base.
@@ -405,6 +411,12 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             crate::vm::run_finalizers(l)?;
             crate::gc::full_gc(l.global());
             crate::vm::run_finalizers(l)?;
+            // Lua 5.1's luaC_step calls setthreshold when the cycle
+            // completes, which re-arms the automatic collector even after
+            // collectgarbage("stop"). Mirror that: a full collection
+            // un-stops the GC, or a later allocation loop (e.g. closure.lua's
+            // `while x[1] do ... end` weak-table loop) would spin forever.
+            l.global().heap.gc_stopped = false;
             push(l, LuaValue::number(0.0));
             Ok(1)
         }
