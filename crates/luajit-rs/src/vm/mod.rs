@@ -849,7 +849,16 @@ impl Interp {
             bp = unsafe { bp.sub(sz) };
             link = unsafe { (*bp.sub(1)).to_bits() };
         }
-        if (link & FRAME_TYPE_MASK) == FRAME_LUA && self.l().openuv.is_empty() {
+        // A FRAME_LUA link is the caller's return PC only when it is a real
+        // code address; the size test separates it from the caller-base
+        // encoding fabricated by `call_c` and `call_hook` (whose frames
+        // carry `(saved_base << 3) | FRAME_LUA`, small enough to index the
+        // stack). Treating an encoded link as a return PC would jump into a
+        // tiny bogus address.
+        if (link & FRAME_TYPE_MASK) == FRAME_LUA
+            && ((link >> 3) as usize) >= self.l().stack.len()
+            && self.l().openuv.is_empty()
+        {
             let ret_ip = link as *const BCIns;
             let call_ins = unsafe { *ret_ip.sub(1) };
             let want = bc_b(call_ins) as i32 - 1;
@@ -864,6 +873,8 @@ impl Interp {
     /// Whether a return from the frame at `bp` may take the inline fast
     /// path: a plain Lua frame link and no open upvalues to close. Returns
     /// the caller's wanted result count (from the CALL instruction's B).
+    /// Reload the interpreter for the closure owning the frame at `fr`'s
+    /// base.
     #[inline(always)]
     fn reload_at(&mut self, fr: Frame) {
         let cl = unsafe { *fr.bp().sub(2) }.as_func().unwrap();
@@ -2156,7 +2167,7 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = fr.cur_base() + pt.framesize as usize;
-        self.l().frame_top = self.l().top;
+                            self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             // A compiled callee (JFUNCF): enter its trace
                             // from the fresh frame.
@@ -2248,7 +2259,7 @@ impl Interp {
                             self.knp = pt.kn.as_ptr();
                             self.ksp = pt.kstrv.as_ptr();
                             self.l().top = fr.cur_base() + pt.framesize as usize;
-        self.l().frame_top = self.l().top;
+                            self.l().frame_top = self.l().top;
                             let head = pt.bc[0];
                             if !REC && bc_op(head) == BCOp::JFUNCF {
                                 sync!();
@@ -3382,21 +3393,13 @@ impl Interp {
         if ((link >> 3) as usize) < self.l().stack.len() {
             // Base-encoded link (host-fabricated frame: C call, debug
             // hook): return to the caller without touching the
-            // interpreter state — this run ends here. Only C-call frames
-            // carry this encoding (`call_c`); a Lua frame's FRAME_LUA
-            // link is always the caller's return PC. The frame below the
-            // encoded base is the invoked C function, which tells the two
-            // apart reliably (a size heuristic misclassifies return PCs
-            // when the bytecode sits at a low heap address).
-            let link_base = (link >> 3) as usize;
-            let is_c_frame = link_base >= 2
-                && self.l().stack[link_base - 2]
-                    .as_func()
-                    .is_some_and(|f| matches!(f.as_ref(), GcFunc::C(_)));
-            if is_c_frame {
-                self.l().top = dst + n;
-                return Some(n);
-            }
+            // interpreter state — this run ends here. Note that the
+            // encoding is *not* unique to C-call frames (the debug hook
+            // frames fabricated by `call_hook` also carry it), so we must
+            // keep the size test rather than keying off the frame's
+            // function type.
+            self.l().top = dst + n;
+            return Some(n);
         }
         // FRAME_LUA: the link is the caller's return PC.
         let ret_ip = link as *const BCIns;

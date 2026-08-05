@@ -586,6 +586,13 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
             l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
+            // The raised frame's slot/PC were recorded for traceback; the
+            // error is now handled, so drop them — the recorded frame may
+            // have been popped (and its closure collected) by the time the
+            // caller runs a traceback, and a stale slot would point at a
+            // recycled closure.
+            l.err_trace_slot = None;
+            l.err_raise_pc = None;
             Ok(2)
         }
         Err(LuaError::Yield) => {
@@ -703,6 +710,11 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
                 }
                 l.base = saved_base;
             }
+            // The error is handled; drop the recorded raise frame so a
+            // later traceback cannot dereference a frame that was already
+            // popped and collected.
+            l.err_trace_slot = None;
+            l.err_raise_pc = None;
             l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
