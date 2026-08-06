@@ -1742,7 +1742,18 @@ impl<'a> Parser<'a> {
 
     fn fs_finish(&mut self, line: BCLine) -> Proto {
         self.fs_fixup_ret();
-        let fs = self.fs.pop().unwrap();
+        let mut fs = self.fs.pop().unwrap();
+        // A vararg function with the implicit `arg` table (body never uses
+        // `...`): the VM stores the table at register `numparams`, so the
+        // frame must cover it. If the body never touches `arg`, `freereg`
+        // (and thus `framesize`) can stop at `numparams`, leaving the arg
+        // slot outside the frame — a nested call's temporaries then
+        // overwrite it, and the parameter slots read as nil afterwards
+        // (LuaJIT test-suite: lang/vararg_jit, lib/coroutine/yield).
+        if (fs.flags & PROTO_VARARG_NEEDSARG) != 0 {
+            let need = (fs.numparams as u32 + 1).max(fs.framesize as u32);
+            fs.framesize = need.min(u8::MAX as u32) as u8;
+        }
         let numline = line - fs.linedefined;
         self.checklimitgt_static(fs.kn.len() as u32, BCMAX_D + 1, "constants", fs.linedefined);
         self.checklimitgt_static(
