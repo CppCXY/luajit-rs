@@ -313,7 +313,7 @@ impl Interner {
         unsafe { std::slice::from_raw_parts(self.get(id).as_ptr(), self.get(id).len()) }
     }
 
-    pub(crate) fn sweep(&mut self, current_white: u8) {
+    pub(crate) fn sweep(&mut self, current_white: u8, budget: &mut usize) -> bool {
         let by_id = &mut self.by_id;
         // Pin any string with empty bytes ("") by marking it before sweep.
         // The sentinel must survive all GC cycles.
@@ -325,7 +325,7 @@ impl Interner {
                 p.set_marked();
             }
         }
-        self.pool.sweep_tricolor(current_white, |s| {
+        let done = self.pool.sweep_tricolor(current_white, budget, |s| {
             let hash = s.hash();
             let bytes = s.as_bytes();
             let mask = self.slots.len() - 1;
@@ -354,6 +354,7 @@ impl Interner {
             // Dead StringIds are left as permanent holes in `by_id`.
         });
         self.bytes = self.pool.iter().map(|s| s.gc_size()).sum();
+        done
     }
     pub(crate) fn update_current_white(&self, cw: u8) {
         self.pool.update_current_white(cw);

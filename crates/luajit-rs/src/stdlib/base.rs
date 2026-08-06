@@ -441,12 +441,13 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
                 crate::gc::start_gc_cycle(g);
             }
             let mut done = false;
+            let unbounded = size == 0;
             loop {
-                if lim == 0 {
+                if !unbounded && lim == 0 {
                     break;
                 }
-                lim -= 1;
-                let step_done = crate::gc::gc_step(&mut g.heap, crate::runtime::gc::GC_STEP_SIZE);
+                lim = lim.saturating_sub(1);
+                let step_done = crate::gc::gc_step(g, crate::runtime::gc::GC_STEP_SIZE);
                 // Detect completion: gc_step returned true, or the cycle finished
                 // behind our back (C-call boundary completed it).
                 if step_done || g.heap.gc_state == crate::runtime::gc::GcState::Pause {
