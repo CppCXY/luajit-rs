@@ -474,11 +474,12 @@ fn call_c(
     l.stack[args_base - 1] = LuaValue::from_bits(((saved_base as u64) << 3) | FRAME_LUA);
     l.base = args_base;
     l.top = args_base + nargs;
-    let (step_size, collect) = {
+    let (step_size, paused, collect) = {
         let g = l.global();
         (
             g.heap.gc_step_size,
-            g.heap.debt > 0 && !g.heap.gc_stopped,
+            g.heap.gc_state == crate::runtime::gc::GcState::Pause,
+            (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped,
         )
     };
     if collect {
@@ -486,7 +487,11 @@ fn call_c(
         // `top`; the caller's frame locals sit below frame_top, so raise
         // top past them for the duration of the step.
         l.top = l.top.max(l.frame_top);
-        crate::gc::gc_step(l.global(), step_size);
+        if paused {
+            crate::gc::start_gc_cycle(l.global());
+        }
+        crate::gc::gc_step(&mut l.global().heap, step_size);
+        l.global().heap.debt = 0;
         l.top = args_base + nargs;
     }
     let r = f(l);
@@ -1876,7 +1881,8 @@ impl Interp {
                 BCOp::TNEW => {
                     // Inline: only sync when GC is due (cold path).
                     let g = self.l().global();
-                    if g.heap.debt > 0
+                    if g.heap.should_collect()
+                        || g.heap.debt > 4096
                         || g.heap.gc_state == crate::runtime::gc::GcState::Finalize
                     {
                         sync!();
@@ -2885,7 +2891,8 @@ impl Interp {
         if g.heap.gc_state == crate::runtime::gc::GcState::Finalize {
             run_finalizers(self.l())?;
         }
-        if g.heap.debt > 0 && !g.heap.gc_stopped {
+        let g = self.l().global();
+        if g.heap.should_collect() || g.heap.debt > 4096 {
             self.gc_collect(need)?;
         }
         Ok(())
@@ -2900,7 +2907,34 @@ impl Interp {
         // while frame temporaries above it are still live, so never drop
         // below the frame extent.
         l.top = l.top.max(l.frame_top).max(need);
-        crate::gc::gc_step(l.global(), l.global().heap.gc_step_size);
+        let step_size = l.global().heap.gc_step_size;
+        let paused = l.global().heap.gc_state == crate::runtime::gc::GcState::Pause;
+        let stopped = l.global().heap.gc_stopped;
+        if stopped {
+            return Ok(());
+        }
+        let g = l.global();
+        if paused {
+            crate::gc::start_gc_cycle(g);
+        }
+        // On-trace string allocation outruns the incremental collector:
+        // a single small step never catches the growing pool, the sweep
+        // lags forever and the debt threshold inflates with the garbage
+        // (measured: the strings benchmark held 1.5 GB of dead strings
+        // and never collected). Drive the cycle to completion at the
+        // boundary (bounded per call so a huge live table's mark phase
+        // is amortized over several exits instead of one long stop).
+        let mut steps = 0;
+        loop {
+            crate::gc::gc_step(&mut g.heap, step_size);
+            steps += 1;
+            if g.heap.gc_state == crate::runtime::gc::GcState::Pause
+                || g.heap.gc_state == crate::runtime::gc::GcState::Finalize
+                || steps >= 512
+            {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -3160,16 +3194,24 @@ impl Interp {
         l.base = args_base;
         l.top = args_base + nargs;
         // C-call boundary is a GC safe point (args anchored, frames below).
-        let (step_size, collect) = {
+        let (step_size, paused, collect) = {
             let g = l.global();
-            (g.heap.gc_step_size, g.heap.debt > 0 && !g.heap.gc_stopped)
+            (
+                g.heap.gc_step_size,
+                g.heap.gc_state == crate::runtime::gc::GcState::Pause,
+                (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped,
+            )
         };
         if collect {
             // lj_gc_step_fixtop: protect the caller's frame locals from
             // the collector's slot clearing (top was lowered to the arg
             // area for this C call).
             l.top = l.top.max(l.frame_top);
-            crate::gc::gc_step(l.global(), step_size);
+            if paused {
+                crate::gc::start_gc_cycle(l.global());
+            }
+            crate::gc::gc_step(&mut l.global().heap, step_size);
+            l.global().heap.debt = 0;
             l.top = args_base + nargs;
         }
         let r = f(l);

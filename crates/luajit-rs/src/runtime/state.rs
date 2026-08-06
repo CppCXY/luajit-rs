@@ -40,10 +40,6 @@ pub struct GcHeap {
     pub cdatas: Pool<CData>,
     pub userdatas: Pool<GcUserData>,
     pub threads: Pool<LuaState>,
-    /// Back-pointer to the owning `GlobalState` (the collector walks the
-    /// roots — globals table, threads, JIT traces — when a cycle starts,
-    /// so `gc_step` must reach them from an allocation site).
-    pub global: *mut GlobalState,
     pub total: usize,
     pub threshold: usize,
     pub table_extra: usize,
@@ -92,7 +88,6 @@ impl Default for GcHeap {
             cdatas: Pool::new(GcObjectKind::CData),
             userdatas: Pool::new(GcObjectKind::UserData),
             threads: Pool::new(GcObjectKind::Thread),
-            global: std::ptr::null_mut(),
             total: 0,
             threshold: gc::GC_THRESHOLD_MIN,
             table_extra: 0,
@@ -155,7 +150,7 @@ impl GcHeap {
         t.heap = self as *const GcHeap;
         let size = t.gc_size();
         self.total += size;
-        gc::gc_step(unsafe { &mut *self.global }, size); // GC first — may start a cycle
+        gc::gc_step(self, size); // GC first — may start a cycle
         self.account_alloc(size);
         self.tables.alloc(t)
     }
@@ -177,7 +172,7 @@ impl GcHeap {
         let sz = p.gc_size();
         self.total += sz;
         self.account_alloc(sz);
-        gc::gc_step(unsafe { &mut *self.global }, sz);
+        gc::gc_step(self, sz);
         self.protos.alloc(p)
     }
 
@@ -185,7 +180,7 @@ impl GcHeap {
         let size = gc::account_func(&f);
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(unsafe { &mut *self.global }, size);
+        gc::gc_step(self, size);
         self.funcs.alloc(f)
     }
 
@@ -193,7 +188,7 @@ impl GcHeap {
         let size = gc::account_upval();
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(unsafe { &mut *self.global }, size);
+        gc::gc_step(self, size);
         let p = self.upvals.alloc(uv);
         p.as_mut().init_closed();
         p
@@ -203,7 +198,7 @@ impl GcHeap {
         let size = gc::account_thread(&th);
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(unsafe { &mut *self.global }, size);
+        gc::gc_step(self, size);
         self.threads.alloc(th)
     }
 
@@ -211,7 +206,7 @@ impl GcHeap {
         let size = std::mem::size_of::<CData>() + cd.data.len();
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(unsafe { &mut *self.global }, size);
+        gc::gc_step(self, size);
         self.cdatas.alloc(cd)
     }
 
@@ -219,7 +214,7 @@ impl GcHeap {
         let size = std::mem::size_of::<GcUserData>();
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(unsafe { &mut *self.global }, size);
+        gc::gc_step(self, size);
         self.userdatas.alloc(ud)
     }
 
@@ -230,7 +225,7 @@ impl GcHeap {
         if new_bytes > prev_bytes {
             let sz = new_bytes - prev_bytes;
             self.account_alloc(sz);
-            gc::gc_step(unsafe { &mut *self.global }, sz);
+            gc::gc_step(self, sz);
         }
         sid
     }
@@ -243,7 +238,7 @@ impl GcHeap {
         if new_bytes > prev_bytes {
             let sz = new_bytes - prev_bytes;
             self.account_alloc(sz);
-            gc::gc_step(unsafe { &mut *self.global }, sz);
+            gc::gc_step(self, sz);
         }
         sid
     }
@@ -817,7 +812,6 @@ impl Lua {
             main: None,
         }));
         let gs = unsafe { &mut *g };
-        gs.heap.global = g;
         gs.globals = gs.heap.alloc_table(LuaTable::new(0, 1));
         gs.registry = gs.heap.alloc_table(LuaTable::new(0, 1));
         for (i, name) in meta::MM_NAMES.iter().enumerate() {
@@ -1083,4 +1077,3 @@ mod tests {
         assert_eq!(l.top, 0);
     }
 }
-
