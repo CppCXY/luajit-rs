@@ -182,7 +182,9 @@ impl Interp {
         };
         match msg {
             Some(m) => self.l().runtime_error(m.as_bytes()),
-            None => self.l().runtime_error(b"attempt to index a non-table value"),
+            None => self
+                .l()
+                .runtime_error(b"attempt to index a non-table value"),
         }
     }
 
@@ -351,44 +353,44 @@ impl Interp {
         }
     }
 
-/// Map an arith instruction + which operand is bad to its register slot,
-/// accounting for the bytecode's operand order (`*NV` puts the constant in
-/// `c`, `*VN` the variable in `b`, VV/VV both in b/c).
-fn arith_operand_slot(op: crate::bc::BCOp, is_b: bool, ins: BCIns) -> Option<u32> {
-    use crate::bc::BCOp::*;
-    match op {
-        // Variable-variable (or unary).
-        UNM | ADDVV | SUBVV | MULVV | DIVVV | MODVV | POW | BAND | BOR | BXOR | BSHL | BSHR => {
-            Some(if is_b {
-                crate::bc::bc_b(ins)
-            } else {
-                crate::bc::bc_c(ins)
-            })
-        }
-        // Variable-constant: `rb` is the variable (b), `rc` is the constant.
-        ADDVN | SUBVN | MULVN | DIVVN | MODVN => {
-            if is_b {
-                Some(crate::bc::bc_b(ins))
-            } else {
-                None
+    /// Map an arith instruction + which operand is bad to its register slot,
+    /// accounting for the bytecode's operand order (`*NV` puts the constant in
+    /// `c`, `*VN` the variable in `b`, VV/VV both in b/c).
+    fn arith_operand_slot(op: crate::bc::BCOp, is_b: bool, ins: BCIns) -> Option<u32> {
+        use crate::bc::BCOp::*;
+        match op {
+            // Variable-variable (or unary).
+            UNM | ADDVV | SUBVV | MULVV | DIVVV | MODVV | POW | BAND | BOR | BXOR | BSHL | BSHR => {
+                Some(if is_b {
+                    crate::bc::bc_b(ins)
+                } else {
+                    crate::bc::bc_c(ins)
+                })
             }
-        }
-        // Constant-variable: `rb` is the constant (c), `rc` is the variable
-        // (b) — the VM passes (kv, yv) with yv = fr.reg(bc_b).
-        ADDNV | SUBNV | MULNV | DIVNV | MODNV => {
-            if is_b {
-                None
-            } else {
-                Some(crate::bc::bc_b(ins))
+            // Variable-constant: `rb` is the variable (b), `rc` is the constant.
+            ADDVN | SUBVN | MULVN | DIVVN | MODVN => {
+                if is_b {
+                    Some(crate::bc::bc_b(ins))
+                } else {
+                    None
+                }
             }
+            // Constant-variable: `rb` is the constant (c), `rc` is the variable
+            // (b) — the VM passes (kv, yv) with yv = fr.reg(bc_b).
+            ADDNV | SUBNV | MULNV | DIVNV | MODNV => {
+                if is_b {
+                    None
+                } else {
+                    Some(crate::bc::bc_b(ins))
+                }
+            }
+            _ => None,
         }
-        _ => None,
     }
-}
 
-/// `lj_meta_arith`: coercion first, then arithmetic metamethod.
-/// Returns `Some(val)` when resolved or `None` for Lua continuation.
-pub(super) fn meta_arith(
+    /// `lj_meta_arith`: coercion first, then arithmetic metamethod.
+    /// Returns `Some(val)` when resolved or `None` for Lua continuation.
+    pub(super) fn meta_arith(
         &mut self,
         mm: MM,
         rb: LuaValue,

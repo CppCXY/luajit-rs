@@ -142,7 +142,7 @@ impl GcHeap {
     /// are managed exclusively by `gc_step` — accruing debt here is what
     /// made every small allocation storm (e.g. closure creation) drive a
     /// full collection.
-    fn account_alloc(&mut self, size: usize) {
+    fn account_alloc(&mut self, _size: usize) {
         let live = self.total + self.strings.bytes() + self.table_extra;
         // Hard cap so a runaway allocator (an unbounded `__gc` finalizer
         // chain, a leak) can't exhaust the host machine while debugging.

@@ -128,11 +128,7 @@ fn dec_token_len(s: &[u8]) -> usize {
             _ => break,
         }
     }
-    if seen_any {
-        i
-    } else {
-        0
-    }
+    if seen_any { i } else { 0 }
 }
 
 /// Length of the longest hex-number prefix (0x..., optional `p` exponent).

@@ -220,7 +220,11 @@ fn loop_unroll(rec: &mut Record) -> Result<(), TraceError> {
             if tr != 0 {
                 tref_ref(tr)
             } else {
-                tref_ref(rec.cur.ir.emitir(ir.ot & !(IRT_ISPHI as u16), ir.op1 as IRRef, ir.op2 as IRRef)?)
+                tref_ref(rec.cur.ir.emitir(
+                    ir.ot & !(IRT_ISPHI as u16),
+                    ir.op1 as IRRef,
+                    ir.op2 as IRRef,
+                )?)
             }
         } else {
             tref_ref(rec.cur.ir.emitir(ir.ot & !(IRT_ISPHI as u16), op1, op2)?)

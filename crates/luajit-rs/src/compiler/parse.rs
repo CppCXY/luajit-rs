@@ -2270,7 +2270,8 @@ impl<'a> Parser<'a> {
                 // than the callee is ambiguous (call continuation vs a new
                 // parenthesized statement) → error.
                 if self.ls.linenumber != self.ls.lastline {
-                    self.ls.error("ambiguous syntax (function call x new statement)");
+                    self.ls
+                        .error("ambiguous syntax (function call x new statement)");
                 }
                 self.expr_tonextreg(v);
                 if self.fr2 != 0 {
@@ -2280,9 +2281,7 @@ impl<'a> Parser<'a> {
                 if nav && (eflags & EXPR_F_NORES) == 0 && !self.suffix_follows() {
                     break;
                 }
-            } else if self.ls.tok == Tok::Str
-                || self.ls.tok == Tok::Char(b'{')
-            {
+            } else if self.ls.tok == Tok::Str || self.ls.tok == Tok::Char(b'{') {
                 self.expr_tonextreg(v);
                 if self.fr2 != 0 {
                     self.bcreg_reserve(1);

@@ -5,7 +5,6 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
-use std::sync::Mutex;
 
 use crate::api::lua_gettop;
 use crate::err::{LuaError, LuaResult};
@@ -71,11 +70,10 @@ fn handle_fd(l: &LuaState, i: usize) -> Option<usize> {
 /// `io.output() == io.stdout`; regular files get a fresh userdata each time
 /// so the GC can close them via `__gc` when unreferenced (LuaJIT semantics).
 fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
-    if id < 3 {
-        if let Some(Some(v)) = l.global().io_file_cache.get(id) {
+    if id < 3
+        && let Some(Some(v)) = l.global().io_file_cache.get(id) {
             return *v;
         }
-    }
     let ud = l.heap().alloc_userdata(GcUserData::new(id));
     push(l, LuaValue::userdata(ud)); // anchor for the metatable alloc
     let ud = arg(l, 0).as_userdata().unwrap();
@@ -98,7 +96,11 @@ fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
         (b"write".as_slice(), handle_write_fd),
     ] {
         let k = l.heap().str_value(l.heap().intern(name));
-        let fref = l.heap().alloc_func(GcFunc::C(CClosure { f, env, upvals: vec![] }));
+        let fref = l.heap().alloc_func(GcFunc::C(CClosure {
+            f,
+            env,
+            upvals: vec![],
+        }));
         mt.as_mut().set(k, LuaValue::func(fref));
     }
     let ts_ref = l.heap().alloc_func(GcFunc::C(CClosure {
@@ -186,9 +188,6 @@ fn handle_setvbuf_fd(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn fd_from_upval(_l: &LuaState) -> usize {
-    unreachable!("file methods use the userdata argument, not an upvalue")
-}
 fn handle_fd_arg(l: &mut LuaState, i: usize) -> LuaResult<usize> {
     match handle_fd(l, i) {
         Some(fd) => Ok(fd),
@@ -367,7 +366,6 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
                         }
                     }
                     Some(FileEntry::Stdin) => {
-                        drop(files);
                         let stdin = std::io::stdin();
                         let mut lock = stdin.lock();
                         for f in fmts {
@@ -407,7 +405,6 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
                     }
                 }
                 Some(FileEntry::Stdin) => {
-                    drop(files);
                     let stdin = std::io::stdin();
                     let mut lock = stdin.lock();
                     for f in fmts {
@@ -448,7 +445,6 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
                     Some(FileEntry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                     Some(FileEntry::ReadWrite(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                     Some(FileEntry::Stdout) | Some(FileEntry::Stderr) => {
-                        drop(files);
                         let mut so = std::io::stdout();
                         chunks
                             .iter()
@@ -477,7 +473,6 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
                 Some(FileEntry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                 Some(FileEntry::ReadWrite(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                 Some(FileEntry::Stdout) => {
-                    drop(files);
                     let mut so = std::io::stdout();
                     chunks
                         .iter()
@@ -485,7 +480,6 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
                         .and_then(|_| so.flush())
                 }
                 Some(FileEntry::Stderr) => {
-                    drop(files);
                     let mut se = std::io::stderr();
                     chunks
                         .iter()
@@ -570,7 +564,7 @@ fn lines_iter(l: &mut LuaState) -> LuaResult<i32> {
     let close_on_eof = l.upvalue(1).is_true();
     let line = {
         let files = l.files_mut();
-        match files.get_mut(fd as usize).and_then(|e| e.as_mut()) {
+        match files.get_mut(fd).and_then(|e| e.as_mut()) {
             Some(FileEntry::Read(r)) => {
                 let mut line = Vec::new();
                 match r.read_until(b'\n', &mut line) {
@@ -596,11 +590,10 @@ fn lines_iter(l: &mut LuaState) -> LuaResult<i32> {
     match line {
         Some(bytes) => ret_string(l, &bytes),
         None => {
-            if close_on_eof {
-                if let Some(slot) = l.global().files.get_mut(fd as usize) {
+            if close_on_eof
+                && let Some(slot) = l.global().files.get_mut(fd) {
                     *slot = None;
                 }
-            }
             push(l, LuaValue::NIL);
             Ok(1)
         }
@@ -733,16 +726,13 @@ fn io_flush(l: &mut LuaState) -> LuaResult<i32> {
                     }
                     Err(e) => ret_fail(l, &e.to_string()),
                 },
-                Some(FileEntry::Stdout | FileEntry::Stderr) => {
-                    drop(files);
-                    match std::io::stdout().flush() {
-                        Ok(()) => {
-                            push(l, LuaValue::TRUE);
-                            Ok(1)
-                        }
-                        Err(e) => ret_fail(l, &e.to_string()),
+                Some(FileEntry::Stdout | FileEntry::Stderr) => match std::io::stdout().flush() {
+                    Ok(()) => {
+                        push(l, LuaValue::TRUE);
+                        Ok(1)
                     }
-                }
+                    Err(e) => ret_fail(l, &e.to_string()),
+                },
                 _ => Err(l.runtime_error(b"default output not writable")),
             }
         }
@@ -955,8 +945,3 @@ fn io_tmpfile(l: &mut LuaState) -> LuaResult<i32> {
         Err(e) => Err(l.runtime_error(format!("tmpfile: {}", e).as_bytes())),
     }
 }
-
-
-
-
-

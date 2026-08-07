@@ -1266,7 +1266,7 @@ fn gc_onestep(heap: &mut GcHeap) -> (usize, bool) {
                 let total = total_live(heap);
                 heap.total = total;
                 heap.estimate = total + heap.strings.bytes();
-                if std::env::var("LUARS_NO_FIN").is_ok() || heap.mmudata.is_empty() {
+                if heap.mmudata.is_empty() {
                     // End of GC cycle: threshold = estimate * pause / 100.
                     heap.gc_state = GcState::Pause;
                     heap.threshold = (heap.estimate * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
@@ -1304,12 +1304,16 @@ fn sweep_one_pool(heap: &mut GcHeap) -> bool {
             true
         }
         1 => {
-            let (d, p) = heap.tables.sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            let (d, p) = heap
+                .tables
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
             heap.gc_sweep_pos = p;
             d
         }
         2 => {
-            let (d, p) = heap.funcs.sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            let (d, p) = heap
+                .funcs
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
             heap.gc_sweep_pos = p;
             d
         }
@@ -1328,19 +1332,23 @@ fn sweep_one_pool(heap: &mut GcHeap) -> bool {
             d
         }
         4 => {
-            let (d, p) = heap.upvals.sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            let (d, p) = heap
+                .upvals
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
             heap.gc_sweep_pos = p;
             d
         }
         5 => {
-            let (d, p) = heap.protos.sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            let (d, p) = heap
+                .protos
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
             heap.gc_sweep_pos = p;
             d
         }
         6 => {
-            let (d, p) =
-                heap.userdatas
-                    .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            let (d, p) = heap
+                .userdatas
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
             heap.gc_sweep_pos = p;
             d
         }

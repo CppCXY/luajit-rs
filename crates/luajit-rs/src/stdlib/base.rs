@@ -504,9 +504,7 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
                 Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
                 None => "?".into(),
             };
-            Err(l.runtime_error(
-                format!("invalid option '{}'", opt).as_bytes(),
-            ))
+            Err(l.runtime_error(format!("invalid option '{}'", opt).as_bytes()))
         }
     }
 }
