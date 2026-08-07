@@ -3014,7 +3014,13 @@ impl Record {
                 // registers/tables (replayed TSETS corrupts metatables:
                 // `__add` lookup then reads a bare address). Phase 2
                 // cannot recreate closures faithfully — abort instead.
-                return Err(TraceError::NYIBC);
+                //
+                // BLACKL (not NYIBC) disables JIT for the whole proto on
+                // the first failure: a closure-creating hot loop can never
+                // be recorded, and letting the penalty counter retry it
+                // dozens of times per loop iteration is pure overhead
+                // (measured: ~3x slower than plain interpretation).
+                return Err(TraceError::BLACKL);
             }
 
             // Everything else is NYI in Phase 2: calls, returns, tables,
