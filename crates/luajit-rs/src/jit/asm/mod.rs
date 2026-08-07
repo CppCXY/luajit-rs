@@ -48,21 +48,6 @@ pub fn assemble(
     stack_end_addr: u64,
     exit_base_addr: u64,
 ) -> Result<(McodeArea, u32, Vec<(u32, u32)>), TraceError> {
-    if std::env::var("LUARS_IRDMP").is_ok() {
-        for r in tr.ir.nk()..tr.ir.nins() {
-            let ins = tr.ir.ir(r);
-            if ins.op() != super::ir::IROp::NOP || r == tr.ir.nk() {
-                eprintln!(
-                    "IR[{}] {:?} t={:#x} op1={} op2={}",
-                    r,
-                    ins.op(),
-                    ins.t(),
-                    ins.op1,
-                    ins.op2
-                );
-            }
-        }
-    }
     match arch {
         Arch::X64 => x64::assemble(tr, link, stack_end_addr, exit_base_addr),
         Arch::Arm64 => arm64::assemble(tr, link, stack_end_addr, exit_base_addr),

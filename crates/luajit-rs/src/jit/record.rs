@@ -2778,12 +2778,6 @@ impl Record {
                 if dst + want > self.maxslot {
                     self.maxslot = dst + want;
                 }
-                if std::env::var("LUAJIT_RS_VARGDBG").is_ok() {
-                    for i in 0..want {
-                        let si = (self.baseslot as u32 + dst + i) as usize;
-                        eprintln!("  after: slot[{}] = {:#x}", si, self.slot[si]);
-                    }
-                }
             }
 
             BCOp::USETV | BCOp::USETS | BCOp::USETN | BCOp::USETP => {

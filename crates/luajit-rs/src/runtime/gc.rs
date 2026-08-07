@@ -1156,11 +1156,7 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             // unmarked (sweep keeps them; weak tables keep their entries,
             // so the finalizer can still reach them). Their metatables
             // are marked so the __gc function stays alive.
-            let mmu = if std::env::var("LUARS_NO_FIN").is_ok() {
-                Vec::new()
-            } else {
-                separate_finalizable(heap)
-            };
+            let mmu = separate_finalizable(heap);
             if !mmu.is_empty() {
                 let mut m = Marker {
                     gray: Vec::new(),
