@@ -19,8 +19,7 @@ use luajit_rs::internal::state::{Lua, load};
 use luajit_rs::internal::table::LuaTable;
 use luajit_rs::{
     LuaError, LuaState, LuaValue, internal, lua_error_message, lua_getglobal, lua_gettop,
-    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadfile, lual_loadstring,
-    lual_openlibs,
+    lua_pcall, lua_peek, lua_pushstring, lua_settop, lual_loadfile, lual_loadstring, lual_openlibs,
 };
 
 const LUA_PROMPT: &str = "> ";
@@ -387,6 +386,18 @@ fn handle_script(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
 }
 
 fn main() {
+    // Deep Lua recursion through C boundaries (e.g. gsub callbacks) walks
+    // the Rust stack; give the VM a generous stack instead of the OS
+    // default.
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(run_main)
+        .expect("spawn main thread")
+        .join()
+        .expect("main thread panicked");
+}
+
+fn run_main() {
     #[cfg(windows)]
     install_crash_handler();
     let args: Vec<String> = std::env::args().collect();

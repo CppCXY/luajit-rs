@@ -20,7 +20,8 @@
 //! materialize the final snapshot into the Lua stack and restart from
 //! the top. A failing guard exits through its covering snapshot.
 
-use crate::jit::{ir, opt_fold, record};
+use crate::jit::opt::opt_fold;
+use crate::jit::{ir, record};
 use crate::runtime::func::{GcFunc, LuaClosure};
 use crate::runtime::gc::GcPtr;
 use crate::runtime::proto::Proto;
@@ -78,6 +79,7 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
     env[0] = heap_ptr as u64;
     JIT_HEAP.with(|c| c.set(heap_ptr));
     let hotexit = g.jit.param(JitParam::HotExit) as u8;
+    let tryside = g.jit.param(JitParam::TrySide) as u8;
     let mut current = traceno;
     // Current frame base: recursive traces (Uprec/Tailrec) and Root
     // links into call frames shift it as frames are pushed on trace.
@@ -223,14 +225,26 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             continue;
         }
         // Exit accounting (lj_trace_exit -> trace_hotside): count taken
-        // exits and start recording a side trace on a hot one.
+        // exits and start recording a side trace on a hot one. Guard
+        // exits (non-final snapshots, e.g. a closure-identity guard that
+        // fails on every pass because the closure is re-created each
+        // iteration) that burned `hotexit + tryside` attempts flush the
+        // trace and blacklist the loop start, so the loop runs
+        // interpreted instead of thrashing record/compile cycles. The
+        // loop-end fall-through (the final snapshot) is never flushed:
+        // its side traces stitch the continuation back to the loop.
+        let is_final_snap = exitno + 1 >= tr.snap.len();
         let snap = &mut tr.snap[exitno];
         if snap.count != SNAPCOUNT_DONE {
             snap.count += 1;
             if snap.count >= hotexit {
-                use crate::jit::trace;
-
-                trace::trace_hot_side(l, cbase, current, exitno);
+                if snap.count > hotexit + tryside && !is_final_snap {
+                    use crate::jit::trace;
+                    trace::trace_flush_blacklist(l, current);
+                } else if snap.count <= hotexit + tryside {
+                    use crate::jit::trace;
+                    trace::trace_hot_side(l, cbase, current, exitno);
+                }
             }
         }
         break ExitResult {
@@ -775,8 +789,8 @@ fn restore_snapshot(l: &mut LuaState, base: usize, tr: &GCtrace, env: &[u64], sn
         let bits = if bits == BUF_MARK {
             let heap = jit_heap();
             let buf = std::mem::take(&mut heap.cat_buf);
-            let v = intern_heap_bytes(heap, &buf);
-            v
+
+            intern_heap_bytes(heap, &buf)
         } else {
             bits
         };

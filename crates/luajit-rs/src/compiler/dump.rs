@@ -58,7 +58,7 @@ fn write_kgc(w: &mut Writer, kgc: &KGc, strs: &Interner) {
 }
 
 fn write_proto(w: &mut Writer, pt: &Proto, strs: &Interner) {
-    w.w_u8(pt.flags);
+    w.w_u16(pt.flags);
     w.w_u8(pt.numparams);
     w.w_u8(pt.framesize);
     w.w_u32(pt.bc.len() as u32);

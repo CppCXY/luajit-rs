@@ -766,7 +766,7 @@ impl IrBuf {
     pub fn emitir(&mut self, ot: u16, a: IRRef, b: IRRef) -> Result<TRef, TraceError> {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            use crate::jit::opt_fold;
+            use crate::jit::opt::opt_fold;
 
             opt_fold::opt_fold(self, IRIns::new(ot, a, b))
         }

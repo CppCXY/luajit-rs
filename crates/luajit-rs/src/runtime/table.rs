@@ -255,7 +255,6 @@ impl LuaTable {
         }
         mode
     }
-
     /// Scan the hash part for a string key (used for GC-time metatable
     /// lookups such as `__mode` / `__gc`, where no interner is available).
     /// The metatable is a strong table, so its string keys are alive and
@@ -417,9 +416,12 @@ impl LuaTable {
             return;
         }
         if k > 0 && (k as u32) < LJ_MAX_ASIZE {
-            self.reasize(k as u32);
-            self.array[k as usize] = v;
-            self.barrier();
+            // Do NOT grow the array part directly to cover `k`: a sparse
+            // large key (e.g. a[2^k] = true) would balloon the table to
+            // 2^k slots. Go through `set` -> `rehash`, which decides the
+            // array/hash split from the real density (`lj_tab_newkey`).
+            // Dense fills still grow the array on the 2^k boundaries.
+            self.set(LuaValue::number(k as f64), v);
             return;
         }
         self.set(LuaValue::number(k as f64), v);
@@ -452,6 +454,12 @@ impl LuaTable {
             }
         }
         !0
+    }
+
+    /// Whether `key` is a key of the table (or was, until a rehash
+    /// reclaimed its dead node). `lj_tab_keyindex != LJ_TNIL`.
+    pub(crate) fn is_valid_key(&self, key: LuaValue) -> bool {
+        self.key_index(key) != !0
     }
 
     /// The next key/value pair after `key` (`lj_tab_next`). `nil` starts the

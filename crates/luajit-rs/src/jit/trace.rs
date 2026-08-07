@@ -13,10 +13,8 @@
 use crate::bc::{self, BCOp, bc_isret, bc_j, bc_op, setbc_d, setbc_op};
 use crate::gc::GcPtr;
 use crate::jit::ir::{self, IrBuf};
-use crate::jit::{
-    GCtrace, SNAP_NORESTORE, asm, opt_dce, opt_ivar, opt_loop, opt_narrow, opt_sink, record,
-    snap_ref, snap_slot,
-};
+use crate::jit::opt::{opt_dce, opt_ivar, opt_loop, opt_narrow, opt_sink};
+use crate::jit::{GCtrace, SNAP_NORESTORE, asm, record, snap_ref, snap_slot};
 use crate::proto::{PROTO_ILOOP, PROTO_NOJIT, Proto};
 use crate::state::{GlobalState, LuaState};
 
@@ -65,6 +63,21 @@ pub fn trace_hot_side(l: &mut LuaState, base: usize, parent: TraceNo, exitno: us
         let t = js.trace[parent as usize]
             .as_ref()
             .expect("hot exit of a freed trace");
+        // Bound the side-trace attempts (lj_record_setup's sidecheck): a
+        // root may accumulate at most `maxside` children, and an exit
+        // that already burned `hotexit + tryside` attempts stops
+        // recording. The exit counter in the executor then keeps rising
+        // past the window and flushes the trace, so a guard that fails
+        // on every pass (e.g. a closure re-created each iteration) ends
+        // up interpreted instead of spawning an endless side-trace chain.
+        let root_no = if t.root == 0 { parent } else { t.root };
+        let root = js.trace[root_no as usize].as_ref().expect("root trace");
+        if root.nchild as u32 >= js.param(JitParam::MaxSide) as u32
+            || t.snap[exitno].count
+                >= js.param(JitParam::HotExit) as u8 + js.param(JitParam::TrySide) as u8
+        {
+            return;
+        }
         // Deep exits record from within the inlined frame: snap_replay
         // rebuilds the frame stack and rec.pt from the snapshot constants.
         let (pt, pc) = (t.startpt, t.snap[exitno].pc as usize);
@@ -219,12 +232,19 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
                 rec.pc = rec.bc_min;
             }
             BCOp::LOOP => {
-                // Only check the range for real loops, not "repeat until true".
-                let pcj = (pc as i64 + bc_j(startins)) as usize;
-                let jins = pt.as_ref().bc[pcj];
-                if bc_op(jins) == BCOp::JMP && bc_j(jins) < 0 {
-                    rec.bc_min = (pcj as i64 + 1 + bc_j(jins)) as usize;
-                    rec.bc_extent = (-bc_j(jins)) as usize;
+                // Only check the range for real loops, not "repeat until
+                // true". The compiler may emit a LOOP with no jump target
+                // (D = 0, the loop closes through an ITERL/FORL instead):
+                // bc_j underflows past BCBIAS_J, so verify the target is
+                // in bounds before indexing.
+                let j = bc_j(startins);
+                if j >= 0 && (pc as i64 + j) < pt.as_ref().bc.len() as i64 {
+                    let pcj = (pc as i64 + j) as usize;
+                    let jins = pt.as_ref().bc[pcj];
+                    if bc_op(jins) == BCOp::JMP && bc_j(jins) < 0 {
+                        rec.bc_min = (pcj as i64 + 1 + bc_j(jins)) as usize;
+                        rec.bc_extent = (-bc_j(jins)) as usize;
+                    }
                 }
                 rec.maxslot = crate::bc::bc_a(startins);
                 rec.pc = pc + 1;
@@ -364,16 +384,6 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
             } else {
                 g.jit.err = e;
                 g.jit.state = TraceState::Err;
-                if std::env::var("LUARS_JITDBG").is_ok() && pc > 0 {
-                    let bc = &rec.pt.as_ref().bc;
-                    let lo = pc.saturating_sub(2);
-                    let hi = (pc + 1).min(bc.len());
-                    let desc = (lo..hi)
-                        .map(|i| format!("{i}:{:?}", bc_op(bc[i])))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    eprintln!("JITABORT {} at pc={} ({})", e.message(), pc, desc);
-                }
                 g.jit.stats_bump(e.message());
                 if pc < rec.pt.as_ref().bc.len() {
                     g.jit.stats_bump_site(
@@ -672,17 +682,65 @@ fn penalty_pc(js: &mut JitState, pt: GcPtr<Proto>, pc: usize, e: TraceError) {
 
 /// `blacklist_pc`: permanently disable hotcount events for an instruction
 /// by patching it to the non-counting variant (FORL -> IFORL etc.).
+/// Handles both the plain and the JIT-patched (JFORL/JITERL/JLOOP/JFUNCF)
+/// forms, and is idempotent: re-running on an already-blacklisted
+/// instruction is a no-op (a second `offset(1)` would otherwise re-patch
+/// IFORL to JFORL).
 fn blacklist_pc(pt: GcPtr<Proto>, pc: usize) {
     let p = pt.as_mut();
     let op = bc_op(p.bc[pc]);
-    if op == BCOp::ITERN {
-        // Undo the ITERN specialization (pairs() dispatch) as well.
-        setbc_op(&mut p.bc[pc], BCOp::ITERC as u32);
-        let t = (pc as i64 + 1 + bc_j(p.bc[pc + 1])) as usize;
-        setbc_op(&mut p.bc[t], BCOp::JMP as u32);
-    } else {
-        setbc_op(&mut p.bc[pc], op.offset(1) as u32);
-        p.flags |= PROTO_ILOOP;
+    match op {
+        BCOp::FORL | BCOp::ITERL | BCOp::LOOP | BCOp::FUNCF => {
+            setbc_op(&mut p.bc[pc], op.offset(1) as u32);
+            p.flags |= PROTO_ILOOP;
+        }
+        // The I-variant sits directly below each J-variant.
+        BCOp::JFORL | BCOp::JITERL | BCOp::JLOOP | BCOp::JFUNCF => {
+            setbc_op(&mut p.bc[pc], op.offset(-1) as u32);
+            p.flags |= PROTO_ILOOP;
+        }
+        BCOp::ITERN => {
+            // Undo the ITERN specialization (pairs() dispatch) as well.
+            setbc_op(&mut p.bc[pc], BCOp::ITERC as u32);
+            let t = (pc as i64 + 1 + bc_j(p.bc[pc + 1])) as usize;
+            setbc_op(&mut p.bc[t], BCOp::JMP as u32);
+        }
+        _ => {} // Already blacklisted, or not a hot-loop header.
+    }
+}
+
+/// `lj_trace_flush` for a loop whose guard exits keep failing (lj_trace_exit's
+/// "too many hot exits: flush trace"): revert the bytecode patches and
+/// blacklist the loop's start instruction, so the loop runs interpreted
+/// instead of re-entering a trace that exits on every pass (e.g. a closure
+/// re-created each iteration defeats the closure-identity guard). The trace
+/// entry and its machine code are kept alive (the bytecode no longer enters
+/// them) so in-flight executions and linked exits stay resolvable.
+pub fn trace_flush_blacklist(l: &mut LuaState, traceno: TraceNo) {
+    let g = l.global();
+    let js = &mut g.jit;
+    // Flush the root of the chain (the bytecode is patched for it); a
+    // side trace's own exits then fall back to it.
+    let root = js.trace[traceno as usize]
+        .as_ref()
+        .map(|t| if t.root == 0 { traceno } else { t.root })
+        .unwrap_or(traceno);
+    let Some(tr) = js.trace[root as usize].as_mut() else {
+        return;
+    };
+    if tr.root == 0 {
+        let pt = tr.startpt;
+        let pc = tr.startpc;
+        if bc_op(tr.startins) == BCOp::FORL {
+            // Revert the FORI patch, too.
+            let fori = (pc as i64 + bc_j(tr.startins)) as usize;
+            setbc_op(&mut pt.as_mut().bc[fori], BCOp::FORI as u32);
+        }
+        // The JIT patch overwrote the loop header's opcode *and* its D
+        // operand (the traceno); restore the original instruction so the
+        // blacklisted I-variant still carries the loop's jump.
+        pt.as_mut().bc[pc] = tr.startins;
+        blacklist_pc(pt, pc);
     }
 }
 

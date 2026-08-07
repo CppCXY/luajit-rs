@@ -93,31 +93,41 @@ fn sub_table(
     }
 }
 
-/// `luaL_pushmodule` equivalent: get or create the module table from
-/// `_LOADED[modname]` / `_G[modname]`.
-fn pushmodule(l: &mut LuaState, modname: &[u8]) -> crate::gc::GcPtr<LuaTable> {
-    let loaded_k = str_key(l, b"_LOADED");
-    let loaded = match l.global().registry.as_ref().get_str(loaded_k).as_table() {
-        Some(t) => t,
-        None => {
-            let t = l.heap().alloc_table(LuaTable::new(0, 4));
-            l.global()
-                .registry
-                .as_mut()
-                .set(loaded_k, LuaValue::table(t));
-            t
+/// `luaL_findtable` equivalent: walk the dotted path `fname` from table
+/// `start`, creating missing tables.  Returns `Err` on a name conflict
+/// (an existing non-table value along the path).
+fn findtable(
+    l: &mut LuaState,
+    start: crate::gc::GcPtr<LuaTable>,
+    fname: &[u8],
+) -> Result<crate::gc::GcPtr<LuaTable>, ()> {
+    let mut cur = start;
+    let mut rest = fname;
+    loop {
+        let dot = rest.iter().position(|&c| c == b'.');
+        let (seg, more) = match dot {
+            Some(p) => (&rest[..p], true),
+            None => (rest, false),
+        };
+        let k = str_key(l, seg);
+        let v = cur.as_ref().get_str(k);
+        match v.as_table() {
+            Some(t) => cur = t,
+            None if v.is_nil() => {
+                let t = l
+                    .heap()
+                    .alloc_table(LuaTable::new(0, if more { 2 } else { 4 }));
+                cur.as_mut().set(k, LuaValue::table(t));
+                cur = t;
+            }
+            None => return Err(()),
         }
-    };
-    let name_v = str_key(l, modname);
-    if let Some(t) = loaded.as_ref().get_str(name_v).as_table() {
-        return t;
+        if !more {
+            break;
+        }
+        rest = &rest[dot.unwrap() + 1..];
     }
-    if let Some(t) = l.global().globals.as_ref().get_str(name_v).as_table() {
-        return t;
-    }
-    let t = l.heap().alloc_table(LuaTable::new(0, 4));
-    l.global().globals.as_mut().set(name_v, LuaValue::table(t));
-    t
+    Ok(cur)
 }
 
 /// Call `func` with `args` and return the first result.  Errors propagate.
@@ -340,30 +350,71 @@ fn lib_module(l: &mut LuaState) -> LuaResult<i32> {
     let name = l.str_static(name_sid).to_vec();
     let nargs = nargs(l);
 
-    let tab = pushmodule(l, &name);
-
-    let k_m = str_key(l, b"_M");
-    tab.as_mut().set(k_m, LuaValue::table(tab));
-    let k_name = str_key(l, b"_NAME");
-    tab.as_mut().set(k_name, str_key(l, &name));
-
-    let dot = name.iter().rposition(|&c| c == b'.');
-    let pkg_slice = match dot {
-        Some(p) => &name[..p],
-        None => &name[..],
+    // Get or create the module table: _LOADED[modname], else the dotted
+    // global path (5.1's ll_module + luaL_findtable).
+    let loaded = {
+        let loaded_k = str_key(l, b"_LOADED");
+        match l.global().registry.as_ref().get_str(loaded_k).as_table() {
+            Some(t) => t,
+            None => {
+                let t = l.heap().alloc_table(LuaTable::new(0, 4));
+                l.global()
+                    .registry
+                    .as_mut()
+                    .set(loaded_k, LuaValue::table(t));
+                t
+            }
+        }
     };
-    let k_package = str_key(l, b"_PACKAGE");
-    let pkg_sid = l.heap().intern(pkg_slice);
-    tab.as_mut().set(k_package, l.heap().str_value(pkg_sid));
+    let name_v = str_key(l, &name);
+    let tab = match loaded.as_ref().get_str(name_v).as_table() {
+        Some(t) => t,
+        None => {
+            let t = findtable(l, l.global().globals, &name).map_err(|_| {
+                l.runtime_error(
+                    format!(
+                        "name conflict for module '{}'",
+                        String::from_utf8_lossy(&name)
+                    )
+                    .as_bytes(),
+                )
+            })?;
+            loaded.as_mut().set(name_v, LuaValue::table(t));
+            t
+        }
+    };
 
-    for i in 1..nargs {
-        let opt = arg(l, i);
-        if opt.is_func() {
-            let _ = call_func(l, opt, &[LuaValue::table(tab)], 0)?;
+    // modinit: initialize _M/_NAME/_PACKAGE unless the table was already
+    // initialized (has a _NAME field).
+    let k_name = str_key(l, b"_NAME");
+    if tab.as_ref().get_str(k_name).is_nil() {
+        tab.as_mut().set(str_key(l, b"_M"), LuaValue::table(tab));
+        tab.as_mut().set(k_name, str_key(l, &name));
+        // _PACKAGE: the full name up to and including the last dot.
+        let pkg_slice = match name.iter().rposition(|&c| c == b'.') {
+            Some(p) => &name[..p + 1],
+            None => &name[..0],
+        };
+        tab.as_mut()
+            .set(str_key(l, b"_PACKAGE"), str_key(l, pkg_slice));
+    }
+
+    // setfenv: the module table becomes the calling function's
+    // environment; error when the caller is not a Lua function.
+    let caller = crate::stdlib::debug::caller_lua_func(l)
+        .ok_or_else(|| l.runtime_error(b"`module` not called from a Lua function"))?;
+    match caller.as_mut() {
+        crate::func::GcFunc::Lua(c) => c.env = tab,
+        crate::func::GcFunc::C(_) => {
+            return Err(l.runtime_error(b"`module` not called from a Lua function"));
         }
     }
 
-    push(l, LuaValue::table(tab));
+    for i in 1..nargs {
+        let opt = arg(l, i);
+        let _ = call_func(l, opt, &[LuaValue::table(tab)], 0)?;
+    }
+
     Ok(0)
 }
 
@@ -487,26 +538,78 @@ fn loader_lua(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
-#[allow(dead_code)]
 fn loader_c(l: &mut LuaState) -> LuaResult<i32> {
-    let name_s = match arg(l, 0).as_string_id() {
-        Some(sid) => String::from_utf8_lossy(l.str_static(sid)).into_owned(),
-        None => String::from("?"),
+    let name_sid = match arg(l, 0).as_string_id() {
+        Some(sid) => sid,
+        None => {
+            return Err(err_bad_arg_type(l, 1, "loader_C", "string", arg(l, 0)));
+        }
     };
-    let msg = format!("\n\tno C loader for module '{}'", name_s);
-    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
-    Ok(1)
+    let name = l.str_static(name_sid);
+    let pkg = package_table(l);
+    let path_k = str_key(l, b"cpath");
+    let path = match pkg.as_ref().get_str(path_k).as_string_id() {
+        Some(sid) => l.str_static(sid).to_vec(),
+        None => default_cpath().to_vec(),
+    };
+    let mut tried = Vec::new();
+    match searchpath(name, &path, b".", LUA_DIRSEP, &mut tried) {
+        Some(fname) => {
+            // The library exists, but there is no dynamic loader in this
+            // VM; report it as a broken file (5.1's errorfile).
+            let fname_str = String::from_utf8_lossy(&fname).into_owned();
+            let msg = format!("\n\tno file '{}' (broken)", fname_str);
+            push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+            Ok(1)
+        }
+        None => {
+            push(
+                l,
+                l.heap()
+                    .str_value(l.heap().intern(tried.concat().as_bytes())),
+            );
+            Ok(1)
+        }
+    }
 }
 
-#[allow(dead_code)]
 fn loader_croot(l: &mut LuaState) -> LuaResult<i32> {
-    let name_s = match arg(l, 0).as_string_id() {
-        Some(sid) => String::from_utf8_lossy(l.str_static(sid)).into_owned(),
-        None => String::from("?"),
+    let name_sid = match arg(l, 0).as_string_id() {
+        Some(sid) => sid,
+        None => {
+            return Err(err_bad_arg_type(l, 1, "loader_Croot", "string", arg(l, 0)));
+        }
     };
-    let msg = format!("\n\tno C root loader for module '{}'", name_s);
-    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
-    Ok(1)
+    let name = l.str_static(name_sid);
+    let name_str = String::from_utf8_lossy(name).into_owned();
+    if !name_str.contains('.') {
+        return Ok(0);
+    }
+    // 5.1's Croot loader: search the C path for the root module name.
+    let root = name_str.split('.').next().unwrap_or(&name_str);
+    let pkg = package_table(l);
+    let path_k = str_key(l, b"cpath");
+    let path = match pkg.as_ref().get_str(path_k).as_string_id() {
+        Some(sid) => l.str_static(sid).to_vec(),
+        None => default_cpath().to_vec(),
+    };
+    let mut tried = Vec::new();
+    match searchpath(root.as_bytes(), &path, b".", LUA_DIRSEP, &mut tried) {
+        Some(fname) => {
+            let fname_str = String::from_utf8_lossy(&fname).into_owned();
+            let msg = format!("\n\tno file '{}' (broken)", fname_str);
+            push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+            Ok(1)
+        }
+        None => {
+            push(
+                l,
+                l.heap()
+                    .str_value(l.heap().intern(tried.concat().as_bytes())),
+            );
+            Ok(1)
+        }
+    }
 }
 
 // ── require ─────────────────────────────────────────────────────────────────
@@ -521,7 +624,9 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
     let pkg = package_table(l);
     let loaded = sub_table(l, pkg, b"loaded");
     let cached = loaded.as_ref().get_str(name_v);
-    if !cached.is_nil() {
+    // Lua 5.1: only a *truthy* cached value counts as loaded; false or
+    // nil means the module must be (re)loaded.
+    if cached.is_truthy() {
         push(l, cached);
         return Ok(1);
     }
@@ -591,8 +696,11 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
         loaded.as_mut().set(name_v, result);
         push(l, result);
     } else {
-        loaded.as_mut().set(name_v, LuaValue::TRUE);
-        push(l, LuaValue::TRUE);
+        // The module ran: `module()` may have set _LOADED[name] itself.
+        // Otherwise the in-progress marker (true) is the result (5.1's
+        // sentinel handling).
+        let v = loaded.as_ref().get_str(name_v);
+        push(l, v);
     }
     Ok(1)
 }
@@ -648,6 +756,15 @@ pub fn open(l: &mut LuaState) {
     ensure_sub_table(l, pkg_idx, "loaded");
     ensure_sub_table(l, pkg_idx, "preload");
 
+    // 5.1: package.loaded is the registry's _LOADED table (module()
+    // writes the registry, require reads package.loaded; same table).
+    {
+        let pkg = package_table(l);
+        let loaded = sub_table(l, pkg, b"loaded");
+        let k = str_key(l, b"_LOADED");
+        l.global().registry.as_mut().set(k, LuaValue::table(loaded));
+    }
+
     // Copy loaded libs into package.loaded
     lua_getfield(l, pkg_idx, "loaded");
     let loaded_idx = lua_gettop(l) as i32;
@@ -690,9 +807,9 @@ pub fn open(l: &mut LuaState) {
     lua_rawseti(l, loaders_idx, 1);
     lua_pushcfunction(l, loader_lua);
     lua_rawseti(l, loaders_idx, 2);
-    lua_pushcfunction(l, loader_preload);
+    lua_pushcfunction(l, loader_c);
     lua_rawseti(l, loaders_idx, 3);
-    lua_pushcfunction(l, loader_lua);
+    lua_pushcfunction(l, loader_croot);
     lua_rawseti(l, loaders_idx, 4);
     lua_setfield(l, pkg_idx, "loaders");
 
