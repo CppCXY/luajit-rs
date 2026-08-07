@@ -55,6 +55,9 @@ pub struct GcHeap {
     /// phase; the VM drains it at the next safe point.
     pub mmudata: Vec<crate::runtime::gc::Finalizable>,
     pub gc_sweep_pool: u8,
+    /// Position within the current pool being swept (incremental sweep:
+    /// each step frees up to `GC_SWEEP_MAX` objects, LuaJIT GCSWEEPMAX).
+    pub gc_sweep_pos: usize,
     pub gc_step_size: usize,
     /// Tri-color white bit (0 or 1), flips each GC cycle.
     pub current_white: u8,
@@ -107,6 +110,7 @@ impl Default for GcHeap {
             gc_weak: Vec::new(),
             mmudata: Vec::new(),
             gc_sweep_pool: 0,
+            gc_sweep_pos: 0,
             gc_step_size: gc::GC_STEP_SIZE,
             current_white: 0,
             gc_stopped: false,

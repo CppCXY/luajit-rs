@@ -2265,8 +2265,22 @@ impl<'a> Parser<'a> {
                 if nav && (eflags & EXPR_F_NORES) == 0 && !self.suffix_follows() {
                     break;
                 }
-            } else if self.ls.tok == Tok::Char(b'(')
-                || self.ls.tok == Tok::Str
+            } else if self.ls.tok == Tok::Char(b'(') {
+                // Lua 5.1 (lj_parse.c parse_args): a `(` on a different line
+                // than the callee is ambiguous (call continuation vs a new
+                // parenthesized statement) → error.
+                if self.ls.linenumber != self.ls.lastline {
+                    self.ls.error("ambiguous syntax (function call x new statement)");
+                }
+                self.expr_tonextreg(v);
+                if self.fr2 != 0 {
+                    self.bcreg_reserve(1);
+                }
+                self.parse_args(v);
+                if nav && (eflags & EXPR_F_NORES) == 0 && !self.suffix_follows() {
+                    break;
+                }
+            } else if self.ls.tok == Tok::Str
                 || self.ls.tok == Tok::Char(b'{')
             {
                 self.expr_tonextreg(v);
@@ -2803,10 +2817,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_break(&mut self) {
+        // LuaJIT marks the scope and defers the "no loop to break" check
+        // to gola resolution at block end; a syntax error (e.g. a stray
+        // token after `break`) must win first, matching 5.1 semantics:
+        // `loadstring("break label")` → "... near 'label'".
         let fs = self.cur_mut();
-        if !fs.scopes.iter().any(|s| (s.flags & FSCOPE_LOOP) != 0) {
-            self.ls.error("no loop to break");
-        }
         fs.scopes.last_mut().unwrap().flags |= FSCOPE_BREAK;
         let pc = self.bcemit_jmp();
         self.gola_new(VName::Break, VSTACK_GOTO, pc);
@@ -3147,7 +3162,11 @@ impl<'a> Parser<'a> {
             Tok::Break => {
                 self.ls.next();
                 self.parse_break();
-                return false;
+                // Lua 5.1: break must be the last statement in a block
+                // (LuaJIT returns `!LJ_52`). A trailing token is a syntax
+                // error reported by the enclosing block: `break label`
+                // → "... near 'label'".
+                return true;
             }
             Tok::Continue => {
                 if !parse_isend(self.ls.peek()) {
@@ -3167,6 +3186,9 @@ impl<'a> Parser<'a> {
                 self.parse_label();
             }
             Tok::Char(b';') => {
+                // Empty statement (LuaJIT 5.2 compat): lua5.1 tests reject
+                // this, but the LuaJIT suite (lang/goto.lua +compat5.2)
+                // requires it.
                 self.ls.next();
             }
             // Not expressible as a match guard: `peek` needs `&mut self`.

@@ -747,6 +747,12 @@ fn io_input(l: &mut LuaState) -> LuaResult<i32> {
         let old = *DEFAULT_INPUT.lock().unwrap();
         *DEFAULT_INPUT.lock().unwrap() = Some(id);
         match old {
+            Some(old_id) if old_id == id => {
+                // Re-selecting the current default input returns the very
+                // same file object (Lua 5.1: io.input(io.stdin) == io.stdin).
+                push(l, v);
+                Ok(1)
+            }
             Some(old_id) => {
                 let h = new_handle(l, old_id);
                 push(l, h);
@@ -804,6 +810,10 @@ fn io_output(l: &mut LuaState) -> LuaResult<i32> {
         let old = *DEFAULT_OUTPUT.lock().unwrap();
         *DEFAULT_OUTPUT.lock().unwrap() = Some(id);
         match old {
+            Some(old_id) if old_id == id => {
+                push(l, v);
+                Ok(1)
+            }
             Some(old_id) => {
                 let h = new_handle(l, old_id);
                 push(l, h);
@@ -892,6 +902,11 @@ pub fn open(l: &mut LuaState) {
         let k = l.heap().str_value(l.heap().intern(name));
         io_tab.as_mut().set(k, h);
     }
+    // Lua 5.1: the default input/output start as stdin/stdout, so
+    // `io.input(io.stdin) == io.stdin` holds and `io.input()` returns
+    // the standard stream.
+    *DEFAULT_INPUT.lock().unwrap() = Some(fdi);
+    *DEFAULT_OUTPUT.lock().unwrap() = Some(fdo);
 }
 
 fn io_tmpfile(l: &mut LuaState) -> LuaResult<i32> {

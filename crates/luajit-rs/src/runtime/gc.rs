@@ -517,13 +517,29 @@ impl<T> Pool<T> {
     /// Tri-color sweep: uses current_white to decide alive/dead.
     /// Surviving objects get change_white() and marked.set(false).
     pub fn sweep_tricolor(&mut self, current_white: u8, mut on_free: impl FnMut(&T)) {
-        let mut i = 0;
-        while i < self.objects.len() {
+        self.sweep_limited(current_white, &mut on_free, usize::MAX, 0);
+    }
+
+    /// Incremental sweep: process up to `limit` objects starting at index
+    /// `start`. Returns `(pool_done, next_start)` — `next_start` continues
+    /// the sweep on the next call; when `pool_done`, the whole pool is
+    /// swept. Mirrors LuaJIT's `gc_sweep` with `GCSWEEPMAX`.
+    pub fn sweep_limited(
+        &mut self,
+        current_white: u8,
+        mut on_free: impl FnMut(&T),
+        limit: usize,
+        start: usize,
+    ) -> (bool, usize) {
+        let mut i = start;
+        let mut scanned = 0;
+        while i < self.objects.len() && scanned < limit {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
             if addr <= 0x1000 || addr >= ADDR_MAX as usize {
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
+                scanned += 1;
                 continue;
             }
             let h = gc_header(ptr);
@@ -551,8 +567,10 @@ impl<T> Pool<T> {
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
             }
+            scanned += 1;
         }
         self.live = self.objects.len();
+        (i >= self.objects.len(), i)
     }
     pub fn update_current_white(&self, cw: u8) {
         self.current_white.set(cw);
@@ -668,6 +686,9 @@ pub const GC_STEPMUL_DEFAULT: usize = 200;
 /// Cost charged to the budget for one sweep-pool step (LuaJIT's
 /// `GCSWEEPMAX*GCSWEEPCOST` = 40*10 = 400).
 pub const GC_SWEEP_COST: usize = 400;
+
+/// Objects swept per incremental sweep step (LuaJIT's `GCSWEEPMAX`).
+pub const GC_SWEEP_MAX: usize = 40;
 
 /// Weak-table mode bits (mirror of LuaJIT's `LJ_GC_WEAKKEY`/`LJ_GC_WEAKVAL`).
 pub const WEAKKEY: u8 = 0x08;
@@ -1233,6 +1254,7 @@ fn gc_onestep(heap: &mut GcHeap) -> (usize, bool) {
             heap.estimate = heap.total + heap.strings.bytes();
             heap.gc_state = GcState::Sweep;
             heap.gc_sweep_pool = 0;
+            heap.gc_sweep_pos = 0;
             (GC_STEP_SIZE, false)
         }
         GcState::Sweep => {
@@ -1270,39 +1292,57 @@ fn gc_onestep(heap: &mut GcHeap) -> (usize, bool) {
     }
 }
 
+/// Sweep up to `GC_SWEEP_MAX` objects of the current pool; the strings pool
+/// is swept whole (its hash table is rebuilt in one pass). Returns true when
+/// the whole sweep phase finished.
 fn sweep_one_pool(heap: &mut GcHeap) -> bool {
-    let done = match heap.gc_sweep_pool {
+    let cw = heap.current_white;
+    let pool = heap.gc_sweep_pool;
+    let pool_done = match pool {
         0 => {
-            heap.strings.sweep(heap.current_white);
-            1
+            heap.strings.sweep(cw);
+            true
         }
         1 => {
-            heap.tables.sweep_tricolor(heap.current_white, |_| {});
-            2
+            let (d, p) = heap.tables.sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         2 => {
-            heap.funcs.sweep_tricolor(heap.current_white, |_| {});
-            3
+            let (d, p) = heap.funcs.sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         3 => {
-            heap.threads.sweep_tricolor(heap.current_white, |th| {
-                for &uv in &th.openuv {
-                    uv.as_mut().close();
-                }
-            });
-            4
+            let (d, p) = heap.threads.sweep_limited(
+                cw,
+                |th| {
+                    for &uv in &th.openuv {
+                        uv.as_mut().close();
+                    }
+                },
+                GC_SWEEP_MAX,
+                heap.gc_sweep_pos,
+            );
+            heap.gc_sweep_pos = p;
+            d
         }
         4 => {
-            heap.upvals.sweep_tricolor(heap.current_white, |_| {});
-            5
+            let (d, p) = heap.upvals.sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         5 => {
-            heap.protos.sweep_tricolor(heap.current_white, |_| {});
-            6
+            let (d, p) = heap.protos.sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         6 => {
-            heap.userdatas.sweep_tricolor(heap.current_white, |_| {});
-            7
+            let (d, p) =
+                heap.userdatas
+                    .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         _ => {
             // All pools swept. The `gc_onestep` Sweep branch finalizes the
@@ -1310,7 +1350,10 @@ fn sweep_one_pool(heap: &mut GcHeap) -> bool {
             return true;
         }
     };
-    heap.gc_sweep_pool = done;
+    if pool_done {
+        heap.gc_sweep_pool += 1;
+        heap.gc_sweep_pos = 0;
+    }
     false
 }
 
