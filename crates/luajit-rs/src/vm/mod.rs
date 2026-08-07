@@ -449,9 +449,16 @@ fn execute_inner_link(
     // at the callee's extent would make later incremental GC marks and
     // finalizer placement (base_slot = max(top, frame_top)) overshoot the
     // true frame, so live locals above the real frame get collected.
-    l.base = saved_base;
-    l.top = saved_top;
-    l.frame_top = saved_frame_top;
+    //
+    // A yield (coroutine suspend) must NOT restore: the suspended frame's
+    // base/top/frame_top are the resume point, and clearing them to the
+    // entry values (base=0/top=1) lets the next GC wipe the suspended
+    // frame's locals (clear_from = max(top, frame_top) = 1).
+    if !matches!(r, Err(LuaError::Yield)) {
+        l.base = saved_base;
+        l.top = saved_top;
+        l.frame_top = saved_frame_top;
+    }
     r
 }
 
@@ -790,6 +797,12 @@ impl Interp {
             let delta = (newbase - callbase) as u64;
             self.set_at(newbase - 1, LuaValue::from_bits((delta << 3) | FRAME_VARG));
             self.base = newbase;
+            // Set TOP to the new frame before anything below may run GC
+            // (alloc_table for the implicit `arg` table steps the collector,
+            // which clears slots above TOP — the just-copied params would be
+            // wiped while TOP still pointed at the caller's frame).
+            self.l().top = newbase + pt.framesize as usize;
+            self.l().frame_top = self.l().top;
             // Lua 5.1 LUA_COMPAT_VARARG: build the implicit `arg` local
             // ({varargs..., n = count}) unless the body uses `...` itself.
             if (pt.flags & PROTO_VARARG_NEEDSARG) != 0 {
