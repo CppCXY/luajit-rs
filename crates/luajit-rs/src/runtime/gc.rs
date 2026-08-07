@@ -657,6 +657,18 @@ use crate::value::{LJ_TCDATA, LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LJ_TUDATA,
 pub const GC_PAUSE: usize = 200;
 pub(crate) const GC_THRESHOLD_MIN: usize = 64 * 1024;
 
+/// LuaJIT's `GCSTEPSIZE`: one unit of GC debt, and the divisor for the
+/// per-step budget (`GCSTEPSIZE/100 * stepmul`, default 200 → ~2048 bytes
+/// of work per `gc_step`). 1024 matches lj_gc.c.
+pub const GC_STEP_SIZE: usize = 1024;
+
+/// Default GC_STEPMUL (LuaJIT's `gc.stepmul`).
+pub const GC_STEPMUL_DEFAULT: usize = 200;
+
+/// Cost charged to the budget for one sweep-pool step (LuaJIT's
+/// `GCSWEEPMAX*GCSWEEPCOST` = 40*10 = 400).
+pub const GC_SWEEP_COST: usize = 400;
+
 /// Weak-table mode bits (mirror of LuaJIT's `LJ_GC_WEAKKEY`/`LJ_GC_WEAKVAL`).
 pub const WEAKKEY: u8 = 0x08;
 pub const WEAKVAL: u8 = 0x10;
@@ -673,7 +685,6 @@ pub enum GcState {
     /// (`vm::run_finalizers`), which returns the collector to `Pause`.
     Finalize,
 }
-pub const GC_STEP_SIZE: usize = 4096;
 
 pub enum Gray {
     Tab(GcPtr<LuaTable>),
@@ -1105,18 +1116,57 @@ pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
 
 /// Run one incremental GC step. Returns `true` when the cycle is complete
 /// (state is Pause).
+/// Perform a limited amount of incremental GC work, LuaJIT's `lj_gc_step`.
+///
+/// The per-call budget is `GCSTEPSIZE/100 * stepmul` (default 200 → ~2000
+/// bytes of work). Returns `true` only when a full cycle completed (back in
+/// `Pause`). `size == usize::MAX` requests a full, unbounded cycle (used by
+/// `full_gc` and `collectgarbage("collect")`).
 pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
-    let step = heap.gc_step_size.max(size);
+    let full = size >= usize::MAX / 2;
+    if heap.total > heap.threshold {
+        heap.debt += heap.total - heap.threshold;
+    }
+    let lim = (GC_STEP_SIZE / 100).max(1) * heap.stepmul;
+    let mut budget = if full { usize::MAX } else { lim };
+    loop {
+        let (cost, done) = gc_onestep(heap);
+        if done {
+            return true;
+        }
+        if full {
+            continue;
+        }
+        budget = budget.saturating_sub(cost);
+        if budget == 0 {
+            break;
+        }
+    }
+    // LuaJIT's post-step debt/threshold adjustment: if the accumulated
+    // debt is large the next allocation triggers another step right away
+    // (threshold = total); if it is small, push the trigger out.
+    if heap.debt < GC_STEP_SIZE {
+        heap.threshold = heap.total + GC_STEP_SIZE;
+        false
+    } else {
+        heap.debt -= GC_STEP_SIZE;
+        heap.threshold = heap.total;
+        false
+    }
+}
+
+/// Advance the collector one state-machine step. Returns `(cost, done)`,
+/// where `done` means the cycle reached `Pause` (or the collector is in a
+/// state the VM must handle, e.g. pending finalizers).
+fn gc_onestep(heap: &mut GcHeap) -> (usize, bool) {
     match heap.gc_state {
         GcState::Pause => {
-            let live = heap.total + heap.strings.bytes() + heap.table_extra;
-            if live >= heap.threshold {
-                heap.debt += live - heap.threshold;
-                heap.threshold = live + GC_STEP_SIZE;
-            }
-            true
+            // No cycle in progress; the caller (`start_gc_cycle`) begins one
+            // when the trigger fires. Nothing to do here.
+            (0, true)
         }
         GcState::Propagate => {
+            let work = 32; // objects per propagate step
             let mut m = Marker {
                 gray: std::mem::take(&mut heap.gc_gray),
                 strings: &heap.strings,
@@ -1124,14 +1174,14 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
                 atomic: false,
                 weak: Vec::new(),
             };
-            let done = m.propagate_step((step / 64).max(1));
+            let done = m.propagate_step(work);
             m.gray.extend(std::mem::take(&mut heap.gc_gray));
             if done && m.gray.is_empty() {
                 heap.gc_state = GcState::Atomic;
             }
             heap.gc_gray = m.gray;
             heap.gc_weak.extend(m.weak);
-            false
+            (GC_STEP_SIZE, false)
         }
         GcState::Atomic => {
             // Atomic: mark the 2nd-chance list once (LuaJIT empties
@@ -1179,9 +1229,11 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             // All marking done: drop weak-table entries whose key or value
             // is about to be swept, before the sweep frees any object.
             clear_weak(heap);
+            // LuaJIT's `atomic()`: initial estimate of live bytes.
+            heap.estimate = heap.total + heap.strings.bytes();
             heap.gc_state = GcState::Sweep;
             heap.gc_sweep_pool = 0;
-            false
+            (GC_STEP_SIZE, false)
         }
         GcState::Sweep => {
             // No propagation in the sweep phase (threads sit in grayagain
@@ -1189,29 +1241,31 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             // atomic round already handled there.
             let done = sweep_one_pool(heap);
             if done {
-                heap.gc_state = if std::env::var("LUARS_NO_FIN").is_ok() || heap.mmudata.is_empty()
-                {
-                    GcState::Pause
-                } else {
-                    GcState::Finalize
-                };
                 let total = total_live(heap);
                 heap.total = total;
-                heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
-                    .max(GC_THRESHOLD_MIN)
-                    .max(heap.threshold / 2);
-                heap.table_extra = 0;
-                heap.debt = 0;
-                true
+                heap.estimate = total + heap.strings.bytes();
+                if std::env::var("LUARS_NO_FIN").is_ok() || heap.mmudata.is_empty() {
+                    // End of GC cycle: threshold = estimate * pause / 100.
+                    heap.gc_state = GcState::Pause;
+                    heap.threshold = (heap.estimate * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
+                    heap.table_extra = 0;
+                    heap.debt = 0;
+                    (0, true)
+                } else {
+                    // Finalizers pending; the VM runs them and returns to
+                    // Pause. The cycle is not finished yet.
+                    heap.gc_state = GcState::Finalize;
+                    (0, false)
+                }
             } else {
-                false
+                (GC_SWEEP_COST, false)
             }
         }
         GcState::Finalize => {
             // The VM runs pending finalizers at a safe point and resets
             // the state to Pause; until then every cycle attempt is a
             // no-op (new collections may start from run_finalizers).
-            true
+            (0, true)
         }
     }
 }
@@ -1251,18 +1305,8 @@ fn sweep_one_pool(heap: &mut GcHeap) -> bool {
             7
         }
         _ => {
-            heap.gc_state = if heap.mmudata.is_empty() {
-                GcState::Pause
-            } else {
-                GcState::Finalize
-            };
-            let total = total_live(heap);
-            heap.total = total;
-            heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
-                .max(GC_THRESHOLD_MIN)
-                .max(heap.threshold / 2);
-            heap.table_extra = 0;
-            heap.debt = 0;
+            // All pools swept. The `gc_onestep` Sweep branch finalizes the
+            // cycle (state, threshold, estimate); just signal completion.
             return true;
         }
     };

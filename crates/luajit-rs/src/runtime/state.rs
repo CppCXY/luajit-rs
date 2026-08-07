@@ -75,6 +75,15 @@ pub struct GcHeap {
     /// The stack slot (relative to a trace's base) holding the buffer —
     /// exits flush `cat_buf` back into it. `u32::MAX` when inactive.
     pub cat_buf_slot: u32,
+    /// GC_STEPMUL: budget multiplier for each `gc_step` (LuaJIT default
+    /// 200). `lim = GC_STEP_SIZE/100 * stepmul` is the byte budget one
+    /// incremental step may spend. Appended at the end of the struct so
+    /// the JIT's baked-in `total`/`threshold` offsets stay stable.
+    pub stepmul: usize,
+    /// LuaJIT's `gc.estimate`: the collector's estimate of live bytes,
+    /// updated at the atomic phase and during sweep. The next cycle's
+    /// threshold is `estimate * GC_PAUSE / 100`.
+    pub estimate: usize,
 }
 
 impl Default for GcHeap {
@@ -104,19 +113,19 @@ impl Default for GcHeap {
             cat_hash: None,
             cat_buf: Vec::new(),
             cat_buf_slot: u32::MAX,
+            stepmul: 200,
+            estimate: 0,
         }
     }
 }
 
 impl GcHeap {
-    /// Track an allocation and accumulate GC debt. Every allocation
-    /// accrues debt unconditionally, so `lj_gc_check`'s `debt > step`
-    /// guard fires even while `live` is far below `threshold` (e.g. a
-    /// tight loop allocating only strings: without the unconditional
-    /// accrual the collector never wakes up and weak tables are never
-    /// cleared).
+    /// Track an allocation for the hard memory cap. The GC trigger is
+    /// `total >= threshold` (LuaJIT's `lj_gc_check`), and debt/threshold
+    /// are managed exclusively by `gc_step` — accruing debt here is what
+    /// made every small allocation storm (e.g. closure creation) drive a
+    /// full collection.
     fn account_alloc(&mut self, size: usize) {
-        self.debt += size;
         let live = self.total + self.strings.bytes() + self.table_extra;
         // Hard cap so a runaway allocator (an unbounded `__gc` finalizer
         // chain, a leak) can't exhaust the host machine while debugging.
@@ -137,20 +146,16 @@ impl GcHeap {
             );
             std::process::exit(70);
         }
-        if live >= self.threshold {
-            // Advance threshold proportionally (LuaJIT's GC_PAUSE: 200%).
-            // This avoids re-triggering the GCSTEP guard on every allocation
-            // while ensuring the next collection triggers at ~2x memory.
-            self.threshold = live + ((live * gc::GC_PAUSE) / 100).max(16384);
-        }
     }
 
     pub fn alloc_table(&mut self, mut t: LuaTable) -> GcPtr<LuaTable> {
         t.table_extra = &mut self.table_extra as *mut usize;
         t.heap = self as *const GcHeap;
         let size = t.gc_size();
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
-        gc::gc_step(self, size); // GC first — may start a cycle
         self.account_alloc(size);
         self.tables.alloc(t)
     }
@@ -170,25 +175,31 @@ impl GcHeap {
 
     pub fn alloc_proto(&mut self, p: Proto) -> GcPtr<Proto> {
         let sz = p.gc_size();
+        if self.total + sz > self.threshold {
+            gc::gc_step(self, sz);
+        }
         self.total += sz;
         self.account_alloc(sz);
-        gc::gc_step(self, sz);
         self.protos.alloc(p)
     }
 
     pub fn alloc_func(&mut self, f: GcFunc) -> GcPtr<GcFunc> {
         let size = gc::account_func(&f);
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.funcs.alloc(f)
     }
 
     pub fn alloc_upval(&mut self, uv: Upval) -> GcPtr<Upval> {
         let size = gc::account_upval();
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         let p = self.upvals.alloc(uv);
         p.as_mut().init_closed();
         p
@@ -196,25 +207,31 @@ impl GcHeap {
 
     pub fn alloc_thread(&mut self, th: LuaState) -> GcPtr<LuaState> {
         let size = gc::account_thread(&th);
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.threads.alloc(th)
     }
 
     pub fn alloc_cdata(&mut self, cd: CData) -> GcPtr<CData> {
         let size = std::mem::size_of::<CData>() + cd.data.len();
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.cdatas.alloc(cd)
     }
 
     pub fn alloc_userdata(&mut self, ud: GcUserData) -> GcPtr<GcUserData> {
         let size = std::mem::size_of::<GcUserData>();
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.userdatas.alloc(ud)
     }
 
@@ -224,8 +241,11 @@ impl GcHeap {
         let new_bytes = self.strings.bytes();
         if new_bytes > prev_bytes {
             let sz = new_bytes - prev_bytes;
+            if self.total + sz > self.threshold {
+                gc::gc_step(self, sz);
+            }
+            self.total += sz;
             self.account_alloc(sz);
-            gc::gc_step(self, sz);
         }
         sid
     }
@@ -237,8 +257,11 @@ impl GcHeap {
         let new_bytes = self.strings.bytes();
         if new_bytes > prev_bytes {
             let sz = new_bytes - prev_bytes;
+            if self.total + sz > self.threshold {
+                gc::gc_step(self, sz);
+            }
+            self.total += sz;
             self.account_alloc(sz);
-            gc::gc_step(self, sz);
         }
         sid
     }

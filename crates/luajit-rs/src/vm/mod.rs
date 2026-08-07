@@ -481,12 +481,11 @@ fn call_c(
     l.stack[args_base - 1] = LuaValue::from_bits(((saved_base as u64) << 3) | FRAME_LUA);
     l.base = args_base;
     l.top = args_base + nargs;
-    let (step_size, paused, collect) = {
+    let (paused, collect) = {
         let g = l.global();
         (
-            g.heap.gc_step_size,
             g.heap.gc_state == crate::runtime::gc::GcState::Pause,
-            (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped,
+            g.heap.should_collect() && !g.heap.gc_stopped,
         )
     };
     if collect {
@@ -497,8 +496,7 @@ fn call_c(
         if paused {
             crate::gc::start_gc_cycle(l.global());
         }
-        crate::gc::gc_step(&mut l.global().heap, step_size);
-        l.global().heap.debt = 0;
+        crate::gc::gc_step(&mut l.global().heap, l.global().heap.gc_step_size);
         l.top = args_base + nargs;
     }
     let r = f(l);
@@ -1895,7 +1893,6 @@ impl Interp {
                     // Inline: only sync when GC is due (cold path).
                     let g = self.l().global();
                     if g.heap.should_collect()
-                        || g.heap.debt > 4096
                         || g.heap.gc_state == crate::runtime::gc::GcState::Finalize
                     {
                         sync!();
@@ -2905,7 +2902,9 @@ impl Interp {
             run_finalizers(self.l())?;
         }
         let g = self.l().global();
-        if g.heap.should_collect() || g.heap.debt > 4096 {
+        // lj_gc_check: only `total >= threshold` triggers a step. The step
+        // itself is budget-limited (`gc_step`), never a full cycle.
+        if g.heap.should_collect() {
             self.gc_collect(need)?;
         }
         Ok(())
@@ -2920,34 +2919,20 @@ impl Interp {
         // while frame temporaries above it are still live, so never drop
         // below the frame extent.
         l.top = l.top.max(l.frame_top).max(need);
-        let step_size = l.global().heap.gc_step_size;
-        let paused = l.global().heap.gc_state == crate::runtime::gc::GcState::Pause;
         let stopped = l.global().heap.gc_stopped;
         if stopped {
             return Ok(());
         }
         let g = l.global();
-        if paused {
+        if g.heap.gc_state == crate::runtime::gc::GcState::Pause {
             crate::gc::start_gc_cycle(g);
         }
-        // On-trace string allocation outruns the incremental collector:
-        // a single small step never catches the growing pool, the sweep
-        // lags forever and the debt threshold inflates with the garbage
-        // (measured: the strings benchmark held 1.5 GB of dead strings
-        // and never collected). Drive the cycle to completion at the
-        // boundary (bounded per call so a huge live table's mark phase
-        // is amortized over several exits instead of one long stop).
-        let mut steps = 0;
-        loop {
-            crate::gc::gc_step(&mut g.heap, step_size);
-            steps += 1;
-            if g.heap.gc_state == crate::runtime::gc::GcState::Pause
-                || g.heap.gc_state == crate::runtime::gc::GcState::Finalize
-                || steps >= 512
-            {
-                break;
-            }
-        }
+        // One budget-limited incremental step (LuaJIT `lj_gc_step`). The
+        // collector paces itself via debt: a fast allocation loop accrues
+        // debt and triggers the next step sooner, eventually finishing the
+        // cycle; it is never driven to completion here.
+        let size = g.heap.gc_step_size;
+        crate::gc::gc_step(&mut g.heap, size);
         Ok(())
     }
 
@@ -3207,12 +3192,11 @@ impl Interp {
         l.base = args_base;
         l.top = args_base + nargs;
         // C-call boundary is a GC safe point (args anchored, frames below).
-        let (step_size, paused, collect) = {
+        let (paused, collect) = {
             let g = l.global();
             (
-                g.heap.gc_step_size,
                 g.heap.gc_state == crate::runtime::gc::GcState::Pause,
-                (g.heap.should_collect() || g.heap.debt > 4096) && !g.heap.gc_stopped,
+                g.heap.should_collect() && !g.heap.gc_stopped,
             )
         };
         if collect {
@@ -3223,8 +3207,7 @@ impl Interp {
             if paused {
                 crate::gc::start_gc_cycle(l.global());
             }
-            crate::gc::gc_step(&mut l.global().heap, step_size);
-            l.global().heap.debt = 0;
+            crate::gc::gc_step(&mut l.global().heap, l.global().heap.gc_step_size);
             l.top = args_base + nargs;
         }
         let r = f(l);
