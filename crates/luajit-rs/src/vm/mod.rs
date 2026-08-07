@@ -2045,8 +2045,13 @@ impl Interp {
                         if k.is_string() {
                             tab.as_mut().set_str(k, v);
                         } else if k.is_number() {
-                            let ki = k.num() as i32;
-                            if ki as f64 == k.num() && ki >= 0 {
+                            let n = k.num();
+                            if n.is_nan() {
+                                sync!();
+                                return Err(self.l().runtime_error(b"table index is NaN"));
+                            }
+                            let ki = n as i32;
+                            if ki as f64 == n && ki >= 0 {
                                 tab.as_mut().set_int(ki, v);
                             } else {
                                 tab.as_mut().set(k, v);

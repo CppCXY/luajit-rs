@@ -361,6 +361,7 @@ pub fn open(l: &mut LuaState) {
         .func(b"frexp", math_frexp)
         .func(b"ldexp", math_ldexp)
         .func(b"log", math_logx)
+        .func(b"log10", log10)
         .func(b"max", math_max)
         .func(b"min", math_min)
         .func(b"modf", math_modf)

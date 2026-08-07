@@ -4,7 +4,7 @@
 //! registry (files are OS resources shared across VMs).
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::sync::Mutex;
 
 use crate::api::lua_gettop;
@@ -21,6 +21,9 @@ use crate::lual_reg;
 enum Entry {
     Read(BufReader<File>),
     Write(BufWriter<File>),
+    /// A handle opened read-write (io.tmpfile, mode "r+"/"w+"): the raw
+    /// `File` so both directions share one cursor (seek moves it for both).
+    ReadWrite(File),
     Stdin,
     Stdout,
     Stderr,
@@ -148,10 +151,15 @@ fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
 
 fn handle_flush_fd(l: &mut LuaState) -> LuaResult<i32> {
     let id = fd_from_upval(l);
-    let files = FILES.lock().unwrap();
-    match &files[id] {
+    let mut files = FILES.lock().unwrap();
+    match &mut files[id] {
         Some(Entry::Write(f)) => {
             let _ = f.get_ref().flush();
+            push(l, LuaValue::TRUE);
+            Ok(1)
+        }
+        Some(Entry::ReadWrite(f)) => {
+            let _ = f.flush();
             push(l, LuaValue::TRUE);
             Ok(1)
         }
@@ -161,13 +169,35 @@ fn handle_flush_fd(l: &mut LuaState) -> LuaResult<i32> {
 
 fn handle_seek_fd(l: &mut LuaState) -> LuaResult<i32> {
     let id = fd_from_upval(l);
-    let files = FILES.lock().unwrap();
-    match &files[id] {
+    // whence (set/cur/end, default "cur") and offset (default 0). The
+    // stack is [file, whence, offset]: whence = arg(1), offset = arg(2).
+    let whence = match arg(l, 1).as_string_id() {
+        Some(sid) => l.heap().strings.get(sid).to_vec(),
+        None => b"cur".to_vec(),
+    };
+    let off = arg(l, 2).as_number().unwrap_or(0.0) as i64;
+    let pos = match whence.as_slice() {
+        b"set" => std::io::SeekFrom::Start(off.max(0) as u64),
+        b"cur" => std::io::SeekFrom::Current(off),
+        b"end" => std::io::SeekFrom::End(off),
+        _ => return Err(l.runtime_error(b"invalid option 'whence'")),
+    };
+    let mut files = FILES.lock().unwrap();
+    let res = match files.get_mut(id).and_then(|e| e.as_mut()) {
+        Some(Entry::Read(r)) => r.seek(pos),
         Some(Entry::Write(f)) => {
-            let _ = f.get_ref().flush();
-            Ok(0)
+            let _ = f.flush();
+            f.get_mut().seek(pos)
         }
-        _ => Ok(0),
+        Some(Entry::ReadWrite(f)) => f.seek(pos),
+        _ => return Err(l.runtime_error(b"attempt to use a closed file")),
+    };
+    match res {
+        Ok(p) => {
+            push(l, LuaValue::number(p as f64));
+            Ok(1)
+        }
+        Err(e) => Err(l.runtime_error(e.to_string().as_bytes())),
     }
 }
 
@@ -330,6 +360,12 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
                             out.push(read_format(l, r, f)?);
                         }
                     }
+                    Some(Entry::ReadWrite(file)) => {
+                        let mut r = BufReader::new(&mut *file);
+                        for f in fmts {
+                            out.push(read_format(l, &mut r, f)?);
+                        }
+                    }
                     Some(Entry::Stdin) => {
                         drop(files);
                         let stdin = std::io::stdin();
@@ -359,6 +395,12 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
                 Some(Entry::Read(r)) => {
                     for f in fmts {
                         out.push(read_format(l, r, f)?);
+                    }
+                }
+                Some(Entry::ReadWrite(file)) => {
+                    let mut r = BufReader::new(&mut *file);
+                    for f in fmts {
+                        out.push(read_format(l, &mut r, f)?);
                     }
                 }
                 Some(Entry::Stdin) => {
@@ -398,6 +440,7 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
                 let mut files = FILES.lock().unwrap();
                 match files.get_mut(id).and_then(|e| e.as_mut()) {
                     Some(Entry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
+                    Some(Entry::ReadWrite(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                     Some(Entry::Stdout) | Some(Entry::Stderr) => {
                         drop(files);
                         let mut so = std::io::stdout();
@@ -424,6 +467,7 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
             let mut files = FILES.lock().unwrap();
             match files.get_mut(id).and_then(|e| e.as_mut()) {
                 Some(Entry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
+                Some(Entry::ReadWrite(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                 Some(Entry::Stdout) => {
                     drop(files);
                     let mut so = std::io::stdout();
@@ -636,6 +680,13 @@ fn io_flush(l: &mut LuaState) -> LuaResult<i32> {
                     }
                     Err(e) => ret_fail(l, &e.to_string()),
                 },
+                Some(Entry::ReadWrite(f)) => match f.flush() {
+                    Ok(()) => {
+                        push(l, LuaValue::TRUE);
+                        Ok(1)
+                    }
+                    Err(e) => ret_fail(l, &e.to_string()),
+                },
                 Some(Entry::Stdout | Entry::Stderr) => {
                     drop(files);
                     match std::io::stdout().flush() {
@@ -795,6 +846,7 @@ fn io_type(l: &mut LuaState) -> LuaResult<i32> {
                 match entry {
                     Entry::Read(_)
                     | Entry::Write(_)
+                    | Entry::ReadWrite(_)
                     | Entry::Stdin
                     | Entry::Stdout
                     | Entry::Stderr => {
@@ -845,9 +897,16 @@ pub fn open(l: &mut LuaState) {
 fn io_tmpfile(l: &mut LuaState) -> LuaResult<i32> {
     let tmp = std::env::temp_dir();
     let path = tmp.join(format!("luajit_rs_{}_{}.tmp", std::process::id(), l.base));
-    match std::fs::File::create(&path) {
+    // Lua 5.1 io.tmpfile uses tmpfile() (mode "w+b"): read-write.
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+    {
         Ok(f) => {
-            let id = registry_put(Entry::Write(BufWriter::new(f)));
+            let id = registry_put(Entry::ReadWrite(f));
             let h = new_handle(l, id);
             push(l, h);
             Ok(1)

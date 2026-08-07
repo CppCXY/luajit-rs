@@ -135,24 +135,36 @@ pub fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
             Vec::new()
         };
         let mut r = LuaValue::NIL;
-        if (2..=36).contains(&base) && !s.is_empty() {
+        // Lua 5.1 luaB_tonumber with base: skip leading whitespace, parse
+        // base digits, skip trailing whitespace, then require end of
+        // string (`tonumber('  1010  ', 2) == 10`, `tonumber('  ', 9)`
+        // is nil, `tonumber('99', 8)` is nil).
+        if (2..=36).contains(&base) {
+            let mut i = 0;
+            while i < s.len() && (s[i] as char).is_ascii_whitespace() {
+                i += 1;
+            }
             let mut n: u64 = 0;
             let mut any = false;
-            for &b in &s {
-                let d = match b {
-                    b'0'..=b'9' => (b - b'0') as u64,
-                    b'a'..=b'z' => (b - b'a' + 10) as u64,
-                    b'A'..=b'Z' => (b - b'A' + 10) as u64,
-                    _ => 0,
+            while i < s.len() {
+                let c = s[i];
+                let d = match c {
+                    b'0'..=b'9' => (c - b'0') as u64,
+                    b'a'..=b'z' => (c - b'a' + 10) as u64,
+                    b'A'..=b'Z' => (c - b'A' + 10) as u64,
+                    _ => break, // invalid digit
                 };
                 if d >= base as u64 {
-                    any = false;
                     break;
                 }
                 n = n.wrapping_mul(base as u64).wrapping_add(d);
                 any = true;
+                i += 1;
             }
-            if any {
+            while i < s.len() && (s[i] as char).is_ascii_whitespace() {
+                i += 1;
+            }
+            if any && i == s.len() {
                 r = LuaValue::number(n as f64);
             }
         }
