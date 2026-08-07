@@ -19,6 +19,19 @@ use crate::value::{GcRef, LJ_TFUNC, LJ_TTAB, LuaValue};
 use crate::vm::FRAME_TYPE_MASK;
 use crate::{LuaError, meta};
 
+/// A registered file entry, indexed by an integer fd. Lives in
+/// `GlobalState` (not a process-global static) so each Lua universe has
+/// independent io state; file handles are userdata referencing it by fd.
+pub enum FileEntry {
+    Read(std::io::BufReader<std::fs::File>),
+    Write(std::io::BufWriter<std::fs::File>),
+    /// Read-write (io.tmpfile, "r+"/"w+"): one shared cursor.
+    ReadWrite(std::fs::File),
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
 /// The GC heap: stable-address object pools.
 ///
 /// Every collectable type lives in its own `Pool`, which allocates objects in
@@ -326,6 +339,14 @@ pub struct GlobalState {
     /// The main thread. Set once the owning [`Lua`] is pinned. The interpreter
     /// entry points use this when no explicit thread is supplied.
     main: Option<StateRef>,
+    /// io file registry (fd → entry) and the default input/output fds.
+    /// Per-universe, unlike the old process-global statics.
+    pub files: Vec<Option<FileEntry>>,
+    pub default_input: Option<usize>,
+    pub default_output: Option<usize>,
+    /// fd → file-handle userdata cache: the same fd always yields the same
+    /// userdata (`io.input(io.stdin) == io.stdin`). GC marks these.
+    pub io_file_cache: Vec<Option<LuaValue>>,
 }
 
 impl GlobalState {
@@ -573,6 +594,21 @@ impl LuaState {
     /// Also serves as a GC check point so loops that push values (e.g. table
     /// stores, string concatenation) eventually trigger collection.
     #[inline]
+    /// The stack grows dynamically up to this many slots; used by the VM
+    /// to bound recursion (lj_checkstack).
+    pub fn max_stack(&self) -> usize {
+        self._max_stack
+    }
+
+    /// Mutable access to the io file registry. Returns `'static` so io
+    /// callbacks can interleave `l.heap()`/`l.runtime_error` with file
+    /// operations without a self-referential borrow. Safe because the io
+    /// library is single-threaded and `GlobalState` outlives every thread.
+    pub fn files_mut(&self) -> &'static mut Vec<Option<FileEntry>> {
+        let g = self.g.get() as *mut GlobalState;
+        unsafe { &mut (*g).files }
+    }
+
     pub fn stack_ensure(&mut self, need: usize) {
         if need >= self.stack.len() {
             let new_len = (self.stack.len() * 2).max(need + 16).min(self._max_stack);
@@ -837,6 +873,10 @@ impl Lua {
             ipairs_iter: LuaValue::NIL,
             boot_time: boot,
             main: None,
+            files: Vec::new(),
+            default_input: None,
+            default_output: None,
+            io_file_cache: Vec::new(),
         }));
         let gs = unsafe { &mut *g };
         gs.globals = gs.heap.alloc_table(LuaTable::new(0, 1));

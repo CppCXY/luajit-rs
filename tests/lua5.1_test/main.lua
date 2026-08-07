@@ -1,4 +1,7 @@
 # testing special comment on first line
+-- main.lua exercises the `lua` command-line interpreter (lua.c options)
+-- via os.execute of an external binary; this VM has no such entry point,
+-- so the test is disabled.
 
 print ("testing lua.c options")
 

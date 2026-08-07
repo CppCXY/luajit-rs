@@ -1549,6 +1549,9 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
     for &v in g.mmname.iter() {
         m.mark_value(v);
     }
+    for v in g.io_file_cache.iter().flatten() {
+        m.mark_value(*v);
+    }
     m.mark_thread(g.main());
     if let Some(cur) = g.cur_l {
         m.mark_thread(cur);

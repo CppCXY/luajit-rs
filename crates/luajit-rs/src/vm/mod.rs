@@ -69,10 +69,11 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
                 l.top = saved_top;
                 l.frame_top = saved_frame_top;
             }
-            Err(e) => {
+            Err(_) => {
+                // __gc errors are swallowed (LuaJIT lj_gc_finalize does
+                // not propagate them); the object is already finalized.
                 l.top = saved_top;
                 l.frame_top = saved_frame_top;
-                return Err(e);
             }
         }
         // The finalizer's argument sits above the live frame and would
@@ -2161,6 +2162,13 @@ impl Interp {
                             let nargs = bc_c(ins) as usize - 1;
                             let fs = pt.framesize as usize;
                             let need = fr.cur_base() + a as usize + 2 + fs + 8;
+                            // LuaJIT `lj_checkstack`: unbounded Lua recursion
+                            // (e.g. `function y() y() end`) must raise a Lua
+                            // error, not grow the stack past its limit.
+                            if need > self.l().max_stack() {
+                                sync!();
+                                return Err(self.l().runtime_error(b"stack overflow"));
+                            }
                             if need > self.l().stack.len() {
                                 sync!();
                                 self.l().stack_ensure(need);

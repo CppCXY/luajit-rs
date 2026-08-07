@@ -8,7 +8,7 @@ use crate::state::LuaState;
 use crate::value::LuaValue;
 use crate::{err::LuaResult, stdlib::time};
 
-use super::{LibTarget, arg, err_bad_arg_type, push};
+use super::{LibTarget, arg, err_bad_arg_type, push, pushv};
 use crate::lual_reg;
 
 fn os_clock(l: &mut LuaState) -> LuaResult<i32> {
@@ -364,8 +364,7 @@ fn os_rename(l: &mut LuaState) -> LuaResult<i32> {
             Err(e) => {
                 let msg = format!("{}", e);
                 let sid = l.heap().intern(msg.as_bytes());
-                push(l, LuaValue::NIL);
-                push(l, l.heap().str_value(sid));
+                pushv(l, &[LuaValue::NIL, l.heap().str_value(sid)]);
                 return Ok(2);
             }
         }

@@ -13,10 +13,177 @@ use crate::meta::{MM, meta_fast, meta_lookup, metatable_of};
 
 const LJ_MAX_IDXCHAIN: usize = 100;
 
+/// Lua type name for error messages ("a nil value", "a string value", ...).
+fn lua_typename(v: LuaValue) -> &'static str {
+    if v.is_nil() {
+        "nil"
+    } else if v.is_bool() {
+        "boolean"
+    } else if v.is_number() {
+        "number"
+    } else if v.is_string() {
+        "string"
+    } else if v.as_table().is_some() {
+        "table"
+    } else if v.as_func().is_some() {
+        "function"
+    } else if v.as_thread().is_some() {
+        "thread"
+    } else if v.as_userdata().is_some() {
+        "userdata"
+    } else {
+        "value"
+    }
+}
+
+/// `debug_varname`: the local variable name bound to `slot` at `pc`.
+fn debug_varname(pt: &crate::runtime::proto::Proto, pc: usize, slot: u32) -> Option<String> {
+    for (s, a, b, name) in &pt.varnames {
+        if *s as u32 == slot && pc >= *a as usize && pc <= *b as usize {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// LuaJIT's `lj_debug_slotname`: deduce the (kind, name) of the value in a
+/// register slot by scanning backwards from `pc` for the instruction that
+/// wrote it. Kinds: "global", "local", "upvalue", "field", "method".
+fn debug_slotname(
+    pt: &crate::runtime::proto::Proto,
+    pc: usize,
+    mut slot: u32,
+) -> Option<(&'static str, String)> {
+    if let Some(n) = debug_varname(pt, pc, slot) {
+        return Some(("local", n));
+    }
+    let kstr = |idx: u32| -> String {
+        pt.kstrv
+            .get(idx as usize)
+            .and_then(|v| v.as_string())
+            .map(|s| String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned())
+            .unwrap_or_else(|| "?".into())
+    };
+    let mut i = pc as isize - 1;
+    loop {
+        if i < 1 {
+            break;
+        }
+        let ins = pt.bc[i as usize];
+        let op = crate::bc::bc_op(ins);
+        let ra = crate::bc::bc_a(ins);
+        // A base-mode instruction (JMP, ISEQ*, ...) can write the slot
+        // range; LuaJIT stops tracing here (`bcmode_a == BCMbase` →
+        // NULL) so `(aaa or aaa)` does not name the inner global.
+        if crate::bc::bcmode_a(op) == crate::bc::BCMode::Base as u32 && slot >= ra {
+            return None;
+        }
+        if crate::bc::bcmode_a(op) == crate::bc::BCMode::Dst as u32 && ra == slot {
+            match op {
+                crate::bc::BCOp::MOV => {
+                    slot = crate::bc::bc_d(ins);
+                    if let Some(n) = debug_varname(pt, pc, slot) {
+                        return Some(("local", n));
+                    }
+                    i -= 1;
+                    continue;
+                }
+                crate::bc::BCOp::GGET => {
+                    return Some(("global", kstr(crate::bc::bc_d(ins))));
+                }
+                crate::bc::BCOp::TGETS => {
+                    let name = kstr(crate::bc::bc_c(ins));
+                    if i > 1 {
+                        let insp = pt.bc[(i - 1) as usize];
+                        // `a:bbbb(...)`: the object is moved to slot+2 (this
+                        // VM's CALL args start at func+2, cf. do_call's
+                        // args_base = func_slot + 2). LuaJIT uses slot+1
+                        // because its CALL layout differs.
+                        if crate::bc::bc_op(insp) == crate::bc::BCOp::MOV
+                            && crate::bc::bc_a(insp) == ra + 2
+                            && crate::bc::bc_d(insp) == crate::bc::bc_b(ins)
+                        {
+                            return Some(("method", name));
+                        }
+                    }
+                    return Some(("field", name));
+                }
+                crate::bc::BCOp::UGET => {
+                    let name = pt
+                        .uvnames
+                        .get(crate::bc::bc_d(ins) as usize)
+                        .cloned()
+                        .unwrap_or_else(|| "?".into());
+                    return Some(("upvalue", name));
+                }
+                _ => return None,
+            }
+        }
+        i -= 1;
+    }
+    None
+}
+
+/// Deduce the callee name for a failing call whose func slot is `func_slot`.
+pub(super) fn debug_callname(l: &LuaState, func_slot: usize) -> Option<(&'static str, String)> {
+    // The current Lua frame's closure sits at `base - 2` (the frame's func
+    // slot), not at `func_slot - 2` (that is the *callee's* slot).
+    let cl = l.stack.get(l.base.saturating_sub(2))?.as_func()?;
+    let crate::func::GcFunc::Lua(c) = cl.as_ref() else {
+        return None;
+    };
+    let pt = c.proto.as_ref();
+    let pc = l.debug_pc;
+    if pc >= 1 && pc - 1 < pt.bc.len() {
+        let ins = pt.bc[pc - 1];
+        let op = crate::bc::bc_op(ins);
+        if matches!(
+            op,
+            crate::bc::BCOp::CALL | crate::bc::BCOp::CALLM | crate::bc::BCOp::CALLT
+        ) {
+            let ra = crate::bc::bc_a(ins);
+            if func_slot >= l.base && func_slot - l.base == ra as usize {
+                // Skip the CALL itself (a base-mode instruction stops the
+                // scan) and trace the func slot from the instruction before.
+                return debug_slotname(pt, pc - 1, ra);
+            }
+        }
+    }
+    None
+}
+
 impl Interp {
     #[inline]
     fn mm_frame(&self) -> usize {
         self.base + self.lua_cl().proto.as_ref().framesize as usize
+    }
+
+    /// `attempt to index <kind> '<name>' (a <type> value)`, deducing the
+    /// object's name from the failing TGET instruction (LuaJIT's
+    /// `lj_meta_tget` error path).
+    fn index_error(&self, o: LuaValue) -> LuaError {
+        let pt = self.proto();
+        let pc = self.pc;
+        let msg = if pc >= 2 && pc - 1 < pt.bc.len() {
+            // The failing TGET is at `pc-1`; skip it (its result slot may
+            // alias the object slot) and scan from the instruction before.
+            let ins = pt.bc[pc - 1];
+            let slot = crate::bc::bc_b(ins);
+            debug_slotname(pt, pc - 1, slot).map(|(kind, name)| {
+                format!(
+                    "attempt to index {} '{}' (a {} value)",
+                    kind,
+                    name,
+                    lua_typename(o)
+                )
+            })
+        } else {
+            None
+        };
+        match msg {
+            Some(m) => self.l().runtime_error(m.as_bytes()),
+            None => self.l().runtime_error(b"attempt to index a non-table value"),
+        }
     }
 
     /// `lj_meta_tget`:
@@ -56,9 +223,7 @@ impl Interp {
             } else {
                 let mo = meta_lookup(self.l().global(), cur, MM::Index);
                 if mo.is_nil() {
-                    return Err(self
-                        .l()
-                        .runtime_error(b"attempt to index a non-table value"));
+                    return Err(self.index_error(cur));
                 }
                 if mo.is_func() {
                     match mo.as_func().unwrap().as_ref() {
@@ -128,9 +293,7 @@ impl Interp {
             } else {
                 let mo = meta_lookup(self.l().global(), cur, MM::Newindex);
                 if mo.is_nil() {
-                    return Err(self
-                        .l()
-                        .runtime_error(b"attempt to index a non-table value"));
+                    return Err(self.index_error(cur));
                 }
                 if mo.is_func() {
                     match mo.as_func().unwrap().as_ref() {
@@ -152,9 +315,80 @@ impl Interp {
             .runtime_error(b"'__newindex' chain too long; possible loop"))
     }
 
-    /// `lj_meta_arith`: coercion first, then arithmetic metamethod.
-    /// Returns `Some(val)` when resolved or `None` for Lua continuation.
-    pub(super) fn meta_arith(
+    /// `attempt to perform arithmetic on <kind> '<name>' (a <type> value)`,
+    /// deducing the offending operand's slot from the arith instruction.
+    fn arith_error(&self, rb: LuaValue, rc: LuaValue) -> LuaError {
+        let pt = self.proto();
+        let pc = self.pc;
+        let msg = if pc >= 2 && pc - 1 < pt.bc.len() {
+            let ins = pt.bc[pc - 1];
+            let op = crate::bc::bc_op(ins);
+            // The operand that cannot be coerced to a number is the one
+            // reported (LuaJIT's `lj_meta_arith` slot).
+            let rb_bad = str2num(self.l(), rb).is_none();
+            let (bad, is_b) = if rb_bad { (rb, true) } else { (rc, false) };
+            let slot = Self::arith_operand_slot(op, is_b, ins);
+            if let Some(slot) = slot {
+                debug_slotname(pt, pc - 1, slot).map(|(kind, name)| {
+                    format!(
+                        "attempt to perform arithmetic on {} '{}' (a {} value)",
+                        kind,
+                        name,
+                        lua_typename(bad)
+                    )
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match msg {
+            Some(m) => self.l().runtime_error(m.as_bytes()),
+            None => self
+                .l()
+                .runtime_error(b"attempt to perform arithmetic on a non-number value"),
+        }
+    }
+
+/// Map an arith instruction + which operand is bad to its register slot,
+/// accounting for the bytecode's operand order (`*NV` puts the constant in
+/// `c`, `*VN` the variable in `b`, VV/VV both in b/c).
+fn arith_operand_slot(op: crate::bc::BCOp, is_b: bool, ins: BCIns) -> Option<u32> {
+    use crate::bc::BCOp::*;
+    match op {
+        // Variable-variable (or unary).
+        UNM | ADDVV | SUBVV | MULVV | DIVVV | MODVV | POW | BAND | BOR | BXOR | BSHL | BSHR => {
+            Some(if is_b {
+                crate::bc::bc_b(ins)
+            } else {
+                crate::bc::bc_c(ins)
+            })
+        }
+        // Variable-constant: `rb` is the variable (b), `rc` is the constant.
+        ADDVN | SUBVN | MULVN | DIVVN | MODVN => {
+            if is_b {
+                Some(crate::bc::bc_b(ins))
+            } else {
+                None
+            }
+        }
+        // Constant-variable: `rb` is the constant (c), `rc` is the variable
+        // (b) — the VM passes (kv, yv) with yv = fr.reg(bc_b).
+        ADDNV | SUBNV | MULNV | DIVNV | MODNV => {
+            if is_b {
+                None
+            } else {
+                Some(crate::bc::bc_b(ins))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `lj_meta_arith`: coercion first, then arithmetic metamethod.
+/// Returns `Some(val)` when resolved or `None` for Lua continuation.
+pub(super) fn meta_arith(
         &mut self,
         mm: MM,
         rb: LuaValue,
@@ -210,9 +444,7 @@ impl Interp {
         if mo.is_nil() {
             mo = meta_lookup(g, rc, mm);
             if mo.is_nil() {
-                return Err(self
-                    .l()
-                    .runtime_error(b"attempt to perform arithmetic on a non-number value"));
+                return Err(self.arith_error(rb, rc));
             }
         }
         if mo.is_func() {
@@ -231,9 +463,7 @@ impl Interp {
         // metamethod is itself called through its __call (the original
         // metamethod becomes the first argument).
         let Some(mo2) = resolve_callable(self.l(), mo) else {
-            return Err(self
-                .l()
-                .runtime_error(b"attempt to perform arithmetic on a non-number value"));
+            return Err(self.arith_error(rb, rc));
         };
         let args = [mo, rb, rc];
         match mo2.as_func().unwrap().as_ref() {
@@ -584,26 +814,35 @@ impl Interp {
                     top -= 1;
                     self.set_at(top, r);
                 } else {
-                    // No __concat available. Try __tostring on non-string operands
-                    // and replace them, then continue the loop.
-                    let mut replaced = false;
-                    if !concat_ok(o1) {
-                        let s = crate::stdlib::tostring_meta(self.l(), o1)?;
-                        let sid = self.l().heap().intern(&s);
-                        self.set_at(top - 1, self.l().heap().str_value(sid));
-                        replaced = true;
-                    }
-                    if !concat_ok(o2) {
-                        let s = crate::stdlib::tostring_meta(self.l(), o2)?;
-                        let sid = self.l().heap().intern(&s);
-                        self.set_at(top, self.l().heap().str_value(sid));
-                        replaced = true;
-                    }
-                    if !replaced {
-                        return Err(self
+                    // No __concat: Lua 5.1 concat only accepts strings and
+                    // numbers — report the offending operand (LuaJIT
+                    // `lj_meta_cat`).
+                    let bad_slot = if !concat_ok(o1) {
+                        top - 1 - self.base
+                    } else {
+                        top - self.base
+                    };
+                    let bad = if !concat_ok(o1) { o1 } else { o2 };
+                    let pt = self.proto();
+                    let pc = self.pc;
+                    let msg = if pc >= 2 && pc - 1 < pt.bc.len() {
+                        debug_slotname(pt, pc - 1, bad_slot as u32).map(|(kind, name)| {
+                            format!(
+                                "attempt to concatenate {} '{}' (a {} value)",
+                                kind,
+                                name,
+                                lua_typename(bad)
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    return Err(match msg {
+                        Some(m) => self.l().runtime_error(m.as_bytes()),
+                        None => self
                             .l()
-                            .runtime_error(b"attempt to concatenate a non-string value"));
-                    }
+                            .runtime_error(b"attempt to concatenate a non-string value"),
+                    });
                 }
             }
             if top <= bottom {
@@ -661,7 +900,18 @@ pub(super) fn meta_call(l: &mut LuaState, func_slot: usize, nargs: usize) -> Lua
     // its own __call, a primitive with a call metatable, ...). Resolve
     // the chain to the first function, like LuaJIT's repeated dispatch.
     let Some(mo) = resolve_callable(l, f) else {
-        return Err(l.runtime_error(b"attempt to call a non-function value"));
+        let msg = match debug_callname(l, func_slot) {
+            Some((kind, name)) => format!(
+                "attempt to call {} '{}' (a {} value)",
+                kind,
+                name,
+                lua_typename(f)
+            ),
+            // Lua 5.1 fallback: report the callee's type
+            // ("attempt to call a number value").
+            None => format!("attempt to call a {} value", lua_typename(f)),
+        };
+        return Err(l.runtime_error(msg.as_bytes()));
     };
     for i in (0..nargs).rev() {
         l.stack[func_slot + 3 + i] = l.stack[func_slot + 2 + i];

@@ -498,13 +498,16 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             push(l, LuaValue::number(bytes as f64 / 1024.0));
             Ok(1)
         }
-        _ => Err(err_bad_arg_type(
-            l,
-            1,
-            "collectgarbage",
-            "option string",
-            arg(l, 0),
-        )),
+        _ => {
+            // LuaJIT: `bad argument #1 to 'collectgarbage' (invalid option 'X')`.
+            let opt = match arg(l, 0).as_string_id() {
+                Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
+                None => "?".into(),
+            };
+            Err(l.runtime_error(
+                format!("invalid option '{}'", opt).as_bytes(),
+            ))
+        }
     }
 }
 
