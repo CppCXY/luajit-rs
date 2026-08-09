@@ -111,7 +111,7 @@ fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
     let ts_key = l.heap().str_value(l.heap().intern(b"__tostring"));
     mt.as_mut().set(ts_key, LuaValue::func(ts_ref));
     let gc_ref = l.heap().alloc_func(GcFunc::C(CClosure {
-        f: handle_close_fd,
+        f: handle_gc_fd,
         env,
         upvals: vec![],
     }));
@@ -221,6 +221,23 @@ fn handle_close_fd(l: &mut LuaState) -> LuaResult<i32> {
     }
     push(l, LuaValue::TRUE);
     Ok(1)
+}
+
+/// File-handle `__gc`: unlike an explicit `close`, finalizing an
+/// already-closed handle is a silent no-op (Lua 5.1's `io_f_gc` clears the
+/// file pointer and only closes when non-null). This matters for the
+/// `io.close(io.output())` idiom: the temporary handle is collected later,
+/// and its `__gc` must not raise "attempt to use a closed file".
+fn handle_gc_fd(l: &mut LuaState) -> LuaResult<i32> {
+    if let Some(fd) = handle_fd(l, 0) {
+        let files = l.files_mut();
+        if let Some(slot) = files.get_mut(fd) {
+            if slot.is_some() {
+                *slot = None;
+            }
+        }
+    }
+    Ok(0)
 }
 
 fn handle_tostring(l: &mut LuaState) -> LuaResult<i32> {
@@ -804,8 +821,7 @@ fn io_input(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn io_output(l: &mut LuaState) -> LuaResult<i32> {
-    if lua_gettop(l) == 0 {
-        let out_id = l.global().default_output;
+    if lua_gettop(l) == 0 {        let out_id = l.global().default_output;
         match out_id {
             Some(id) => {
                 let h = new_handle(l, id);

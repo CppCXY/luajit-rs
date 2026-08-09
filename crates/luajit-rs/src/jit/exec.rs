@@ -55,6 +55,9 @@ pub struct ExitResult {
     /// `run_ir` (Uprec frames pushed on the Lua stack). The exit's
     /// snapshot values are relative to `entry base + shift`.
     pub shift: usize,
+    /// A recursive trace (Uprec/Tailrec) hit the value-stack limit: the
+    /// caller must raise "stack overflow" instead of resuming.
+    pub stack_overflow: bool,
 }
 
 /// Execute trace `traceno` for the frame at `base` and follow the trace
@@ -166,6 +169,7 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
                 baseslot: (cbase - base) + tr.snap[exitno].baseslot as usize,
                 gcexit: true,
                 shift: cbase - base,
+                stack_overflow: false,
             };
         }
 
@@ -181,7 +185,23 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
                 restore_snapshot(l, cbase, tr, &env, exitno);
             }
             cbase += tr.snap[exitno].baseslot as usize - 2;
-            l.stack_ensure(cbase + tr.startpt.as_ref().framesize as usize + 8);
+            let need = cbase + tr.startpt.as_ref().framesize as usize + 8;
+            if need > l.max_stack() {
+                // The value stack is at its cap: growing the recursion any
+                // further would overflow the buffer (the restore below
+                // would index past the end). This is an unbounded
+                // recursion (`function y() y() end`); hand it back to the
+                // caller to raise "stack overflow".
+                break ExitResult {
+                    pc: tr.snap[exitno].pc as usize,
+                    exitno,
+                    baseslot: (cbase - base) + tr.snap[exitno].baseslot as usize,
+                    gcexit: false,
+                    shift: cbase - base,
+                    stack_overflow: true,
+                };
+            }
+            l.stack_ensure(need);
             continue;
         }
         // Follow a side trace linked to this exit. (Machine-code parents
@@ -253,6 +273,7 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
             baseslot: (cbase - base) + tr.snap[exitno].baseslot as usize,
             gcexit: false,
             shift: cbase - base,
+            stack_overflow: false,
         };
     };
     let g = l.global();
@@ -312,6 +333,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let idx = (cbase as i64 + ins.op1 as i64 - 2) as usize;
                     let v = l.stack[idx];
                     if ins.is_guard() && !typecheck(v, ins.t()) {
+                        env[(r - REF_BIAS) as usize] = v.to_bits();
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
@@ -321,6 +343,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let p = const_bits(ir, ins.op1 as IRRef) as *const LuaValue;
                     let v = unsafe { *p };
                     if ins.is_guard() && !typecheck(v, ins.t()) {
+                        env[(r - REF_BIAS) as usize] = v.to_bits();
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
@@ -344,6 +367,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         val(env, ins.op2 as IRRef),
                     ));
                     if ins.is_guard() && !typecheck(v, ins.t()) {
+                        env[(r - REF_BIAS) as usize] = v.to_bits();
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
@@ -360,6 +384,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     }
                     let v = unsafe { *t.as_ref().aptr.add(ki as usize) };
                     if !typecheck(v, ins.t()) {
+                        env[(r - REF_BIAS) as usize] = v.to_bits();
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
@@ -506,6 +531,14 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     };
                     let v = LuaValue::from_bits(bits);
                     if ins.is_guard() && !typecheck(v, ins.t()) {
+                        // The guard failed on this value (e.g. the `next`
+                        // iterator hit the end of the table and returned
+                        // nil against a key-type guard). Record the actual
+                        // value first so the snapshot restore hands the
+                        // interpreter the true result — otherwise the stale
+                        // previous value is restored and the loop body is
+                        // re-run once, double-counting the last iteration.
+                        env[(r - REF_BIAS) as usize] = v.to_bits();
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                     env[(r - REF_BIAS) as usize] = v.to_bits();
@@ -776,6 +809,13 @@ pub(super) fn const_bits(ir: &IrBuf, r: IRRef) -> u64 {
 /// `lj_snap_restore`: write the snapshot's slots back to the Lua stack.
 fn restore_snapshot(l: &mut LuaState, base: usize, tr: &GCtrace, env: &[u64], snapidx: usize) {
     let snap = &tr.snap[snapidx];
+    // The exit's slots extend to `base + nslots - 2` (snapshot slots are
+    // relative to baseslot=2); ensure the stack has room before writing,
+    // or a deep trace (cbase near the top) restores past the end.
+    let need = base + snap.nslots as usize + 8;
+    if need > l.stack.len() {
+        l.stack_ensure(need);
+    }
     let map = &tr.snapmap[snap.mapofs as usize..(snap.mapofs as usize + snap.nent as usize)];
     for &sn in map {
         if sn & SNAP_NORESTORE != 0 {
@@ -783,6 +823,23 @@ fn restore_snapshot(l: &mut LuaState, base: usize, tr: &GCtrace, env: &[u64], sn
         }
         let s = snap_slot(sn) as usize;
         debug_assert!(s != 1, "the root frame link is never restored");
+        let abs = base + s - 2;
+        if abs >= l.stack.len() {
+            eprintln!(
+                "RESTORE-OOB base={} s={} abs={} slen={} nslots={} nent={} traceno={} snapidx={} nsnap={} mapofs={}",
+                base,
+                s,
+                abs,
+                l.stack.len(),
+                snap.nslots,
+                snap.nent,
+                tr.traceno,
+                snapidx,
+                tr.snap.len(),
+                snap.mapofs
+            );
+            return;
+        }
         let bits = read_ref(&tr.ir, env, snap_ref(sn));
         // lj_buf: a slot still holding the buffer marker must be flushed
         // to its interned string before the interpreter resumes.
@@ -816,6 +873,7 @@ fn exit_snapshot(
         baseslot: (cbase - base) + tr.snap[snapidx].baseslot as usize,
         gcexit: false,
         shift: cbase - base,
+        stack_overflow: false,
     }
 }
 
@@ -1254,5 +1312,6 @@ pub fn trace_exec(_l: &mut crate::state::LuaState, _base: usize, _traceno: u32) 
         baseslot: 2,
         gcexit: false,
         shift: 0,
+        stack_overflow: false,
     }
 }

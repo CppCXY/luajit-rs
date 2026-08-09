@@ -134,10 +134,14 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
     js.startpc = pc;
     js.startins = startins;
 
-    // Phase 2 recorder handles FORL/LOOP/ITERL/FUNCF roots; penalize the
-    // rest (ITERN roots arrive with pairs() recording). Side traces
-    // start at an arbitrary bytecode.
-    if js.parent == 0 && !matches!(op, BCOp::FORL | BCOp::LOOP | BCOp::FUNCF | BCOp::ITERL) {
+    // Phase 2 recorder handles FORL/LOOP/FUNCF roots; penalize the
+    // rest (ITERN roots arrive with pairs() recording). ITERL roots are
+    // also excluded: a generic-for loop's `next` key is a runtime helper
+    // result whose guard exits restore a stale control variable, so the
+    // interpreter re-runs the loop body and double-counts entries
+    // (nextvar.lua's `assert(n.n == 9000)`). Iterator loops run
+    // interpreted instead.
+    if js.parent == 0 && !matches!(op, BCOp::FORL | BCOp::LOOP | BCOp::FUNCF) {
         js.err = TraceError::NYIBC;
         js.state = TraceState::Err;
         trace_abort(g);
@@ -305,7 +309,14 @@ fn trace_findfree(js: &mut JitState) -> Option<TraceNo> {
 pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bool {
     let g = l.global();
     debug_assert!(g.jit.state == TraceState::Record);
-    let mut rec = g.jit.rec.take().expect("recording without context");
+    let Some(mut rec) = g.jit.rec.take() else {
+        let opn = pt.as_ref().bc.get(pc).copied().map(crate::bc::bc_op);
+        eprintln!(
+            "REC-NOCONTEXT state={:?} pc={} bc={} op={:?}",
+            g.jit.state, pc, pt.as_ref().bc.len(), opn
+        );
+        panic!("recording without context");
+    };
 
     // Single-frame traces: crossing into another proto means a call or
     // return slipped through — abort defensively.

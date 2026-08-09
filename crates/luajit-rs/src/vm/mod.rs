@@ -43,7 +43,15 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
     loop {
         let g = l.global();
         let Some(o) = g.heap.mmudata.pop() else {
+            // The cycle's finalizer stage is done: this is the true end of
+            // the GC cycle. Reset the per-cycle debt counters here as well
+            // as when the sweep finishes with no pending finalizers, or a
+            // permanent finalizer chain (newproxy self-recycling) would
+            // keep mmudata non-empty forever and `table_extra` would never
+            // be cleared, inflating gcinfo()/GC debt without bound.
             g.heap.gc_state = crate::runtime::gc::GcState::Pause;
+            g.heap.table_extra = 0;
+            g.heap.debt = 0;
             return Ok(());
         };
         // The finalizer ran: the object is now dead for the *next* cycle.
@@ -69,11 +77,15 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
                 l.top = saved_top;
                 l.frame_top = saved_frame_top;
             }
-            Err(_) => {
-                // __gc errors are swallowed (LuaJIT lj_gc_finalize does
-                // not propagate them); the object is already finalized.
+            Err(e) => {
+                // LuaJIT lj_gc_finalize rethrows the finalizer error to
+                // the allocation/collectgarbage caller (`lj_err_run`);
+                // gc.lua's `assert(not pcall(collectgarbage))` depends on
+                // it. The object is already finalized.
                 l.top = saved_top;
                 l.frame_top = saved_frame_top;
+                l.base = saved_base;
+                return Err(e);
             }
         }
         // The finalizer's argument sits above the live frame and would
@@ -1288,6 +1300,12 @@ impl Interp {
 
         loop {
             if REC {
+                // A nested call (or hook) may have aborted recording while
+                // we were inside it; rec_ins consumes the recorder context,
+                // so re-check before dispatching another instruction.
+                if self.l().global().jit.state != crate::jit::TraceState::Record {
+                    return Ok(Flow::Rec);
+                }
                 // Recording dispatch: feed the instruction about to be
                 // executed through the recorder (lj_trace_ins).
                 sync!();
@@ -2198,6 +2216,9 @@ impl Interp {
                                 sync!();
                                 let r = trace_exec(self.l(), self.base, bc_d(head));
                                 self.sp = self.l().stack.as_mut_ptr();
+                                if r.stack_overflow {
+                                    return Err(self.l().runtime_error(b"stack overflow"));
+                                }
                                 self.pc = r.pc;
                                 if r.baseslot != 2 {
                                     self.trace_exit_frame(r.baseslot);
@@ -2288,6 +2309,9 @@ impl Interp {
                                 sync!();
                                 let r = trace_exec(self.l(), self.base, bc_d(head));
                                 self.sp = self.l().stack.as_mut_ptr();
+                                if r.stack_overflow {
+                                    return Err(self.l().runtime_error(b"stack overflow"));
+                                }
                                 self.pc = r.pc;
                                 if r.baseslot != 2 {
                                     self.trace_exit_frame(r.baseslot);

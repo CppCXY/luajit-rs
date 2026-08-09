@@ -731,6 +731,13 @@ fn walk_next(l: &LuaState, mut slot: usize, mut cur_link: u64) -> Option<usize> 
                 Some((cur_link >> 3) as usize)
             } else {
                 let ret_ip = cur_link as *const crate::bc::BCIns;
+                // A Lua→Lua frame link is a bytecode address; a garbage
+                // link (a stack overflow's uninitialized slots) can point
+                // at unmapped memory. Reject implausible addresses instead
+                // of dereferencing them.
+                if (ret_ip as usize) >= (1usize << 47) {
+                    return None;
+                }
                 let call_ins = unsafe { *ret_ip.sub(1) };
                 let a = crate::bc::bc_a(call_ins) as usize;
                 Some(slot.saturating_sub(2 + a))

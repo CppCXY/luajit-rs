@@ -1078,7 +1078,14 @@ impl Record {
             // to the innermost frame's proto).
             self.pc = 1;
             if stop_uprec {
-                return Ok(Some((TraceLink::Uprec, self.cur.traceno)));
+                // Self-recursion: the Uprec link runs the recursion
+                // natively in machine-code frames that the Lua stack
+                // traceback cannot see — an infinite recursion's traceback
+                // then lacks the expected frames (errors.lua's
+                // `while stack[i] ~= l1` walk). GFAIL (not NYIBC) aborts
+                // without leaving a stitch prefix behind, so recursive
+                // functions stay fully interpreted.
+                return Err(TraceError::GFAIL);
             }
             return Ok(Some((TraceLink::Root, bc_d(callee_head) as TraceNo)));
         }
@@ -1129,7 +1136,21 @@ impl Record {
             let iterc = self.pt.as_ref().bc[pc - 1];
             debug_assert!(matches!(bc_op(iterc), BCOp::ITERC | BCOp::ITERN));
             self.maxslot = ra - 1 + bc_b(iterc);
-            self.pc = (pc as i64 + 1 + bc_j(iterins)) as usize;
+            // The loop-exit: when the iterator returns nil at runtime, the
+            // trace must resume AFTER the loop — not at the body start,
+            // or the last body is re-run (double-counting the final
+            // entry). Snapshot the opposite outcome (mirroring rec_for)
+            // and guard the key against nil.
+            let exit_pc = pc + 1;
+            let body_pc = (pc as i64 + 1 + bc_j(iterins)) as usize;
+            self.pc = exit_pc;
+            self.snap_add();
+            let _ = self.cur.ir.emitir(
+                irtg(IROp::NE, IRT_NIL),
+                tref_ref(tr),
+                tref_ref(tref_pri(IRT_NIL)),
+            );
+            self.pc = body_pc;
             LoopEvent::Enter
         } else {
             self.maxslot = ra - 3;
@@ -1210,8 +1231,12 @@ impl Record {
             fr.callee = cpt; // The pending return now belongs to the new callee.
         }
         if stop_tailrec {
+            // Tail self-recursion (e.g. `function y() y() end`) would run
+            // in native frames invisible to the Lua stack traceback. Run
+            // it in the interpreter so the recursion's frames (and the
+            // "stack overflow" it eventually raises) are real Lua frames.
             self.pc = 1;
-            return Ok(Some((TraceLink::Tailrec, self.cur.traceno)));
+            return Err(TraceError::GFAIL);
         }
         Ok(None)
     }
