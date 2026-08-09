@@ -61,10 +61,17 @@ fn civil_to_timestamp(y: i64, mo: i64, d: i64, h: i64, m: i64, s: i64) -> i64 {
 }
 
 fn os_date(l: &mut LuaState) -> LuaResult<i32> {
-    let fmt = match arg(l, 0).as_string_id() {
+    let mut fmt = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
         None => b"%c".to_vec(),
     };
+    // A leading '!' selects UTC. Our civil_from_days already computes the
+    // date from the raw epoch (no local-timezone shift), so UTC and local
+    // coincide; just drop the flag so the rest of the format (and the
+    // "*t" table form) is parsed normally.
+    if fmt.first() == Some(&b'!') {
+        fmt.remove(0);
+    }
     let ts = arg(l, 1)
         .as_number()
         .map_or_else(|| time::unix_secs() as i64, |n| n as i64);
@@ -94,9 +101,7 @@ fn os_date(l: &mut LuaState) -> LuaResult<i32> {
         set_int("wday", wday as i64 + 1);
         set_int("yday", yday + 1);
         let sid = l.heap().intern(b"isdst");
-        let dsid = l.heap().intern(b"false");
-        t.as_mut()
-            .set(l.heap().str_value(sid), l.heap().str_value(dsid));
+        t.as_mut().set(l.heap().str_value(sid), LuaValue::FALSE);
         push(l, LuaValue::table(t));
     } else {
         let out = format_fmt(&fmt, y, mo, d, h as u64, m as u64, s as u64, wday, yday);
@@ -335,9 +340,12 @@ fn os_remove(l: &mut LuaState) -> LuaResult<i32> {
             Err(e) => {
                 let msg = format!("{}", e);
                 let sid = l.heap().intern(msg.as_bytes());
-                push(l, LuaValue::NIL);
-                push(l, l.heap().str_value(sid));
-                return Ok(2);
+                let errno = e.raw_os_error().unwrap_or(0) as f64;
+                crate::stdlib::pushv(
+                    l,
+                    &[LuaValue::NIL, l.heap().str_value(sid), LuaValue::number(errno)],
+                );
+                return Ok(3);
             }
         }
         Ok(1)

@@ -2161,12 +2161,6 @@ impl Interp {
 
                 // -- Calls / returns --
                 BCOp::CALL => {
-                    // "call" hook event (not for tail calls).
-                    if self.l().hookmask & HOOKMASK_CALL != 0 && !self.l().hook_active {
-                        sync!();
-                        self.hook_event("call")?;
-                        resync!();
-                    }
                     // Fast path (LuaJIT's ins_call): a Lua callee switches
                     // frames right here — one store for the frame link, no
                     // sync round-trip. C callees and vararg protos go slow.
@@ -2174,6 +2168,14 @@ impl Interp {
                     if let Some(gf) = f.as_func()
                         && let GcFunc::Lua(cl) = gf.as_ref()
                     {
+                        // "call" hook event (Lua 5.1 fires it only for Lua
+                        // callees, not C functions — a C call like
+                        // collectgarbage() must not trip the hook).
+                        if self.l().hookmask & HOOKMASK_CALL != 0 && !self.l().hook_active {
+                            sync!();
+                            self.hook_event("call")?;
+                            resync!();
+                        }
                         let ptref = cl.proto;
                         let pt = cl.proto.as_ref();
                         if (pt.flags & PROTO_VARARG) == 0 {

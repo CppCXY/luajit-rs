@@ -344,6 +344,8 @@ pub struct GlobalState {
     pub files: Vec<Option<FileEntry>>,
     pub default_input: Option<usize>,
     pub default_output: Option<usize>,
+    /// fd → setvbuf mode: 0 = full (default), 1 = line, 2 = no buffering.
+    pub file_buf_mode: Vec<u8>,
     /// fd → file-handle userdata cache: the same fd always yields the same
     /// userdata (`io.input(io.stdin) == io.stdin`). GC marks these.
     pub io_file_cache: Vec<Option<LuaValue>>,
@@ -876,6 +878,7 @@ impl Lua {
             files: Vec::new(),
             default_input: None,
             default_output: None,
+            file_buf_mode: Vec::new(),
             io_file_cache: Vec::new(),
         }));
         let gs = unsafe { &mut *g };

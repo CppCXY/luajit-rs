@@ -184,6 +184,20 @@ fn handle_seek_fd(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn handle_setvbuf_fd(l: &mut LuaState) -> LuaResult<i32> {
+    // setvbuf("no") = flush every write, "line" = flush on newline,
+    // otherwise (full/default) = flush on close/flush.
+    let fd = handle_fd_arg(l, 0)?;
+    let mode = match arg(l, 1).as_string_id().map(|sid| l.str_static(sid)) {
+        Some(b"no") => 2u8,
+        Some(b"line") => 1u8,
+        Some(b"full") | Some(b"") => 0u8,
+        _ => return Err(l.runtime_error(b"bad argument #2 to 'setvbuf' (invalid option)")),
+    };
+    let m = &mut l.global().file_buf_mode;
+    if m.len() <= fd {
+        m.resize(fd + 1, 0);
+    }
+    m[fd] = mode;
     push(l, LuaValue::TRUE);
     Ok(1)
 }
@@ -230,6 +244,17 @@ fn handle_close_fd(l: &mut LuaState) -> LuaResult<i32> {
 /// and its `__gc` must not raise "attempt to use a closed file".
 fn handle_gc_fd(l: &mut LuaState) -> LuaResult<i32> {
     if let Some(fd) = handle_fd(l, 0) {
+        // Never close the standard streams, or a file that is still the
+        // current default input/output, via GC: a discarded
+        // `io.input()`/`io.output()` handle must not close the file it
+        // points at (files.lua reads a file to EOF while an earlier
+        // temporary handle is collected).
+        if fd < 3 {
+            return Ok(0);
+        }
+        if l.global().default_input == Some(fd) || l.global().default_output == Some(fd) {
+            return Ok(0);
+        }
         let files = l.files_mut();
         if let Some(slot) = files.get_mut(fd) {
             if slot.is_some() {
@@ -265,6 +290,18 @@ fn read_format(l: &mut LuaState, r: &mut dyn BufRead, fmt: LuaValue) -> Result<L
     if let Some(n) = fmt.as_number() {
         // Read exactly n bytes.
         let want = n.max(0.0) as usize;
+        if want == 0 {
+            // io.read(0): Lua 5.1's `test_eof` — the empty string
+            // mid-file, nil at end of file.
+            let b = match r.fill_buf() {
+                Ok(b) => b.to_vec(),
+                Err(e) => return Err(l.runtime_error(e.to_string().as_bytes())),
+            };
+            if b.is_empty() {
+                return Ok(LuaValue::NIL);
+            }
+            return Ok(l.heap().str_value(l.heap().intern(b"")));
+        }
         let mut buf = vec![0u8; want];
         let mut got = 0;
         while got < want {
@@ -444,6 +481,23 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
 
 // -- Writing -----------------------------------------------------------------
 
+/// Write `chunks`, then flush per the file's setvbuf mode: 2 ("no") flushes
+/// every call, 1 ("line") flushes when a chunk contains a newline, 0
+/// ("full") keeps the BufWriter's default (flush on close/flush).
+fn write_chunks_buffered(
+    w: &mut dyn std::io::Write,
+    chunks: &[Vec<u8>],
+    mode: u8,
+) -> std::io::Result<()> {
+    for c in chunks {
+        w.write_all(c)?;
+    }
+    if mode == 2 || (mode == 1 && chunks.iter().any(|c| c.contains(&b'\n'))) {
+        w.flush()?;
+    }
+    Ok(())
+}
+
 fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32> {
     let n = lua_gettop(l);
     let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(n.saturating_sub(first));
@@ -457,9 +511,10 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
     let result: std::io::Result<()> = match fd {
         None => match l.global().default_output {
             Some(id) => {
+                let mode = l.global().file_buf_mode.get(id).copied().unwrap_or(0);
                 let files = l.files_mut();
                 match files.get_mut(id).and_then(|e| e.as_mut()) {
-                    Some(FileEntry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
+                    Some(FileEntry::Write(f)) => write_chunks_buffered(f, &chunks, mode),
                     Some(FileEntry::ReadWrite(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                     Some(FileEntry::Stdout) | Some(FileEntry::Stderr) => {
                         let mut so = std::io::stdout();
@@ -485,9 +540,10 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
             }
         },
         Some(id) => {
+            let mode = l.global().file_buf_mode.get(id).copied().unwrap_or(0);
             let files = l.files_mut();
             match files.get_mut(id).and_then(|e| e.as_mut()) {
-                Some(FileEntry::Write(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
+                Some(FileEntry::Write(f)) => write_chunks_buffered(f, &chunks, mode),
                 Some(FileEntry::ReadWrite(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                 Some(FileEntry::Stdout) => {
                     let mut so = std::io::stdout();
@@ -660,6 +716,24 @@ fn io_open(l: &mut LuaState) -> LuaResult<i32> {
             .create(true)
             .open(&path)
             .map(|f| FileEntry::Write(BufWriter::new(f))),
+        "r+" => std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map(|f| FileEntry::ReadWrite(f)),
+        "w+" => std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map(|f| FileEntry::ReadWrite(f)),
+        "a+" => std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)
+            .map(|f| FileEntry::ReadWrite(f)),
         _ => return ret_fail(l, &format!("invalid mode '{}'", mode)),
     };
     match entry {
@@ -713,11 +787,14 @@ fn io_close(l: &mut LuaState) -> LuaResult<i32> {
     if lua_gettop(l) >= 1 {
         return handle_close(l);
     }
-    // Close default output: drop the file handle (BufWriter flushes on drop).
+    // Close default output: drop the file handle (BufWriter flushes on
+    // drop). Keep `default_output` pointing at the id so a subsequent
+    // io.write/io.output fails with "attempt to use a closed file" instead
+    // of silently falling back to stdout (Lua 5.1: io.close() leaves the
+    // default file closed until io.output is called again).
     let out_id = l.global().default_output;
     if let Some(id) = out_id {
         l.global().files[id] = None;
-        l.global().default_output = None;
     }
     push(l, LuaValue::TRUE);
     Ok(1)
@@ -763,12 +840,35 @@ fn io_flush(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
+fn cache_handle(l: &mut LuaState, id: usize, v: LuaValue) {
+    let cache = &mut l.global().io_file_cache;
+    if cache.len() <= id {
+        cache.resize(id + 1, None);
+    }
+    cache[id] = Some(v);
+}
+
+fn clear_handle_cache(l: &mut LuaState, id: usize) {
+    let cache = &mut l.global().io_file_cache;
+    if id < cache.len() {
+        cache[id] = None;
+    }
+}
+
 fn io_input(l: &mut LuaState) -> LuaResult<i32> {
     if lua_gettop(l) == 0 {
         let in_id = l.global().default_input;
         match in_id {
             Some(id) => {
-                let h = new_handle(l, id);
+                let cached = l.global().io_file_cache.get(id).and_then(|o| *o);
+                let h = match cached {
+                    Some(v) => v,
+                    None => {
+                        let h = new_handle(l, id);
+                        cache_handle(l, id, h);
+                        h
+                    }
+                };
                 push(l, h);
                 Ok(1)
             }
@@ -799,6 +899,9 @@ fn io_input(l: &mut LuaState) -> LuaResult<i32> {
         };
         let old = l.global().default_input;
         l.global().default_input = Some(id);
+        if let Some(fd) = handle_fd(l, 0) {
+            cache_handle(l, fd, arg(l, 0));
+        }
         match old {
             Some(old_id) if old_id == id => {
                 // Re-selecting the current default input returns the very
@@ -807,13 +910,14 @@ fn io_input(l: &mut LuaState) -> LuaResult<i32> {
                 Ok(1)
             }
             Some(old_id) => {
-                let h = new_handle(l, old_id);
-                push(l, h);
+                // The old default is no longer the default: let its cached
+                // handle be collected (and the file closed) if unused.
+                clear_handle_cache(l, old_id);
+                push(l, v);
                 Ok(1)
             }
             None => {
-                let h = new_handle(l, id);
-                push(l, h);
+                push(l, v);
                 Ok(1)
             }
         }
@@ -821,10 +925,19 @@ fn io_input(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn io_output(l: &mut LuaState) -> LuaResult<i32> {
-    if lua_gettop(l) == 0 {        let out_id = l.global().default_output;
+    if lua_gettop(l) == 0 {
+        let out_id = l.global().default_output;
         match out_id {
             Some(id) => {
-                let h = new_handle(l, id);
+                let cached = l.global().io_file_cache.get(id).and_then(|o| *o);
+                let h = match cached {
+                    Some(v) => v,
+                    None => {
+                        let h = new_handle(l, id);
+                        cache_handle(l, id, h);
+                        h
+                    }
+                };
                 push(l, h);
                 Ok(1)
             }
@@ -861,19 +974,21 @@ fn io_output(l: &mut LuaState) -> LuaResult<i32> {
         };
         let old = l.global().default_output;
         l.global().default_output = Some(id);
+        if let Some(fd) = handle_fd(l, 0) {
+            cache_handle(l, fd, arg(l, 0));
+        }
         match old {
             Some(old_id) if old_id == id => {
                 push(l, v);
                 Ok(1)
             }
             Some(old_id) => {
-                let h = new_handle(l, old_id);
-                push(l, h);
+                clear_handle_cache(l, old_id);
+                push(l, v);
                 Ok(1)
             }
             None => {
-                let h = new_handle(l, id);
-                push(l, h);
+                push(l, v);
                 Ok(1)
             }
         }
@@ -914,7 +1029,6 @@ pub fn open(l: &mut LuaState) {
     let fde = registry_put(l, FileEntry::Stderr);
     let io_tab = lual_reg!(l, b"io", LibTarget::Global)
         .func(b"open", io_open)
-        .func(b"popen", io_open)
         .func(b"tmpfile", io_tmpfile)
         .func(b"read", io_read)
         .func(b"write", io_write)

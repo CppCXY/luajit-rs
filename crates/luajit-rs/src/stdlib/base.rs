@@ -732,6 +732,11 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
                     && n >= 1
                 {
                     l.errval = l.stack[fs];
+                } else {
+                    // The message handler itself raised (e.g.
+                    // `xpcall(error, error)`): Lua reports
+                    // "error in error handling" as the final message.
+                    l.errval = l.heap().str_value(l.heap().intern(b"error in error handling"));
                 }
                 l.base = saved_base;
             }

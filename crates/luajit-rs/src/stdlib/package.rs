@@ -622,7 +622,15 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
     let name = l.str_static(name_sid).to_vec();
 
     let pkg = package_table(l);
-    let loaded = sub_table(l, pkg, b"loaded");
+    // Lua 5.1: require reads the registry's _LOADED/_LOADERS (not the
+    // `package` global), so it survives a test clearing `_G.package`.
+    let loaded = {
+        let k = str_key(l, b"_LOADED");
+        match l.global().registry.as_ref().get_str(k).as_table() {
+            Some(t) => t,
+            None => sub_table(l, pkg, b"loaded"),
+        }
+    };
     let cached = loaded.as_ref().get_str(name_v);
     // Lua 5.1: only a *truthy* cached value counts as loaded; false or
     // nil means the module must be (re)loaded.
@@ -634,12 +642,19 @@ fn lib_require(l: &mut LuaState) -> LuaResult<i32> {
     loaded.as_mut().set(name_v, LuaValue::TRUE);
 
     let loaders_tab = {
-        let k = str_key(l, b"loaders");
-        match pkg.as_ref().get_str(k).as_table() {
+        let k = str_key(l, b"_LOADERS");
+        let from_reg = l.global().registry.as_ref().get_str(k).as_table();
+        match from_reg {
             Some(t) => t,
             None => {
-                loaded.as_mut().set(name_v, LuaValue::NIL);
-                return Err(l.runtime_error(b"'package.loaders' must be a table"));
+                let k = str_key(l, b"loaders");
+                match pkg.as_ref().get_str(k).as_table() {
+                    Some(t) => t,
+                    None => {
+                        loaded.as_mut().set(name_v, LuaValue::NIL);
+                        return Err(l.runtime_error(b"'package.loaders' must be a table"));
+                    }
+                }
             }
         }
     };
@@ -812,6 +827,17 @@ pub fn open(l: &mut LuaState) {
     lua_pushcfunction(l, loader_croot);
     lua_rawseti(l, loaders_idx, 4);
     lua_setfield(l, pkg_idx, "loaders");
+    // 5.1: require reads _LOADERS from the registry (not the `package`
+    // global), so it keeps working even if a test clears `_G.package`
+    // (nextvar.lua's global wipe).
+    {
+        let pkg = package_table(l);
+        let k = str_key(l, b"loaders");
+        if let Some(t) = pkg.as_ref().get_str(k).as_table() {
+            let lk = str_key(l, b"_LOADERS");
+            l.global().registry.as_mut().set(lk, LuaValue::table(t));
+        }
+    }
 
     // searchpath, loadlib, seeall
     lua_pushcfunction(l, lib_searchpath);

@@ -1419,7 +1419,23 @@ impl<'a> Parser<'a> {
                 let mut fi = top;
                 loop {
                     let nuv = self.fs[fi].nuv as usize;
-                    self.checklimit(nuv as u32, LJ_MAX_UPVAL, "upvalues");
+                    // Report the *frame that hit the limit* (e.g. an outer
+                    // function whose upvalues grew past 60 while a deep
+                    // nested body was parsed), not the innermost one.
+                    if nuv as u32 >= LJ_MAX_UPVAL {
+                        let ld = self.fs[fi].linedefined;
+                        if ld == 0 {
+                            self.ls.error(&format!(
+                                "main function has more than {} upvalues",
+                                LJ_MAX_UPVAL
+                            ));
+                        } else {
+                            self.ls.error(&format!(
+                                "function at line {} has more than {} upvalues",
+                                ld, LJ_MAX_UPVAL
+                            ));
+                        }
+                    }
                     self.fs[fi].uvmap[nuv] = vidx;
                     self.fs[fi].nuv = (nuv + 1) as u8;
                     let pend = (fi, nuv);
