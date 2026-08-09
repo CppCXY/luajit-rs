@@ -134,14 +134,10 @@ fn trace_start(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) {
     js.startpc = pc;
     js.startins = startins;
 
-    // Phase 2 recorder handles FORL/LOOP/FUNCF roots; penalize the
-    // rest (ITERN roots arrive with pairs() recording). ITERL roots are
-    // also excluded: a generic-for loop's `next` key is a runtime helper
-    // result whose guard exits restore a stale control variable, so the
-    // interpreter re-runs the loop body and double-counts entries
-    // (nextvar.lua's `assert(n.n == 9000)`). Iterator loops run
-    // interpreted instead.
-    if js.parent == 0 && !matches!(op, BCOp::FORL | BCOp::LOOP | BCOp::FUNCF) {
+    // Phase 2 recorder handles FORL/LOOP/ITERL/FUNCF roots; penalize the
+    // rest (ITERN roots arrive with pairs() recording). Side traces
+    // start at an arbitrary bytecode.
+    if js.parent == 0 && !matches!(op, BCOp::FORL | BCOp::LOOP | BCOp::FUNCF | BCOp::ITERL) {
         js.err = TraceError::NYIBC;
         js.state = TraceState::Err;
         trace_abort(g);

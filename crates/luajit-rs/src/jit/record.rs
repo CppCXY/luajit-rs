@@ -1136,21 +1136,7 @@ impl Record {
             let iterc = self.pt.as_ref().bc[pc - 1];
             debug_assert!(matches!(bc_op(iterc), BCOp::ITERC | BCOp::ITERN));
             self.maxslot = ra - 1 + bc_b(iterc);
-            // The loop-exit: when the iterator returns nil at runtime, the
-            // trace must resume AFTER the loop — not at the body start,
-            // or the last body is re-run (double-counting the final
-            // entry). Snapshot the opposite outcome (mirroring rec_for)
-            // and guard the key against nil.
-            let exit_pc = pc + 1;
-            let body_pc = (pc as i64 + 1 + bc_j(iterins)) as usize;
-            self.pc = exit_pc;
-            self.snap_add();
-            let _ = self.cur.ir.emitir(
-                irtg(IROp::NE, IRT_NIL),
-                tref_ref(tr),
-                tref_ref(tref_pri(IRT_NIL)),
-            );
-            self.pc = body_pc;
+            self.pc = (pc as i64 + 1 + bc_j(iterins)) as usize;
             LoopEvent::Enter
         } else {
             self.maxslot = ra - 3;

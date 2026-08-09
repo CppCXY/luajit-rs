@@ -904,6 +904,7 @@ impl<'g> Marker<'g> {
                         self.mark_value(l.stack[i]);
                     }
                     self.mark_value(l.errval);
+                    self.mark_value(l.hook);
                     for &uv in &l.openuv {
                         self.mark_upval(uv);
                     }
@@ -1007,6 +1008,7 @@ impl<'g> Marker<'g> {
                         self.mark_value(l.stack[i]);
                     }
                     self.mark_value(l.errval);
+                    self.mark_value(l.hook);
                     for &uv in &l.openuv {
                         self.mark_upval(uv);
                     }
