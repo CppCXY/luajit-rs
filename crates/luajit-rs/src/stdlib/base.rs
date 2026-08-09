@@ -3,6 +3,7 @@
 //! `error`, `pcall`, `xpcall`, `rawequal`, `rawget`, `rawset`, `getmetatable`,
 //! `newproxy`.
 
+use crate::api::{lua_pushcfunction, lua_setglobal};
 use crate::err::{LuaError, LuaResult};
 use crate::runtime::meta::MM;
 use crate::runtime::userdata::GcUserData;
@@ -1199,7 +1200,6 @@ pub fn open(l: &mut LuaState) {
         .func(b"pcall", lib_pcall)
         .func(b"xpcall", lib_xpcall)
         .func(b"getmetatable", lib_getmetatable)
-        .func(b"rawlen", lib_rawlen)
         .func(b"setfenv", lib_setfenv)
         .func(b"getfenv", lib_getfenv)
         .func(b"loadstring", lib_loadstring)
@@ -1209,6 +1209,11 @@ pub fn open(l: &mut LuaState) {
         .func(b"module", lib_module)
         .func(b"newproxy", lib_newproxy)
         .build();
+    if l.compat52 {
+        // `rawlen` is a Lua 5.2 function (LuaJIT: `#if LJ_52`).
+        lua_pushcfunction(l, lib_rawlen);
+        lua_setglobal(l, "rawlen");
+    }
 
     // The internal ipairs iterator stays off the global namespace; the
     // registry table keeps it reachable for the GC.

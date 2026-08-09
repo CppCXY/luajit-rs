@@ -524,6 +524,11 @@ pub struct LuaState {
     /// The environment table of this (possibly coroutine) thread
     /// (`debug.setfenv` on a thread; `getfenv(0)` reports it).
     pub thread_env: GcPtr<LuaTable>,
+    /// Lua 5.2 compatibility mode (`LUAJIT_ENABLE_LUA52COMPAT`). Off by
+    /// default, matching a stock LuaJIT 2.1 5.1 build: `;` empty
+    /// statements, `table.pack`/`table.unpack`, the global `rawlen`, and
+    /// `goto` as a reserved word only exist when this is set.
+    pub compat52: bool,
     /// Debug hook function (debug.sethook); nil when inactive.
     pub hook: LuaValue,
     /// Hook mask: bit0 = line, bit1 = call, bit2 = return, bit3 = count.
@@ -581,6 +586,7 @@ impl LuaState {
             debug_pc: 0,
             debug_chunkname: Vec::new(),
             thread_env: g.get_ref().globals,
+            compat52: false,
             hook: LuaValue::NIL,
             hookmask: 0,
             hookcount: 0,
@@ -939,7 +945,12 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
         }
         return Err("corrupted dump cache".to_string());
     } else {
-        let mut parser = Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
+        let mut parser = Parser::new(
+            src,
+            chunkname.to_string(),
+            &mut g.heap.strings,
+            l.compat52,
+        );
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));

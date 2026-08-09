@@ -243,23 +243,28 @@ fn handle_close_fd(l: &mut LuaState) -> LuaResult<i32> {
 /// `io.close(io.output())` idiom: the temporary handle is collected later,
 /// and its `__gc` must not raise "attempt to use a closed file".
 fn handle_gc_fd(l: &mut LuaState) -> LuaResult<i32> {
-    if let Some(fd) = handle_fd(l, 0) {
-        // Never close the standard streams, or a file that is still the
-        // current default input/output, via GC: a discarded
-        // `io.input()`/`io.output()` handle must not close the file it
-        // points at (files.lua reads a file to EOF while an earlier
-        // temporary handle is collected).
-        if fd < 3 {
-            return Ok(0);
-        }
-        if l.global().default_input == Some(fd) || l.global().default_output == Some(fd) {
-            return Ok(0);
-        }
-        let files = l.files_mut();
-        if let Some(slot) = files.get_mut(fd) {
-            if slot.is_some() {
-                *slot = None;
-            }
+    let fd = match handle_fd(l, 0) {
+        Some(fd) => fd,
+        // Lua 5.1's `io_gc` calls `tofilep` unconditionally: invoking
+        // `getmetatable(io.stdin).__gc()` without a file argument raises
+        // "bad argument #1 to '__gc' (FILE* expected, got no value)".
+        None => return Err(err_bad_arg_type(l, 1, "__gc", "FILE*", arg(l, 0))),
+    };
+    // Never close the standard streams, or a file that is still the
+    // current default input/output, via GC: a discarded
+    // `io.input()`/`io.output()` handle must not close the file it
+    // points at (files.lua reads a file to EOF while an earlier
+    // temporary handle is collected).
+    if fd < 3 {
+        return Ok(0);
+    }
+    if l.global().default_input == Some(fd) || l.global().default_output == Some(fd) {
+        return Ok(0);
+    }
+    let files = l.files_mut();
+    if let Some(slot) = files.get_mut(fd) {
+        if slot.is_some() {
+            *slot = None;
         }
     }
     Ok(0)

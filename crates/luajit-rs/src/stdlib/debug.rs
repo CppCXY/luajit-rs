@@ -811,7 +811,13 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
     }
     let mut first = true;
     let mut first_lua = true;
-    for _ in 0..64 {
+    let mut frames: Vec<String> = Vec::new();
+    // Lua 5.1's `traceback`: walk the whole call chain (bounded by the
+    // stack limit, ~32K frames), then truncate to the first `LEVELS1` and
+    // the last `LEVELS2` frames with a "..." gap — a stack overflow's deep
+    // recursion must still show the outermost frame (the test suite walks
+    // to it).
+    for _ in 0..1_000_000 {
         if slot < 2 {
             break;
         }
@@ -892,7 +898,7 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
                     if let Some(mm) = self_mm_name(l, orig_slot) {
                         label = format!("function '{}'", mm);
                     }
-                    trace.push_str(&format!("\t{}:{}: in {}\n", src, line, label));
+                    frames.push(format!("\t{}:{}: in {}\n", src, line, label));
                     first = false;
                     first_lua = false;
                 }
@@ -902,9 +908,9 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
                     if let Some((_nw, name)) =
                         funcname_from_caller(l, orig_slot).or_else(|| c_frame_name(l, orig_slot))
                     {
-                        trace.push_str(&format!("\t[C]: in function '{}'\n", name));
+                        frames.push(format!("\t[C]: in function '{}'\n", name));
                     } else {
-                        trace.push_str("\t[C]: in function\n");
+                        frames.push("\t[C]: in function\n".to_string());
                     }
                     first = false;
                 }
@@ -916,6 +922,22 @@ fn lib_traceback(l: &mut LuaState) -> LuaResult<i32> {
             slot = next;
         } else {
             break;
+        }
+    }
+
+    // Lua 5.1 `traceback`: `LEVELS1` head frames + `LEVELS2` tail frames.
+    const LEVELS1: usize = 10;
+    const LEVELS2: usize = 11;
+    if frames.len() > LEVELS1 + LEVELS2 {
+        let mut head = frames[..LEVELS1].to_vec();
+        head.push("\t...\n".to_string());
+        head.extend_from_slice(&frames[frames.len() - LEVELS2..]);
+        for f in head {
+            trace.push_str(&f);
+        }
+    } else {
+        for f in frames {
+            trace.push_str(&f);
         }
     }
 

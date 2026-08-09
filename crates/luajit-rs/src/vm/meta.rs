@@ -46,17 +46,18 @@ fn debug_varname(pt: &crate::runtime::proto::Proto, pc: usize, slot: u32) -> Opt
     None
 }
 
-/// LuaJIT's `lj_debug_slotname`: deduce the (kind, name) of the value in a
-/// register slot by scanning backwards from `pc` for the instruction that
-/// wrote it. Kinds: "global", "local", "upvalue", "field", "method".
+/// Deduce the (kind, name) of the value in a register slot, mirroring Lua
+/// 5.1's `luaG_typeerror`/`getobjname`+`symbexec` dataflow: walk *forward*
+/// from the start of the function, following control flow for the tracked
+/// register, and remember the last instruction that wrote or clobbered it.
+/// A test/branch instruction that observes the register (e.g. the `or`/`and`
+/// truthiness test) invalidates the name, so `(aaa or aaa)` does NOT name
+/// the inner global — unlike LuaJIT's backward `lj_debug_slotname`.
 fn debug_slotname(
     pt: &crate::runtime::proto::Proto,
     pc: usize,
     mut slot: u32,
 ) -> Option<(&'static str, String)> {
-    if let Some(n) = debug_varname(pt, pc, slot) {
-        return Some(("local", n));
-    }
     let kstr = |idx: u32| -> String {
         pt.kstrv
             .get(idx as usize)
@@ -64,64 +65,159 @@ fn debug_slotname(
             .map(|s| String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned())
             .unwrap_or_else(|| "?".into())
     };
-    let mut i = pc as isize - 1;
-    loop {
-        if i < 1 {
-            break;
+    let uvname = |idx: u32| -> String {
+        pt.uvnames
+            .get(idx as usize)
+            .cloned()
+            .unwrap_or_else(|| "?".into())
+    };
+    let is_branch = |op: crate::bc::BCOp| -> bool {
+        use crate::bc::BCOp::*;
+        matches!(
+            op,
+            ISLT
+                | ISGE
+                | ISLE
+                | ISGT
+                | ISEQV
+                | ISNEV
+                | ISEQS
+                | ISNES
+                | ISEQN
+                | ISNEN
+                | ISEQP
+                | ISNEP
+                | ISTC
+                | ISFC
+                | IST
+                | ISF
+                | ISTYPE
+                | ISNUM
+                | ISNEXT
+        )
+    };
+    let is_loop = |op: crate::bc::BCOp| -> bool {
+        use crate::bc::BCOp::*;
+        matches!(
+            op,
+            FORI
+                | JFORI
+                | FORL
+                | IFORL
+                | JFORL
+                | ITERL
+                | IITERL
+                | JITERL
+                | ITERC
+                | ITERN
+                | LOOP
+                | ILOOP
+                | JLOOP
+        )
+    };
+    'outer: loop {
+        if let Some(n) = debug_varname(pt, pc, slot) {
+            return Some(("local", n));
         }
-        let ins = pt.bc[i as usize];
-        let op = crate::bc::bc_op(ins);
-        let ra = crate::bc::bc_a(ins);
-        // A base-mode instruction (JMP, ISEQ*, ...) can write the slot
-        // range; LuaJIT stops tracing here (`bcmode_a == BCMbase` →
-        // NULL) so `(aaa or aaa)` does not name the inner global.
-        if crate::bc::bcmode_a(op) == crate::bc::BCMode::Base as u32 && slot >= ra {
-            return None;
-        }
-        if crate::bc::bcmode_a(op) == crate::bc::BCMode::Dst as u32 && ra == slot {
-            match op {
-                crate::bc::BCOp::MOV => {
-                    slot = crate::bc::bc_d(ins);
-                    if let Some(n) = debug_varname(pt, pc, slot) {
-                        return Some(("local", n));
-                    }
-                    i -= 1;
+        // Forward symbolic scan (Lua 5.1 `symbexec`): `last` is the index of
+        // the last instruction (in execution order) that wrote or clobbered
+        // `slot` before the failing instruction at `pc`.
+        let mut last: Option<(usize, u32)> = None;
+        let mut i: isize = 1;
+        let limit = pc as isize;
+        while i < limit {
+            let ins = pt.bc[i as usize];
+            let op = crate::bc::bc_op(ins);
+            let ra = crate::bc::bc_a(ins);
+            if op == crate::bc::BCOp::JMP {
+                // Unconditional jump: simulate it (Lua 5.1 `pc += b`), so a
+                // writer skipped by the branch never updates `last`.
+                let dest = i + 1 + crate::bc::bc_j(ins) as isize;
+                if dest > i && dest <= limit {
+                    i = dest;
                     continue;
                 }
-                crate::bc::BCOp::GGET => {
-                    return Some(("global", kstr(crate::bc::bc_d(ins))));
-                }
-                crate::bc::BCOp::TGETS => {
-                    let name = kstr(crate::bc::bc_c(ins));
-                    if i > 1 {
-                        let insp = pt.bc[(i - 1) as usize];
-                        // `a:bbbb(...)`: the object is moved to slot+2 (this
-                        // VM's CALL args start at func+2, cf. do_call's
-                        // args_base = func_slot + 2). LuaJIT uses slot+1
-                        // because its CALL layout differs.
-                        if crate::bc::bc_op(insp) == crate::bc::BCOp::MOV
-                            && crate::bc::bc_a(insp) == ra + 2
-                            && crate::bc::bc_d(insp) == crate::bc::bc_b(ins)
-                        {
-                            return Some(("method", name));
-                        }
-                    }
-                    return Some(("field", name));
-                }
-                crate::bc::BCOp::UGET => {
-                    let name = pt
-                        .uvnames
-                        .get(crate::bc::bc_d(ins) as usize)
-                        .cloned()
-                        .unwrap_or_else(|| "?".into());
-                    return Some(("upvalue", name));
-                }
-                _ => return None,
+                i += 1;
+                continue;
             }
+            if is_branch(op) {
+                // Test/branch instruction observes `slot` → its name becomes
+                // unreliable (Lua 5.1's `testAMode` marks the register).
+                let tested = if op == crate::bc::BCOp::ISTC || op == crate::bc::BCOp::ISFC {
+                    Some(crate::bc::bc_d(ins))
+                } else {
+                    Some(ra)
+                };
+                if tested == Some(slot) {
+                    last = Some((i as usize, op as u32));
+                }
+                i += 1;
+                continue;
+            }
+            if op == crate::bc::BCOp::KNIL {
+                if slot >= ra && slot <= crate::bc::bc_d(ins) {
+                    last = Some((i as usize, op as u32));
+                }
+                i += 1;
+                continue;
+            }
+            if is_loop(op) {
+                if slot >= ra {
+                    last = Some((i as usize, op as u32));
+                }
+                i += 1;
+                continue;
+            }
+            match crate::bc::bcmode_a(op) as u32 {
+                m if m == crate::bc::BCMode::Dst as u32 => {
+                    if ra == slot {
+                        if op == crate::bc::BCOp::MOV {
+                            // Follow the MOV source (LuaJIT `goto restart`).
+                            slot = crate::bc::bc_d(ins);
+                            continue 'outer;
+                        }
+                        last = Some((i as usize, op as u32));
+                    }
+                }
+                m if m == crate::bc::BCMode::Base as u32 => {
+                    // CALL/VARG/UCLO/... write a slot range.
+                    if slot >= ra {
+                        last = Some((i as usize, op as u32));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
         }
-        i -= 1;
+        let (li, lop) = last?;
+        use crate::bc::BCOp as Op;
+        if lop == Op::GGET as u32 {
+            return Some(("global", kstr(crate::bc::bc_d(pt.bc[li]))));
+        }
+        if lop == Op::TGETS as u32 {
+            let ins = pt.bc[li];
+            let ra = crate::bc::bc_a(ins);
+            let name = kstr(crate::bc::bc_c(ins));
+            if li > 1 {
+                let insp = pt.bc[li - 1];
+                // `a:bbbb(...)`: the object is moved to slot+2 (this
+                // VM's CALL args start at func+2, cf. do_call's
+                // args_base = func_slot + 2). LuaJIT uses slot+1
+                // because its CALL layout differs.
+                if crate::bc::bc_op(insp) == Op::MOV
+                    && crate::bc::bc_a(insp) == ra + 2
+                    && crate::bc::bc_d(insp) == crate::bc::bc_b(ins)
+                {
+                    return Some(("method", name));
+                }
+            }
+            return Some(("field", name));
+        }
+        if lop == Op::UGET as u32 {
+            return Some(("upvalue", uvname(crate::bc::bc_d(pt.bc[li]))));
+        }
+        return None;
     }
-    None
 }
 
 /// Deduce the callee name for a failing call whose func slot is `func_slot`.
@@ -507,12 +603,23 @@ impl Interp {
             loop {
                 let mm = if (op & 2) != 0 { MM::Le } else { MM::Lt };
                 let g = self.l().global();
-                // LuaJIT 2.1 (LJ_52) lj_meta_comp: the metamethod of the
-                // first operand wins; only when both lack it does the
-                // order error (mixed metamethods compare fine).
+                let compat52 = self.l().compat52;
+                // LuaJIT 2.1 `lj_meta_comp`:
+                // - 5.2 (LJ_52): the metamethod of the first operand wins,
+                //   falling back to the second when missing (mixed
+                //   metamethods compare fine).
+                // - 5.1: both operands must expose the *same* __lt/__le
+                //   metamethod, otherwise the comparison is an error.
                 let mut mo = meta_lookup(g, o1, mm);
-                if mo.is_nil() {
-                    mo = meta_lookup(g, o2, mm);
+                if compat52 {
+                    if mo.is_nil() {
+                        mo = meta_lookup(g, o2, mm);
+                    }
+                } else {
+                    let mo2 = meta_lookup(g, o2, mm);
+                    if mo.is_nil() || mo2.is_nil() || mo.to_bits() != mo2.to_bits() {
+                        mo = LuaValue::NIL;
+                    }
                 }
                 if mo.is_nil() {
                     if (op & 2) != 0 {
@@ -687,7 +794,9 @@ impl Interp {
                 .runtime_error(b"attempt to get length of a non-table value"));
         }
         if mo.is_func() {
-            let args = [o, o];
+            // Lua 5.2 (LuaJIT compat52) passes the object twice (`__len(o, len)`);
+            // Lua 5.1 passes the raw length as nil.
+            let args = if self.l().compat52 { [o, o] } else { [o, LuaValue::NIL] };
             match mo.as_func().unwrap().as_ref() {
                 GcFunc::C(cc) => {
                     let v = self.call_c_fn(cc.f, mo, &args)?;
@@ -706,7 +815,11 @@ impl Interp {
                 .l()
                 .runtime_error(b"attempt to get length of a non-table value"));
         };
-        let args = [mo, o, o];
+        let args = if self.l().compat52 {
+            [mo, o, o]
+        } else {
+            [mo, o, LuaValue::NIL]
+        };
         match mo2.as_func().unwrap().as_ref() {
             GcFunc::C(cc) => {
                 let v = self.call_c_fn(cc.f, mo2, &args)?;

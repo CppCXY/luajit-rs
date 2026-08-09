@@ -1,7 +1,7 @@
 //! Table library: `table.concat`, `table.insert`, `table.move`,
 //! `table.pack`, `table.remove`, `table.sort`, `table.unpack`.
 
-use crate::api::lua_gettop;
+use crate::api::{lua_gettop, lua_pop, lua_pushcfunction, lua_setfield};
 use crate::err::LuaResult;
 use crate::state::LuaState;
 use crate::table::LuaTable;
@@ -254,11 +254,18 @@ pub fn open(l: &mut LuaState) {
         .func(b"maxn", tab_maxn)
         .func(b"move", tab_move)
         .func(b"new", tab_new)
-        .func(b"pack", tab_pack)
         .func(b"remove", tab_remove)
         .func(b"sort", tab_sort)
-        .func(b"unpack", tab_unpack)
         .build();
+    if l.compat52 {
+        // `table.pack`/`table.unpack` are Lua 5.2 functions
+        // (LuaJIT: `#if LJ_52`).
+        lua_pushcfunction(l, tab_pack);
+        lua_setfield(l, -2, "pack");
+        lua_pushcfunction(l, tab_unpack);
+        lua_setfield(l, -2, "unpack");
+        lua_pop(l, 1);
+    }
 }
 
 fn tab_foreach(l: &mut LuaState) -> LuaResult<i32> {
