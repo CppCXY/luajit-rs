@@ -1192,12 +1192,16 @@ impl<'a> Asm<'a> {
             rec::IRCALL_STR_SUB => exec::jit_str_sub as *const () as u64,
             rec::IRCALL_VARG => exec::jit_varg as *const () as u64,
             rec::IRCALL_STR_CHAR => exec::jit_str_char as *const () as u64,
+            rec::IRCALL_STR_UPPER => exec::jit_str_upper as *const () as u64,
+            rec::IRCALL_STR_LOWER => exec::jit_str_lower as *const () as u64,
+            rec::IRCALL_STR_REVERSE => exec::jit_str_reverse as *const () as u64,
             rec::IRCALL_TAB_LEN => exec::jit_alen as *const () as u64,
             rec::IRCALL_TAB_CONCAT => exec::jit_tconcat as *const () as u64,
             rec::IRCALL_CAT => exec::jit_cat as *const () as u64,
             rec::IRCALL_USET => exec::jit_uset as *const () as u64,
             rec::IRCALL_TOSTR_NUM => exec::jit_tostr_num as *const () as u64,
             rec::IRCALL_FFI => crate::ffi::lib::jit_ffi_call as *const () as u64,
+            rec::IRCALL_STRFMT => exec::jit_strfmt as *const () as u64,
             _ => return Err(TraceError::NYIIR),
         };
         match rec::ircall_arity(idx) {

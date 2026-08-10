@@ -150,14 +150,15 @@ fn itoa_i64(mut v: i64, buf: &mut [u8; 64]) -> usize {
 }
 
 /// A single format argument for `string.format`.
+#[derive(Clone)]
 pub enum FmtArg<'a> {
     Num(f64),
     Str(&'a [u8]),
 }
 
 /// Parsed flags/width/precision of one conversion spec.
-#[derive(Clone, Copy, Default)]
-struct Spec {
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct Spec {
     left: bool,
     zero: bool,
     space: bool,
@@ -287,195 +288,227 @@ fn utooct(mut n: u64, buf: &mut [u8; 32]) -> &[u8] {
     &buf[i..]
 }
 
-/// A minimal `string.format`, covering the conversions used so far:
-/// `%%`, `%d/%i/%u`, `%c`, `%x/%X`, `%o`, `%f/%F`, `%e/%E`, `%g/%G`, `%s`,
-/// with optional flags, width and precision. Returns an error message on a
-/// malformed spec or argument-type mismatch.
-pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    let mut ai = 0usize;
+/// One pre-parsed unit of a compiled format string: either a literal byte
+/// run or a conversion spec. Compiling once (per format string) and
+/// replaying the parts every call is what makes hot `string.format` loops
+/// fast (mirrors `lj_strfmt`'s compiled fmt).
+#[derive(Clone)]
+pub enum FmtPart {
+    Lit(Vec<u8>),
+    Conv(Spec, u8),
+}
+
+/// Compile a format string into parts; `%%` collapses into a literal `%`.
+/// Returns an error on a malformed spec, matching `format()`.
+pub fn compile(fmt: &[u8]) -> Result<Vec<FmtPart>, String> {
+    let mut parts: Vec<FmtPart> = Vec::new();
+    let mut lit_start = 0usize;
     let mut i = 0usize;
     while i < fmt.len() {
-        let c = fmt[i];
-        if c != b'%' {
-            out.push(c);
+        if fmt[i] == b'%' {
+            if i + 1 < fmt.len() && fmt[i + 1] == b'%' {
+                // `%%` is a literal `%`: flush the current literal run,
+                // emit a single `%`, and skip both bytes.
+                if i > lit_start {
+                    parts.push(FmtPart::Lit(fmt[lit_start..i].to_vec()));
+                }
+                parts.push(FmtPart::Lit(vec![b'%']));
+                i += 2;
+                lit_start = i;
+                continue;
+            }
+            if i > lit_start {
+                parts.push(FmtPart::Lit(fmt[lit_start..i].to_vec()));
+            }
             i += 1;
-            continue;
-        }
-        i += 1;
-        if i < fmt.len() && fmt[i] == b'%' {
-            out.push(b'%');
-            i += 1;
-            continue;
-        }
-        let start = i;
-        // flags
-        while i < fmt.len() && matches!(fmt[i], b'-' | b'+' | b' ' | b'#' | b'0') {
-            i += 1;
-        }
-        // width
-        while i < fmt.len() && fmt[i].is_ascii_digit() {
-            i += 1;
-        }
-        // precision
-        if i < fmt.len() && fmt[i] == b'.' {
-            i += 1;
+            let start = i;
+            while i < fmt.len() && matches!(fmt[i], b'-' | b'+' | b' ' | b'#' | b'0') {
+                i += 1;
+            }
             while i < fmt.len() && fmt[i].is_ascii_digit() {
                 i += 1;
             }
-        }
-        if i >= fmt.len() {
-            return Err("invalid conversion to 'format'".into());
-        }
-        let conv = fmt[i];
-        let spec = parse_spec_bytes(fmt, start, i);
-        i += 1;
-
-        let next_num = |ai: &mut usize| -> Result<f64, String> {
-            let a = args
-                .get(*ai)
-                .ok_or_else(|| "bad argument to 'format'".to_string())?;
-            *ai += 1;
-            match a {
-                FmtArg::Num(n) => Ok(*n),
-                FmtArg::Str(s) => std::str::from_utf8(s)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<f64>().ok())
-                    .ok_or_else(|| "bad argument to 'format' (number expected)".to_string()),
-            }
-        };
-
-        match conv {
-            b'd' | b'i' => {
-                let n = next_num(&mut ai)? as i64;
-                let mut buf = [0u8; 32];
-                let digits = itoa(n, &mut buf);
-                let sign = if n < 0 {
-                    b'-'
-                } else if spec.plus {
-                    b'+'
-                } else if spec.space {
-                    b' '
-                } else {
-                    0
-                };
-                push_padded(&mut out, &spec, digits, sign, false);
-            }
-            b'u' => {
-                let n = next_num(&mut ai)? as i64 as u64;
-                let mut buf = [0u8; 32];
-                let digits = itoa(n as i64, &mut buf);
-                push_padded(&mut out, &spec, digits, 0, false);
-            }
-            b'c' => {
-                let n = next_num(&mut ai)? as i64 as u8;
-                out.push(n);
-            }
-            b'x' => {
-                let n = next_num(&mut ai)? as i64 as u64;
-                let mut buf = [0u8; 32];
-                let digits = utohex(n, &mut buf, false);
-                push_padded(&mut out, &spec, digits, 0, false);
-            }
-            b'X' => {
-                let n = next_num(&mut ai)? as i64 as u64;
-                let mut buf = [0u8; 32];
-                let digits = utohex(n, &mut buf, true);
-                push_padded(&mut out, &spec, digits, 0, false);
-            }
-            b'o' => {
-                let n = next_num(&mut ai)? as i64 as u64;
-                let mut buf = [0u8; 32];
-                let digits = utooct(n, &mut buf);
-                push_padded(&mut out, &spec, digits, 0, false);
-            }
-            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
-                let n = next_num(&mut ai)?;
-                let body = fmt_float_body(&spec, conv, n);
-                let sign = if n.is_sign_negative() {
-                    b'-'
-                } else if spec.plus {
-                    b'+'
-                } else if spec.space {
-                    b' '
-                } else {
-                    0
-                };
-                push_padded(&mut out, &spec, body.as_bytes(), sign, true);
-            }
-            b'a' | b'A' => {
-                let n = next_num(&mut ai)?;
-                let prec = spec.prec.unwrap_or(13);
-                let mut s = fmt_a(n, prec, conv == b'A');
-                if n.is_sign_positive() && spec.plus {
-                    s.insert(0, '+');
-                } else if n.is_sign_positive() && spec.space && !s.starts_with(' ') {
-                    s.insert(0, ' ');
+            if i < fmt.len() && fmt[i] == b'.' {
+                i += 1;
+                while i < fmt.len() && fmt[i].is_ascii_digit() {
+                    i += 1;
                 }
-                out.extend_from_slice(&pad(s.into_bytes(), spec.width, spec.left));
             }
-            b's' => {
-                let a = args
-                    .get(ai)
-                    .ok_or_else(|| "bad argument to 'format'".to_string())?;
-                ai += 1;
-                let body: &[u8] = match a {
-                    FmtArg::Str(s) => s,
-                    FmtArg::Num(n) => {
-                        let t = g14(*n);
-                        out.extend_from_slice(t.as_bytes());
-                        &[]
+            if i >= fmt.len() {
+                return Err("invalid conversion to 'format'".into());
+            }
+            let conv = fmt[i];
+            let spec = parse_spec_bytes(fmt, start, i);
+            i += 1;
+            parts.push(FmtPart::Conv(spec, conv));
+            lit_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    if lit_start < fmt.len() {
+        parts.push(FmtPart::Lit(fmt[lit_start..].to_vec()));
+    }
+    Ok(parts)
+}
+
+/// Format using a compiled format string.
+pub fn format_parts(parts: &[FmtPart], args: &[FmtArg]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut ai = 0usize;
+    for part in parts {
+        match part {
+            FmtPart::Lit(b) => out.extend_from_slice(&b),
+            FmtPart::Conv(spec, conv) => {
+                let conv = *conv;
+                let next_num = |ai: &mut usize| -> Result<f64, String> {
+                    let a = args
+                        .get(*ai)
+                        .ok_or_else(|| "bad argument to 'format'".to_string())?;
+                    *ai += 1;
+                    match a {
+                        FmtArg::Num(n) => Ok(*n),
+                        FmtArg::Str(s) => std::str::from_utf8(s)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<f64>().ok())
+                            .ok_or_else(|| "bad argument to 'format' (number expected)".to_string()),
                     }
                 };
-                if !body.is_empty() {
-                    // Precision truncates; otherwise write through with
-                    // the padding rules (no intermediate clone).
-                    let body = match spec.prec {
-                        Some(p) if p < body.len() => &body[..p],
-                        _ => body,
-                    };
-                    push_padded(&mut out, &spec, body, 0, false);
-                }
-            }
-            b'q' => {
-                let a = args
-                    .get(ai)
-                    .ok_or_else(|| "bad argument to 'format'".to_string())?;
-                ai += 1;
-                out.push(b'"');
-                if let FmtArg::Str(s) = a {
-                    for &b in *s {
-                        match b {
-                            b'"' | b'\\' => {
-                                out.push(b'\\');
-                                out.push(b);
+                match conv {
+                    b'd' | b'i' => {
+                        let n = next_num(&mut ai)? as i64;
+                        let mut buf = [0u8; 32];
+                        let digits = itoa(n, &mut buf);
+                        let sign = if n < 0 {
+                            b'-'
+                        } else if spec.plus {
+                            b'+'
+                        } else if spec.space {
+                            b' '
+                        } else {
+                            0
+                        };
+                        push_padded(&mut out, spec, digits, sign, false);
+                    }
+                    b'u' => {
+                        let n = next_num(&mut ai)? as i64 as u64;
+                        let mut buf = [0u8; 32];
+                        let digits = itoa(n as i64, &mut buf);
+                        push_padded(&mut out, spec, digits, 0, false);
+                    }
+                    b'c' => {
+                        let n = next_num(&mut ai)? as i64 as u8;
+                        out.push(n);
+                    }
+                    b'x' => {
+                        let n = next_num(&mut ai)? as i64 as u64;
+                        let mut buf = [0u8; 32];
+                        let digits = utohex(n, &mut buf, false);
+                        push_padded(&mut out, spec, digits, 0, false);
+                    }
+                    b'X' => {
+                        let n = next_num(&mut ai)? as i64 as u64;
+                        let mut buf = [0u8; 32];
+                        let digits = utohex(n, &mut buf, true);
+                        push_padded(&mut out, spec, digits, 0, false);
+                    }
+                    b'o' => {
+                        let n = next_num(&mut ai)? as i64 as u64;
+                        let mut buf = [0u8; 32];
+                        let digits = utooct(n, &mut buf);
+                        push_padded(&mut out, spec, digits, 0, false);
+                    }
+                    b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+                        let n = next_num(&mut ai)?;
+                        let body = fmt_float_body(spec, conv, n);
+                        let sign = if n.is_sign_negative() {
+                            b'-'
+                        } else if spec.plus {
+                            b'+'
+                        } else if spec.space {
+                            b' '
+                        } else {
+                            0
+                        };
+                        push_padded(&mut out, spec, body.as_bytes(), sign, true);
+                    }
+                    b'a' | b'A' => {
+                        let n = next_num(&mut ai)?;
+                        let prec = spec.prec.unwrap_or(13);
+                        let mut s = fmt_a(n, prec, conv == b'A');
+                        if n.is_sign_positive() && spec.plus {
+                            s.insert(0, '+');
+                        } else if n.is_sign_positive() && spec.space && !s.starts_with(' ') {
+                            s.insert(0, ' ');
+                        }
+                        out.extend_from_slice(&pad(s.into_bytes(), spec.width, spec.left));
+                    }
+                    b's' => {
+                        let a = args
+                            .get(ai)
+                            .ok_or_else(|| "bad argument to 'format'".to_string())?;
+                        ai += 1;
+                        let body: &[u8] = match a {
+                            FmtArg::Str(s) => s,
+                            FmtArg::Num(n) => {
+                                let t = g14(*n);
+                                out.extend_from_slice(t.as_bytes());
+                                &[]
                             }
-                            // LuaJIT quotes newline/CR with a backslash
-                            // followed by the *literal* byte.
-                            b'\n' | b'\r' => {
-                                out.push(b'\\');
-                                out.push(b);
-                            }
-                            b'\t' => out.extend_from_slice(b"\\t"),
-                            b'\x07' => out.extend_from_slice(b"\\a"),
-                            b'\x08' => out.extend_from_slice(b"\\b"),
-                            b'\x0c' => out.extend_from_slice(b"\\f"),
-                            b'\x0b' => out.extend_from_slice(b"\\v"),
-                            // Other control bytes: 3-digit octal ("\000").
-                            b if b < 32 || b == 127 => {
-                                let oct = format!("\\{:03o}", b);
-                                out.extend_from_slice(oct.as_bytes());
-                            }
-                            _ => out.push(b),
+                        };
+                        if !body.is_empty() {
+                            let body = match spec.prec {
+                                Some(p) if p < body.len() => &body[..p],
+                                _ => body,
+                            };
+                            push_padded(&mut out, spec, body, 0, false);
                         }
                     }
+                    b'q' => {
+                        let a = args
+                            .get(ai)
+                            .ok_or_else(|| "bad argument to 'format'".to_string())?;
+                        ai += 1;
+                        out.push(b'"');
+                        if let FmtArg::Str(s) = a {
+                            for &b in *s {
+                                match b {
+                                    b'"' | b'\\' => {
+                                        out.push(b'\\');
+                                        out.push(b);
+                                    }
+                                    b'\n' | b'\r' => {
+                                        out.push(b'\\');
+                                        out.push(b);
+                                    }
+                                    b'\t' => out.extend_from_slice(b"\\t"),
+                                    b'\x07' => out.extend_from_slice(b"\\a"),
+                                    b'\x08' => out.extend_from_slice(b"\\b"),
+                                    b'\x0c' => out.extend_from_slice(b"\\f"),
+                                    b'\x0b' => out.extend_from_slice(b"\\v"),
+                                    b if b < 32 || b == 127 => {
+                                        let oct = format!("\\{:03o}", b);
+                                        out.extend_from_slice(oct.as_bytes());
+                                    }
+                                    _ => out.push(b),
+                                }
+                            }
+                        }
+                        out.push(b'"');
+                    }
+                    _ => return Err(format!("invalid conversion '%{}'", conv as char)),
                 }
-                out.push(b'"');
             }
-            _ => return Err(format!("invalid conversion '%{}'", conv as char)),
         }
     }
     Ok(out)
+}
+
+/// A minimal `string.format`: compile the format string once, then
+/// replay the parts over the arguments each call.
+pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
+    let parts = compile(fmt)?;
+    format_parts(&parts, args)
 }
 
 fn pad(s: Vec<u8>, width: Option<usize>, left: bool) -> Vec<u8> {

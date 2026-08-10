@@ -499,6 +499,9 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                                 record::IRCALL_STR_CHAR => jit_str_char(x),
                                 record::IRCALL_TAB_LEN => jit_alen(x),
                                 record::IRCALL_TOSTR_NUM => jit_tostr_num(x),
+                                record::IRCALL_STR_UPPER => jit_str_upper(x),
+                                record::IRCALL_STR_LOWER => jit_str_lower(x),
+                                record::IRCALL_STR_REVERSE => jit_str_reverse(x),
                                 _ => unreachable!("bad IRCALL index"),
                             }
                         }
@@ -532,6 +535,15 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                                     val(env, cargj.op2 as IRRef),
                                 );
                                 crate::ffi::lib::jit_ffi_call(a, b, c, d)
+                            } else if idx == record::IRCALL_STRFMT {
+                                let cargh = *ir.ir(cargi.op1 as IRRef);
+                                debug_assert_eq!(cargh.op(), IROp::CARG);
+                                jit_strfmt(
+                                    val(env, cargh.op1 as IRRef),
+                                    val(env, cargh.op2 as IRRef),
+                                    val(env, cargi.op2 as IRRef),
+                                    val(env, cargj.op2 as IRRef),
+                                )
                             } else {
                                 let (x, y, z) = (
                                     val(env, cargi.op1 as IRRef),
@@ -541,6 +553,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                                 match idx {
                                     record::IRCALL_STR_SUB => jit_str_sub(x, y, z),
                                     record::IRCALL_VARG => jit_varg(x, y, z),
+                                    record::IRCALL_STR_CHAR_N => jit_str_char_n(x, y, z),
                                     _ => unreachable!("bad IRCALL index"),
                                 }
                             }
@@ -1130,12 +1143,89 @@ pub extern "C" fn jit_str_char(c_bits: u64) -> u64 {
     jit_intern(&[b])
 }
 
+/// string.char(a, b, c): pack up to 3 byte values (NIL-padded) and intern.
+pub extern "C" fn jit_str_char_n(a_bits: u64, b_bits: u64, c_bits: u64) -> u64 {
+    let mut out = Vec::with_capacity(3);
+    for bits in [a_bits, b_bits, c_bits] {
+        let v = LuaValue::from_bits(bits);
+        if v.is_nil() {
+            break;
+        }
+        out.push((f64::from_bits(bits) as u32 & 0xff) as u8);
+    }
+    jit_intern(&out)
+}
+
+/// string.upper: map bytes to uppercase and intern.
+pub extern "C" fn jit_str_upper(s_bits: u64) -> u64 {
+    let s = str_bytes(s_bits);
+    let mut out = Vec::with_capacity(s.len());
+    for &b in s {
+        out.push(b.to_ascii_uppercase());
+    }
+    jit_intern(&out)
+}
+
+/// string.lower: map bytes to lowercase and intern.
+pub extern "C" fn jit_str_lower(s_bits: u64) -> u64 {
+    let s = str_bytes(s_bits);
+    let mut out = Vec::with_capacity(s.len());
+    for &b in s {
+        out.push(b.to_ascii_lowercase());
+    }
+    jit_intern(&out)
+}
+
+/// string.reverse: reverse the byte order and intern.
+pub extern "C" fn jit_str_reverse(s_bits: u64) -> u64 {
+    let s = str_bytes(s_bits);
+    let mut out = Vec::with_capacity(s.len());
+    out.extend(s.iter().rev());
+    jit_intern(&out)
+}
+
 /// tostring(number): exact decimal formatting, matching the interpreter.
 pub extern "C" fn jit_tostr_num(n_bits: u64) -> u64 {
     let n = f64::from_bits(n_bits);
     let mut buf = [0u8; 64];
     let len = crate::strfmt::g14_to_buf(n, &mut buf);
     jit_intern(&buf[..len])
+}
+
+/// string.format inlined: fmt is a compiled-once format string; up to 3
+/// arguments follow (NIL-padded). Reuses the compiled-format cache so hot
+/// loops skip the parse.
+pub extern "C" fn jit_strfmt(fmt_bits: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    use crate::strfmt::FmtArg;
+    let fv = LuaValue::from_bits(fmt_bits);
+    let Some(_sid) = fv.as_string_id() else {
+        return LuaValue::NIL.to_bits();
+    };
+    let fmt_bytes = str_bytes(fmt_bits);
+    let arg_bits = [a0, a1, a2];
+    let nconv = crate::strfmt::compile(fmt_bytes)
+        .map(|p| {
+            p.iter()
+                .filter(|part| matches!(part, crate::strfmt::FmtPart::Conv(_, _)))
+                .count()
+        })
+        .unwrap_or(0);
+    let nused = nconv.min(3);
+    let mut args: Vec<FmtArg> = Vec::with_capacity(nused);
+    for i in 0..nused {
+        let v = LuaValue::from_bits(arg_bits[i]);
+        args.push(if let Some(n) = v.as_number() {
+            FmtArg::Num(n)
+        } else if v.is_string() {
+            FmtArg::Str(str_bytes(arg_bits[i]))
+        } else {
+            return LuaValue::NIL.to_bits();
+        });
+    }
+    match crate::strfmt::format(fmt_bytes, &args) {
+        Ok(bytes) => jit_intern(&bytes),
+        Err(_) => LuaValue::NIL.to_bits(),
+    }
 }
 
 // -- Table allocation and library helpers ------------------------------------

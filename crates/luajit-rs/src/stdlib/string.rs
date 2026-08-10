@@ -118,15 +118,24 @@ fn str_match(l: &mut LuaState) -> LuaResult<i32> {
 
     match find(s, pat, init.saturating_sub(1)) {
         Ok(Some((start, end, caps))) => {
-            let caps_vec: Vec<CaptureValue> = caps.iter().cloned().collect();
-            let n = caps_vec.len();
+            let n = caps.len();
             if n == 0 {
                 let sid = l.heap().intern(&s[start..end]);
                 l.stack[l.base] = l.heap().str_value(sid);
                 l.top = l.base + 1;
                 Ok(1)
             } else {
-                push_captures(l, &caps_vec, s, l.base);
+                for (i, capture) in caps.iter().enumerate() {
+                    match capture {
+                        CaptureValue::Substring(st, en) => {
+                            let sid = l.heap().intern(&s[*st..*en]);
+                            l.stack[l.base + i] = l.heap().str_value(sid);
+                        }
+                        CaptureValue::Position(p) => {
+                            l.stack[l.base + i] = LuaValue::number(*p as f64);
+                        }
+                    }
+                }
                 l.top = l.base + n;
                 Ok(n as i32)
             }
@@ -141,14 +150,14 @@ fn str_match(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn str_gmatch(l: &mut LuaState) -> LuaResult<i32> {
-    let text = match arg(l, 0).as_string_id() {
-        Some(sid) => l.str_static(sid).to_vec(),
+    let text_sid = match arg(l, 0).as_string_id() {
+        Some(sid) => sid,
         None => {
             return Err(err_bad_arg_type(l, 1, "string.gmatch", "string", arg(l, 0)));
         }
     };
-    let pat = match arg(l, 1).as_string_id() {
-        Some(sid) => l.str_static(sid).to_vec(),
+    let pat_sid = match arg(l, 1).as_string_id() {
+        Some(sid) => sid,
         None => {
             return Err(err_bad_arg_type(
                 l,
@@ -159,8 +168,6 @@ fn str_gmatch(l: &mut LuaState) -> LuaResult<i32> {
             ));
         }
     };
-    let text_sid = l.heap().intern(&text);
-    let pat_sid = l.heap().intern(&pat);
     let closure = l
         .heap()
         .alloc_func(crate::func::GcFunc::C(crate::func::CClosure {
@@ -187,25 +194,35 @@ fn gmatch_iter(l: &mut LuaState) -> LuaResult<i32> {
         None => return Ok(0),
     };
     let pos = l.upvalue(2).as_number().unwrap_or(1.0) as usize;
-    let text = l.heap().strings.get(text_sid).to_vec();
-    let pat = l.heap().strings.get(pat_sid).to_vec();
+    let text = l.str_static(text_sid);
+    let pat = l.str_static(pat_sid);
 
-    match find(&text, &pat, pos.saturating_sub(1)) {
+    match find(text, pat, pos.saturating_sub(1)) {
         Ok(Some((start, end, caps))) => {
             // Advance past empty matches (5.1 gmatch_aux: `e == src` skips
             // one char so `()` on "abcde" yields positions 1..6).
             let next = if end == start { start + 1 } else { end };
             l.set_upvalue(2, LuaValue::number((next + 1) as f64));
-            let caps_vec: Vec<CaptureValue> = caps.iter().cloned().collect();
-            if caps_vec.is_empty() {
+            let n = caps.len();
+            if n == 0 {
                 let sid = l.heap().intern(&text[start..end]);
                 l.stack[l.base] = l.heap().str_value(sid);
                 l.top = l.base + 1;
                 Ok(1)
             } else {
-                push_captures(l, &caps_vec, &text, l.base);
-                l.top = l.base + caps_vec.len();
-                Ok(caps_vec.len() as i32)
+                for (i, capture) in caps.iter().enumerate() {
+                    match capture {
+                        CaptureValue::Substring(st, en) => {
+                            let sid = l.heap().intern(&text[*st..*en]);
+                            l.stack[l.base + i] = l.heap().str_value(sid);
+                        }
+                        CaptureValue::Position(p) => {
+                            l.stack[l.base + i] = LuaValue::number(*p as f64);
+                        }
+                    }
+                }
+                l.top = l.base + n;
+                Ok(n as i32)
             }
         }
         Ok(None) => {
@@ -573,13 +590,14 @@ fn str_dump(l: &mut LuaState) -> LuaResult<i32> {
     }
 }
 
-fn str_format(l: &mut LuaState) -> LuaResult<i32> {
-    let fmt = match arg(l, 0).as_string_id() {
-        Some(sid) => l.str_static(sid),
+pub fn str_format(l: &mut LuaState) -> LuaResult<i32> {
+    let fmt_sid = match arg(l, 0).as_string_id() {
+        Some(sid) => sid,
         None => {
             return Err(err_bad_arg_type(l, 1, "string.format", "string", arg(l, 0)));
         }
     };
+    let fmt = l.str_static(fmt_sid);
     let n = lua_gettop(l);
     // Borrow string arguments (zero-copy); only non-string values are
     // materialized, and their buffers are pinned in `owned`.
@@ -603,7 +621,17 @@ fn str_format(l: &mut LuaState) -> LuaResult<i32> {
             oi += 1;
         }
     }
-    match crate::strfmt::format(fmt, &args) {
+    use std::sync::Arc;
+    let parts = if let Some(p) = l.heap().fmt_cache.get(&fmt_sid) {
+        Arc::clone(p)
+    } else {
+        let compiled = crate::strfmt::compile(fmt)
+            .map_err(|e| l.runtime_error(e.as_bytes()))?;
+        let p = Arc::new(compiled);
+        l.heap().fmt_cache.insert(fmt_sid, Arc::clone(&p));
+        p
+    };
+    match crate::strfmt::format_parts(&parts, &args) {
         Ok(bytes) => {
             let sid = l.heap().intern(&bytes);
             push(l, l.heap().str_value(sid));
@@ -638,10 +666,10 @@ fn map_bytes(l: &mut LuaState, f: fn(u8) -> u8) -> LuaResult<i32> {
     Ok(1)
 }
 
-fn str_lower(l: &mut LuaState) -> LuaResult<i32> {
+pub fn str_lower(l: &mut LuaState) -> LuaResult<i32> {
     map_bytes(l, |b| b.to_ascii_lowercase())
 }
-fn str_upper(l: &mut LuaState) -> LuaResult<i32> {
+pub fn str_upper(l: &mut LuaState) -> LuaResult<i32> {
     map_bytes(l, |b| b.to_ascii_uppercase())
 }
 
@@ -692,7 +720,7 @@ fn num_arg_coerce(l: &mut LuaState, i: usize) -> Option<f64> {
     None
 }
 
-fn str_reverse(l: &mut LuaState) -> LuaResult<i32> {
+pub fn str_reverse(l: &mut LuaState) -> LuaResult<i32> {
     let bytes = match arg(l, 0).as_string_id() {
         Some(sid) => l.str_static(sid).to_vec(),
         None => {
