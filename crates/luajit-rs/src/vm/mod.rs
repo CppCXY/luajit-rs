@@ -3640,7 +3640,7 @@ impl Interp {
                 .alloc_func(GcFunc::Lua(LuaClosure {
                     proto,
                     env,
-                    upvals: Vec::new(),
+                    upvals: crate::func::Upvals::empty(),
                 }));
             return LuaValue::func(fref);
         }
@@ -3649,11 +3649,8 @@ impl Interp {
         // upvalue vector through a raw pointer so the mutable find_upval
         // below doesn't conflict (no clone — a hot factory inherits the
         // same cells every iteration).
-        let parent_upvals: &[GcPtr<Upval>] = unsafe {
-            let p = self.lua_cl() as *const LuaClosure;
-            &(*p).upvals
-        };
-        let mut upvals = Vec::with_capacity(nuv);
+        let parent = self.lua_cl() as *const LuaClosure;
+        let mut upvals = crate::func::Upvals::empty();
         for i in 0..nuv {
             let v = pt.uv[i];
             if (v & PROTO_UV_LOCAL) != 0 {
@@ -3664,7 +3661,8 @@ impl Interp {
                 }
                 upvals.push(uv);
             } else {
-                upvals.push(parent_upvals[(v & 0xff) as usize]);
+                let inherited = unsafe { (*parent).upvals.get((v & 0xff) as usize) };
+                upvals.push(inherited.copied().unwrap());
             }
         }
         let fref = self

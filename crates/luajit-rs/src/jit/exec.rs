@@ -1254,7 +1254,7 @@ pub extern "C" fn jit_cnew(proto_ptr: u64, env_bits: u64) -> u64 {
     let cl = jit_heap().alloc_func(GcFunc::Lua(LuaClosure {
         proto,
         env,
-        upvals: Vec::new(),
+        upvals: crate::func::Upvals::empty(),
     }));
     LuaValue::func(cl).to_bits()
 }

@@ -983,7 +983,7 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
     let fref = g.heap.alloc_func(GcFunc::Lua(LuaClosure {
         proto: proto_ref,
         env,
-        upvals: Vec::new(),
+        upvals: crate::func::Upvals::empty(),
     }));
     Ok(LuaValue::func(fref))
 }

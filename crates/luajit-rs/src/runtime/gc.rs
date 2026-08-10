@@ -430,6 +430,11 @@ pub struct Pool<T> {
     live: usize,
     kind: GcObjectKind,
     current_white: Cell<u8>,
+    /// Reusable raw blocks (GcHeader address, mapped flag) reclaimed by the
+    /// sweep. `alloc` pops from here before falling back to `alloc_block`,
+    /// so a hot create/collect loop (e.g. closure creation) reuses the same
+    /// memory instead of malloc/free-ing every object (Lua's freelist).
+    freelist: Vec<(NonNull<u8>, bool)>,
 }
 impl<T> Pool<T> {
     pub fn with_page_size(_: usize) -> Self {
@@ -442,20 +447,45 @@ impl<T> Pool<T> {
             live: 0,
             kind,
             current_white: Cell::new(0),
+            freelist: Vec::new(),
         }
+    }
+    #[inline]
+    fn layout() -> (std::alloc::Layout, usize) {
+        std::alloc::Layout::new::<GcHeader>()
+            .extend(std::alloc::Layout::new::<T>())
+            .unwrap()
     }
     pub fn alloc(&mut self, v: T) -> GcPtr<T> {
         let cw = self.current_white.get();
-        let (nn, m) = alloc_block(v, self.kind, std::mem::size_of::<T>() as u32, cw);
+        let sz = std::mem::size_of::<T>() as u32;
+        let (nn, m) = if let Some((raw, mapped)) = self.freelist.pop() {
+            unsafe {
+                (raw.as_ptr() as *mut GcHeader).write(GcHeader::new(cw, self.kind, sz));
+                let (_, data_offset) = Self::layout();
+                let dp = raw.as_ptr().add(data_offset) as *mut T;
+                dp.write(v);
+                (NonNull::new_unchecked(dp), mapped)
+            }
+        } else {
+            alloc_block(v, self.kind, sz, cw)
+        };
         self.objects.push(nn);
         self.mapped.push(m);
         self.live += 1;
         GcPtr::new(nn)
     }
+    #[inline]
+    fn retire(&mut self, data: NonNull<T>, mapped: bool) {
+        let (_, data_offset) = Self::layout();
+        let raw = unsafe { (data.as_ptr() as *const u8).sub(data_offset) };
+        self.freelist
+            .push((unsafe { NonNull::new_unchecked(raw as *mut u8) }, mapped));
+    }
     pub fn free(&mut self, p: GcPtr<T>) {
         unsafe { p.0.as_ptr().drop_in_place() };
         let idx = self.objects.iter().position(|&x| x == p.0).unwrap();
-        dealloc_block(p.0, self.mapped[idx]);
+        self.retire(p.0, self.mapped[idx]);
         self.objects.swap_remove(idx);
         self.mapped.swap_remove(idx);
         self.live -= 1;
@@ -507,7 +537,7 @@ impl<T> Pool<T> {
                 unsafe {
                     ptr.as_ptr().drop_in_place();
                 }
-                dealloc_block(ptr, self.mapped[i]);
+                self.retire(ptr, self.mapped[i]);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
             }
@@ -563,7 +593,7 @@ impl<T> Pool<T> {
                 unsafe {
                     ptr.as_ptr().drop_in_place();
                 }
-                dealloc_block(ptr, self.mapped[i]);
+                self.retire(ptr, self.mapped[i]);
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
             }
@@ -586,6 +616,11 @@ impl<T> Drop for Pool<T> {
         for (i, &nn) in self.objects.iter().enumerate() {
             unsafe { nn.as_ptr().drop_in_place() };
             dealloc_block(nn, self.mapped[i]);
+        }
+        for &(raw, mapped) in &self.freelist {
+            let (layout, _) = Self::layout();
+            let layout = layout.pad_to_align();
+            unsafe { lowmem::dealloc(raw, layout, mapped) };
         }
     }
 }
@@ -871,13 +906,13 @@ impl<'g> Marker<'g> {
                     GcFunc::Lua(c) => {
                         self.mark_table(c.env);
                         self.mark_proto(c.proto);
-                        for &uv in &c.upvals {
+                        for &uv in c.upvals.iter() {
                             self.mark_upval(uv);
                         }
                     }
                     GcFunc::C(c) => {
                         self.mark_table(c.env);
-                        for &v in &c.upvals {
+                        for &v in c.upvals.iter() {
                             self.mark_value(v);
                         }
                     }
@@ -958,13 +993,13 @@ impl<'g> Marker<'g> {
                         GcFunc::Lua(c) => {
                             self.mark_table(c.env);
                             self.mark_proto(c.proto);
-                            for &uv in &c.upvals {
+                            for &uv in c.upvals.iter() {
                                 self.mark_upval(uv);
                             }
                         }
                         GcFunc::C(c) => {
                             self.mark_table(c.env);
-                            for &v in &c.upvals {
+                            for &v in c.upvals.iter() {
                                 self.mark_value(v);
                             }
                         }

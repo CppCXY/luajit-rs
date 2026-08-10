@@ -1128,7 +1128,7 @@ fn lib_getupvalue(l: &mut LuaState) -> LuaResult<i32> {
                     push(l, l.heap().str_value(l.heap().intern(b"")));
                 }
                 let val = if uv_idx < cl.upvals.len() {
-                    cl.upvals[uv_idx].as_ref().get()
+                    cl.upvals.get(uv_idx).unwrap().as_ref().get()
                 } else {
                     LuaValue::NIL
                 };
@@ -1175,7 +1175,7 @@ fn lib_setupvalue(l: &mut LuaState) -> LuaResult<i32> {
                 } else {
                     push(l, l.heap().str_value(l.heap().intern(b"")));
                 }
-                cl.upvals[uv_idx].as_mut().set(val);
+                cl.upvals.get(uv_idx).unwrap().as_mut().set(val);
                 Ok(1)
             }
             GcFunc::C(c) => {
