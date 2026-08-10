@@ -75,8 +75,7 @@ fn debug_slotname(
         use crate::bc::BCOp::*;
         matches!(
             op,
-            ISLT
-                | ISGE
+            ISLT | ISGE
                 | ISLE
                 | ISGT
                 | ISEQV
@@ -100,8 +99,7 @@ fn debug_slotname(
         use crate::bc::BCOp::*;
         matches!(
             op,
-            FORI
-                | JFORI
+            FORI | JFORI
                 | FORL
                 | IFORL
                 | JFORL
@@ -796,7 +794,11 @@ impl Interp {
         if mo.is_func() {
             // Lua 5.2 (LuaJIT compat52) passes the object twice (`__len(o, len)`);
             // Lua 5.1 passes the raw length as nil.
-            let args = if self.l().compat52 { [o, o] } else { [o, LuaValue::NIL] };
+            let args = if self.l().compat52 {
+                [o, o]
+            } else {
+                [o, LuaValue::NIL]
+            };
             match mo.as_func().unwrap().as_ref() {
                 GcFunc::C(cc) => {
                     let v = self.call_c_fn(cc.f, mo, &args)?;

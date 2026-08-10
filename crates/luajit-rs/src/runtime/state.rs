@@ -945,12 +945,7 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
         }
         return Err("corrupted dump cache".to_string());
     } else {
-        let mut parser = Parser::new(
-            src,
-            chunkname.to_string(),
-            &mut g.heap.strings,
-            l.compat52,
-        );
+        let mut parser = Parser::new(src, chunkname.to_string(), &mut g.heap.strings, l.compat52);
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.parse()));

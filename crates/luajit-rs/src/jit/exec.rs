@@ -277,7 +277,8 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
         };
     };
     let g = l.global();
-    g.jit.exec_env = env;    r
+    g.jit.exec_env = env;
+    r
 }
 
 /// The IR interpreter proper.

@@ -309,7 +309,10 @@ pub fn rec_ins(l: &mut LuaState, base: usize, pt: GcPtr<Proto>, pc: usize) -> bo
         let opn = pt.as_ref().bc.get(pc).copied().map(crate::bc::bc_op);
         eprintln!(
             "REC-NOCONTEXT state={:?} pc={} bc={} op={:?}",
-            g.jit.state, pc, pt.as_ref().bc.len(), opn
+            g.jit.state,
+            pc,
+            pt.as_ref().bc.len(),
+            opn
         );
         panic!("recording without context");
     };

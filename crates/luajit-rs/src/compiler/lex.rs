@@ -247,9 +247,7 @@ impl<'a> LexState<'a> {
                 // `'aa'`, raw bytes) rather than the interned value.
                 String::from_utf8_lossy(&self.src[self.tok_start..self.pos]).into_owned()
             }
-            Tok::Name => {
-                String::from_utf8_lossy(self.strs.get(self.tokval.str)).into_owned()
-            }
+            Tok::Name => String::from_utf8_lossy(self.strs.get(self.tokval.str)).into_owned(),
             Tok::Number => String::from_utf8_lossy(&self.sb).into_owned(),
             t => tok2str(t),
         };

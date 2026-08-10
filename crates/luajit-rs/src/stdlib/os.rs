@@ -343,7 +343,11 @@ fn os_remove(l: &mut LuaState) -> LuaResult<i32> {
                 let errno = e.raw_os_error().unwrap_or(0) as f64;
                 crate::stdlib::pushv(
                     l,
-                    &[LuaValue::NIL, l.heap().str_value(sid), LuaValue::number(errno)],
+                    &[
+                        LuaValue::NIL,
+                        l.heap().str_value(sid),
+                        LuaValue::number(errno),
+                    ],
                 );
                 return Ok(3);
             }

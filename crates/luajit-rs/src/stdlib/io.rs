@@ -71,9 +71,10 @@ fn handle_fd(l: &LuaState, i: usize) -> Option<usize> {
 /// so the GC can close them via `__gc` when unreferenced (LuaJIT semantics).
 fn new_handle(l: &mut LuaState, id: usize) -> LuaValue {
     if id < 3
-        && let Some(Some(v)) = l.global().io_file_cache.get(id) {
-            return *v;
-        }
+        && let Some(Some(v)) = l.global().io_file_cache.get(id)
+    {
+        return *v;
+    }
     let ud = l.heap().alloc_userdata(GcUserData::new(id));
     push(l, LuaValue::userdata(ud)); // anchor for the metatable alloc
     let ud = arg(l, 0).as_userdata().unwrap();
@@ -668,10 +669,9 @@ fn lines_iter(l: &mut LuaState) -> LuaResult<i32> {
     match line {
         Some(bytes) => ret_string(l, &bytes),
         None => {
-            if close_on_eof
-                && let Some(slot) = l.global().files.get_mut(fd) {
-                    *slot = None;
-                }
+            if close_on_eof && let Some(slot) = l.global().files.get_mut(fd) {
+                *slot = None;
+            }
             push(l, LuaValue::NIL);
             Ok(1)
         }
