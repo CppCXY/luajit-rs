@@ -2609,6 +2609,17 @@ impl Interp {
                     if self.l().global().jit.invalidate_all {
                         self.l().global().jit.invalidate_all = false;
                         crate::jit::trace_flush_all(self.l());
+                        #[cfg(debug_assertions)]
+                        eprintln!("JFORL invalidate flush at pc={}", self.l().debug_pc);
+                        // Reset the loop's hot counter so it won't instantly
+                        // re-record (and re-flush) on every setmetatable — a
+                        // loop that mutates metatables each iteration can
+                        // never produce a stable trace. The interpreted loop
+                        // runs until hotcount accumulates again.
+                        let reset =
+                            (self.l().global().jit.param(crate::jit::JitParam::HotLoop) as u32
+                                * crate::jit::HOTCOUNT_LOOP as u32) as crate::jit::HotCount;
+                        self.l().global().jit.hotcount_set(ip as usize, reset);
                         let reverted = unsafe { *ip.sub(1) };
                         let a2 = bc_a(reverted);
                         forl_body!(reverted, a2);

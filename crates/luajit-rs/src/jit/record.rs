@@ -1161,6 +1161,23 @@ impl Record {
         let Some(gf) = fv.as_func() else {
             return Err(TraceError::NYIBC);
         };
+        // `return f(...)` on a C (fast) function: record it as an ordinary
+        // call and return its result (LuaJIT lowers the tailcall to a plain
+        // CALL for fast functions). The C-call path writes the result into
+        // slot a; then pop the inlined frame so the caller's RET sees it.
+        if let crate::func::GcFunc::C(cc) = gf.as_ref() {
+            let want = 1;
+            let mut argv = [LuaValue::NIL; 3];
+            for i in 0..nargs.min(3) {
+                argv[i as usize] = self.slot_val(l, base, a + 2 + i);
+            }
+            for i in 0..nargs {
+                self.getslot(l, base, a + 2 + i);
+            }
+            self.rec_callff_core(l, a, want, nargs, fv, cc.f, &argv)?;
+            self.rec_ret(l, base, a, 1)?;
+            return Ok(None);
+        }
         let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
             return Err(TraceError::NYIBC);
         };
@@ -2179,6 +2196,57 @@ impl Record {
                 self.rec_tset(l, tabv, tab, keyv, key, val)?;
                 nres = 0;
             }
+            Recff::SetMetatable => {
+                // setmetatable(t, mt): guard t is a table, mt is a table or
+                // nil, then store mt into the table's metatable field
+                // (FSTORE IRFL_TAB_META). __newindex presence change flags
+                // invalidation exactly like the interpreter path.
+                if nargs < 2 {
+                    return Err(TraceError::NYIBC);
+                }
+                let tab = self.base_ref(a + 2);
+                let mt = self.base_ref(a + 3);
+                let tabv = argv[0];
+                let mtv = argv[1];
+                if !tref_istab(tab) {
+                    return Err(TraceError::NYIBC);
+                }
+                if !mtv.is_table() && !mtv.is_nil() {
+                    return Err(TraceError::NYIBC);
+                }
+                let g = l.global();
+                // Protected metatable check (lj_meta_lookup(o, MM_metatable)):
+                // abort if the current metatable exposes `__metatable`.
+                if let Some(cur_mt) = tabv
+                    .as_table()
+                    .and_then(|t| t.as_ref().metatable)
+                {
+                    let mmet = g.mmname[crate::meta::MM::Metatable as usize];
+                    if !cur_mt.as_ref().get_str(mmet).is_nil() {
+                        return Err(TraceError::NYIBC);
+                    }
+                }
+                let nidx = g.mmname[crate::meta::MM::Newindex as usize];
+                let old_has = tabv
+                    .as_table()
+                    .and_then(|t| t.as_ref().metatable)
+                    .map(|m| !m.as_ref().get_str(nidx).is_nil())
+                    .unwrap_or(false);
+                let new_has = mtv
+                    .as_table()
+                    .map(|m| !m.as_ref().get_str(nidx).is_nil())
+                    .unwrap_or(false);
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::FSTORE, IRT_NIL),
+                    tref_ref(tab),
+                    if mtv.is_nil() { 0 } else { tref_ref(mt) },
+                ));
+                if old_has != new_has {
+                    l.global().jit.invalidate_all = true;
+                }
+                res[0] = tab;
+                nres = 1;
+            }
             Recff::ToNumber => {
                 let arg0 = self.base_ref(a + 2);
                 if tref_isnum(arg0) || tref_isint(arg0) {
@@ -3123,6 +3191,7 @@ enum Recff {
     Type,
     RawGet,
     RawSet,
+    SetMetatable,
     ToNumber,
     ToString,
     /// `ffi.C` symbol call wrapper (call_c): the address and cdef
@@ -3135,7 +3204,7 @@ enum Recff {
 fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
     use crate::func::CFunction;
     use crate::stdlib::{base, bit, math, string, table};
-    let entries: [(CFunction, Recff); 33] = [
+    let entries: [(CFunction, Recff); 34] = [
         (crate::ffi::lib::call_c, Recff::FFICall),
         (math::floor, Recff::Floor),
         (math::ceil, Recff::Ceil),
@@ -3161,6 +3230,7 @@ fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
         (string::str_byte, Recff::StrByte),
         (string::str_sub, Recff::StrSub),
         (string::str_char, Recff::StrChar),
+        (base::lib_setmetatable, Recff::SetMetatable),
         (table::tab_insert, Recff::TableInsert),
         (table::tab_remove, Recff::TableRemove),
         (table::tab_concat, Recff::TableConcat),

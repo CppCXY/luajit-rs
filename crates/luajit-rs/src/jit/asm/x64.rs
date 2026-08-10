@@ -484,6 +484,7 @@ impl<'a> Asm<'a> {
                 }
                 IROp::ALOAD => self.asm_aload(&ins)?,
                 IROp::ASTORE => self.asm_astore(&ins)?,
+                IROp::FSTORE => self.asm_fstore(&ins)?,
                 IROp::GCSTEP => self.asm_gcstep(&ins),
                 IROp::POW => self.asm_pow(&ins)?,
                 IROp::TOBIT => self.asm_tobit(&ins)?,
@@ -1087,6 +1088,25 @@ impl<'a> Asm<'a> {
         } else {
             self.gpr_load_ref(RDX, val);
             self.mov_sib_r64(RAX, RCX, RDX);
+        }
+        Ok(())
+    }
+
+    /// FSTORE: inlined setmetatable — store the metatable pointer (op2,
+    /// nil for `setmetatable(t, nil)`) into `tab->metatable` (IRFL_TAB_META).
+    fn asm_fstore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const META_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
+        self.gpr_load_ref(RAX, ins.op1 as IRRef);
+        self.mov_r64_imm64(RCX, crate::value::LJ_GCVMASK);
+        self.and_rr64(RAX, RCX); // NaN-boxed table value -> pointer.
+        if ins.op2 == 0 {
+            self.mov_r64_imm64(RCX, 0);
+            self.mov_mem_r64(RAX, META_OFF, RCX);
+        } else {
+            self.gpr_load_ref(RDX, ins.op2 as IRRef);
+            self.mov_r64_imm64(RCX, crate::value::LJ_GCVMASK);
+            self.and_rr64(RDX, RCX); // NaN-boxed metatable -> pointer.
+            self.mov_mem_r64(RAX, META_OFF, RDX);
         }
         Ok(())
     }

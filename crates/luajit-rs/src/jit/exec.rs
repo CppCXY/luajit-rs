@@ -405,6 +405,20 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     let v = LuaValue::from_bits(val(env, carg.op2 as IRRef));
                     unsafe { *t.as_ref().aptr.add(ki as usize) = v };
                 }
+                IROp::FSTORE => {
+                    // setmetatable inlined: write the table's metatable
+                    // field (IRFL_TAB_META). op2 is nil for `setmetatable
+                    // (t, nil)`.
+                    let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
+                    let t = tv.as_table().expect("FSTORE on a non-table");
+                    let mt = if ins.op2 == 0 {
+                        None
+                    } else {
+                        let mv = LuaValue::from_bits(val(env, ins.op2 as IRRef));
+                        Some(mv.as_table().expect("FSTORE metatable must be a table or nil"))
+                    };
+                    t.as_mut().metatable = mt;
+                }
                 IROp::BUFHDR => {
                     // lj_buf: idempotent materialization — the first pass
                     // copies the source string into the heap buffer; when

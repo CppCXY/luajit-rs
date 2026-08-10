@@ -473,32 +473,37 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         let cell_addrs = (js.stack_end_cell_addr(), js.exit_base_cell_addr());
         #[cfg(target_arch = "wasm32")]
         let cell_addrs = (0u64, 0u64);
-        if !js.no_asm
-            && let Ok((mc, inner, tails)) =
-                asm::assemble(&trace, link_target, arch, cell_addrs.0, cell_addrs.1)
-        {
-            if js.trace_dump {
-                eprintln!(
-                    "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",
-                    trace.traceno,
-                    mc.ptr(),
-                    mc.len(),
-                    inner,
-                    trace
-                        .startpt
-                        .as_ref()
-                        .lines
-                        .get(trace.startpc)
-                        .copied()
-                        .unwrap_or(0),
-                    trace.root,
-                    trace.link,
-                    trace.linktype,
-                );
+        let asm_result = if !js.no_asm {
+            asm::assemble(&trace, link_target, arch, cell_addrs.0, cell_addrs.1)
+        } else {
+            Err(TraceError::NYIBC)
+        };
+        match asm_result {
+            Ok((mc, inner, tails)) => {
+                if js.trace_dump {
+                    eprintln!(
+                        "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",
+                        trace.traceno,
+                        mc.ptr(),
+                        mc.len(),
+                        inner,
+                        trace
+                            .startpt
+                            .as_ref()
+                            .lines
+                            .get(trace.startpc)
+                            .copied()
+                            .unwrap_or(0),
+                        trace.root,
+                        trace.link,
+                        trace.linktype,
+                    );
+                }
+                trace.mcode = Some(mc);
+                trace.inner_ofs = inner;
+                trace.stub_tails = tails;
             }
-            trace.mcode = Some(mc);
-            trace.inner_ofs = inner;
-            trace.stub_tails = tails;
+            Err(_e) => {}
         }
         trace
     };

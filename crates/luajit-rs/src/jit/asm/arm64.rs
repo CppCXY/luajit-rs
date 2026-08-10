@@ -1037,6 +1037,25 @@ impl<'a> Asm<'a> {
         self.guard(cond::NE);
     }
 
+    // FSTORE: inlined setmetatable — store the metatable pointer (op2,
+    // nil for `setmetatable(t, nil)`) into `tab->metatable` (IRFL_TAB_META).
+    fn asm_fstore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const META_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
+        self.gpr_load_ref(RSCRATCH, ins.op1 as IRRef);
+        self.code.mov64(RSCRATCH2, crate::value::LJ_GCVMASK);
+        self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
+        if ins.op2 == 0 {
+            self.code.mov64(RSCRATCH2, 0);
+            self.code.str(RSCRATCH2, RSCRATCH, META_OFF);
+        } else {
+            self.gpr_load_ref(RSCRATCH2, ins.op2 as IRRef);
+            self.code.mov64(RSCRATCH3, crate::value::LJ_GCVMASK);
+            self.code.and_rr(RSCRATCH2, RSCRATCH2, RSCRATCH3);
+            self.code.str(RSCRATCH2, RSCRATCH, META_OFF);
+        }
+        Ok(())
+    }
+
     // ── helper_call: emit a call to an extern "C" helper ──────────────────
     // Parks volatile FP registers (v0-v7, v16-v31) to env, loads up to 3
     // u64 arguments into x0-x2, calls the helper via blr, and returns
@@ -1715,6 +1734,7 @@ impl<'a> Asm<'a> {
                 }
                 IROp::ALOAD => self.asm_aload(&ins)?,
                 IROp::ASTORE => self.asm_astore(&ins)?,
+                IROp::FSTORE => self.asm_fstore(&ins)?,
                 IROp::GCSTEP => self.asm_gcstep(&ins),
                 IROp::POW => {
                     self.helper_call(

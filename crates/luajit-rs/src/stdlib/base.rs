@@ -323,7 +323,7 @@ fn lib_ipairs(l: &mut LuaState) -> LuaResult<i32> {
     Ok(3)
 }
 
-fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
+pub fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
     let t = arg(l, 0);
     let mt = arg(l, 1);
     let tab = match t.as_table() {
@@ -345,12 +345,20 @@ fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
     if !crate::meta::meta_lookup(l.global(), t, MM::Metatable).is_nil() {
         return Err(l.runtime_error(b"cannot change a protected metatable"));
     }
-    tab.as_mut().metatable = mt.as_table();
     // Traces may have specialized table stores to this metatable's
-    // `__newindex` (or its absence); flag invalidation so the next trace
-    // entry flushes them (deferred — setmetatable may run inside a trace,
-    // where freeing the registry underneath it would crash).
-    l.global().jit.invalidate_all = true;
+    // `__newindex` (or its absence). Only a change in that property
+    // invalidates them — a hot loop that re-setmetatables each iteration
+    // (e.g. an object factory) keeps the same (absent) `__newindex` and
+    // must not flush its trace every pass. Deferred anyway: setmetatable
+    // may run inside a trace, where freeing the registry would crash.
+    let g = l.global();
+    let nidx = g.mmname[crate::meta::MM::Newindex as usize];
+    let old_has = tab.as_ref().metatable.map(|m| !m.as_ref().get_str(nidx).is_nil()).unwrap_or(false);
+    let new_has = mt.as_table().map(|m| !m.as_ref().get_str(nidx).is_nil()).unwrap_or(false);
+    tab.as_mut().metatable = mt.as_table();
+    if old_has != new_has {
+        g.jit.invalidate_all = true;
+    }
     push(l, t);
     Ok(1)
 }
