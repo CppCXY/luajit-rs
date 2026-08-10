@@ -48,7 +48,7 @@ jobs:
           echo "## Benchmark Results - Linux (ubuntu-latest)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          chmod +x run_benchmarks.sh
+          chmod +x benchmarks/run_benchmarks.sh
           ./benchmarks/run_benchmarks.sh --nocolor 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
@@ -140,7 +140,7 @@ jobs:
           echo "## Benchmark Results - macOS (macos-latest)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          chmod +x run_benchmarks.sh
+          chmod +x benchmarks/run_benchmarks.sh
           ./benchmarks/run_benchmarks.sh --nocolor 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 

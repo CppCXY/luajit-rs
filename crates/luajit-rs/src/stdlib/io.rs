@@ -945,7 +945,11 @@ fn io_input(l: &mut LuaState) -> LuaResult<i32> {
             let path = String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned();
             match File::open(&path) {
                 Ok(f) => registry_put(l, FileEntry::Read(BufReader::new(f))),
-                Err(e) => return ret_fail(l, &format!("{}: {}", path, e)),
+                // Lua 5.1 `g_iofile`: a string argument that cannot be
+                // opened raises (fileerror), it does not return nil.
+                Err(e) => {
+                    return Err(l.runtime_error(format!("{}: {}", path, e).as_bytes()));
+                }
             }
         } else {
             return Err(err_bad_arg_type(l, 1, "input", "string or file", arg(l, 0)));
@@ -1014,7 +1018,11 @@ fn io_output(l: &mut LuaState) -> LuaResult<i32> {
             let path = String::from_utf8_lossy(s.as_ref().as_bytes()).into_owned();
             match File::create(&path) {
                 Ok(f) => registry_put(l, FileEntry::Write(BufWriter::new(f))),
-                Err(e) => return ret_fail(l, &format!("{}: {}", path, e)),
+                // Lua 5.1 `g_iofile`: a string argument that cannot be
+                // opened raises (fileerror), it does not return nil.
+                Err(e) => {
+                    return Err(l.runtime_error(format!("{}: {}", path, e).as_bytes()));
+                }
             }
         } else {
             return Err(err_bad_arg_type(
