@@ -424,6 +424,11 @@ fn gc_header<T>(ptr: NonNull<T>) -> &'static GcHeader {
 }
 
 // ── Pool ────────────────────────────────────────────────────────────────
+/// Free-list trim threshold, mirroring LuaJIT's `DEFAULT_TRIM_THRESHOLD`
+/// in `lj_alloc.c`: when the reclaimed-object free list holds more than
+/// this many bytes, the excess is returned to the OS.
+const DEFAULT_TRIM_THRESHOLD: usize = 2 * 1024 * 1024;
+
 pub struct Pool<T> {
     objects: Vec<NonNull<T>>,
     mapped: Vec<bool>,
@@ -435,6 +440,12 @@ pub struct Pool<T> {
     /// so a hot create/collect loop (e.g. closure creation) reuses the same
     /// memory instead of malloc/free-ing every object (Lua's freelist).
     freelist: Vec<(NonNull<u8>, bool)>,
+    /// Total object bytes currently sitting in `freelist` (excludes the
+    /// GcHeader overhead — an approximation of the reclaimed footprint).
+    free_bytes: usize,
+    /// Auto-trim trigger (`trim_check` in dlmalloc terms). When
+    /// `free_bytes` exceeds it, `retire` returns the excess to the OS.
+    trim_check: usize,
 }
 impl<T> Pool<T> {
     pub fn with_page_size(_: usize) -> Self {
@@ -448,6 +459,8 @@ impl<T> Pool<T> {
             kind,
             current_white: Cell::new(0),
             freelist: Vec::new(),
+            free_bytes: 0,
+            trim_check: DEFAULT_TRIM_THRESHOLD,
         }
     }
     #[inline]
@@ -456,10 +469,16 @@ impl<T> Pool<T> {
             .extend(std::alloc::Layout::new::<T>())
             .unwrap()
     }
+    fn dealloc_block_raw(&self, raw: NonNull<u8>, mapped: bool) {
+        let (layout, _) = Self::layout();
+        let layout = layout.pad_to_align();
+        unsafe { lowmem::dealloc(raw, layout, mapped) };
+    }
     pub fn alloc(&mut self, v: T) -> GcPtr<T> {
         let cw = self.current_white.get();
         let sz = std::mem::size_of::<T>() as u32;
         let (nn, m) = if let Some((raw, mapped)) = self.freelist.pop() {
+            self.free_bytes = self.free_bytes.saturating_sub(sz as usize);
             unsafe {
                 (raw.as_ptr() as *mut GcHeader).write(GcHeader::new(cw, self.kind, sz));
                 let (_, data_offset) = Self::layout();
@@ -481,6 +500,31 @@ impl<T> Pool<T> {
         let raw = unsafe { (data.as_ptr() as *const u8).sub(data_offset) };
         self.freelist
             .push((unsafe { NonNull::new_unchecked(raw as *mut u8) }, mapped));
+        let sz = std::mem::size_of::<T>();
+        self.free_bytes += sz;
+        // LuaJIT `lj_alloc` `alloc_trim`: once the reclaimed free list
+        // exceeds the threshold, hand the excess back to the OS. Keep half
+        // as a reserve (hysteresis) so a hot create/collect loop — which
+        // hovers around one block — never churns, while a one-off spike
+        // (build a big structure, drop it) returns most of the memory.
+        if self.free_bytes > self.trim_check {
+            let reserve = self.trim_check / 2;
+            let mut trimmed = 0usize;
+            while self.free_bytes > reserve {
+                let Some((raw, mapped)) = self.freelist.pop() else {
+                    break;
+                };
+                self.free_bytes = self.free_bytes.saturating_sub(sz);
+                self.dealloc_block_raw(raw, mapped);
+                trimmed += 1;
+            }
+            if std::env::var("LUARS_TRIMDBG").is_ok() {
+                eprintln!(
+                    "[trim] kind={:?} blocks={} freed={} bytes={} free_bytes={}",
+                    self.kind, trimmed, trimmed * sz, self.free_bytes, self.free_bytes
+                );
+            }
+        }
     }
     pub fn free(&mut self, p: GcPtr<T>) {
         unsafe { p.0.as_ptr().drop_in_place() };
@@ -618,9 +662,7 @@ impl<T> Drop for Pool<T> {
             dealloc_block(nn, self.mapped[i]);
         }
         for &(raw, mapped) in &self.freelist {
-            let (layout, _) = Self::layout();
-            let layout = layout.pad_to_align();
-            unsafe { lowmem::dealloc(raw, layout, mapped) };
+            self.dealloc_block_raw(raw, mapped);
         }
     }
 }

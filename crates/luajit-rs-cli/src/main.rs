@@ -13,6 +13,10 @@
 //!   -          Execute stdin (non-interactive)
 
 use std::io::{self, BufRead, IsTerminal, Read, Write};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+use mimalloc::MiMalloc;
 use std::process::exit;
 
 use luajit_rs::internal::state::{Lua, load};
