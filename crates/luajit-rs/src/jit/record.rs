@@ -1537,6 +1537,13 @@ impl Record {
             return Err(TraceError::NYIBC); // Runtime error path.
         }
         self.meta_guard(tab);
+        // GC-debt guard before the store: the store may grow the table,
+        // and a compiled loop otherwise never reaches a GC safe point.
+        // Emitting it here (before the side effect) means a GC exit
+        // resumes at the covering snapshot with nothing committed, so the
+        // interpreter re-executes the store cleanly instead of double
+        // applying it. One guard per trace (deduped by `rec_gcstep`).
+        self.rec_gcstep(l);
         let carg = self.cur.ir.emit_ins(IRIns::new(
             irt(IROp::CARG, IRT_NIL),
             tref_ref(key),
@@ -1556,10 +1563,6 @@ impl Record {
                 tref_ref(tab),
                 tref_ref(carg),
             ));
-            // Stores may grow the table via the exit path: the loop must
-            // still reach a GC safe point, so a pure-array trace gets the
-            // same IR_GCSTEP guard as a hash-store one (deduped per trace).
-            self.rec_gcstep(l);
             self.needsnap = true;
             return Ok(());
         }
@@ -1568,16 +1571,17 @@ impl Record {
             tref_ref(tab),
             tref_ref(carg),
         ));
-        self.rec_gcstep(l);
         Ok(())
     }
 
     /// GC-debt guard: exit when a collection is due (the boundary check
-    /// in the trace-entry dispatch arms then collects). Must follow any
-    /// on-trace allocation (table growth, string interning). One guard
-    /// per trace suffices: the debt accumulates and a single iteration
-    /// allocates far less than the threshold headroom (the loop peel
-    /// keeps one copy in the loop body).
+    /// in the trace-entry dispatch arms then collects). Must precede any
+    /// on-trace allocation (table growth, string interning) so a GC exit
+    /// resumes at a snapshot where no side effect of the current
+    /// instruction has committed yet — placing it after the store would
+    /// make the interpreter re-execute (and double-apply) the store.
+    /// One guard per trace suffices: the debt accumulates and a single
+    /// iteration allocates far less than the threshold headroom.
     fn rec_gcstep(&mut self, l: &LuaState) {
         if self.cur.ir.chain[IROp::GCSTEP as usize] != 0 {
             self.needsnap = true;

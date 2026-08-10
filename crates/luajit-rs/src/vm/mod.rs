@@ -1477,15 +1477,14 @@ impl Interp {
                         let n = self.l().heap().strings.get(sid).len();
                         fr.set(a, LuaValue::number(n as f64));
                     } else if let Some(t) = v.as_table() {
-                        // Lua 5.1 / stock LuaJIT: `__len` does not apply to
-                        // tables — only the 5.2-compat build uses it.
+                        // Lua 5.2+: `__len` applies to tables when present.
                         let has_len_mm = crate::meta::meta_fast(
                             self.l().global(),
                             t.as_ref().metatable,
                             MM::Len,
                         )
                         .is_some();
-                        if !self.l().compat52 || !has_len_mm {
+                        if !has_len_mm {
                             fr.set(a, LuaValue::number(t.as_ref().len() as f64));
                         } else {
                             sync!();

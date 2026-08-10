@@ -36,8 +36,10 @@ assert(not doit("tostring(1)") and doit("tostring()"))
 assert(doit"tonumber()")
 assert(doit"repeat until 1; a")
 checksyntax("break label", "", "label", 1)
-assert(doit";")
-assert(doit"a=1;;")
+-- Lua 5.2+: `;` is an empty statement, not an error; but `return`
+-- must still be the last statement, so a statement after it errors.
+assert(not doit";")
+assert(not doit"a=1;;")
 assert(doit"return;;")
 assert(doit"assert(false)")
 assert(doit"assert(nil)")

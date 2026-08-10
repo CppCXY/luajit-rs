@@ -279,9 +279,6 @@ pub struct Parser<'a> {
     level: u32,
     fr2: u32,
     fs: Vec<FuncState>,
-    /// Lua 5.2 compatibility mode (mirrors LuaJIT's `LJ_52`): gates the
-    /// `;` empty statement and the reserved `goto` keyword.
-    compat52: bool,
     /// Interned chunk source name, propagated to every proto so error
     /// messages from nested functions report the real file (Lua's
     /// `luaO_chunkid` behaviour).
@@ -289,12 +286,7 @@ pub struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(
-        src: Vec<u8>,
-        chunkname: String,
-        strs: &'a mut Interner,
-        compat52: bool,
-    ) -> Parser<'a> {
+    pub fn new(src: Vec<u8>, chunkname: String, strs: &'a mut Interner) -> Parser<'a> {
         let chunk_sid = if chunkname.is_empty() {
             None
         } else {
@@ -308,7 +300,6 @@ impl<'a> Parser<'a> {
             level: 0,
             fr2: 1,
             fs: Vec::new(),
-            compat52,
             chunk_sid,
         }
     }
@@ -2891,11 +2882,14 @@ impl<'a> Parser<'a> {
         let pc = self.cur().pc;
         let idx = self.gola_new(VName::Str(name), VSTACK_LABEL, pc);
         self.lex_check(Tok::Label);
+        // Recursively parse trailing statements: labels and `;` (Lua 5.2).
         loop {
             if self.ls.tok == Tok::Label {
                 self.synlevel_begin();
                 self.parse_label();
                 self.synlevel_end();
+            } else if self.ls.tok == Tok::Char(b';') {
+                self.ls.next();
             } else {
                 break;
             }
@@ -3211,28 +3205,17 @@ impl<'a> Parser<'a> {
                 self.parse_label();
             }
             Tok::Char(b';') => {
-                // Empty statement: a Lua 5.2 / LuaJIT `compat52` feature.
-                // Lua 5.1 (and a stock LuaJIT 5.1 build) have no empty
-                // statement: `;` in statement position is a syntax error.
-                if self.compat52 {
-                    self.ls.next();
-                } else {
-                    self.ls.err_near("unexpected symbol");
-                }
+                // Empty statement: a Lua 5.2+ feature.
+                self.ls.next();
             }
             // Not expressible as a match guard: `peek` needs `&mut self`.
-            #[allow(clippy::collapsible_match)]
             Tok::Goto => {
                 if lex_isname(self.ls.peek()) {
                     self.ls.next();
                     self.parse_goto();
-                } else if self.compat52 {
-                    // `goto` is a reserved word only under 5.2 compat.
-                    self.err_syntax("<name> expected");
                 } else {
-                    // Lua 5.1 / LuaJIT default: `goto` is a soft keyword,
-                    // so `goto = 1` / `goto()` use it as an identifier.
-                    self.parse_call_assign();
+                    // `goto` is a reserved word (Lua 5.2+).
+                    self.err_syntax("<name> expected");
                 }
             }
             _ => {

@@ -601,23 +601,12 @@ impl Interp {
             loop {
                 let mm = if (op & 2) != 0 { MM::Le } else { MM::Lt };
                 let g = self.l().global();
-                let compat52 = self.l().compat52;
-                // LuaJIT 2.1 `lj_meta_comp`:
-                // - 5.2 (LJ_52): the metamethod of the first operand wins,
-                //   falling back to the second when missing (mixed
-                //   metamethods compare fine).
-                // - 5.1: both operands must expose the *same* __lt/__le
-                //   metamethod, otherwise the comparison is an error.
+                // Lua 5.2+ (`lj_meta_comp` with LJ_52): the metamethod of
+                // the first operand wins, falling back to the second when
+                // missing (mixed metamethods compare fine).
                 let mut mo = meta_lookup(g, o1, mm);
-                if compat52 {
-                    if mo.is_nil() {
-                        mo = meta_lookup(g, o2, mm);
-                    }
-                } else {
-                    let mo2 = meta_lookup(g, o2, mm);
-                    if mo.is_nil() || mo2.is_nil() || mo.to_bits() != mo2.to_bits() {
-                        mo = LuaValue::NIL;
-                    }
+                if mo.is_nil() {
+                    mo = meta_lookup(g, o2, mm);
                 }
                 if mo.is_nil() {
                     if (op & 2) != 0 {
@@ -792,13 +781,8 @@ impl Interp {
                 .runtime_error(b"attempt to get length of a non-table value"));
         }
         if mo.is_func() {
-            // Lua 5.2 (LuaJIT compat52) passes the object twice (`__len(o, len)`);
-            // Lua 5.1 passes the raw length as nil.
-            let args = if self.l().compat52 {
-                [o, o]
-            } else {
-                [o, LuaValue::NIL]
-            };
+            // Lua 5.2+ passes the object twice (`__len(o, len)`).
+            let args = [o, o];
             match mo.as_func().unwrap().as_ref() {
                 GcFunc::C(cc) => {
                     let v = self.call_c_fn(cc.f, mo, &args)?;
@@ -817,11 +801,7 @@ impl Interp {
                 .l()
                 .runtime_error(b"attempt to get length of a non-table value"));
         };
-        let args = if self.l().compat52 {
-            [mo, o, o]
-        } else {
-            [mo, o, LuaValue::NIL]
-        };
+        let args = [mo, o, o];
         match mo2.as_func().unwrap().as_ref() {
             GcFunc::C(cc) => {
                 let v = self.call_c_fn(cc.f, mo2, &args)?;
