@@ -27,6 +27,9 @@ pub enum FileEntry {
     Write(std::io::BufWriter<std::fs::File>),
     /// Read-write (io.tmpfile, "r+"/"w+"): one shared cursor.
     ReadWrite(std::fs::File),
+    /// `io.popen`: an OS subprocess whose stdout (`"r"`) or stdin (`"w"`)
+    /// is wired to the handle. Closing the handle waits for the child.
+    Pipe(std::process::Child),
     Stdin,
     Stdout,
     Stderr,

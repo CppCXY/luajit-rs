@@ -226,13 +226,18 @@ fn handle_lines_fd(l: &mut LuaState) -> LuaResult<i32> {
 fn handle_close_fd(l: &mut LuaState) -> LuaResult<i32> {
     let fd = handle_fd_arg(l, 0)?;
     let files = l.files_mut();
-    match files.get_mut(fd).and_then(|e| e.as_ref()) {
-        Some(_) => {
-            files[fd] = None;
+    match files.get_mut(fd) {
+        Some(slot) if slot.is_some() => {
+            // io.popen: wait for the child before dropping the entry
+            // (dropping a Child without wait() leaves a zombie).
+            if let Some(FileEntry::Pipe(child)) = slot.as_mut() {
+                let _ = child.wait();
+            }
+            *slot = None;
         }
         // LuaJIT: closing an already-closed file is an error (a GC `__gc`
         // re-invocation is caught by the collector).
-        None => return Err(l.runtime_error(b"attempt to use a closed file")),
+        _ => return Err(l.runtime_error(b"attempt to use a closed file")),
     }
     push(l, LuaValue::TRUE);
     Ok(1)
@@ -265,6 +270,9 @@ fn handle_gc_fd(l: &mut LuaState) -> LuaResult<i32> {
     let files = l.files_mut();
     if let Some(slot) = files.get_mut(fd) {
         if slot.is_some() {
+            if let Some(FileEntry::Pipe(child)) = slot {
+                let _ = child.wait();
+            }
             *slot = None;
         }
     }
@@ -432,6 +440,20 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
                             out.push(read_format(l, &mut lock, f)?);
                         }
                     }
+                    // io.popen("cmd", "r"): read the child's stdout.
+                    Some(FileEntry::Pipe(child)) => match child.stdout.as_mut() {
+                        Some(stdout) => {
+                            let mut r = BufReader::new(stdout);
+                            for f in fmts {
+                                out.push(read_format(l, &mut r, f)?);
+                            }
+                        }
+                        None => {
+                            for _ in &fmts {
+                                out.push(LuaValue::NIL);
+                            }
+                        }
+                    },
                     // LuaJIT: reading a write-mode handle yields nil (EOF).
                     Some(FileEntry::Write(_) | FileEntry::Stdout | FileEntry::Stderr) => {
                         for _ in &fmts {
@@ -469,6 +491,23 @@ fn do_read(l: &mut LuaState, fd: Option<usize>, first_fmt: usize) -> LuaResult<i
                     let mut lock = stdin.lock();
                     for f in fmts {
                         out.push(read_format(l, &mut lock, f)?);
+                    }
+                }
+                // io.popen("cmd", "r"): read the child's stdout.
+                Some(FileEntry::Pipe(child)) => {
+                    match child.stdout.as_mut() {
+                        Some(stdout) => {
+                            let mut r = BufReader::new(stdout);
+                            for f in fmts {
+                                out.push(read_format(l, &mut r, f)?);
+                            }
+                        }
+                        // Write-mode pipe ("w"): nothing to read.
+                        None => {
+                            for _ in &fmts {
+                                out.push(LuaValue::NIL);
+                            }
+                        }
                     }
                 }
                 Some(FileEntry::Write(_) | FileEntry::Stdout | FileEntry::Stderr) => {
@@ -529,6 +568,11 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
                             .try_for_each(|c| so.write_all(c))
                             .and_then(|_| so.flush())
                     }
+                    // io.popen("cmd", "w"): write to the child's stdin.
+                    Some(FileEntry::Pipe(child)) => match child.stdin.as_mut() {
+                        Some(stdin) => chunks.iter().try_for_each(|c| stdin.write_all(c)),
+                        None => return ret_fail3(l, "file not opened for writing"),
+                    },
                     Some(FileEntry::Read(_) | FileEntry::Stdin) => {
                         // LuaJIT: writing a read-mode handle returns
                         // (nil, msg, errno) instead of raising.
@@ -565,6 +609,11 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
                         .try_for_each(|c| se.write_all(c))
                         .and_then(|_| se.flush())
                 }
+                // io.popen("cmd", "w"): write to the child's stdin.
+                Some(FileEntry::Pipe(child)) => match child.stdin.as_mut() {
+                    Some(stdin) => chunks.iter().try_for_each(|c| stdin.write_all(c)),
+                    None => return ret_fail3(l, "file not opened for writing"),
+                },
                 Some(FileEntry::Read(_) | FileEntry::Stdin) => {
                     // LuaJIT: writing a read-mode handle returns
                     // (nil, msg, errno) instead of raising.
@@ -1034,6 +1083,7 @@ pub fn open(l: &mut LuaState) {
     let fde = registry_put(l, FileEntry::Stderr);
     let io_tab = lual_reg!(l, b"io", LibTarget::Global)
         .func(b"open", io_open)
+        .func(b"popen", io_popen)
         .func(b"tmpfile", io_tmpfile)
         .func(b"read", io_read)
         .func(b"write", io_write)
@@ -1058,6 +1108,54 @@ pub fn open(l: &mut LuaState) {
     // the standard stream.
     l.global().default_input = Some(fdi);
     l.global().default_output = Some(fdo);
+}
+
+fn io_popen(l: &mut LuaState) -> LuaResult<i32> {
+    let fname = str_arg(l, 0, "io.popen")?;
+    let mode = if lua_gettop(l) >= 2 {
+        String::from_utf8_lossy(str_arg(l, 1, "io.popen")?).into_owned()
+    } else {
+        "r".to_string()
+    };
+    let m = mode.trim_end_matches('b');
+    let mut cmd = std::process::Command::new(shell_for_popen());
+    cmd.arg(shell_flag_for_popen()).arg(String::from_utf8_lossy(fname).into_owned());
+    match m {
+        // "r": capture the child's stdout on the handle.
+        "r" => cmd.stdout(std::process::Stdio::piped()).stdin(std::process::Stdio::null()),
+        // "w": the handle feeds the child's stdin.
+        "w" => cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()),
+        _ => return ret_fail(l, &format!("invalid mode '{}'", mode)),
+    };
+    match cmd.spawn() {
+        Ok(child) => {
+            let id = registry_put(l, FileEntry::Pipe(child));
+            let h = new_handle(l, id);
+            push(l, h);
+            Ok(1)
+        }
+        Err(e) => ret_fail3(l, &format!("{}: {}", String::from_utf8_lossy(fname), e)),
+    }
+}
+
+/// The shell `io.popen` runs its command through. Windows uses `cmd /C`,
+/// everything else uses `sh -c` (LuaJIT's `popen`/`_popen`).
+#[cfg(target_os = "windows")]
+fn shell_for_popen() -> &'static str {
+    "cmd"
+}
+#[cfg(not(target_os = "windows"))]
+fn shell_for_popen() -> &'static str {
+    "sh"
+}
+
+#[cfg(target_os = "windows")]
+fn shell_flag_for_popen() -> &'static str {
+    "/C"
+}
+#[cfg(not(target_os = "windows"))]
+fn shell_flag_for_popen() -> &'static str {
+    "-c"
 }
 
 fn io_tmpfile(l: &mut LuaState) -> LuaResult<i32> {
