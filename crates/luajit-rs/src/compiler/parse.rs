@@ -1669,14 +1669,7 @@ impl<'a> Parser<'a> {
         // every weak-table key). Clear the block's temp range on exit,
         // *after* UCLO so closed upvalues keep their values.
         let max_fr = bl.max_freereg;
-        // Inside a loop body the temporaries are rewritten every iteration;
-        // clearing them on the hot path is wasted work. Defer the KNIL to
-        // the loop's end: the enclosing loop scope (FSCOPE_LOOP) emits it
-        // once after the back-edge, so GC never sees stale loop temps
-        // (which would wrongly pin weak-table keys). Non-loop scopes clear
-        // inline as before.
-        let in_loop = self.cur().scopes.iter().any(|s| (s.flags & FSCOPE_LOOP) != 0);
-        if max_fr > nactvar && !in_loop {
+        if max_fr > nactvar {
             self.cur_mut().freereg = nactvar;
             self.bcemit_ad(BCOp::KNIL, nactvar, max_fr - 1);
         }
