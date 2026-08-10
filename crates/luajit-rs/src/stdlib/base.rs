@@ -346,6 +346,11 @@ fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
         return Err(l.runtime_error(b"cannot change a protected metatable"));
     }
     tab.as_mut().metatable = mt.as_table();
+    // Traces may have specialized table stores to this metatable's
+    // `__newindex` (or its absence); flag invalidation so the next trace
+    // entry flushes them (deferred — setmetatable may run inside a trace,
+    // where freeing the registry underneath it would crash).
+    l.global().jit.invalidate_all = true;
     push(l, t);
     Ok(1)
 }

@@ -87,6 +87,9 @@ pub fn trace_exec(l: &mut LuaState, base: usize, traceno: TraceNo) -> ExitResult
     // Current frame base: recursive traces (Uprec/Tailrec) and Root
     // links into call frames shift it as frames are pushed on trace.
     let mut cbase = base;
+    // A metatable was changed while a previous trace ran: the interpreter's
+    // JFORL/JLOOP entry flushed everything and reverted the loop bytecode,
+    // so no live trace is being entered here.
     let r = loop {
         // The recursive machine-code tails check their stack headroom
         // against this bound (re-bound each iteration: growth happens

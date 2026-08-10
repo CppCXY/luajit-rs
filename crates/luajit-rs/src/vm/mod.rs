@@ -2599,6 +2599,21 @@ impl Interp {
                     forl_body!(ins, a);
                 }
                 BCOp::JFORL => {
+                    // A setmetatable call flagged invalidation (the trace
+                    // specialized to a metatable's `__newindex`, which may
+                    // have changed). Flush now — this JFORL entry runs in
+                    // the interpreter, before any trace mcode is entered, so
+                    // freeing the registry is safe. trace_flush_all reverted
+                    // the JFORL in place to the original FORL; re-read it
+                    // and take its loop-back jump.
+                    if self.l().global().jit.invalidate_all {
+                        self.l().global().jit.invalidate_all = false;
+                        crate::jit::trace_flush_all(self.l());
+                        let reverted = unsafe { *ip.sub(1) };
+                        let a2 = bc_a(reverted);
+                        forl_body!(reverted, a2);
+                        continue;
+                    }
                     // IFORL semantics; on loop-taken enter the compiled
                     // trace (the dasc VMs dispatch to BC_JLOOP).
                     let i = fr.reg(a + FORL_IDX).num();

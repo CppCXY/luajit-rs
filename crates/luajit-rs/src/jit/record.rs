@@ -1530,13 +1530,27 @@ impl Record {
         let Some(t) = tabv.as_table() else {
             return Err(TraceError::NYIBC);
         };
-        if t.as_ref().metatable.is_some() {
-            return Err(TraceError::NYIBC); // __newindex / protected path NYI.
-        }
         if keyv.is_nil() {
             return Err(TraceError::NYIBC); // Runtime error path.
         }
-        self.meta_guard(tab);
+        // A metatable with no `__newindex` still allows the raw store
+        // (LuaJIT: hasmm == 0 -> HSTORE); only abort when `__newindex`
+        // exists. The interpreter's TSET path only consults the metatable
+        // for `__newindex`; with it absent the store is always raw, so no
+        // runtime metatable guard is needed (the record-time check below
+        // pins it).
+        let mt = t.as_ref().metatable;
+        if let Some(mt) = mt {
+            let g = l.global();
+            let nidx = g.mmname[crate::meta::MM::Newindex as usize];
+            if !mt.as_ref().get_str(nidx).is_nil() {
+                return Err(TraceError::NYIBC); // __newindex path NYI.
+            }
+        } else {
+            // No metatable at all: guard it stays nil (a hot loop may
+            // setmetatable mid-flight).
+            self.meta_guard(tab);
+        }
         // GC-debt guard before the store: the store may grow the table,
         // and a compiled loop otherwise never reaches a GC safe point.
         // Emitting it here (before the side effect) means a GC exit
