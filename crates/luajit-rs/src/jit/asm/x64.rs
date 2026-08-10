@@ -484,6 +484,7 @@ impl<'a> Asm<'a> {
                 }
                 IROp::ALOAD => self.asm_aload(&ins)?,
                 IROp::ASTORE => self.asm_astore(&ins)?,
+                IROp::FSTORE => self.asm_fstore(&ins)?,
                 IROp::GCSTEP => self.asm_gcstep(&ins),
                 IROp::POW => self.asm_pow(&ins)?,
                 IROp::TOBIT => self.asm_tobit(&ins)?,
@@ -834,12 +835,16 @@ impl<'a> Asm<'a> {
             rec::IRCALL_STR_SUB => exec::jit_str_sub as *const () as u64,
             rec::IRCALL_VARG => exec::jit_varg as *const () as u64,
             rec::IRCALL_STR_CHAR => exec::jit_str_char as *const () as u64,
+            rec::IRCALL_STR_UPPER => exec::jit_str_upper as *const () as u64,
+            rec::IRCALL_STR_LOWER => exec::jit_str_lower as *const () as u64,
+            rec::IRCALL_STR_REVERSE => exec::jit_str_reverse as *const () as u64,
             rec::IRCALL_TAB_LEN => exec::jit_alen as *const () as u64,
             rec::IRCALL_TAB_CONCAT => exec::jit_tconcat as *const () as u64,
             rec::IRCALL_CAT => exec::jit_cat as *const () as u64,
             rec::IRCALL_USET => exec::jit_uset as *const () as u64,
             rec::IRCALL_TOSTR_NUM => exec::jit_tostr_num as *const () as u64,
             rec::IRCALL_FFI => crate::ffi::lib::jit_ffi_call as *const () as u64,
+            rec::IRCALL_STRFMT => exec::jit_strfmt as *const () as u64,
             _ => unreachable!("bad IRCALL index"),
         };
         match rec::ircall_arity(idx) {
@@ -1087,6 +1092,25 @@ impl<'a> Asm<'a> {
         } else {
             self.gpr_load_ref(RDX, val);
             self.mov_sib_r64(RAX, RCX, RDX);
+        }
+        Ok(())
+    }
+
+    /// FSTORE: inlined setmetatable — store the metatable pointer (op2,
+    /// nil for `setmetatable(t, nil)`) into `tab->metatable` (IRFL_TAB_META).
+    fn asm_fstore(&mut self, ins: &IRIns) -> Result<(), TraceError> {
+        const META_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
+        self.gpr_load_ref(RAX, ins.op1 as IRRef);
+        self.mov_r64_imm64(RCX, crate::value::LJ_GCVMASK);
+        self.and_rr64(RAX, RCX); // NaN-boxed table value -> pointer.
+        if ins.op2 == 0 {
+            self.mov_r64_imm64(RCX, 0);
+            self.mov_mem_r64(RAX, META_OFF, RCX);
+        } else {
+            self.gpr_load_ref(RDX, ins.op2 as IRRef);
+            self.mov_r64_imm64(RCX, crate::value::LJ_GCVMASK);
+            self.and_rr64(RDX, RCX); // NaN-boxed metatable -> pointer.
+            self.mov_mem_r64(RAX, META_OFF, RDX);
         }
         Ok(())
     }

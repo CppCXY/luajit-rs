@@ -473,32 +473,37 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
         let cell_addrs = (js.stack_end_cell_addr(), js.exit_base_cell_addr());
         #[cfg(target_arch = "wasm32")]
         let cell_addrs = (0u64, 0u64);
-        if !js.no_asm
-            && let Ok((mc, inner, tails)) =
-                asm::assemble(&trace, link_target, arch, cell_addrs.0, cell_addrs.1)
-        {
-            if js.trace_dump {
-                eprintln!(
-                    "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",
-                    trace.traceno,
-                    mc.ptr(),
-                    mc.len(),
-                    inner,
-                    trace
-                        .startpt
-                        .as_ref()
-                        .lines
-                        .get(trace.startpc)
-                        .copied()
-                        .unwrap_or(0),
-                    trace.root,
-                    trace.link,
-                    trace.linktype,
-                );
+        let asm_result = if !js.no_asm {
+            asm::assemble(&trace, link_target, arch, cell_addrs.0, cell_addrs.1)
+        } else {
+            Err(TraceError::NYIBC)
+        };
+        match asm_result {
+            Ok((mc, inner, tails)) => {
+                if js.trace_dump {
+                    eprintln!(
+                        "TRACE {} mcode {:p}+{:#x} inner={:#x} line={} root={} link={} {:?}",
+                        trace.traceno,
+                        mc.ptr(),
+                        mc.len(),
+                        inner,
+                        trace
+                            .startpt
+                            .as_ref()
+                            .lines
+                            .get(trace.startpc)
+                            .copied()
+                            .unwrap_or(0),
+                        trace.root,
+                        trace.link,
+                        trace.linktype,
+                    );
+                }
+                trace.mcode = Some(mc);
+                trace.inner_ofs = inner;
+                trace.stub_tails = tails;
             }
-            trace.mcode = Some(mc);
-            trace.inner_ofs = inner;
-            trace.stub_tails = tails;
+            Err(_e) => {}
         }
         trace
     };
@@ -726,6 +731,33 @@ fn blacklist_pc(pt: GcPtr<Proto>, pc: usize) {
 /// re-created each iteration defeats the closure-identity guard). The trace
 /// entry and its machine code are kept alive (the bytecode no longer enters
 /// them) so in-flight executions and linked exits stay resolvable.
+/// Flush every compiled trace: revert the patched loop bytecode (JFORL ->
+/// FORL, JLOOP -> LOOP, JITERL -> ITERL, JFUNCF -> FUNCF) and drop the
+/// trace registry. Used by setmetatable (metatable change) so a trace that
+/// specialized to a metatable's `__newindex` observes the new one.
+pub fn trace_flush_all(l: &mut LuaState) {
+    let g = l.global();
+    let js = &mut g.jit;
+    let mut revert: Vec<(GcPtr<crate::proto::Proto>, usize, bc::BCIns)> = Vec::new();
+    for tr in js.trace.iter() {
+        if let Some(tr) = tr {
+            if tr.root == 0 {
+                revert.push((tr.startpt, tr.startpc, tr.startins));
+            }
+        }
+    }
+    for slot in js.trace.iter_mut() {
+        *slot = None;
+    }
+    for (pt, pc, ins) in revert {
+        if bc_op(ins) == BCOp::FORL {
+            let fori = (pc as i64 + bc_j(ins)) as usize;
+            setbc_op(&mut pt.as_mut().bc[fori], BCOp::FORI as u32);
+        }
+        pt.as_mut().bc[pc] = ins;
+    }
+}
+
 pub fn trace_flush_blacklist(l: &mut LuaState, traceno: TraceNo) {
     let g = l.global();
     let js = &mut g.jit;

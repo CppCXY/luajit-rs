@@ -96,7 +96,103 @@ pub struct LuaClosure {
     /// Environment table for global accesses (GGET/GSET).
     pub env: GcPtr<LuaTable>,
     /// Upvalue objects (`uvptr`), shared between closures.
-    pub upvals: Vec<GcPtr<Upval>>,
+    pub upvals: Upvals,
+}
+
+/// Inline capacity for a Lua closure's upvalue references.
+const INLINE_UV: usize = 4;
+
+/// Upvalue references of a Lua closure. Up to `INLINE_UV` are stored inline
+/// (no heap allocation); beyond that they spill to a heap `Vec`. Mirrors
+/// LuaJIT's inline `uvptr` array inside `GCfuncL` — a hot
+/// `function() ... end` loop then makes no per-closure upvalue allocation.
+pub enum Upvals {
+    /// Few upvalues: stored inline, no heap allocation.
+    Inline {
+        n: u8,
+        uv: [GcPtr<Upval>; INLINE_UV],
+    },
+    /// More than `INLINE_UV` upvalues: spilled to the heap.
+    Heap(Vec<GcPtr<Upval>>),
+}
+
+impl Upvals {
+    pub fn empty() -> Upvals {
+        Upvals::Inline {
+            n: 0,
+            uv: [GcPtr::new(NonNull::dangling()); INLINE_UV],
+        }
+    }
+    pub fn from_vec(v: Vec<GcPtr<Upval>>) -> Upvals {
+        if v.len() <= INLINE_UV {
+            let mut uv = [GcPtr::new(NonNull::dangling()); INLINE_UV];
+            for (i, &p) in v.iter().enumerate() {
+                uv[i] = p;
+            }
+            Upvals::Inline { n: v.len() as u8, uv }
+        } else {
+            Upvals::Heap(v)
+        }
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Upvals::Inline { n, .. } => *n as usize,
+            Upvals::Heap(v) => v.len(),
+        }
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<&GcPtr<Upval>> {
+        match self {
+            Upvals::Inline { uv, .. } => uv.get(i),
+            Upvals::Heap(v) => v.get(i),
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &GcPtr<Upval>> {
+        match self {
+            Upvals::Inline { n, uv } => uv[..*n as usize].iter(),
+            Upvals::Heap(v) => v.iter(),
+        }
+    }
+    pub fn as_slice(&self) -> &[GcPtr<Upval>] {
+        match self {
+            Upvals::Inline { n, uv } => &uv[..*n as usize],
+            Upvals::Heap(v) => v,
+        }
+    }
+    pub fn push(&mut self, v: GcPtr<Upval>) {
+        match self {
+            Upvals::Inline { n, uv } => {
+                let ni = *n as usize;
+                if ni < INLINE_UV {
+                    uv[ni] = v;
+                    *n += 1;
+                } else {
+                    let mut heap = uv[..INLINE_UV].to_vec();
+                    heap.push(v);
+                    *self = Upvals::Heap(heap);
+                }
+            }
+            Upvals::Heap(heap) => heap.push(v),
+        }
+    }
+}
+
+impl Default for Upvals {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::ops::Index<usize> for Upvals {
+    type Output = GcPtr<Upval>;
+    fn index(&self, i: usize) -> &GcPtr<Upval> {
+        &self.as_slice()[i]
+    }
 }
 
 /// A builtin implemented in Rust, corresponding to LuaJIT's `GCfuncC`.

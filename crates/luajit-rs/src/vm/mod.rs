@@ -594,6 +594,18 @@ enum Flow {
     Rec,
 }
 
+/// Result of the inlined `call_lua_fast` frame switch (shared by BC_CALL
+/// and BC_CALLM).
+enum CallFast {
+    /// Fast path applied: keep dispatching in the callee frame.
+    Applied,
+    /// Fast path applied, but the dispatcher must return (trace enter or a
+    /// hot call started recording).
+    Trace(Flow),
+    /// Callee is not a plain fixed-arity Lua function: use `do_call`.
+    Slow,
+}
+
 /// The interpreter's register window over the Lua stack: `(sp, base)`
 /// standing for LuaJIT's BASE pointer (`sp + base`). A value type, so the
 /// dispatch loop keeps it in registers; recreate it from the interpreter
@@ -1342,8 +1354,11 @@ impl Interp {
             }
             let ins = unsafe { *ip };
             ip = unsafe { ip.add(1) };
-            // Always keep debug_pc current so error messages have source info.
-            self.l().debug_pc = unsafe { ip.offset_from(self.bcp) as usize };
+            // `debug_pc` is flushed lazily at the points that read it
+            // (error raises, metamethod calls, sync to C) — not every
+            // instruction — so the hot dispatch keeps `pc` in a register
+            // (LuaJIT's interpreter tracks PC in a register and only
+            // materializes it for error reporting).
             let a = bc_a(ins);
             match bc_op(ins) {
                 // -- Comparisons (ORDER matters; see bc.rs) --
@@ -2179,105 +2194,53 @@ impl Interp {
                     // Fast path (LuaJIT's ins_call): a Lua callee switches
                     // frames right here — one store for the frame link, no
                     // sync round-trip. C callees and vararg protos go slow.
-                    let f = fr.reg(a);
-                    if let Some(gf) = f.as_func()
-                        && let GcFunc::Lua(cl) = gf.as_ref()
-                    {
-                        // "call" hook event (Lua 5.1 fires it only for Lua
-                        // callees, not C functions — a C call like
-                        // collectgarbage() must not trip the hook).
-                        if self.l().hookmask & HOOKMASK_CALL != 0 && !self.l().hook_active {
-                            sync!();
-                            self.hook_event("call")?;
-                            resync!();
-                        }
-                        let ptref = cl.proto;
-                        let pt = cl.proto.as_ref();
-                        if (pt.flags & PROTO_VARARG) == 0 {
-                            let nargs = bc_c(ins) as usize - 1;
-                            let fs = pt.framesize as usize;
-                            let need = fr.cur_base() + a as usize + 2 + fs + 8;
-                            // LuaJIT `lj_checkstack`: unbounded Lua recursion
-                            // (e.g. `function y() y() end`) must raise a Lua
-                            // error, not grow the stack past its limit.
-                            if need > self.l().max_stack() {
-                                sync!();
-                                return Err(self.l().runtime_error(b"stack overflow"));
-                            }
-                            if need > self.l().stack.len() {
-                                sync!();
-                                self.l().stack_ensure(need);
-                                self.sp = self.l().stack.as_mut_ptr();
-                                resync!();
-                            }
-                            let newfr = Frame::new(self.sp, fr.cur_base() + a as usize + 2);
-                            newfr.set_abs(
-                                fr.cur_base() + a as usize + 1,
-                                LuaValue::from_bits(ip as u64),
-                            );
-                            for i in nargs..pt.numparams as usize {
-                                newfr.set(i as u32, LuaValue::NIL);
-                            }
-                            fr = newfr;
-                            ip = unsafe { pt.bc.as_ptr().add(1) };
-                            self.cl = gf;
-                            self.bcp = pt.bc.as_ptr();
-                            self.knp = pt.kn.as_ptr();
-                            self.ksp = pt.kstrv.as_ptr();
-                            self.l().top = fr.cur_base() + pt.framesize as usize;
-                            self.l().frame_top = self.l().top;
-                            let head = pt.bc[0];
-                            // A compiled callee (JFUNCF): enter its trace
-                            // from the fresh frame.
-                            if !REC && bc_op(head) == BCOp::JFUNCF {
-                                sync!();
-                                let r = trace_exec(self.l(), self.base, bc_d(head));
-                                self.sp = self.l().stack.as_mut_ptr();
-                                if r.stack_overflow {
-                                    return Err(self.l().runtime_error(b"stack overflow"));
-                                }
-                                self.pc = r.pc;
-                                if r.baseslot != 2 {
-                                    self.trace_exit_frame(r.baseslot);
-                                } else {
-                                    fr = Frame::new(self.sp, self.base);
-                                    self.reload_at(fr);
-                                    self.l().top = self.base + self.proto().framesize as usize;
-                                }
-                                if self.rec_started() {
-                                    return Ok(Flow::Rec); // Hot exit side trace.
-                                }
-                                self.gc_check(self.l().frame_top)?;
-                                resync!();
-                                continue;
-                            }
-                            // hotcall (vm_hotcall): count the FUNCF header.
-                            // The other Lua-entry paths do not count until
-                            // call recording lands (Phase 3).
-                            if !REC
-                                && bc_op(head) == BCOp::FUNCF
-                                && self.hot_count(ip as usize, HOTCOUNT_CALL)
-                            {
-                                sync!();
-                                if self.hot_call(ptref) {
-                                    // Record from the callee's first ins.
-                                    return Ok(Flow::Rec);
-                                }
-                                resync!();
-                            }
+                    let nargs = bc_c(ins) as usize - 1;
+                    match self.call_lua_fast::<REC>(a, nargs, fr, ip)? {
+                        (nf, nip, CallFast::Applied) => {
+                            fr = nf;
+                            ip = nip;
                             continue;
                         }
+                        (nf, nip, CallFast::Trace(f)) => {
+                            fr = nf;
+                            ip = nip;
+                            return Ok(f);
+                        }
+                        (nf, nip, CallFast::Slow) => {
+                            fr = nf;
+                            ip = nip;
+                            sync!();
+                            self.do_call(a, nargs, bc_b(ins) as i32 - 1)?;
+                            resync!();
+                        }
                     }
-                    let nargs = bc_c(ins) as usize - 1;
-                    sync!();
-                    self.do_call(a, nargs, bc_b(ins) as i32 - 1)?;
-                    resync!();
                 }
                 BCOp::CALLM => {
+                    // BC_CALLM: the callee's argument count includes the
+                    // results of the previous multi-return call (`multres`).
+                    // Plain Lua callees take the same inline fast path as
+                    // BC_CALL (a previous call's results already sit in the
+                    // right argument slots); only the arg count differs.
                     let nargs = bc_c(ins) as usize + self.multres;
-                    sync!();
-                    self.do_call(a, nargs, bc_b(ins) as i32 - 1)?;
-                    resync!();
+                    match self.call_lua_fast::<REC>(a, nargs, fr, ip)? {
+                        (nf, nip, CallFast::Applied) => {
+                            fr = nf;
+                            ip = nip;
+                            continue;
+                        }
+                        (nf, nip, CallFast::Trace(f)) => {
+                            fr = nf;
+                            ip = nip;
+                            return Ok(f);
+                        }
+                        (nf, nip, CallFast::Slow) => {
+                            fr = nf;
+                            ip = nip;
+                            sync!();
+                            self.do_call(a, nargs, bc_b(ins) as i32 - 1)?;
+                            resync!();
+                        }
+                    }
                 }
                 BCOp::CALLT => {
                     // Fast path: Lua callee, no vararg frame on either side
@@ -2599,6 +2562,32 @@ impl Interp {
                     forl_body!(ins, a);
                 }
                 BCOp::JFORL => {
+                    // A setmetatable call flagged invalidation (the trace
+                    // specialized to a metatable's `__newindex`, which may
+                    // have changed). Flush now — this JFORL entry runs in
+                    // the interpreter, before any trace mcode is entered, so
+                    // freeing the registry is safe. trace_flush_all reverted
+                    // the JFORL in place to the original FORL; re-read it
+                    // and take its loop-back jump.
+                    if self.l().global().jit.invalidate_all {
+                        self.l().global().jit.invalidate_all = false;
+                        crate::jit::trace_flush_all(self.l());
+                        #[cfg(debug_assertions)]
+                        eprintln!("JFORL invalidate flush at pc={}", self.l().debug_pc);
+                        // Reset the loop's hot counter so it won't instantly
+                        // re-record (and re-flush) on every setmetatable — a
+                        // loop that mutates metatables each iteration can
+                        // never produce a stable trace. The interpreted loop
+                        // runs until hotcount accumulates again.
+                        let reset =
+                            (self.l().global().jit.param(crate::jit::JitParam::HotLoop) as u32
+                                * crate::jit::HOTCOUNT_LOOP as u32) as crate::jit::HotCount;
+                        self.l().global().jit.hotcount_set(ip as usize, reset);
+                        let reverted = unsafe { *ip.sub(1) };
+                        let a2 = bc_a(reverted);
+                        forl_body!(reverted, a2);
+                        continue;
+                    }
                     // IFORL semantics; on loop-taken enter the compiled
                     // trace (the dasc VMs dispatch to BC_JLOOP).
                     let i = fr.reg(a + FORL_IDX).num();
@@ -2924,6 +2913,7 @@ impl Interp {
     /// frame link — were restored from the snapshot) and reload the
     /// interpreter for that frame's closure.
     #[cold]
+    #[inline(never)]
     fn trace_exit_frame(&mut self, baseslot: usize) {
         self.base += baseslot - 2;
         self.reload_at(Frame::new(self.sp, self.base));
@@ -2998,6 +2988,7 @@ impl Interp {
 
     /// BC_CAT: string concatenation through the `__concat` metamethod path.
     #[cold]
+    #[inline(never)]
     fn op_cat(&mut self, a: u32, b: u32, c: u32) -> LuaResult<LuaValue> {
         self.gc_check(self.base + a as usize + 1)?;
         self.meta_cat(b, c)
@@ -3005,6 +2996,7 @@ impl Interp {
 
     /// BC_TDUP: clone the template table in `kgc[d]`.
     #[cold]
+    #[inline(never)]
     fn op_tdup(&mut self, a: u32, d: u32) -> LuaResult<LuaValue> {
         self.gc_check(self.base + a as usize + 1)?;
         let templ = match &self.proto().kgc[d as usize] {
@@ -3017,12 +3009,14 @@ impl Interp {
 
     /// BC_UCLO: close open upvalues at or above the register `a`.
     #[cold]
+    #[inline(never)]
     fn op_uclo(&mut self, a: u32) {
         self.close_upvals(self.base + a as usize);
     }
 
     /// BC_FNEW: allocate a new closure from the prototype in `kgc[d]`.
     #[cold]
+    #[inline(never)]
     fn op_fnew(&mut self, a: u32, d: u32) -> LuaResult<LuaValue> {
         self.gc_check(self.base + a as usize + 1)?;
         Ok(self.new_closure(d))
@@ -3032,6 +3026,7 @@ impl Interp {
     /// between the vararg frame and the frame below it; their extent is
     /// recovered from the FRAME_VARG delta, LuaJIT-style.
     #[cold]
+    #[inline(never)]
     fn op_varg(&mut self, a: u32, b: u32) {
         let base = self.base;
         let link = self.at(base - 1).to_bits();
@@ -3121,6 +3116,175 @@ impl Interp {
 
     // -- Calls -----------------------------------------------------------
 
+    /// `sync!` for a helper that receives the frame/ip as parameters.
+    #[inline(always)]
+    fn sync_fr(&mut self, fr: Frame, ip: *const BCIns) {
+        self.base = fr.cur_base();
+        self.pc = unsafe { ip.offset_from(self.bcp) as usize };
+        self.l().debug_pc = self.pc;
+        self.l().base = self.base;
+    }
+
+    /// `resync!` for a helper: rebuild the frame/ip locals from the synced
+    /// fields (returns them by value so the loop can keep them in
+    /// registers).
+    #[inline(always)]
+    fn resync_fr(&mut self) -> (Frame, *const BCIns) {
+        (
+            Frame::new(self.sp, self.base),
+            unsafe { self.bcp.add(self.pc) },
+        )
+    }
+
+    /// Inline fast path shared by BC_CALL and BC_CALLM (LuaJIT's
+    /// `ins_call`): a plain (non-vararg) Lua callee switches frames right
+    /// here — one store for the frame link, no sync round-trip. C callees
+    /// and vararg protos fall back to `do_call`.
+    #[allow(clippy::too_many_arguments)]
+    fn call_lua_fast<const REC: bool>(
+        &mut self,
+        a: u32,
+        nargs: usize,
+        mut fr: Frame,
+        mut ip: *const BCIns,
+    ) -> LuaResult<(Frame, *const BCIns, CallFast)> {
+        let f = fr.reg(a);
+        let Some(gf) = f.as_func() else {
+            return Ok((fr, ip, CallFast::Slow));
+        };
+        let GcFunc::Lua(cl) = gf.as_ref() else {
+            return Ok((fr, ip, CallFast::Slow));
+        };
+        // "call" hook event (Lua 5.1 fires it only for Lua callees, not C
+        // functions — a C call like collectgarbage() must not trip it).
+        if self.l().hookmask & HOOKMASK_CALL != 0 && !self.l().hook_active {
+            self.sync_fr(fr, ip);
+            self.hook_event("call")?;
+            (fr, ip) = self.resync_fr();
+        }
+        let ptref = cl.proto;
+        let pt = cl.proto.as_ref();
+        let fs = pt.framesize as usize;
+        let numparams = pt.numparams as usize;
+        let callbase = fr.cur_base() + a as usize + 2;
+        let is_vararg = (pt.flags & PROTO_VARARG) != 0;
+        // FUNCV shifts the fixed params up past the varargs, so its frame
+        // base sits above the vararg area; FUNCF reuses the call slot.
+        let newbase = if is_vararg {
+            callbase + nargs + 2
+        } else {
+            callbase
+        };
+        let need = if is_vararg {
+            newbase + numparams + fs + 16
+        } else {
+            callbase + fs + 8
+        };
+        // LuaJIT `lj_checkstack`: unbounded Lua recursion
+        // (e.g. `function y() y() end`) must raise a Lua error, not grow
+        // the stack past its limit.
+        if need > self.l().max_stack() {
+            self.sync_fr(fr, ip);
+            return Err(self.l().runtime_error(b"stack overflow"));
+        }
+        if need > self.l().stack.len() {
+            self.sync_fr(fr, ip);
+            self.l().stack_ensure(need);
+            self.sp = self.l().stack.as_mut_ptr();
+            (fr, ip) = self.resync_fr();
+        }
+        // The caller's frame link (return PC) always sits at `callbase - 1`;
+        // a vararg callee chains its FRAME_VARG link on top of it.
+        self.set_at(callbase - 1, LuaValue::from_bits(ip as u64));
+        if is_vararg {
+            // FUNCV: shift the fixed params up past the varargs and chain a
+            // vararg frame back to the one holding the real link.
+            self.set_at(newbase - 2, LuaValue::func(gf));
+            for i in 0..numparams {
+                let v = if i < nargs { self.at(callbase + i) } else { LuaValue::NIL };
+                self.set_at(newbase + i, v);
+            }
+            let delta = (newbase - callbase) as u64;
+            self.set_at(newbase - 1, LuaValue::from_bits((delta << 3) | FRAME_VARG));
+            self.base = newbase;
+            // Set TOP to the new frame before anything below may run GC
+            // (alloc_table for the implicit `arg` table steps the collector,
+            // which clears slots above TOP — the just-copied params would be
+            // wiped while TOP still pointed at the caller's frame).
+            self.l().top = newbase + fs;
+            self.l().frame_top = self.l().top;
+            // Lua 5.1 LUA_COMPAT_VARARG: build the implicit `arg` local
+            // ({varargs..., n = count}) unless the body uses `...` itself.
+            if (pt.flags & PROTO_VARARG_NEEDSARG) != 0 {
+                let nvar = nargs.saturating_sub(numparams);
+                let l = self.l();
+                let tab = l
+                    .heap()
+                    .alloc_table(crate::table::LuaTable::new(nvar as u32, 1));
+                for i in 0..nvar {
+                    tab.as_mut()
+                        .set_int(i as i32 + 1, self.at(callbase + numparams + i));
+                }
+                let nsid = l.heap().intern(b"n");
+                tab.as_mut()
+                    .set(l.heap().str_value(nsid), LuaValue::number(nvar as f64));
+                self.set_at(newbase + numparams, LuaValue::table(tab));
+            } else {
+                self.set_at(newbase + numparams, LuaValue::NIL);
+            }
+        } else {
+            for i in nargs..numparams {
+                self.set_at(callbase + i, LuaValue::NIL);
+            }
+            self.base = callbase;
+        }
+        fr = Frame::new(self.sp, self.base);
+        ip = unsafe { pt.bc.as_ptr().add(1) };
+        self.cl = gf;
+        self.bcp = pt.bc.as_ptr();
+        self.knp = pt.kn.as_ptr();
+        self.ksp = pt.kstrv.as_ptr();
+        self.l().top = fr.cur_base() + fs;
+        self.l().frame_top = self.l().top;
+        let head = pt.bc[0];
+        // A compiled callee (JFUNCF): enter its trace from the fresh frame.
+        if !REC && bc_op(head) == BCOp::JFUNCF {
+            self.sync_fr(fr, ip);
+            let r = trace_exec(self.l(), self.base, bc_d(head));
+            self.sp = self.l().stack.as_mut_ptr();
+            if r.stack_overflow {
+                return Err(self.l().runtime_error(b"stack overflow"));
+            }
+            self.pc = r.pc;
+            if r.baseslot != 2 {
+                self.trace_exit_frame(r.baseslot);
+            } else {
+                fr = Frame::new(self.sp, self.base);
+                self.reload_at(fr);
+                self.l().top = self.base + self.proto().framesize as usize;
+            }
+            if self.rec_started() {
+                return Ok((fr, ip, CallFast::Trace(Flow::Rec))); // Hot exit side trace.
+            }
+            self.gc_check(self.l().frame_top)?;
+            (fr, ip) = self.resync_fr();
+            return Ok((fr, ip, CallFast::Applied));
+        }
+        // hotcall (vm_hotcall): count the FUNCF header.
+        if !REC
+            && bc_op(head) == BCOp::FUNCF
+            && self.hot_count(ip as usize, HOTCOUNT_CALL)
+        {
+            self.sync_fr(fr, ip);
+            if self.hot_call(ptref) {
+                return Ok((fr, ip, CallFast::Trace(Flow::Rec))); // Record from callee.
+            }
+            (fr, ip) = self.resync_fr();
+        }
+        Ok((fr, ip, CallFast::Applied))
+    }
+
+    #[inline(never)]
     fn do_call(&mut self, a: u32, nargs: usize, want: i32) -> LuaResult<()> {
         let func_slot = self.base + a as usize;
         let mut nargs = nargs;
@@ -3168,6 +3332,7 @@ impl Interp {
     /// A C function called from a Lua frame yielded (`coroutine.yield`):
     /// capture the resume point. Yield values move to `func_slot`.
     #[cold]
+    #[inline(never)]
     fn suspend_call(&mut self, func_slot: usize, want: i32) -> LuaError {
         let ny = self.l().nyield as usize;
         // A yield through pcall/xpcall rewrote the suspend with the
@@ -3366,6 +3531,7 @@ impl Interp {
     /// as in LuaJIT's BC_RET: the caller base, wanted results and result
     /// slot all come from the CALL instruction at the stored return PC.
     /// Returns `Some(n)` when a host (`FRAME_C`) entry returns.
+    #[inline(never)]
     fn do_return(&mut self, src: usize, n: usize) -> Option<usize> {
         // sp and the frame link at self.base-1 may be stale from a C-call
         // stack resize (push -> stack_ensure) inside a JIT helper or the
@@ -3604,8 +3770,27 @@ impl Interp {
         };
         let pt = proto.as_ref();
         let nuv = pt.uv.len();
-        let mut upvals = Vec::with_capacity(nuv);
-        let parent_upvals: Vec<GcPtr<Upval>> = self.lua_cl().upvals.clone();
+        // Fast path: no upvalues — avoid cloning the parent's upvalue
+        // vector (a hot `function() ... end` loop allocates nothing here).
+        if nuv == 0 {
+            let env = self.lua_cl().env;
+            let fref = self
+                .l()
+                .heap()
+                .alloc_func(GcFunc::Lua(LuaClosure {
+                    proto,
+                    env,
+                    upvals: crate::func::Upvals::empty(),
+                }));
+            return LuaValue::func(fref);
+        }
+        let env = self.lua_cl().env;
+        // The parent closure lives at a stable heap address; borrow its
+        // upvalue vector through a raw pointer so the mutable find_upval
+        // below doesn't conflict (no clone — a hot factory inherits the
+        // same cells every iteration).
+        let parent = self.lua_cl() as *const LuaClosure;
+        let mut upvals = crate::func::Upvals::empty();
         for i in 0..nuv {
             let v = pt.uv[i];
             if (v & PROTO_UV_LOCAL) != 0 {
@@ -3616,10 +3801,10 @@ impl Interp {
                 }
                 upvals.push(uv);
             } else {
-                upvals.push(parent_upvals[(v & 0xff) as usize]);
+                let inherited = unsafe { (*parent).upvals.get((v & 0xff) as usize) };
+                upvals.push(inherited.copied().unwrap());
             }
         }
-        let env = self.lua_cl().env;
         let fref = self
             .l()
             .heap()

@@ -12,6 +12,8 @@
 //!   --         Stop handling options
 //!   -          Execute stdin (non-interactive)
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::process::exit;
 

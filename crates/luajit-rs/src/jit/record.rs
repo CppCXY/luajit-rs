@@ -65,14 +65,33 @@ pub const IRCALL_USET: u32 = 10;
 pub const IRCALL_VARG: u32 = 11;
 pub const IRCALL_TOSTR_NUM: u32 = 12;
 pub const IRCALL_FFI: u32 = 13;
+/// string.format inlined as a helper: op1 is CARG(fmt, arg0, ...) up to 3
+/// args (matching the CARG arity machinery); the helper re-compiles the
+/// format string from the cache on first use and formats into a fresh
+/// interned string.
+pub const IRCALL_STRFMT: u32 = 14;
+pub const IRCALL_STR_UPPER: u32 = 15;
+pub const IRCALL_STR_LOWER: u32 = 16;
+pub const IRCALL_STR_REVERSE: u32 = 17;
+/// string.char with up to 3 args inlined: CARG(a0, a1, a2) -> interned
+/// bytes. NIL arguments are skipped (matching str_char's varargs).
+pub const IRCALL_STR_CHAR_N: u32 = 18;
 
 /// Argument count of an IRCALL: 1 = op1 is the argument, 2 = op1 is a
 /// CARG pair, 3 = op1 is CARG(CARG(a, b), c), 4 = one more level.
 pub fn ircall_arity(idx: u32) -> u32 {
     match idx {
-        IRCALL_STR_LEN | IRCALL_STR_CHAR | IRCALL_TAB_LEN | IRCALL_TOSTR_NUM => 1,
+        IRCALL_STR_LEN
+        | IRCALL_STR_CHAR
+        | IRCALL_TAB_LEN
+        | IRCALL_TOSTR_NUM
+        | IRCALL_STR_UPPER
+        | IRCALL_STR_LOWER
+        | IRCALL_STR_REVERSE => 1,
         IRCALL_STR_SUB | IRCALL_VARG => 3,
         IRCALL_FFI => 4,
+        IRCALL_STRFMT => 4,
+        IRCALL_STR_CHAR_N => 3,
         _ => 2,
     }
 }
@@ -1079,12 +1098,12 @@ impl Record {
             self.pc = 1;
             if stop_uprec {
                 // Self-recursion: the Uprec link runs the recursion
-                // natively in machine-code frames that the Lua stack
-                // traceback cannot see — an infinite recursion's traceback
-                // then lacks the expected frames (errors.lua's
-                // `while stack[i] ~= l1` walk). GFAIL (not NYIBC) aborts
-                // without leaving a stitch prefix behind, so recursive
-                // functions stay fully interpreted.
+                // natively in machine-code frames. Currently disabled
+                // (GFAIL): the mcode recursive frame setup (snapshot
+                // restore + per-frame slot growth) is slower than the
+                // interpreter's frame push, so tail-recursion benchmarks
+                // regress (~25%). Recursive functions stay interpreted
+                // until the mcode frame path is optimized.
                 return Err(TraceError::GFAIL);
             }
             return Ok(Some((TraceLink::Root, bc_d(callee_head) as TraceNo)));
@@ -1161,6 +1180,23 @@ impl Record {
         let Some(gf) = fv.as_func() else {
             return Err(TraceError::NYIBC);
         };
+        // `return f(...)` on a C (fast) function: record it as an ordinary
+        // call and return its result (LuaJIT lowers the tailcall to a plain
+        // CALL for fast functions). The C-call path writes the result into
+        // slot a; then pop the inlined frame so the caller's RET sees it.
+        if let crate::func::GcFunc::C(cc) = gf.as_ref() {
+            let want = 1;
+            let mut argv = [LuaValue::NIL; 3];
+            for i in 0..nargs.min(3) {
+                argv[i as usize] = self.slot_val(l, base, a + 2 + i);
+            }
+            for i in 0..nargs {
+                self.getslot(l, base, a + 2 + i);
+            }
+            self.rec_callff_core(l, a, want, nargs, fv, cc.f, &argv)?;
+            self.rec_ret(l, base, a, 1)?;
+            return Ok(None);
+        }
         let crate::func::GcFunc::Lua(cl) = gf.as_ref() else {
             return Err(TraceError::NYIBC);
         };
@@ -1530,13 +1566,27 @@ impl Record {
         let Some(t) = tabv.as_table() else {
             return Err(TraceError::NYIBC);
         };
-        if t.as_ref().metatable.is_some() {
-            return Err(TraceError::NYIBC); // __newindex / protected path NYI.
-        }
         if keyv.is_nil() {
             return Err(TraceError::NYIBC); // Runtime error path.
         }
-        self.meta_guard(tab);
+        // A metatable with no `__newindex` still allows the raw store
+        // (LuaJIT: hasmm == 0 -> HSTORE); only abort when `__newindex`
+        // exists. The interpreter's TSET path only consults the metatable
+        // for `__newindex`; with it absent the store is always raw, so no
+        // runtime metatable guard is needed (the record-time check below
+        // pins it).
+        let mt = t.as_ref().metatable;
+        if let Some(mt) = mt {
+            let g = l.global();
+            let nidx = g.mmname[crate::meta::MM::Newindex as usize];
+            if !mt.as_ref().get_str(nidx).is_nil() {
+                return Err(TraceError::NYIBC); // __newindex path NYI.
+            }
+        } else {
+            // No metatable at all: guard it stays nil (a hot loop may
+            // setmetatable mid-flight).
+            self.meta_guard(tab);
+        }
         // GC-debt guard before the store: the store may grow the table,
         // and a compiled loop otherwise never reaches a GC safe point.
         // Emitting it here (before the side effect) means a GC exit
@@ -1933,8 +1983,75 @@ impl Record {
                 self.rec_gcstep(l);
                 nres = 1;
             }
+            Recff::StrUpper | Recff::StrLower | Recff::StrReverse => {
+                if nargs != 1 {
+                    return Err(TraceError::NYIBC);
+                }
+                let s = self.base_ref(a + 2);
+                if !tref_isstr(s) {
+                    return Err(TraceError::NYIBC); // Number coercion path.
+                }
+                let ircall = match ff {
+                    Recff::StrUpper => IRCALL_STR_UPPER,
+                    Recff::StrLower => IRCALL_STR_LOWER,
+                    _ => IRCALL_STR_REVERSE,
+                };
+                res[0] = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_STR),
+                    tref_ref(s),
+                    ircall,
+                ));
+                self.rec_gcstep(l);
+                nres = 1;
+            }
             Recff::StrChar => {
-                // Single argument only (multi-arg concatenation NYI).
+                // 2-3 args inline via the multi-char helper (arity-3 CARG);
+                // 1 arg uses the single-char fast path; 4+ go to the
+                // interpreter.
+                let k0 = self.cur.ir.knum(0.0);
+                let k255 = self.cur.ir.knum(255.0);
+                if nargs >= 2 && nargs <= 3 {
+                    let mut args = [0u32; 3];
+                    for i in 0..nargs as usize {
+                        let c = self.base_ref(a + 2 + i as u32);
+                        if !tref_isnum(c) {
+                            return Err(TraceError::NYIBC);
+                        }
+                        self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::UGE, IRT_GUARD | IRT_INT),
+                            tref_ref(c),
+                            tref_ref(k0),
+                        ));
+                        self.cur.ir.emit_ins(IRIns::new(
+                            irt(IROp::ULE, IRT_GUARD | IRT_INT),
+                            tref_ref(c),
+                            tref_ref(k255),
+                        ));
+                        args[i] = tref_ref(c);
+                    }
+                    let c0 = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CARG, IRT_NIL),
+                        args[0],
+                        args[1],
+                    ));
+                    let c1 = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CARG, IRT_NIL),
+                        tref_ref(c0),
+                        if nargs == 3 {
+                            args[2]
+                        } else {
+                            tref_ref(TREF_NIL)
+                        },
+                    ));
+                    res[0] = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_STR),
+                        tref_ref(c1),
+                        IRCALL_STR_CHAR_N,
+                    ));
+                    self.rec_gcstep(l);
+                    nres = 1;
+                    return Ok(());
+                }
                 if nargs != 1 {
                     return Err(TraceError::NYIBC);
                 }
@@ -1944,8 +2061,6 @@ impl Record {
                 }
                 // Out-of-range exits to the interpreter, which raises
                 // "out of range" (string.char(300) is an error).
-                let k0 = self.cur.ir.knum(0.0);
-                let k255 = self.cur.ir.knum(255.0);
                 self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::UGE, IRT_GUARD | IRT_INT),
                     tref_ref(c),
@@ -2165,6 +2280,57 @@ impl Record {
                 self.rec_tset(l, tabv, tab, keyv, key, val)?;
                 nres = 0;
             }
+            Recff::SetMetatable => {
+                // setmetatable(t, mt): guard t is a table, mt is a table or
+                // nil, then store mt into the table's metatable field
+                // (FSTORE IRFL_TAB_META). __newindex presence change flags
+                // invalidation exactly like the interpreter path.
+                if nargs < 2 {
+                    return Err(TraceError::NYIBC);
+                }
+                let tab = self.base_ref(a + 2);
+                let mt = self.base_ref(a + 3);
+                let tabv = argv[0];
+                let mtv = argv[1];
+                if !tref_istab(tab) {
+                    return Err(TraceError::NYIBC);
+                }
+                if !mtv.is_table() && !mtv.is_nil() {
+                    return Err(TraceError::NYIBC);
+                }
+                let g = l.global();
+                // Protected metatable check (lj_meta_lookup(o, MM_metatable)):
+                // abort if the current metatable exposes `__metatable`.
+                if let Some(cur_mt) = tabv
+                    .as_table()
+                    .and_then(|t| t.as_ref().metatable)
+                {
+                    let mmet = g.mmname[crate::meta::MM::Metatable as usize];
+                    if !cur_mt.as_ref().get_str(mmet).is_nil() {
+                        return Err(TraceError::NYIBC);
+                    }
+                }
+                let nidx = g.mmname[crate::meta::MM::Newindex as usize];
+                let old_has = tabv
+                    .as_table()
+                    .and_then(|t| t.as_ref().metatable)
+                    .map(|m| !m.as_ref().get_str(nidx).is_nil())
+                    .unwrap_or(false);
+                let new_has = mtv
+                    .as_table()
+                    .map(|m| !m.as_ref().get_str(nidx).is_nil())
+                    .unwrap_or(false);
+                self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::FSTORE, IRT_NIL),
+                    tref_ref(tab),
+                    if mtv.is_nil() { 0 } else { tref_ref(mt) },
+                ));
+                if old_has != new_has {
+                    l.global().jit.invalidate_all = true;
+                }
+                res[0] = tab;
+                nres = 1;
+            }
             Recff::ToNumber => {
                 let arg0 = self.base_ref(a + 2);
                 if tref_isnum(arg0) || tref_isint(arg0) {
@@ -2197,6 +2363,63 @@ impl Record {
                 } else {
                     return Err(TraceError::NYIBC); // Metatable __tostring path.
                 }
+            }
+            Recff::Format => {
+                // string.format(fmt, ...): the format string must be a
+                // constant; up to 3 arguments are collected into a CARG
+                // chain and formatted by the shared helper (which reuses
+                // the compiled-format cache).
+                if nargs < 1 {
+                    return Err(TraceError::NYIBC);
+                }
+                let fmt_t = self.base_ref(a + 2);
+                let fmtv = argv[0];
+                let Some(fmt_sid) = fmtv.as_string_id() else {
+                    return Err(TraceError::NYIBC);
+                };
+                if !tref_isk(fmt_t) && !tref_isstr(fmt_t) {
+                    return Err(TraceError::NYIBC);
+                }
+                let nconv = crate::strfmt::compile(l.str_static(fmt_sid))
+                    .map(|p| p.iter().filter(|part| matches!(part, crate::strfmt::FmtPart::Conv(_, _))).count())
+                    .unwrap_or(99);
+                if nconv > 3 {
+                    return Err(TraceError::NYIBC); // Multi-conv formats go to the interpreter.
+                }
+                let nfmt_args = nargs.saturating_sub(1);
+                if nfmt_args > 3 {
+                    return Err(TraceError::NYIBC);
+                }
+                // Build a fixed 4-wide CARG chain (fmt + up to 3 args,
+                // missing args are NIL): the native backends read arity 4
+                // as CARG(CARG(CARG(fmt,a0),a1),a2).
+                let abase = a as usize + 2;
+                let a0 = if 1 <= nfmt_args { self.base_ref(abase as u32 + 1) } else { 0 };
+                let a1 = if 2 <= nfmt_args { self.base_ref(abase as u32 + 2) } else { 0 };
+                let a2 = if 3 <= nfmt_args { self.base_ref(abase as u32 + 3) } else { 0 };
+                let c0 = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(fmt_t),
+                    tref_ref(a0),
+                ));
+                let c1 = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(c0),
+                    tref_ref(a1),
+                ));
+                let c2 = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CARG, IRT_NIL),
+                    tref_ref(c1),
+                    tref_ref(a2),
+                ));
+                let r = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::CALLL, IRT_STR),
+                    tref_ref(c2),
+                    IRCALL_STRFMT,
+                ));
+                self.rec_gcstep(l);
+                res[0] = r;
+                nres = 1;
             }
             Recff::FFICall => {
                 // `ffi.C.sym` calls: the wrapper closure's upvalues hold
@@ -3028,14 +3251,11 @@ impl Record {
                 // address here would leak a tag-less number into
                 // registers/tables (replayed TSETS corrupts metatables:
                 // `__add` lookup then reads a bare address). Phase 2
-                // cannot recreate closures faithfully — abort instead.
-                //
-                // BLACKL (not NYIBC) disables JIT for the whole proto on
-                // the first failure: a closure-creating hot loop can never
-                // be recorded, and letting the penalty counter retry it
-                // dozens of times per loop iteration is pure overhead
-                // (measured: ~3x slower than plain interpretation).
-                return Err(TraceError::BLACKL);
+                // cannot recreate closures faithfully. Like LuaJIT
+                // (BC_FNEW -> LJ_TRERR_NYIBC), abort this instruction
+                // only — the surrounding loop may still be traced, so the
+                // interpreter handles just the closure allocation.
+                return Err(TraceError::NYIBC);
             }
 
             // Everything else is NYI in Phase 2: calls, returns, tables,
@@ -3106,14 +3326,19 @@ enum Recff {
     StrByte,
     StrSub,
     StrChar,
+    StrUpper,
+    StrLower,
+    StrReverse,
     TableInsert,
     TableRemove,
     TableConcat,
     Type,
     RawGet,
     RawSet,
+    SetMetatable,
     ToNumber,
     ToString,
+    Format,
     /// `ffi.C` symbol call wrapper (call_c): the address and cdef
     /// declaration id live in the closure's upvalues; the call is
     /// recorded as a 4-argument helper (architecture-independent, so
@@ -3124,7 +3349,7 @@ enum Recff {
 fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
     use crate::func::CFunction;
     use crate::stdlib::{base, bit, math, string, table};
-    let entries: [(CFunction, Recff); 33] = [
+    let entries: [(CFunction, Recff); 38] = [
         (crate::ffi::lib::call_c, Recff::FFICall),
         (math::floor, Recff::Floor),
         (math::ceil, Recff::Ceil),
@@ -3150,6 +3375,10 @@ fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
         (string::str_byte, Recff::StrByte),
         (string::str_sub, Recff::StrSub),
         (string::str_char, Recff::StrChar),
+        (string::str_upper, Recff::StrUpper),
+        (string::str_lower, Recff::StrLower),
+        (string::str_reverse, Recff::StrReverse),
+        (base::lib_setmetatable, Recff::SetMetatable),
         (table::tab_insert, Recff::TableInsert),
         (table::tab_remove, Recff::TableRemove),
         (table::tab_concat, Recff::TableConcat),
@@ -3158,6 +3387,7 @@ fn recff_lookup(f: crate::func::CFunction) -> Option<Recff> {
         (base::lib_rawset, Recff::RawSet),
         (base::lib_tonumber, Recff::ToNumber),
         (base::lib_tostring, Recff::ToString),
+        (string::str_format, Recff::Format),
     ];
     entries
         .iter()

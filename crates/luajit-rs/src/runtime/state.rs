@@ -103,6 +103,10 @@ pub struct GcHeap {
     /// updated at the atomic phase and during sweep. The next cycle's
     /// threshold is `estimate * GC_PAUSE / 100`.
     pub estimate: usize,
+    /// Compiled `string.format` formats, keyed by the format string's StrId
+    /// (never recycled), so a hot loop reuses the parsed spec parts instead
+    /// of re-parsing the format string every call.
+    pub fmt_cache: std::collections::HashMap<u32, std::sync::Arc<Vec<crate::util::strfmt::FmtPart>>>,
 }
 
 impl Default for GcHeap {
@@ -135,6 +139,7 @@ impl Default for GcHeap {
             cat_buf_slot: u32::MAX,
             stepmul: 200,
             estimate: 0,
+            fmt_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -978,7 +983,7 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
     let fref = g.heap.alloc_func(GcFunc::Lua(LuaClosure {
         proto: proto_ref,
         env,
-        upvals: Vec::new(),
+        upvals: crate::func::Upvals::empty(),
     }));
     Ok(LuaValue::func(fref))
 }

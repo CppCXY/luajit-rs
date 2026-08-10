@@ -3266,6 +3266,19 @@ impl<'a> Parser<'a> {
         }
         let line = self.ls.linenumber;
         let pt = self.fs_finish(line);
+        if std::env::var("LUARS_BCDUMP").is_ok() {
+            for (i, &ins) in pt.bc.iter().enumerate() {
+                eprintln!(
+                    "  BC[{:3}] {:?} A={} B={} C={} D={}",
+                    i,
+                    crate::bc::bc_op(ins),
+                    crate::bc::bc_a(ins),
+                    crate::bc::bc_b(ins),
+                    crate::bc::bc_c(ins),
+                    crate::bc::bc_d(ins)
+                );
+            }
+        }
         debug_assert!(self.fs.is_empty());
         debug_assert!(pt.uv.is_empty());
         pt

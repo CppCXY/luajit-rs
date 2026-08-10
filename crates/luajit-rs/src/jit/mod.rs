@@ -37,7 +37,7 @@ mod record;
 mod trace;
 
 pub use exec::trace_exec;
-pub use trace::{rec_abort_error, rec_ins, trace_hot};
+pub use trace::{rec_abort_error, rec_ins, trace_flush_all, trace_hot};
 
 use crate::bc::BCIns;
 use crate::gc::GcPtr;
@@ -397,6 +397,12 @@ pub struct JitState {
     pub arch: self::asm::Arch,
     /// Skip native code generation (LUAJIT_RS_NOASM), cached at startup.
     pub no_asm: bool,
+    /// Set by setmetatable (and similar metatable-mutating builtins) while a
+    /// trace may be mid-flight: the next trace entry flushes all compiled
+    /// traces, so stores that specialized to a metatable's `__newindex`
+    /// (or absence) observe the new metatable. Deferred to the entry so the
+    /// currently executing trace is never freed underneath itself.
+    pub invalidate_all: bool,
     /// Trace dump enabled (LUAJIT_RS_TRDUMP), cached at startup.
     pub trace_dump: bool,
     /// Trace dump level 2 (LUAJIT_RS_TRDUMP=2), cached at startup.
@@ -439,6 +445,7 @@ impl JitState {
             no_asm: std::env::var("LUAJIT_RS_NOASM").is_ok(),
             #[cfg(target_arch = "wasm32")]
             no_asm: true,
+            invalidate_all: false,
             #[cfg(not(target_arch = "wasm32"))]
             trace_dump: std::env::var("LUAJIT_RS_TRDUMP").is_ok(),
             #[cfg(target_arch = "wasm32")]

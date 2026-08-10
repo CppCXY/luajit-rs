@@ -284,6 +284,7 @@ impl Interp {
     /// `lj_meta_tget`:
     /// resolved directly (raw hit, C metamethod) or `None` when a Lua
     /// metamethod continuation frame was set up.
+    #[inline(never)]
     pub(super) fn meta_tget(
         &mut self,
         o: LuaValue,
@@ -343,6 +344,7 @@ impl Interp {
 
     /// `lj_meta_tset`: `__newindex` chain.  Returns `Some(true)` if the
     /// raw set was done inline, `None` if a Lua metamethod was called.
+    #[inline(never)]
     pub(super) fn meta_tset(
         &mut self,
         o: LuaValue,
@@ -483,6 +485,7 @@ impl Interp {
 
     /// `lj_meta_arith`: coercion first, then arithmetic metamethod.
     /// Returns `Some(val)` when resolved or `None` for Lua continuation.
+    #[inline(never)]
     pub(super) fn meta_arith(
         &mut self,
         mm: MM,
@@ -580,6 +583,7 @@ impl Interp {
     /// Only the first operand's metamethod is consulted (LuaJIT semantics;
     /// the second operand's metatable may differ). LE without `__le` falls
     /// back to `not (o2 < o1)` through the second operand's `__lt`.
+    #[inline(never)]
     pub(super) fn meta_comp(
         &mut self,
         mut o1: LuaValue,
@@ -717,6 +721,7 @@ impl Interp {
         Some(LuaValue::cdata(p))
     }
 
+    #[inline(never)]
     pub(super) fn meta_equal(
         &mut self,
         o1: LuaValue,
@@ -772,6 +777,7 @@ impl Interp {
     /// `lj_meta_len`: `__len` metamethod. Passes the object twice
     /// (LuaJIT 2.1 5.2-compat semantics). Returns `Some(len)` when
     /// resolved inline or `None` for a Lua continuation frame.
+    #[inline(never)]
     pub(super) fn meta_len(&mut self, o: LuaValue, a: u32) -> LuaResult<Option<LuaValue>> {
         let mo = meta_lookup(self.l().global(), o, MM::Len);
         if mo.is_nil() {
@@ -815,6 +821,7 @@ impl Interp {
 
     /// `lj_meta_cat`: iterative concat over `b..=c` (absolute slots),
     /// right-to-left, with `__concat` (via execute recursion — cold).
+    #[inline(never)]
     pub(super) fn meta_cat(&mut self, b: u32, c: u32) -> LuaResult<LuaValue> {
         let bottom = self.base + b as usize;
         let mut top = self.base + c as usize;
