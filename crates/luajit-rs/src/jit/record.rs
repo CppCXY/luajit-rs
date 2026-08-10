@@ -3028,14 +3028,11 @@ impl Record {
                 // address here would leak a tag-less number into
                 // registers/tables (replayed TSETS corrupts metatables:
                 // `__add` lookup then reads a bare address). Phase 2
-                // cannot recreate closures faithfully — abort instead.
-                //
-                // BLACKL (not NYIBC) disables JIT for the whole proto on
-                // the first failure: a closure-creating hot loop can never
-                // be recorded, and letting the penalty counter retry it
-                // dozens of times per loop iteration is pure overhead
-                // (measured: ~3x slower than plain interpretation).
-                return Err(TraceError::BLACKL);
+                // cannot recreate closures faithfully. Like LuaJIT
+                // (BC_FNEW -> LJ_TRERR_NYIBC), abort this instruction
+                // only — the surrounding loop may still be traced, so the
+                // interpreter handles just the closure allocation.
+                return Err(TraceError::NYIBC);
             }
 
             // Everything else is NYI in Phase 2: calls, returns, tables,

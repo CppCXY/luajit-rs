@@ -3604,8 +3604,30 @@ impl Interp {
         };
         let pt = proto.as_ref();
         let nuv = pt.uv.len();
+        // Fast path: no upvalues — avoid cloning the parent's upvalue
+        // vector (a hot `function() ... end` loop allocates nothing here).
+        if nuv == 0 {
+            let env = self.lua_cl().env;
+            let fref = self
+                .l()
+                .heap()
+                .alloc_func(GcFunc::Lua(LuaClosure {
+                    proto,
+                    env,
+                    upvals: Vec::new(),
+                }));
+            return LuaValue::func(fref);
+        }
+        let env = self.lua_cl().env;
+        // The parent closure lives at a stable heap address; borrow its
+        // upvalue vector through a raw pointer so the mutable find_upval
+        // below doesn't conflict (no clone — a hot factory inherits the
+        // same cells every iteration).
+        let parent_upvals: &[GcPtr<Upval>] = unsafe {
+            let p = self.lua_cl() as *const LuaClosure;
+            &(*p).upvals
+        };
         let mut upvals = Vec::with_capacity(nuv);
-        let parent_upvals: Vec<GcPtr<Upval>> = self.lua_cl().upvals.clone();
         for i in 0..nuv {
             let v = pt.uv[i];
             if (v & PROTO_UV_LOCAL) != 0 {
@@ -3619,7 +3641,6 @@ impl Interp {
                 upvals.push(parent_upvals[(v & 0xff) as usize]);
             }
         }
-        let env = self.lua_cl().env;
         let fref = self
             .l()
             .heap()
