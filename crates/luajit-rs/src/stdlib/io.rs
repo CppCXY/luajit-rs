@@ -268,14 +268,13 @@ fn handle_gc_fd(l: &mut LuaState) -> LuaResult<i32> {
         return Ok(0);
     }
     let files = l.files_mut();
-    if let Some(slot) = files.get_mut(fd) {
-        if slot.is_some() {
+    if let Some(slot) = files.get_mut(fd)
+        && slot.is_some() {
             if let Some(FileEntry::Pipe(child)) = slot {
                 let _ = child.wait();
             }
             *slot = None;
         }
-    }
     Ok(0)
 }
 
@@ -774,20 +773,20 @@ fn io_open(l: &mut LuaState) -> LuaResult<i32> {
             .read(true)
             .write(true)
             .open(&path)
-            .map(|f| FileEntry::ReadWrite(f)),
+            .map(FileEntry::ReadWrite),
         "w+" => std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)
-            .map(|f| FileEntry::ReadWrite(f)),
+            .map(FileEntry::ReadWrite),
         "a+" => std::fs::OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(&path)
-            .map(|f| FileEntry::ReadWrite(f)),
+            .map(FileEntry::ReadWrite),
         _ => return ret_fail(l, &format!("invalid mode '{}'", mode)),
     };
     match entry {
@@ -1119,12 +1118,17 @@ fn io_popen(l: &mut LuaState) -> LuaResult<i32> {
     };
     let m = mode.trim_end_matches('b');
     let mut cmd = std::process::Command::new(shell_for_popen());
-    cmd.arg(shell_flag_for_popen()).arg(String::from_utf8_lossy(fname).into_owned());
+    cmd.arg(shell_flag_for_popen())
+        .arg(String::from_utf8_lossy(fname).into_owned());
     match m {
         // "r": capture the child's stdout on the handle.
-        "r" => cmd.stdout(std::process::Stdio::piped()).stdin(std::process::Stdio::null()),
+        "r" => cmd
+            .stdout(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null()),
         // "w": the handle feeds the child's stdin.
-        "w" => cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()),
+        "w" => cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null()),
         _ => return ret_fail(l, &format!("invalid mode '{}'", mode)),
     };
     match cmd.spawn() {

@@ -62,7 +62,7 @@ echo -e "${CYAN}========================================${NC}"
 echo ""
 
 # Detect luajit-rs binary location
-LUARS_BIN="./target/release/luajit-rs"
+LUARS_BIN="../target/release/luajit-rs"
 if [ ! -f "$LUARS_BIN" ]; then
     echo "Building luajit-rs in release mode..."
     cargo build --release

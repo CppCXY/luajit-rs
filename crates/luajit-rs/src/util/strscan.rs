@@ -134,16 +134,12 @@ fn dec_token_len(s: &[u8]) -> usize {
 /// Length of the longest hex-number prefix (0x..., optional `p` exponent).
 fn hex_token_len(s: &[u8]) -> usize {
     let mut i = 2; // past "0x"
-    let mut seen_digit = false;
     while i < s.len() {
         let c = s[i];
         if c.is_ascii_hexdigit() {
-            seen_digit = true;
             i += 1;
         } else if c == b'.' {
             i += 1;
-        } else if (c == b'p' || c == b'P') && seen_digit {
-            break;
         } else {
             break;
         }

@@ -166,7 +166,7 @@ fn debug_slotname(
                 i += 1;
                 continue;
             }
-            match crate::bc::bcmode_a(op) as u32 {
+            match crate::bc::bcmode_a(op) {
                 m if m == crate::bc::BCMode::Dst as u32 => {
                     if ra == slot {
                         if op == crate::bc::BCOp::MOV {
@@ -177,12 +177,11 @@ fn debug_slotname(
                         last = Some((i as usize, op as u32));
                     }
                 }
-                m if m == crate::bc::BCMode::Base as u32 => {
+                m if m == crate::bc::BCMode::Base as u32
                     // CALL/VARG/UCLO/... write a slot range.
-                    if slot >= ra {
+                    && slot >= ra => {
                         last = Some((i as usize, op as u32));
                     }
-                }
                 _ => {}
             }
             i += 1;

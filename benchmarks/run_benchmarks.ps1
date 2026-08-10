@@ -78,7 +78,7 @@ foreach ($bench in $benchmarks) {
     Write-Output ""
     
     Write-ColorHost "--- Luajit-RS ---" "Magenta"
-    Invoke-BenchmarkRuntime -Executable ".\target\release\luajit-rs.exe" -ScriptPath "benchmarks\$bench"
+    Invoke-BenchmarkRuntime -Executable "..\target\release\luajit-rs.exe" -ScriptPath "benchmarks\$bench"
     
     Write-Output ""
     Write-ColorHost "--- Native Lua ---" "Green"

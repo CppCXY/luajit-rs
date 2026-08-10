@@ -49,7 +49,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           chmod +x run_benchmarks.sh
-          ./run_benchmarks.sh --nocolor 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          ./benchmarks/run_benchmarks.sh --nocolor 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
 
@@ -99,7 +99,7 @@ jobs:
           echo '```' >> $env:GITHUB_STEP_SUMMARY
           # Use the lua we built
           $env:NATIVE_LUA = "$env:GITHUB_WORKSPACE\lua_bin\lua.exe"
-          .\run_benchmarks.ps1 -NoColor 2>&1 | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          .\benchmarks\run_benchmarks.ps1 -NoColor 2>&1 | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
           echo '```' >> $env:GITHUB_STEP_SUMMARY
 
 
@@ -141,6 +141,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           chmod +x run_benchmarks.sh
-          ./run_benchmarks.sh --nocolor 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+          ./benchmarks/run_benchmarks.sh --nocolor 2>&1 | tee -a $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 

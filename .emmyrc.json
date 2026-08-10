@@ -1,6 +1,6 @@
 {
     "runtime": {
-        "version": "LuaJIT-Ext"
+        "version": "LuaJIT"
     },
     "workspace": {
         "library": [
