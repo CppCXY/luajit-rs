@@ -57,13 +57,14 @@ impl GcHeader {
     fn rb(&self) -> u8 {
         self.bits.get()
     }
+    #[allow(dead_code)]
+    pub(crate) fn raw_bits(&self) -> u8 {
+        self.rb()
+    }
     fn wb(&self, v: u8) {
         self.bits.set(v);
     }
 
-    pub fn is_white(&self) -> bool {
-        (self.rb() & COLOR_MASK) != BIT_BLACK && (self.rb() & COLOR_MASK) != 0
-    }
     pub fn is_black(&self) -> bool {
         (self.rb() & BIT_BLACK) != 0
     }
@@ -462,11 +463,28 @@ impl<T> Pool<T> {
     pub fn len(&self) -> usize {
         self.live
     }
+    #[allow(dead_code)]
+    pub(crate) fn object_count(&self) -> usize {
+        self.objects.len()
+    }
     pub fn is_empty(&self) -> bool {
         self.live == 0
     }
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.objects.iter().map(|nn| unsafe { nn.as_ref() })
+    }
+    /// Clear the per-cycle `marked` flag on every object. The flag records
+    /// "marked in the current cycle"; without resetting it at a cycle
+    /// boundary, an object marked by an interrupted/incomplete cycle keeps
+    /// `marked == true` and is treated as live in the next cycle — weak
+    /// tables then fail to drop it, and the sweep retains it forever.
+    pub fn reset_marked(&mut self) {
+        for nn in &self.objects {
+            let h = gc_header(*nn);
+            if h.marked.get() {
+                h.marked.set(false);
+            }
+        }
     }
     pub fn sweep(&mut self, mut on_free: impl FnMut(&T)) {
         // Old marked-only sweep (backward compat).
@@ -499,18 +517,39 @@ impl<T> Pool<T> {
     /// Tri-color sweep: uses current_white to decide alive/dead.
     /// Surviving objects get change_white() and marked.set(false).
     pub fn sweep_tricolor(&mut self, current_white: u8, mut on_free: impl FnMut(&T)) {
-        let mut i = 0;
-        while i < self.objects.len() {
+        self.sweep_limited(current_white, &mut on_free, usize::MAX, 0);
+    }
+
+    /// Incremental sweep: process up to `limit` objects starting at index
+    /// `start`. Returns `(pool_done, next_start)` — `next_start` continues
+    /// the sweep on the next call; when `pool_done`, the whole pool is
+    /// swept. Mirrors LuaJIT's `gc_sweep` with `GCSWEEPMAX`.
+    pub fn sweep_limited(
+        &mut self,
+        current_white: u8,
+        mut on_free: impl FnMut(&T),
+        limit: usize,
+        start: usize,
+    ) -> (bool, usize) {
+        let mut i = start;
+        let mut scanned = 0;
+        while i < self.objects.len() && scanned < limit {
             let ptr = self.objects[i];
             let addr = ptr.as_ptr() as usize;
             if addr <= 0x1000 || addr >= ADDR_MAX as usize {
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
+                scanned += 1;
                 continue;
             }
             let h = gc_header(ptr);
             let was_marked = h.marked.get();
-            let alive = was_marked || !h.is_dead(current_white);
+            // Alive = marked this cycle, or a non-dead color. `marked` is
+            // cleared at every cycle start, so `was_marked` only reflects
+            // this cycle's mark; objects a stale BLACK left by an
+            // interrupted earlier cycle are kept alive here (conservative),
+            // and weak tables drop them via `may_clear`'s `!is_marked`.
+            let alive = was_marked || (!h.is_dead(current_white) && !h.is_black());
             if alive {
                 if was_marked {
                     h.change_white();
@@ -528,8 +567,10 @@ impl<T> Pool<T> {
                 self.objects.swap_remove(i);
                 self.mapped.swap_remove(i);
             }
+            scanned += 1;
         }
         self.live = self.objects.len();
+        (i >= self.objects.len(), i)
     }
     pub fn update_current_white(&self, cw: u8) {
         self.current_white.set(cw);
@@ -581,19 +622,13 @@ impl<T> GcPtr<T> {
         gc_header(self.0).marked.get()
     }
 
-    /// `iswhite`: the object is not marked (carries any white bit). This is
-    /// what `gc_mayclear` tests: an entry whose key/value was not marked in
-    /// this cycle is dropped from a weak table, even if the object would
-    /// only be swept one cycle later.
-    pub(crate) fn is_white(self) -> bool {
-        gc_header(self.0).is_white()
+    #[allow(dead_code)]
+    pub(crate) fn mark_bits(self) -> (bool, u8) {
+        let h = gc_header(self.0);
+        (h.marked.get(), h.raw_bits())
     }
 
-    /// `isfinalized`: the `__gc` finalizer already ran (see `Finalizable`).
-    pub(crate) fn is_finalized(self) -> bool {
-        gc_header(self.0).is_finalized()
-    }
-
+    #[track_caller]
     pub fn set_marked(self) {
         let h = gc_header(self.0);
         h.marked.set(true);
@@ -640,6 +675,21 @@ use crate::value::{LJ_TCDATA, LJ_TFUNC, LJ_TSTR, LJ_TTAB, LJ_TTHREAD, LJ_TUDATA,
 pub const GC_PAUSE: usize = 200;
 pub(crate) const GC_THRESHOLD_MIN: usize = 64 * 1024;
 
+/// LuaJIT's `GCSTEPSIZE`: one unit of GC debt, and the divisor for the
+/// per-step budget (`GCSTEPSIZE/100 * stepmul`, default 200 → ~2048 bytes
+/// of work per `gc_step`). 1024 matches lj_gc.c.
+pub const GC_STEP_SIZE: usize = 1024;
+
+/// Default GC_STEPMUL (LuaJIT's `gc.stepmul`).
+pub const GC_STEPMUL_DEFAULT: usize = 200;
+
+/// Cost charged to the budget for one sweep-pool step (LuaJIT's
+/// `GCSWEEPMAX*GCSWEEPCOST` = 40*10 = 400).
+pub const GC_SWEEP_COST: usize = 400;
+
+/// Objects swept per incremental sweep step (LuaJIT's `GCSWEEPMAX`).
+pub const GC_SWEEP_MAX: usize = 40;
+
 /// Weak-table mode bits (mirror of LuaJIT's `LJ_GC_WEAKKEY`/`LJ_GC_WEAKVAL`).
 pub const WEAKKEY: u8 = 0x08;
 pub const WEAKVAL: u8 = 0x10;
@@ -656,7 +706,6 @@ pub enum GcState {
     /// (`vm::run_finalizers`), which returns the collector to `Pause`.
     Finalize,
 }
-pub const GC_STEP_SIZE: usize = 4096;
 
 pub enum Gray {
     Tab(GcPtr<LuaTable>),
@@ -671,26 +720,22 @@ pub enum Gray {
 /// point (after the sweep, so every object the finalizer may touch is
 /// still alive).
 pub enum Finalizable {
-    Table(GcPtr<LuaTable>),
     UData(GcPtr<GcUserData>),
 }
 
 impl Finalizable {
     pub fn value(&self) -> LuaValue {
         match self {
-            Finalizable::Table(t) => LuaValue::table(*t),
             Finalizable::UData(u) => LuaValue::userdata(*u),
         }
     }
     pub fn metatable(&self) -> Option<GcPtr<LuaTable>> {
         match self {
-            Finalizable::Table(t) => t.as_ref().metatable,
             Finalizable::UData(u) => u.as_ref().metatable,
         }
     }
     pub fn mark_finalized(&self, current_white: u8) {
         match self {
-            Finalizable::Table(t) => gc_header(t.0).make_dead_next(current_white),
             Finalizable::UData(u) => gc_header(u.0).make_dead_next(current_white),
         }
     }
@@ -709,6 +754,7 @@ struct Marker<'g> {
     weak: Vec<(GcPtr<LuaTable>, u8)>,
 }
 impl<'g> Marker<'g> {
+    #[track_caller]
     fn mark_value(&mut self, v: LuaValue) {
         match v.itype() {
             LJ_TSTR => {
@@ -798,7 +844,11 @@ impl<'g> Marker<'g> {
                     t.gc_traverse(|v| this.mark_value(v));
                 }
                 KGc::TableRef(t) => {
-                    t.as_ref().gc_traverse(|v| this.mark_value(v));
+                    // The template table is a heap object referenced by
+                    // the prototype: it must be marked (and grayed for
+                    // its contents), or the pool reclaims it while the
+                    // proto's kgc still points at it.
+                    this.mark_table(*t);
                 }
                 KGc::Proto(_) | KGc::CData(_) => {}
             }
@@ -854,6 +904,7 @@ impl<'g> Marker<'g> {
                         self.mark_value(l.stack[i]);
                     }
                     self.mark_value(l.errval);
+                    self.mark_value(l.hook);
                     for &uv in &l.openuv {
                         self.mark_upval(uv);
                     }
@@ -862,9 +913,9 @@ impl<'g> Marker<'g> {
                     }
                     if self.atomic {
                         // lj_gc_step_fixtop: never clear slots below the
-                        // current Lua frame top (frame_top is exact here;
-                        // `top` may have been lowered to a C-call result
-                        // area).
+                        // current instruction's live top (or the frame
+                        // extent, which protects live temporaries above a
+                        // transiently lowered top).
                         let clear_from = l.top.max(l.frame_top);
                         for s in l.stack[clear_from..].iter_mut() {
                             *s = LuaValue::NIL;
@@ -939,7 +990,9 @@ impl<'g> Marker<'g> {
                                 t.gc_traverse(|v| self.mark_value(v));
                             }
                             KGc::TableRef(t) => {
-                                t.as_ref().gc_traverse(|v| self.mark_value(v));
+                                // Same as mark_kgc_slice: the template
+                                // table itself must survive.
+                                self.mark_table(*t);
                             }
                             _ => {}
                         }
@@ -955,6 +1008,7 @@ impl<'g> Marker<'g> {
                         self.mark_value(l.stack[i]);
                     }
                     self.mark_value(l.errval);
+                    self.mark_value(l.hook);
                     for &uv in &l.openuv {
                         self.mark_upval(uv);
                     }
@@ -963,9 +1017,9 @@ impl<'g> Marker<'g> {
                     }
                     if self.atomic {
                         // lj_gc_step_fixtop: never clear slots below the
-                        // current Lua frame top (frame_top is exact here;
-                        // `top` may have been lowered to a C-call result
-                        // area).
+                        // current instruction's live top (or the frame
+                        // extent, which protects live temporaries above a
+                        // transiently lowered top).
                         let clear_from = l.top.max(l.frame_top);
                         for s in l.stack[clear_from..].iter_mut() {
                             *s = LuaValue::NIL;
@@ -1085,18 +1139,57 @@ pub fn barrier_back(heap: &mut GcHeap, t: GcPtr<LuaTable>) {
 
 /// Run one incremental GC step. Returns `true` when the cycle is complete
 /// (state is Pause).
+/// Perform a limited amount of incremental GC work, LuaJIT's `lj_gc_step`.
+///
+/// The per-call budget is `GCSTEPSIZE/100 * stepmul` (default 200 → ~2000
+/// bytes of work). Returns `true` only when a full cycle completed (back in
+/// `Pause`). `size == usize::MAX` requests a full, unbounded cycle (used by
+/// `full_gc` and `collectgarbage("collect")`).
 pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
-    let step = heap.gc_step_size.max(size);
+    let full = size >= usize::MAX / 2;
+    if heap.total > heap.threshold {
+        heap.debt += heap.total - heap.threshold;
+    }
+    let lim = (GC_STEP_SIZE / 100).max(1) * heap.stepmul;
+    let mut budget = if full { usize::MAX } else { lim };
+    loop {
+        let (cost, done) = gc_onestep(heap);
+        if done {
+            return true;
+        }
+        if full {
+            continue;
+        }
+        budget = budget.saturating_sub(cost);
+        if budget == 0 {
+            break;
+        }
+    }
+    // LuaJIT's post-step debt/threshold adjustment: if the accumulated
+    // debt is large the next allocation triggers another step right away
+    // (threshold = total); if it is small, push the trigger out.
+    if heap.debt < GC_STEP_SIZE {
+        heap.threshold = heap.total + GC_STEP_SIZE;
+        false
+    } else {
+        heap.debt -= GC_STEP_SIZE;
+        heap.threshold = heap.total;
+        false
+    }
+}
+
+/// Advance the collector one state-machine step. Returns `(cost, done)`,
+/// where `done` means the cycle reached `Pause` (or the collector is in a
+/// state the VM must handle, e.g. pending finalizers).
+fn gc_onestep(heap: &mut GcHeap) -> (usize, bool) {
     match heap.gc_state {
         GcState::Pause => {
-            let live = heap.total + heap.strings.bytes() + heap.table_extra;
-            if live >= heap.threshold {
-                heap.debt += live - heap.threshold;
-                heap.threshold = live + GC_STEP_SIZE;
-            }
-            true
+            // No cycle in progress; the caller (`start_gc_cycle`) begins one
+            // when the trigger fires. Nothing to do here.
+            (0, true)
         }
         GcState::Propagate => {
+            let work = 32; // objects per propagate step
             let mut m = Marker {
                 gray: std::mem::take(&mut heap.gc_gray),
                 strings: &heap.strings,
@@ -1104,14 +1197,14 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
                 atomic: false,
                 weak: Vec::new(),
             };
-            let done = m.propagate_step((step / 64).max(1));
+            let done = m.propagate_step(work);
             m.gray.extend(std::mem::take(&mut heap.gc_gray));
             if done && m.gray.is_empty() {
                 heap.gc_state = GcState::Atomic;
             }
             heap.gc_gray = m.gray;
             heap.gc_weak.extend(m.weak);
-            false
+            (GC_STEP_SIZE, false)
         }
         GcState::Atomic => {
             // Atomic: mark the 2nd-chance list once (LuaJIT empties
@@ -1136,11 +1229,7 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             // unmarked (sweep keeps them; weak tables keep their entries,
             // so the finalizer can still reach them). Their metatables
             // are marked so the __gc function stays alive.
-            let mmu = if std::env::var("LUARS_NO_FIN").is_ok() {
-                Vec::new()
-            } else {
-                separate_finalizable(heap)
-            };
+            let mmu = separate_finalizable(heap);
             if !mmu.is_empty() {
                 let mut m = Marker {
                     gray: Vec::new(),
@@ -1163,9 +1252,12 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             // All marking done: drop weak-table entries whose key or value
             // is about to be swept, before the sweep frees any object.
             clear_weak(heap);
+            // LuaJIT's `atomic()`: initial estimate of live bytes.
+            heap.estimate = heap.total + heap.strings.bytes();
             heap.gc_state = GcState::Sweep;
             heap.gc_sweep_pool = 0;
-            false
+            heap.gc_sweep_pos = 0;
+            (GC_STEP_SIZE, false)
         }
         GcState::Sweep => {
             // No propagation in the sweep phase (threads sit in grayagain
@@ -1173,84 +1265,105 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
             // atomic round already handled there.
             let done = sweep_one_pool(heap);
             if done {
-                heap.gc_state = if std::env::var("LUARS_NO_FIN").is_ok() || heap.mmudata.is_empty()
-                {
-                    GcState::Pause
-                } else {
-                    GcState::Finalize
-                };
                 let total = total_live(heap);
                 heap.total = total;
-                heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
-                    .max(GC_THRESHOLD_MIN)
-                    .max(heap.threshold / 2);
-                heap.table_extra = 0;
-                heap.debt = 0;
-                true
+                heap.estimate = total + heap.strings.bytes();
+                if heap.mmudata.is_empty() {
+                    // End of GC cycle: threshold = estimate * pause / 100.
+                    heap.gc_state = GcState::Pause;
+                    heap.threshold = (heap.estimate * GC_PAUSE / 100).max(GC_THRESHOLD_MIN);
+                    heap.table_extra = 0;
+                    heap.debt = 0;
+                    (0, true)
+                } else {
+                    // Finalizers pending; the VM runs them and returns to
+                    // Pause. The cycle is not finished yet.
+                    heap.gc_state = GcState::Finalize;
+                    (0, false)
+                }
             } else {
-                false
+                (GC_SWEEP_COST, false)
             }
         }
         GcState::Finalize => {
             // The VM runs pending finalizers at a safe point and resets
             // the state to Pause; until then every cycle attempt is a
             // no-op (new collections may start from run_finalizers).
-            true
+            (0, true)
         }
     }
 }
 
+/// Sweep up to `GC_SWEEP_MAX` objects of the current pool; the strings pool
+/// is swept whole (its hash table is rebuilt in one pass). Returns true when
+/// the whole sweep phase finished.
 fn sweep_one_pool(heap: &mut GcHeap) -> bool {
-    let done = match heap.gc_sweep_pool {
+    let cw = heap.current_white;
+    let pool = heap.gc_sweep_pool;
+    let pool_done = match pool {
         0 => {
-            heap.strings.sweep(heap.current_white);
-            1
+            heap.strings.sweep(cw);
+            true
         }
         1 => {
-            heap.tables.sweep_tricolor(heap.current_white, |_| {});
-            2
+            let (d, p) = heap
+                .tables
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         2 => {
-            heap.funcs.sweep_tricolor(heap.current_white, |_| {});
-            3
+            let (d, p) = heap
+                .funcs
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         3 => {
-            heap.threads.sweep_tricolor(heap.current_white, |th| {
-                for &uv in &th.openuv {
-                    uv.as_mut().close();
-                }
-            });
-            4
+            let (d, p) = heap.threads.sweep_limited(
+                cw,
+                |th| {
+                    for &uv in &th.openuv {
+                        uv.as_mut().close();
+                    }
+                },
+                GC_SWEEP_MAX,
+                heap.gc_sweep_pos,
+            );
+            heap.gc_sweep_pos = p;
+            d
         }
         4 => {
-            heap.upvals.sweep_tricolor(heap.current_white, |_| {});
-            5
+            let (d, p) = heap
+                .upvals
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         5 => {
-            heap.protos.sweep_tricolor(heap.current_white, |_| {});
-            6
+            let (d, p) = heap
+                .protos
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         6 => {
-            heap.userdatas.sweep_tricolor(heap.current_white, |_| {});
-            7
+            let (d, p) = heap
+                .userdatas
+                .sweep_limited(cw, |_| {}, GC_SWEEP_MAX, heap.gc_sweep_pos);
+            heap.gc_sweep_pos = p;
+            d
         }
         _ => {
-            heap.gc_state = if heap.mmudata.is_empty() {
-                GcState::Pause
-            } else {
-                GcState::Finalize
-            };
-            let total = total_live(heap);
-            heap.total = total;
-            heap.threshold = ((total + heap.strings.bytes()) * GC_PAUSE / 100)
-                .max(GC_THRESHOLD_MIN)
-                .max(heap.threshold / 2);
-            heap.table_extra = 0;
-            heap.debt = 0;
+            // All pools swept. The `gc_onestep` Sweep branch finalizes the
+            // cycle (state, threshold, estimate); just signal completion.
             return true;
         }
     };
-    heap.gc_sweep_pool = done;
+    if pool_done {
+        heap.gc_sweep_pool += 1;
+        heap.gc_sweep_pos = 0;
+    }
     false
 }
 
@@ -1297,9 +1410,9 @@ pub(crate) fn may_clear(v: LuaValue, is_val: bool, cw: u8) -> bool {
             }
             false
         }
-        LJ_TTAB => v.as_table().is_some_and(|p| p.is_white()),
-        LJ_TFUNC => v.as_func().is_some_and(|p| p.is_white()),
-        LJ_TTHREAD => v.as_thread().is_some_and(|p| p.is_white()),
+        LJ_TTAB => v.as_table().is_some_and(|p| !p.is_marked()),
+        LJ_TFUNC => v.as_func().is_some_and(|p| !p.is_marked()),
+        LJ_TTHREAD => v.as_thread().is_some_and(|p| !p.is_marked()),
         LJ_TUDATA => v.as_userdata().is_some_and(|p| {
             // Keys: cleared only when dead (other-white) — a finalized
             // key survives the cycle its finalizer ran in, then dies the
@@ -1312,7 +1425,7 @@ pub(crate) fn may_clear(v: LuaValue, is_val: bool, cw: u8) -> bool {
                 h.is_dead(cw)
             }
         }),
-        LJ_TCDATA => v.as_cdata().is_some_and(|p| p.is_white()),
+        LJ_TCDATA => v.as_cdata().is_some_and(|p| !p.is_marked()),
         _ => false,
     }
 }
@@ -1343,6 +1456,10 @@ fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
     // [u, p1, ..., p10]. run_finalizers pops from the end, so the newest
     // object is finalized first — LuaJIT's mmudata LIFO, which the gc.lua
     // suite depends on (a[o] == 10-s).
+    //
+    // LuaJIT's gc_separateudata only separates userdata and threads —
+    // tables with a __gc metatable are never finalized (the metatable
+    // itself stays alive while its userdata is pending finalization).
     let mut out = Vec::new();
     for i in 0..heap.userdatas.objects.len() {
         let u = heap.userdatas.objects[i];
@@ -1354,15 +1471,6 @@ fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
             h.make_undead();
             h.set_finalized();
             out.push(Finalizable::UData(GcPtr(u)));
-        }
-    }
-    for i in 0..heap.tables.objects.len() {
-        let t = heap.tables.objects[i];
-        let h = gc_header(t);
-        if !h.marked.get() && !h.is_finalized() && has_gc_meta(unsafe { t.as_ref() }.metatable) {
-            h.make_undead();
-            h.set_finalized();
-            out.push(Finalizable::Table(GcPtr(t)));
         }
     }
     out
@@ -1423,6 +1531,18 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
     g.heap.threads.update_current_white(cw);
     g.heap.cdatas.update_current_white(cw);
     g.heap.userdatas.update_current_white(cw);
+    // The `marked` flag records "marked in the current cycle". An
+    // interrupted cycle (an allocation-driven step that stops mid-mark)
+    // leaves it set; without a reset here, those objects would count as
+    // live in this fresh cycle even though they are never re-marked —
+    // weak tables would keep them and the sweep would retain them.
+    g.heap.tables.reset_marked();
+    g.heap.funcs.reset_marked();
+    g.heap.threads.reset_marked();
+    g.heap.upvals.reset_marked();
+    g.heap.protos.reset_marked();
+    g.heap.userdatas.reset_marked();
+    g.heap.cdatas.reset_marked();
     g.heap.gc_state = GcState::Propagate;
     let mut m = Marker {
         gray: Vec::with_capacity(64),
@@ -1438,6 +1558,9 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
     }
     for &v in g.mmname.iter() {
         m.mark_value(v);
+    }
+    for v in g.io_file_cache.iter().flatten() {
+        m.mark_value(*v);
     }
     m.mark_thread(g.main());
     if let Some(cur) = g.cur_l {

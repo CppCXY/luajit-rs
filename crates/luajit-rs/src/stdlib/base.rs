@@ -3,6 +3,7 @@
 //! `error`, `pcall`, `xpcall`, `rawequal`, `rawget`, `rawset`, `getmetatable`,
 //! `newproxy`.
 
+use crate::api::{lua_pushcfunction, lua_setglobal};
 use crate::err::{LuaError, LuaResult};
 use crate::runtime::meta::MM;
 use crate::runtime::userdata::GcUserData;
@@ -81,6 +82,8 @@ pub fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
         b"function"
     } else if v.is_cdata() {
         b"cdata"
+    } else if v.is_thread() {
+        b"thread"
     } else {
         b"userdata"
     };
@@ -90,14 +93,37 @@ pub fn lib_type(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn lib_tostring(l: &mut LuaState) -> LuaResult<i32> {
+    if crate::stdlib::nargs(l) < 1 {
+        return Err(l.runtime_error(b"bad argument #1 to 'tostring' (value expected)"));
+    }
     let v = arg(l, 0);
-    let bytes = tostring_meta(l, v)?;
+    // Lua 5.1 luaB_tostring: the __tostring result is returned verbatim
+    // (even nil); only when there is no metamethod is the raw fallback used.
+    let mo = crate::meta::meta_lookup(l.global(), v, crate::meta::MM::Tostring);
+    if !mo.is_nil() {
+        let saved_top = l.top;
+        let saved_base = l.base;
+        let fs = l.top + 16;
+        l.stack_ensure(fs + 4);
+        l.stack[fs] = mo;
+        l.stack[fs + 2] = v;
+        crate::vm::execute(l, fs, 1, 1)?;
+        let r = l.stack[fs];
+        l.top = saved_top;
+        l.base = saved_base;
+        push(l, r);
+        return Ok(1);
+    }
+    let bytes = crate::stdlib::tostring_bytes(l, v);
     let sid = l.heap().intern(&bytes);
     push(l, l.heap().str_value(sid));
     Ok(1)
 }
 
 pub fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
+    if crate::stdlib::nargs(l) < 1 {
+        return Err(l.runtime_error(b"bad argument #1 to 'tonumber' (value expected)"));
+    }
     let v = arg(l, 0);
     let r = if nargs(l) > 1 {
         // tonumber(e, base): parse e (string or number) in the given base.
@@ -110,24 +136,36 @@ pub fn lib_tonumber(l: &mut LuaState) -> LuaResult<i32> {
             Vec::new()
         };
         let mut r = LuaValue::NIL;
-        if (2..=36).contains(&base) && !s.is_empty() {
+        // Lua 5.1 luaB_tonumber with base: skip leading whitespace, parse
+        // base digits, skip trailing whitespace, then require end of
+        // string (`tonumber('  1010  ', 2) == 10`, `tonumber('  ', 9)`
+        // is nil, `tonumber('99', 8)` is nil).
+        if (2..=36).contains(&base) {
+            let mut i = 0;
+            while i < s.len() && (s[i] as char).is_ascii_whitespace() {
+                i += 1;
+            }
             let mut n: u64 = 0;
             let mut any = false;
-            for &b in &s {
-                let d = match b {
-                    b'0'..=b'9' => (b - b'0') as u64,
-                    b'a'..=b'z' => (b - b'a' + 10) as u64,
-                    b'A'..=b'Z' => (b - b'A' + 10) as u64,
-                    _ => 0,
+            while i < s.len() {
+                let c = s[i];
+                let d = match c {
+                    b'0'..=b'9' => (c - b'0') as u64,
+                    b'a'..=b'z' => (c - b'a' + 10) as u64,
+                    b'A'..=b'Z' => (c - b'A' + 10) as u64,
+                    _ => break, // invalid digit
                 };
                 if d >= base as u64 {
-                    any = false;
                     break;
                 }
                 n = n.wrapping_mul(base as u64).wrapping_add(d);
                 any = true;
+                i += 1;
             }
-            if any {
+            while i < s.len() && (s[i] as char).is_ascii_whitespace() {
+                i += 1;
+            }
+            if any && i == s.len() {
                 r = LuaValue::number(n as f64);
             }
         }
@@ -156,12 +194,23 @@ fn lib_select(l: &mut LuaState) -> LuaResult<i32> {
         push(l, LuaValue::number((n - 1) as f64));
         return Ok(1);
     }
-    let k = match first.as_number() {
-        Some(k) if k >= 1.0 => k as usize,
+    // 5.1 luaB_select: negative i counts from the end (i = n + i), then
+    // clamps to [1, n] (select(10000, ...) yields nothing, no error).
+    let mut k = match first.as_number() {
+        Some(k) if k >= 1.0 => k as isize,
+        Some(k) if k < 0.0 => n as isize + k as isize,
         _ => {
             return Err(err_bad_arg_type(l, 1, "select", "number or '#'", arg(l, 0)));
         }
     };
+    if k > n as isize {
+        k = n as isize;
+    }
+    if k < 1 {
+        return Err(l.runtime_error(b"bad argument #1 to 'select' (index out of range)"));
+    }
+    let k = k as usize;
+    // Args are 0-based on the stack; the value args sit at 1..n.
     let mut cnt = 0;
     l.stack_ensure(l.base + n.saturating_sub(k));
     for i in k..n {
@@ -180,8 +229,11 @@ pub fn lib_next(l: &mut LuaState) -> LuaResult<i32> {
         Some(t) => t,
         None => return Err(err_bad_arg_type(l, 1, "next", "table", arg(l, 0))),
     };
-    // Lua 5.1: a non-nil key must actually be in the table.
-    if !k.is_nil() && tab.as_ref().get(k).is_nil() {
+    // LuaJIT's lj_tab_next raises for a key that is not (or no longer) a
+    // key of the table. A key deleted mid-traversal stays findable until
+    // a rehash reclaims its node, so the strict check does not break
+    // `for k in pairs(t) do t[k] = nil end` loops.
+    if !k.is_nil() && !tab.as_ref().is_valid_key(k) {
         return Err(l.runtime_error(b"invalid key to 'next'"));
     }
     match tab.as_ref().next(k) {
@@ -202,20 +254,16 @@ fn lib_pairs(l: &mut LuaState) -> LuaResult<i32> {
     let mo = crate::meta::meta_lookup(l.global(), t, crate::meta::MM::Pairs);
     if !mo.is_nil() {
         let obase = l.base;
-        let _saved_top = l.top;
         let fs = l.top + 16;
         l.stack_ensure(fs + 4);
         l.stack[fs] = mo;
         l.stack[fs + 2] = t;
         crate::vm::execute(l, fs, 1, 3)?;
-        let n = (l.top - fs).min(3);
+        // execute restores the caller's top; the three results (padded
+        // with nil) are always at fs..fs+3.
         l.stack_ensure(obase + 3);
         for i in 0..3 {
-            l.stack[obase + i] = if i < n {
-                l.stack[fs + i]
-            } else {
-                LuaValue::NIL
-            };
+            l.stack[obase + i] = l.stack[fs + i];
         }
         l.top = obase + 3;
         l.base = obase;
@@ -258,14 +306,11 @@ fn lib_ipairs(l: &mut LuaState) -> LuaResult<i32> {
         l.stack[fs] = mo;
         l.stack[fs + 2] = t;
         crate::vm::execute(l, fs, 1, 3)?;
-        let n = (l.top - fs).min(3);
+        // execute restores the caller's top; the three results (padded
+        // with nil) are always at fs..fs+3.
         l.stack_ensure(obase + 3);
         for i in 0..3 {
-            l.stack[obase + i] = if i < n {
-                l.stack[fs + i]
-            } else {
-                LuaValue::NIL
-            };
+            l.stack[obase + i] = l.stack[fs + i];
         }
         l.top = obase + 3;
         l.base = obase;
@@ -316,17 +361,11 @@ fn lib_assert(l: &mut LuaState) -> LuaResult<i32> {
         // pcall) has no source line, so the message stays bare.
         let loc = assert_where(l);
         let full = if let Some(sid) = msg.as_string_id() {
-            format!(
-                "{}{}",
-                loc,
-                String::from_utf8_lossy(l.str_static(sid))
-            )
+            format!("{}{}", loc, String::from_utf8_lossy(l.str_static(sid)))
         } else {
             format!("{}assertion failed!", loc)
         };
-        l.errval = l
-            .heap()
-            .str_value(l.heap().intern(full.as_bytes()));
+        l.errval = l.heap().str_value(l.heap().intern(full.as_bytes()));
         Err(LuaError::Runtime)
     }
 }
@@ -352,7 +391,10 @@ fn assert_where(l: &LuaState) -> String {
         return String::new();
     };
     let pt = cl.proto.as_ref();
-    let pc = l.debug_pc.min(pt.lines.len().saturating_sub(1));
+    let pc = l
+        .debug_pc
+        .saturating_sub(1)
+        .min(pt.lines.len().saturating_sub(1));
     let line = pt.lines[pc];
     let src = pt
         .source
@@ -367,11 +409,7 @@ fn assert_where(l: &LuaState) -> String {
         })
         .unwrap_or(b"?")
         .to_vec();
-    format!(
-        "{}:{}: ",
-        String::from_utf8_lossy(&src),
-        line
-    )
+    format!("{}:{}: ", String::from_utf8_lossy(&src), line)
 }
 
 fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
@@ -386,6 +424,12 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             crate::vm::run_finalizers(l)?;
             crate::gc::full_gc(l.global());
             crate::vm::run_finalizers(l)?;
+            // Lua 5.1's luaC_step calls setthreshold when the cycle
+            // completes, which re-arms the automatic collector even after
+            // collectgarbage("stop"). Mirror that: a full collection
+            // un-stops the GC, or a later allocation loop (e.g. closure.lua's
+            // `while x[1] do ... end` weak-table loop) would spin forever.
+            l.global().heap.gc_stopped = false;
             push(l, LuaValue::number(0.0));
             Ok(1)
         }
@@ -455,13 +499,14 @@ fn lib_collectgarbage(l: &mut LuaState) -> LuaResult<i32> {
             push(l, LuaValue::number(bytes as f64 / 1024.0));
             Ok(1)
         }
-        _ => Err(err_bad_arg_type(
-            l,
-            1,
-            "collectgarbage",
-            "option string",
-            arg(l, 0),
-        )),
+        _ => {
+            // LuaJIT: `bad argument #1 to 'collectgarbage' (invalid option 'X')`.
+            let opt = match arg(l, 0).as_string_id() {
+                Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
+                None => "?".into(),
+            };
+            Err(l.runtime_error(format!("invalid option '{}'", opt).as_bytes()))
+        }
     }
 }
 
@@ -567,6 +612,13 @@ fn lib_pcall(l: &mut LuaState) -> LuaResult<i32> {
             l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
+            // The raised frame's slot/PC were recorded for traceback; the
+            // error is now handled, so drop them — the recorded frame may
+            // have been popped (and its closure collected) by the time the
+            // caller runs a traceback, and a stale slot would point at a
+            // recycled closure.
+            l.err_trace_slot = None;
+            l.err_raise_pc = None;
             Ok(2)
         }
         Err(LuaError::Yield) => {
@@ -681,9 +733,21 @@ fn lib_xpcall(l: &mut LuaState) -> LuaResult<i32> {
                     && n >= 1
                 {
                     l.errval = l.stack[fs];
+                } else {
+                    // The message handler itself raised (e.g.
+                    // `xpcall(error, error)`): Lua reports
+                    // "error in error handling" as the final message.
+                    l.errval = l
+                        .heap()
+                        .str_value(l.heap().intern(b"error in error handling"));
                 }
                 l.base = saved_base;
             }
+            // The error is handled; drop the recorded raise frame so a
+            // later traceback cannot dereference a frame that was already
+            // popped and collected.
+            l.err_trace_slot = None;
+            l.err_raise_pc = None;
             l.stack_ensure(l.base + 2);
             l.stack[l.base] = LuaValue::FALSE;
             l.stack[l.base + 1] = l.errval;
@@ -727,7 +791,21 @@ fn lib_setfenv(l: &mut LuaState) -> LuaResult<i32> {
         t.get().thread_env = tab;
         push(l, o);
     } else if o.is_number() {
-        return Err(l.runtime_error(b"setfenv: numeric level not supported"));
+        let level = o.as_number().unwrap() as i32;
+        if level == 0 {
+            // setfenv(0, t): the environment of the running thread.
+            l.thread_env = tab;
+            push(l, LuaValue::TRUE);
+        } else if let Some(func) = crate::stdlib::debug::frame_func(l, level) {
+            match func.as_mut() {
+                crate::func::GcFunc::Lua(c) => c.env = tab,
+                crate::func::GcFunc::C(c) => c.env = tab,
+            }
+            // Lua 5.1's luaB_setfenv returns the function at the level.
+            push(l, LuaValue::func(func));
+        } else {
+            return Err(l.runtime_error(b"`setfenv' cannot change environment of given object"));
+        }
     } else {
         return Err(err_bad_arg_type(
             l,
@@ -750,6 +828,16 @@ fn lib_getfenv(l: &mut LuaState) -> LuaResult<i32> {
         },
         // getfenv(0): the environment of the running thread.
         _ if o.as_number() == Some(0.0) => l.thread_env,
+        // getfenv(n): the environment of the function at debug level n.
+        _ if o.is_number() => {
+            match crate::stdlib::debug::frame_func(l, o.as_number().unwrap() as i32) {
+                Some(f) => match f.as_ref() {
+                    crate::func::GcFunc::Lua(c) => c.env,
+                    crate::func::GcFunc::C(c) => c.env,
+                },
+                None => l.global().globals,
+            }
+        }
         _ => l.global().globals,
     };
     push(l, LuaValue::table(env));
@@ -795,9 +883,15 @@ fn call_reader(l: &mut LuaState, reader: LuaValue) -> Result<Vec<u8>, Vec<u8>> {
             }
         }
         Err(_e) => {
+            // Preserve the reader's error message (error("hhi") → "hhi").
+            let msg = if let Some(sid) = l.errval.as_string_id() {
+                l.str_static(sid).to_vec()
+            } else {
+                crate::stdlib::tostring_bytes(l, l.errval)
+            };
             l.top = saved_top;
             l.base = saved_base;
-            Err(b"reader function error".to_vec())
+            Err(msg)
         }
     }
 }
@@ -906,9 +1000,8 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
     // Lua 5.1's luaL_loadbuffer: no explicit name (or a nil one) means
     // the chunk name is the source itself; luaO_chunkid handles newlines
     // and truncation.
-    let default_name = || {
-        String::from_utf8_lossy(v.as_string().unwrap().as_ref().as_bytes()).into_owned()
-    };
+    let default_name =
+        || String::from_utf8_lossy(v.as_string().unwrap().as_ref().as_bytes()).into_owned();
     let chunkname = if nargs(l) >= 2 {
         let nv = arg(l, 1);
         if let Some(s) = nv.as_string() {
@@ -935,12 +1028,6 @@ fn lib_loadstring(l: &mut LuaState) -> LuaResult<i32> {
             format!("[string \"{}...\"]", &chunkname[start..len])
         }
     };
-    if std::env::var("LUARS_SRCDBG").is_ok() {
-        eprintln!("SRCDBG chunkname={:?}", chunkname);
-    }
-    if std::env::var("LUARS_SRCDBG").is_ok() {
-        eprintln!("SRCDBG chunkname={:?}", chunkname);
-    }
     match crate::state::load(l, code, &chunkname) {
         Ok(v) => {
             push(l, v);
@@ -1115,7 +1202,6 @@ pub fn open(l: &mut LuaState) {
         .func(b"pcall", lib_pcall)
         .func(b"xpcall", lib_xpcall)
         .func(b"getmetatable", lib_getmetatable)
-        .func(b"rawlen", lib_rawlen)
         .func(b"setfenv", lib_setfenv)
         .func(b"getfenv", lib_getfenv)
         .func(b"loadstring", lib_loadstring)
@@ -1125,6 +1211,9 @@ pub fn open(l: &mut LuaState) {
         .func(b"module", lib_module)
         .func(b"newproxy", lib_newproxy)
         .build();
+    // `rawlen` is a Lua 5.2 function (LuaJIT: `#if LJ_52`).
+    lua_pushcfunction(l, lib_rawlen);
+    lua_setglobal(l, "rawlen");
 
     // The internal ipairs iterator stays off the global namespace; the
     // registry table keeps it reachable for the GC.

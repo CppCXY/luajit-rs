@@ -175,6 +175,8 @@ pub fn tostring_bytes(l: &mut LuaState, v: LuaValue) -> Vec<u8> {
         "table"
     } else if v.is_func() {
         "function"
+    } else if v.is_thread() {
+        "thread"
     } else {
         "userdata"
     };

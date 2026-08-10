@@ -450,9 +450,22 @@ pub fn format(fmt: &[u8], args: &[FmtArg]) -> Result<Vec<u8>, String> {
                                 out.push(b'\\');
                                 out.push(b);
                             }
-                            b'\n' => out.extend_from_slice(b"\\n"),
-                            b'\r' => out.extend_from_slice(b"\\r"),
-                            0 => out.extend_from_slice(b"\\0"),
+                            // LuaJIT quotes newline/CR with a backslash
+                            // followed by the *literal* byte.
+                            b'\n' | b'\r' => {
+                                out.push(b'\\');
+                                out.push(b);
+                            }
+                            b'\t' => out.extend_from_slice(b"\\t"),
+                            b'\x07' => out.extend_from_slice(b"\\a"),
+                            b'\x08' => out.extend_from_slice(b"\\b"),
+                            b'\x0c' => out.extend_from_slice(b"\\f"),
+                            b'\x0b' => out.extend_from_slice(b"\\v"),
+                            // Other control bytes: 3-digit octal ("\000").
+                            b if b < 32 || b == 127 => {
+                                let oct = format!("\\{:03o}", b);
+                                out.extend_from_slice(oct.as_bytes());
+                            }
                             _ => out.push(b),
                         }
                     }

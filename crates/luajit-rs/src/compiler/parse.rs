@@ -6,7 +6,7 @@ use crate::bc::{bc_a, bc_b, bc_c, bc_d};
 use crate::lex::*;
 use crate::proto::{
     KGc, PROTO_BITOP, PROTO_CHILD, PROTO_FFI, PROTO_FIXUP_RETURN, PROTO_HAS_RETURN,
-    PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, Proto,
+    PROTO_UV_IMMUTABLE, PROTO_UV_LOCAL, PROTO_VARARG, PROTO_VARARG_NEEDSARG, Proto,
 };
 use crate::table::LuaTable;
 use crate::value::LuaValue;
@@ -267,7 +267,7 @@ fn lex_isname(tok: Tok) -> bool {
 fn parse_isend(tok: Tok) -> bool {
     matches!(
         tok,
-        Tok::Else | Tok::Elseif | Tok::End | Tok::Until | Tok::Eof | Tok::Char(b';')
+        Tok::Else | Tok::Elseif | Tok::End | Tok::Until | Tok::Eof
     )
 }
 
@@ -279,10 +279,19 @@ pub struct Parser<'a> {
     level: u32,
     fr2: u32,
     fs: Vec<FuncState>,
+    /// Interned chunk source name, propagated to every proto so error
+    /// messages from nested functions report the real file (Lua's
+    /// `luaO_chunkid` behaviour).
+    chunk_sid: Option<StrId>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: Vec<u8>, chunkname: String, strs: &'a mut Interner) -> Parser<'a> {
+        let chunk_sid = if chunkname.is_empty() {
+            None
+        } else {
+            Some(strs.intern(chunkname.as_bytes()))
+        };
         Parser {
             ls: LexState::new(src, chunkname, strs),
             vstack: Vec::new(),
@@ -291,6 +300,7 @@ impl<'a> Parser<'a> {
             level: 0,
             fr2: 1,
             fs: Vec::new(),
+            chunk_sid,
         }
     }
 
@@ -1409,7 +1419,23 @@ impl<'a> Parser<'a> {
                 let mut fi = top;
                 loop {
                     let nuv = self.fs[fi].nuv as usize;
-                    self.checklimit(nuv as u32, LJ_MAX_UPVAL, "upvalues");
+                    // Report the *frame that hit the limit* (e.g. an outer
+                    // function whose upvalues grew past 60 while a deep
+                    // nested body was parsed), not the innermost one.
+                    if nuv as u32 >= LJ_MAX_UPVAL {
+                        let ld = self.fs[fi].linedefined;
+                        if ld == 0 {
+                            self.ls.error(&format!(
+                                "main function has more than {} upvalues",
+                                LJ_MAX_UPVAL
+                            ));
+                        } else {
+                            self.ls.error(&format!(
+                                "function at line {} has more than {} upvalues",
+                                ld, LJ_MAX_UPVAL
+                            ));
+                        }
+                    }
                     self.fs[fi].uvmap[nuv] = vidx;
                     self.fs[fi].nuv = (nuv + 1) as u8;
                     let pend = (fi, nuv);
@@ -1642,10 +1668,10 @@ impl<'a> Parser<'a> {
         // `a[newproxy(u)]` cascade through the shared metatable and mark
         // every weak-table key). Clear the block's temp range on exit,
         // *after* UCLO so closed upvalues keep their values.
-        let max_fr = bl.max_freereg as u32;
+        let max_fr = bl.max_freereg;
         if max_fr > nactvar {
             self.cur_mut().freereg = nactvar;
-            self.bcemit_ad(BCOp::KNIL, nactvar, (max_fr - 1) as u32);
+            self.bcemit_ad(BCOp::KNIL, nactvar, max_fr - 1);
         }
         self.cur_mut().freereg = nactvar;
         debug_assert!(bl.nactvar as u32 == self.cur().nactvar);
@@ -1732,7 +1758,18 @@ impl<'a> Parser<'a> {
 
     fn fs_finish(&mut self, line: BCLine) -> Proto {
         self.fs_fixup_ret();
-        let fs = self.fs.pop().unwrap();
+        let mut fs = self.fs.pop().unwrap();
+        // A vararg function with the implicit `arg` table (body never uses
+        // `...`): the VM stores the table at register `numparams`, so the
+        // frame must cover it. If the body never touches `arg`, `freereg`
+        // (and thus `framesize`) can stop at `numparams`, leaving the arg
+        // slot outside the frame — a nested call's temporaries then
+        // overwrite it, and the parameter slots read as nil afterwards
+        // (LuaJIT test-suite: lang/vararg_jit, lib/coroutine/yield).
+        if (fs.flags & PROTO_VARARG_NEEDSARG) != 0 {
+            let need = (fs.numparams as u32 + 1).max(fs.framesize as u32);
+            fs.framesize = need.min(u8::MAX as u32) as u8;
+        }
         let numline = line - fs.linedefined;
         self.checklimitgt_static(fs.kn.len() as u32, BCMAX_D + 1, "constants", fs.linedefined);
         self.checklimitgt_static(
@@ -1820,7 +1857,7 @@ impl<'a> Parser<'a> {
             numline,
             uvnames,
             varnames,
-            source: None,
+            source: fs.source,
         }
     }
 
@@ -1840,7 +1877,14 @@ impl<'a> Parser<'a> {
 
     fn fs_init(&mut self) {
         let vbase = self.vstack.len();
-        self.fs.push(FuncState::new(vbase));
+        // Nested functions inherit the chunk source; the outermost one
+        // gets it from the chunkname.
+        let source = if self.fs.is_empty() {
+            self.chunk_sid
+        } else {
+            self.cur().source
+        };
+        self.fs.push(FuncState::new(vbase, source));
     }
 
     // -- Expressions ---------------------------------------------------------
@@ -2036,7 +2080,12 @@ impl<'a> Parser<'a> {
                     nparams += 1;
                 } else if self.ls.tok == Tok::Dots {
                     self.ls.next();
-                    self.cur_mut().flags |= PROTO_VARARG;
+                    self.cur_mut().flags |= PROTO_VARARG | PROTO_VARARG_NEEDSARG;
+                    // Lua 5.1 LUA_COMPAT_VARARG: declare the implicit
+                    // `arg` local (its value is built by the VM when the
+                    // body never uses `...` itself).
+                    self.var_new_lit(nparams, b"arg");
+                    nparams += 1;
                     break;
                 } else {
                     self.err_syntax("<name> or '...' expected");
@@ -2061,7 +2110,9 @@ impl<'a> Parser<'a> {
         };
         let fs = self.cur_mut();
         fs.linedefined = line;
-        fs.numparams = nparams as u8;
+        // The implicit `arg` local occupies one register; it is not a
+        // fixed parameter.
+        fs.numparams = nparams.saturating_sub((fs.flags & PROTO_VARARG != 0) as BCReg) as u8;
         fs.bcbase = pbcbase + ppc as usize;
         self.bcemit_ad(BCOp::FUNCF, 0, 0);
     }
@@ -2230,10 +2281,23 @@ impl<'a> Parser<'a> {
                 if nav && (eflags & EXPR_F_NORES) == 0 && !self.suffix_follows() {
                     break;
                 }
-            } else if self.ls.tok == Tok::Char(b'(')
-                || self.ls.tok == Tok::Str
-                || self.ls.tok == Tok::Char(b'{')
-            {
+            } else if self.ls.tok == Tok::Char(b'(') {
+                // Lua 5.1 (lj_parse.c parse_args): a `(` on a different line
+                // than the callee is ambiguous (call continuation vs a new
+                // parenthesized statement) → error.
+                if self.ls.linenumber != self.ls.lastline {
+                    self.ls
+                        .error("ambiguous syntax (function call x new statement)");
+                }
+                self.expr_tonextreg(v);
+                if self.fr2 != 0 {
+                    self.bcreg_reserve(1);
+                }
+                self.parse_args(v);
+                if nav && (eflags & EXPR_F_NORES) == 0 && !self.suffix_follows() {
+                    break;
+                }
+            } else if self.ls.tok == Tok::Str || self.ls.tok == Tok::Char(b'{') {
                 self.expr_tonextreg(v);
                 if self.fr2 != 0 {
                     self.bcreg_reserve(1);
@@ -2317,6 +2381,9 @@ impl<'a> Parser<'a> {
                 if (self.cur().flags & PROTO_VARARG) == 0 {
                     self.err_syntax("cannot use '...' outside a vararg function");
                 }
+                // 5.1: using `...` in the body disables the implicit `arg`
+                // table (lparser.c primaryexp TK_DOTS).
+                self.cur_mut().flags &= !PROTO_VARARG_NEEDSARG;
                 self.bcreg_reserve(1);
                 let base = self.cur().freereg - 1;
                 let numparams = self.cur().numparams as u32;
@@ -2420,12 +2487,33 @@ impl<'a> Parser<'a> {
     }
 
     fn expr_cond(&mut self) -> BCPos {
+        let freg = self.cur().freereg;
         let mut v = ExpDesc::init(VVoid, 0);
         self.expr(&mut v, 0);
         if v.k == VKNil {
             v.k = VKFalse;
         }
         self.bcemit_branch_t(&mut v);
+        // The condition's temp slots are dead after the branch. Clear
+        // them (and restore the register allocator) so a GC triggered
+        // later in the enclosing block cannot keep values alive through
+        // stale registers — e.g. a weak-table value read by the loop
+        // condition must not survive in a dead register slot and defeat
+        // weak-table clearing. Sits on the taken path, so loops re-run
+        // it every iteration.
+        let freereg = self.cur().freereg;
+        // The condition value itself lives in a register (`VNonReloc`)
+        // that `freereg` no longer accounts for, so extend the cleared
+        // range to cover it. Locals (VLocal) sit below `freg` and are
+        // skipped.
+        let mut to = freereg;
+        if v.k == VNonReloc && v.info != NO_REG {
+            to = to.max(v.info + 1);
+        }
+        if to > freg {
+            self.bcemit_nil(freg, to - freg);
+            self.cur_mut().freereg = freg;
+        }
         v.f
     }
 
@@ -2744,10 +2832,11 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_break(&mut self) {
+        // LuaJIT marks the scope and defers the "no loop to break" check
+        // to gola resolution at block end; a syntax error (e.g. a stray
+        // token after `break`) must win first, matching 5.1 semantics:
+        // `loadstring("break label")` → "... near 'label'".
         let fs = self.cur_mut();
-        if !fs.scopes.iter().any(|s| (s.flags & FSCOPE_LOOP) != 0) {
-            self.ls.error("no loop to break");
-        }
         fs.scopes.last_mut().unwrap().flags |= FSCOPE_BREAK;
         let pc = self.bcemit_jmp();
         self.gola_new(VName::Break, VSTACK_GOTO, pc);
@@ -2793,11 +2882,14 @@ impl<'a> Parser<'a> {
         let pc = self.cur().pc;
         let idx = self.gola_new(VName::Str(name), VSTACK_LABEL, pc);
         self.lex_check(Tok::Label);
+        // Recursively parse trailing statements: labels and `;` (Lua 5.2).
         loop {
             if self.ls.tok == Tok::Label {
                 self.synlevel_begin();
                 self.parse_label();
                 self.synlevel_end();
+            } else if self.ls.tok == Tok::Char(b';') {
+                self.ls.next();
             } else {
                 break;
             }
@@ -3088,10 +3180,15 @@ impl<'a> Parser<'a> {
             Tok::Break => {
                 self.ls.next();
                 self.parse_break();
-                return false;
+                // Lua 5.1: break must be the last statement in a block
+                // (LuaJIT returns `!LJ_52`). A trailing token is a syntax
+                // error reported by the enclosing block: `break label`
+                // → "... near 'label'".
+                return true;
             }
             Tok::Continue => {
-                if !parse_isend(self.ls.peek()) {
+                let peeked = self.ls.peek();
+                if !(parse_isend(peeked) || peeked == Tok::Char(b';')) {
                     self.parse_call_assign();
                     return false;
                 }
@@ -3108,16 +3205,16 @@ impl<'a> Parser<'a> {
                 self.parse_label();
             }
             Tok::Char(b';') => {
+                // Empty statement: a Lua 5.2+ feature.
                 self.ls.next();
             }
             // Not expressible as a match guard: `peek` needs `&mut self`.
-            #[allow(clippy::collapsible_match)]
             Tok::Goto => {
                 if lex_isname(self.ls.peek()) {
                     self.ls.next();
                     self.parse_goto();
                 } else {
-                    // `goto` is a keyword: `goto = 1` is a syntax error.
+                    // `goto` is a reserved word (Lua 5.2+).
                     self.err_syntax("<name> expected");
                 }
             }
@@ -3138,7 +3235,9 @@ impl<'a> Parser<'a> {
             // it with the upcoming statement's opening token.
             self.ls.lastline = self.ls.linenumber;
             islast = self.parse_stmt();
-            while self.ls.tok == Tok::Char(b';') {
+            // Lua 5.1's `testnext(ls, ';')`: consume at most one `;` after
+            // a statement. A second `;` (e.g. `a=1;;`) is an error.
+            if self.ls.tok == Tok::Char(b';') {
                 self.ls.next();
             }
             debug_assert!(

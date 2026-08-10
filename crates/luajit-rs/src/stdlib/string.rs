@@ -23,7 +23,8 @@ fn push_captures(l: &mut LuaState, captures: &[CaptureValue], text: &[u8], base:
                 l.stack[base + i] = l.heap().str_value(sid);
             }
             CaptureValue::Position(p) => {
-                l.stack[base + i] = LuaValue::number((*p + 1) as f64);
+                // Already 1-based (engine adds +1).
+                l.stack[base + i] = LuaValue::number(*p as f64);
             }
         }
     }
@@ -48,7 +49,14 @@ fn str_find(l: &mut LuaState) -> LuaResult<i32> {
             ));
         }
     };
-    let init = arg(l, 2).as_number().map_or(1, |n| n.max(1.0) as usize);
+    // init: negative counts from the end (1-based: len + init + 1).
+    let init_n = arg(l, 2).as_number().unwrap_or(1.0);
+    let init = if init_n < 0.0 {
+        let len = s.len() as f64;
+        (len + init_n + 1.0).max(1.0) as usize
+    } else {
+        init_n.max(1.0) as usize
+    };
     let plain = arg(l, 3).is_truthy();
 
     if plain {
@@ -57,8 +65,10 @@ fn str_find(l: &mut LuaState) -> LuaResult<i32> {
             .position(|w| w == pat)
         {
             let start = init + pos;
-            push(l, LuaValue::number(start as f64));
-            push(l, LuaValue::number((start + pat.len() - 1) as f64));
+            l.stack_ensure(l.base + 2);
+            l.stack[l.base] = LuaValue::number(start as f64);
+            l.stack[l.base + 1] = LuaValue::number((start + pat.len() - 1) as f64);
+            l.top = l.base + 2;
             return Ok(2);
         }
         push(l, LuaValue::NIL);
@@ -182,7 +192,10 @@ fn gmatch_iter(l: &mut LuaState) -> LuaResult<i32> {
 
     match find(&text, &pat, pos.saturating_sub(1)) {
         Ok(Some((start, end, caps))) => {
-            l.set_upvalue(2, LuaValue::number((end + 1) as f64));
+            // Advance past empty matches (5.1 gmatch_aux: `e == src` skips
+            // one char so `()` on "abcde" yields positions 1..6).
+            let next = if end == start { start + 1 } else { end };
+            l.set_upvalue(2, LuaValue::number((next + 1) as f64));
             let caps_vec: Vec<CaptureValue> = caps.iter().cloned().collect();
             if caps_vec.is_empty() {
                 let sid = l.heap().intern(&text[start..end]);
@@ -238,6 +251,27 @@ fn str_gsub(l: &mut LuaState) -> LuaResult<i32> {
         l.stack[l.base + 1] = LuaValue::number(count as f64);
         l.top = l.base + 2;
         Ok(2)
+    } else if let Some(tab) = repl_arg.as_table() {
+        let (result, count) = gsub_tab(l, &s, &pat, tab, max)?;
+        let sid = l.heap().intern(&result);
+        l.stack_ensure(l.base + 2);
+        l.stack[l.base] = l.heap().str_value(sid);
+        l.stack[l.base + 1] = LuaValue::number(count as f64);
+        l.top = l.base + 2;
+        Ok(2)
+    } else if let Some(n) = repl_arg.as_number() {
+        let repl = crate::strfmt::g14(n).as_bytes().to_vec();
+        match gsub(&s, &pat, &repl, max) {
+            Ok((result, count)) => {
+                let sid = l.heap().intern(&result);
+                l.stack_ensure(l.base + 2);
+                l.stack[l.base] = l.heap().str_value(sid);
+                l.stack[l.base + 1] = LuaValue::number(count as f64);
+                l.top = l.base + 2;
+                Ok(2)
+            }
+            Err(e) => Err(l.runtime_error(e.as_bytes())),
+        }
     } else {
         let repl = match repl_arg.as_string_id() {
             Some(sid) => l.str_static(sid).to_vec(),
@@ -285,23 +319,30 @@ fn gsub_fn(
             Ok(Some((m_start, m_end, caps))) => {
                 out.extend_from_slice(&s[pos..m_start]);
                 let mut args: Vec<LuaValue> = Vec::new();
+                if caps.is_empty() {
+                    // No captures: the whole match is the single argument.
+                    let sid = l.heap().intern(&s[m_start..m_end]);
+                    args.push(l.heap().str_value(sid));
+                }
                 for i in 0..caps.len() {
                     match caps.get(i) {
                         Some(crate::stdlib::pattern::CaptureValue::Substring(cs, ce)) => {
                             let sid = l.heap().intern(&s[*cs..*ce]);
                             args.push(l.heap().str_value(sid));
                         }
-                        Some(crate::stdlib::pattern::CaptureValue::Position(_)) => {
-                            args.push(LuaValue::number(m_start as f64 + 1.0));
+                        Some(crate::stdlib::pattern::CaptureValue::Position(p)) => {
+                            // Already 1-based relative to the source start.
+                            args.push(LuaValue::number(*p as f64));
                         }
                         None => args.push(LuaValue::NIL),
                     }
                 }
                 let r = call_lua_fn(l, func, &args)?;
-                if let Some(sid) = r.as_string_id() {
+                if r.is_nil() || r.is_false() {
+                    // Lua 5.1: a nil/false result keeps the original match.
+                    out.extend_from_slice(&s[m_start..m_end]);
+                } else if let Some(sid) = r.as_string_id() {
                     out.extend_from_slice(l.str_static(sid));
-                } else if r.is_false() || r.is_nil() {
-                    // Use empty string for false/nil
                 } else {
                     let ts = crate::stdlib::tostring_bytes(l, r);
                     out.extend_from_slice(&ts);
@@ -323,6 +364,102 @@ fn gsub_fn(
     }
     out.extend_from_slice(&s[pos..]);
     Ok((out, count))
+}
+
+/// `string.gsub` with a table replacement: the key is the first capture
+/// (or the whole match when there are no captures); nil/false values keep
+/// the original match (Lua 5.1 `add_value`/`push_onecapture`).
+fn gsub_tab(
+    l: &mut LuaState,
+    s: &[u8],
+    pat: &[u8],
+    tab: crate::gc::GcPtr<crate::table::LuaTable>,
+    max: Option<usize>,
+) -> Result<(Vec<u8>, usize), crate::err::LuaError> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut count = 0;
+    loop {
+        if let Some(limit) = max
+            && count >= limit
+        {
+            break;
+        }
+        match crate::stdlib::pattern::find(s, pat, pos) {
+            Ok(Some((m_start, m_end, caps))) => {
+                out.extend_from_slice(&s[pos..m_start]);
+                let kval = if !caps.is_empty() {
+                    match caps.get(0) {
+                        Some(CaptureValue::Substring(cs, ce)) => {
+                            let sid = l.heap().intern(&s[*cs..*ce]);
+                            l.heap().str_value(sid)
+                        }
+                        Some(CaptureValue::Position(p)) => LuaValue::number(*p as f64),
+                        None => {
+                            let sid = l.heap().intern(&s[m_start..m_end]);
+                            l.heap().str_value(sid)
+                        }
+                    }
+                } else {
+                    let sid = l.heap().intern(&s[m_start..m_end]);
+                    l.heap().str_value(sid)
+                };
+                let v = gettable(l, LuaValue::table(tab), kval)?;
+                if v.is_nil() || v.is_false() {
+                    // nil/false: keep the original match.
+                    out.extend_from_slice(&s[m_start..m_end]);
+                } else if let Some(sid) = v.as_string_id() {
+                    out.extend_from_slice(l.str_static(sid));
+                } else if let Some(n) = v.as_number() {
+                    out.extend_from_slice(crate::strfmt::g14(n).as_bytes());
+                } else {
+                    let tn = crate::stdlib::type_name(v);
+                    return Err(l.runtime_error(
+                        format!("invalid replacement value (a {})", tn).as_bytes(),
+                    ));
+                }
+                count += 1;
+                if m_end == m_start {
+                    if m_end == s.len() {
+                        break;
+                    }
+                    out.push(s[m_end]);
+                    pos = m_end + 1;
+                } else {
+                    pos = m_end;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(l.runtime_error(e.as_bytes())),
+        }
+    }
+    out.extend_from_slice(&s[pos..]);
+    Ok((out, count))
+}
+
+/// `lua_gettable`-style lookup honoring `__index` chains (5.1 `gsub`
+/// uses a plain `lua_gettable` on the replacement table).
+fn gettable(
+    l: &mut LuaState,
+    mut cur: LuaValue,
+    k: LuaValue,
+) -> Result<LuaValue, crate::err::LuaError> {
+    for _ in 0..100 {
+        let Some(t) = cur.as_table() else {
+            return Err(l.runtime_error(b"attempt to index a non-table value"));
+        };
+        let tv = t.as_ref().get(k);
+        if !tv.is_nil() {
+            return Ok(tv);
+        }
+        let mo = crate::meta::meta_fast(l.global(), t.as_ref().metatable, crate::meta::MM::Index);
+        match mo {
+            Some(mo) if mo.is_func() => return call_lua_fn(l, mo, &[cur, k]),
+            Some(mo) => cur = mo,
+            None => return Ok(LuaValue::NIL),
+        }
+    }
+    Err(l.runtime_error(b"'__index' chain too long; possible loop"))
 }
 
 fn call_lua_fn(
@@ -355,19 +492,27 @@ pub fn str_byte(l: &mut LuaState) -> LuaResult<i32> {
     let i = arg(l, 1).as_number().unwrap_or(1.0) as i64;
     let j = arg(l, 2).as_number().map_or(i, |n| n as i64);
     let len = s.len() as i64;
-    let (lo, hi) = if i < 0 {
-        (len + i, if j < 0 { len + j } else { j })
+    // Lua 5.1: negative indices count from the end, then clamp to
+    // [1, len] (1-based).
+    let mut lo = if i < 0 { len + i + 1 } else { i };
+    let mut hi = if j < 0 { len + j + 1 } else { j };
+    if lo < 1 {
+        lo = 1;
+    }
+    if hi > len {
+        hi = len;
+    }
+    if lo > hi {
+        // LuaJIT: an empty interval returns no values (a 0-value
+        // expression compares as nil, but char(byte(..., 1, 0)) gets 0
+        // arguments).
+        Ok(0)
     } else {
-        (i - 1, if j < 0 { len + j } else { j - 1 })
-    };
-    if lo < 0 || lo > hi || lo >= len {
-        push(l, LuaValue::NIL);
-        Ok(1)
-    } else {
-        let hi = hi.min(len - 1);
-        l.stack_ensure(l.base + (hi - lo) as usize + 1);
-        for k in lo..=hi {
-            l.stack[l.base + (k - lo) as usize] = LuaValue::number(s[k as usize] as f64);
+        let lo = (lo - 1) as usize;
+        let hi = (hi - 1) as usize;
+        l.stack_ensure(l.base + (hi - lo) + 1);
+        for (k, &b) in s[lo..=hi].iter().enumerate() {
+            l.stack[l.base + k] = LuaValue::number(b as f64);
         }
         Ok((hi - lo + 1) as i32)
     }
@@ -714,6 +859,16 @@ pub fn open(l: &mut LuaState) {
         .func(b"sub", str_sub)
         .func(b"upper", str_upper)
         .build();
+    // LUA_COMPAT_GFIND: gfind is the *same* closure as gmatch
+    // (lstrlib.c: `lua_getfield(gmatch); lua_setfield(gfind)`), so the
+    // test `string.gfind == string.gmatch` holds.
+    {
+        let g = l.global();
+        let sid = g.heap.intern(b"gmatch");
+        let val = strtab.as_ref().get(g.heap.str_value(sid));
+        let sid = g.heap.intern(b"gfind");
+        strtab.as_mut().set(g.heap.str_value(sid), val);
+    }
 
     // Base metatable for strings: __index = string table (lib_string.c's
     // LJLIB_MODULE mt setup: `s:upper()` etc. resolve through it).

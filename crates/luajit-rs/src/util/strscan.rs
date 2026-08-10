@@ -47,10 +47,104 @@ pub fn scan_number(s: &[u8]) -> Option<f64> {
     if s.is_empty() {
         return None;
     }
-    if s.len() >= 2 && s[0] == b'0' && (s[1] | 0x20) == b'x' {
-        return scan_hex(s);
+    // Lua 5.1 `luaO_str2d`: skip leading whitespace, parse the numeric
+    // token, skip trailing whitespace, then require the end of string
+    // (math.lua: `"2" + " 3e0 "` works, but `tonumber("1  a")` is nil).
+    let start = skip_leading_space(s);
+    if start >= s.len() {
+        return None;
     }
-    scan_dec(s)
+    let rest = &s[start..];
+    let hex = rest.len() >= 2 && rest[0] == b'0' && (rest[1] | 0x20) == b'x';
+    let end = if hex {
+        let e = hex_token_len(rest);
+        if e <= 2 {
+            return None;
+        }
+        e
+    } else {
+        let e = dec_token_len(rest);
+        if e == 0 {
+            return None;
+        }
+        e
+    };
+    // Trailing whitespace is allowed; anything else is invalid.
+    let mut after = end;
+    while after < rest.len() && (rest[after] as char).is_ascii_whitespace() {
+        after += 1;
+    }
+    if after != rest.len() {
+        return None;
+    }
+    if hex {
+        scan_hex(&rest[..end])
+    } else {
+        scan_dec(&rest[..end])
+    }
+}
+
+/// Length of the leading run of ASCII whitespace.
+fn skip_leading_space(s: &[u8]) -> usize {
+    let mut i = 0;
+    while i < s.len() && (s[i] as char).is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Length of the longest decimal-number prefix of `s` (sign, digits,
+/// optional fraction and exponent). `0` when it cannot start a number.
+fn dec_token_len(s: &[u8]) -> usize {
+    let mut i = 0;
+    if i < s.len() && (s[i] == b'-' || s[i] == b'+') {
+        i += 1;
+    }
+    let mut seen_any = false;
+    let mut seen_exp = false;
+    while i < s.len() {
+        match s[i] {
+            b'0'..=b'9' => {
+                seen_any = true;
+                i += 1;
+            }
+            b'.' => {
+                if seen_exp {
+                    break;
+                }
+                seen_any = true; // ".5" and "3." are valid.
+                i += 1;
+            }
+            b'e' | b'E' => {
+                if seen_exp {
+                    break;
+                }
+                seen_exp = true;
+                i += 1;
+                if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
+    if seen_any { i } else { 0 }
+}
+
+/// Length of the longest hex-number prefix (0x..., optional `p` exponent).
+fn hex_token_len(s: &[u8]) -> usize {
+    let mut i = 2; // past "0x"
+    while i < s.len() {
+        let c = s[i];
+        if c.is_ascii_hexdigit() {
+            i += 1;
+        } else if c == b'.' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
 }
 
 fn scan_dec(s: &[u8]) -> Option<f64> {
@@ -97,7 +191,7 @@ fn scan_dec(s: &[u8]) -> Option<f64> {
         }
         i += 1;
     }
-    if !seen_digit || (seen_exp && !exp_digits) {
+    if (!seen_digit && !seen_dot) || (seen_exp && !exp_digits) {
         return None;
     }
     // Parse the magnitude (without the leading sign, which the full

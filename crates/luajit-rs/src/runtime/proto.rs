@@ -40,7 +40,7 @@ pub struct Proto {
     pub kstrv: Vec<LuaValue>,
     /// Upvalue references: `PROTO_UV_LOCAL | slot` or parent upvalue index.
     pub uv: Vec<u16>,
-    pub flags: u8,
+    pub flags: u16,
     pub numparams: u8,
     pub framesize: u8,
     pub firstline: BCLine,
@@ -68,17 +68,20 @@ impl Proto {
 }
 
 /// Prototype flags (subset of LuaJIT's PROTO_* used by the compiler).
-pub const PROTO_CHILD: u8 = 0x01;
-pub const PROTO_VARARG: u8 = 0x02;
+pub const PROTO_CHILD: u16 = 0x01;
+pub const PROTO_VARARG: u16 = 0x02;
 #[allow(dead_code)]
-pub const PROTO_FFI: u8 = 0x04;
+pub const PROTO_FFI: u16 = 0x04;
 /// JIT disabled for this function.
-pub const PROTO_NOJIT: u8 = 0x08;
+pub const PROTO_NOJIT: u16 = 0x08;
 /// Patched bytecode with ILOOP etc. (blacklisted by the trace compiler).
-pub const PROTO_ILOOP: u8 = 0x10;
-pub const PROTO_HAS_RETURN: u8 = 0x20;
-pub const PROTO_FIXUP_RETURN: u8 = 0x40;
-pub const PROTO_BITOP: u8 = 0x80;
+pub const PROTO_ILOOP: u16 = 0x10;
+pub const PROTO_HAS_RETURN: u16 = 0x20;
+pub const PROTO_FIXUP_RETURN: u16 = 0x40;
+pub const PROTO_BITOP: u16 = 0x80;
+/// Lua 5.1 LUA_COMPAT_VARARG: the implicit `arg` local must be built at
+/// call time (cleared when the body actually uses `...`).
+pub const PROTO_VARARG_NEEDSARG: u16 = 0x0100;
 
 pub const PROTO_UV_LOCAL: u16 = 0x8000;
 pub const PROTO_UV_IMMUTABLE: u16 = 0x4000;

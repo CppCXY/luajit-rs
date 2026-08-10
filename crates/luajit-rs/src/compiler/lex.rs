@@ -152,6 +152,10 @@ pub struct TokVal {
 pub struct LexState<'a> {
     src: Vec<u8>,
     pos: usize,
+    /// Source offset where the current token starts (for `near '...'`
+    /// error text — LuaJIT reports the token's source spelling, e.g. the
+    /// full `[[a]]`, not the interned value).
+    tok_start: usize,
     pub c: i32,
     pub tok: Tok,
     pub tokval: TokVal,
@@ -192,6 +196,7 @@ impl<'a> LexState<'a> {
         let mut ls = LexState {
             src,
             pos: 0,
+            tok_start: 0,
             c: 0,
             tok: Tok::Eof,
             tokval: TokVal::default(),
@@ -237,9 +242,12 @@ impl<'a> LexState<'a> {
 
     pub fn err_near(&self, msg: &str) -> ! {
         let near = match self.tok {
-            Tok::Name | Tok::Str => {
-                String::from_utf8_lossy(self.strs.get(self.tokval.str)).into_owned()
+            Tok::Str => {
+                // LuaJIT reports the token's source spelling (`[[a]]`,
+                // `'aa'`, raw bytes) rather than the interned value.
+                String::from_utf8_lossy(&self.src[self.tok_start..self.pos]).into_owned()
             }
+            Tok::Name => String::from_utf8_lossy(self.strs.get(self.tokval.str)).into_owned(),
             Tok::Number => String::from_utf8_lossy(&self.sb).into_owned(),
             t => tok2str(t),
         };
@@ -601,6 +609,7 @@ impl<'a> LexState<'a> {
     }
 
     fn scan(&mut self) -> (Tok, TokVal) {
+        self.tok_start = self.pos.saturating_sub(1);
         self.sb.clear();
         loop {
             if is_digit(self.c) {

@@ -7,7 +7,7 @@
 //! body (instructions after LOOP) for induction variable uses and
 //! replaces eligible affine expressions with new PHIs.
 
-use super::ir::*;
+use super::super::ir::*;
 
 /// Count of new induction variables (cap to prevent bloat).
 const MAX_IVARS: usize = 16;

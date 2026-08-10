@@ -310,7 +310,7 @@ pub const BC_MAX: u32 = BC_NAMES.len() as u32;
 impl BCOp {
     #[inline]
     pub fn from_u32(op: u32) -> BCOp {
-        debug_assert!(op < BC_MAX);
+        debug_assert!(op < BC_MAX, "bad op {op}");
         unsafe { std::mem::transmute(op as u8) }
     }
 

@@ -19,6 +19,22 @@ use crate::value::{GcRef, LJ_TFUNC, LJ_TTAB, LuaValue};
 use crate::vm::FRAME_TYPE_MASK;
 use crate::{LuaError, meta};
 
+/// A registered file entry, indexed by an integer fd. Lives in
+/// `GlobalState` (not a process-global static) so each Lua universe has
+/// independent io state; file handles are userdata referencing it by fd.
+pub enum FileEntry {
+    Read(std::io::BufReader<std::fs::File>),
+    Write(std::io::BufWriter<std::fs::File>),
+    /// Read-write (io.tmpfile, "r+"/"w+"): one shared cursor.
+    ReadWrite(std::fs::File),
+    /// `io.popen`: an OS subprocess whose stdout (`"r"`) or stdin (`"w"`)
+    /// is wired to the handle. Closing the handle waits for the child.
+    Pipe(std::process::Child),
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
 /// The GC heap: stable-address object pools.
 ///
 /// Every collectable type lives in its own `Pool`, which allocates objects in
@@ -55,6 +71,9 @@ pub struct GcHeap {
     /// phase; the VM drains it at the next safe point.
     pub mmudata: Vec<crate::runtime::gc::Finalizable>,
     pub gc_sweep_pool: u8,
+    /// Position within the current pool being swept (incremental sweep:
+    /// each step frees up to `GC_SWEEP_MAX` objects, LuaJIT GCSWEEPMAX).
+    pub gc_sweep_pos: usize,
     pub gc_step_size: usize,
     /// Tri-color white bit (0 or 1), flips each GC cycle.
     pub current_white: u8,
@@ -75,6 +94,15 @@ pub struct GcHeap {
     /// The stack slot (relative to a trace's base) holding the buffer —
     /// exits flush `cat_buf` back into it. `u32::MAX` when inactive.
     pub cat_buf_slot: u32,
+    /// GC_STEPMUL: budget multiplier for each `gc_step` (LuaJIT default
+    /// 200). `lim = GC_STEP_SIZE/100 * stepmul` is the byte budget one
+    /// incremental step may spend. Appended at the end of the struct so
+    /// the JIT's baked-in `total`/`threshold` offsets stay stable.
+    pub stepmul: usize,
+    /// LuaJIT's `gc.estimate`: the collector's estimate of live bytes,
+    /// updated at the atomic phase and during sweep. The next cycle's
+    /// threshold is `estimate * GC_PAUSE / 100`.
+    pub estimate: usize,
 }
 
 impl Default for GcHeap {
@@ -98,26 +126,45 @@ impl Default for GcHeap {
             gc_weak: Vec::new(),
             mmudata: Vec::new(),
             gc_sweep_pool: 0,
+            gc_sweep_pos: 0,
             gc_step_size: gc::GC_STEP_SIZE,
             current_white: 0,
             gc_stopped: false,
             cat_hash: None,
             cat_buf: Vec::new(),
             cat_buf_slot: u32::MAX,
+            stepmul: 200,
+            estimate: 0,
         }
     }
 }
 
 impl GcHeap {
-    /// Track an allocation and accumulate GC debt.
-    fn account_alloc(&mut self, size: usize) {
+    /// Track an allocation for the hard memory cap. The GC trigger is
+    /// `total >= threshold` (LuaJIT's `lj_gc_check`), and debt/threshold
+    /// are managed exclusively by `gc_step` — accruing debt here is what
+    /// made every small allocation storm (e.g. closure creation) drive a
+    /// full collection.
+    fn account_alloc(&mut self, _size: usize) {
         let live = self.total + self.strings.bytes() + self.table_extra;
-        if live >= self.threshold {
-            self.debt += size;
-            // Advance threshold proportionally (LuaJIT's GC_PAUSE: 200%).
-            // This avoids re-triggering the GCSTEP guard on every allocation
-            // while ensuring the next collection triggers at ~2x memory.
-            self.threshold = live + ((live * gc::GC_PAUSE) / 100).max(16384);
+        // Hard cap so a runaway allocator (an unbounded `__gc` finalizer
+        // chain, a leak) can't exhaust the host machine while debugging.
+        // Every GC allocation passes through here.
+        const MEM_LIMIT: usize = 500 * 1024 * 1024; // 500 MiB
+        if live > MEM_LIMIT {
+            eprintln!(
+                "luajit-rs: memory limit exceeded ({} bytes): total={} strings={} table_extra={} tables={} funcs={} protos={} udata={} upval={}",
+                live,
+                self.total,
+                self.strings.bytes(),
+                self.table_extra,
+                self.tables.len(),
+                self.funcs.len(),
+                self.protos.len(),
+                self.userdatas.len(),
+                self.upvals.len(),
+            );
+            std::process::exit(70);
         }
     }
 
@@ -125,8 +172,10 @@ impl GcHeap {
         t.table_extra = &mut self.table_extra as *mut usize;
         t.heap = self as *const GcHeap;
         let size = t.gc_size();
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
-        gc::gc_step(self, size); // GC first — may start a cycle
         self.account_alloc(size);
         self.tables.alloc(t)
     }
@@ -146,25 +195,31 @@ impl GcHeap {
 
     pub fn alloc_proto(&mut self, p: Proto) -> GcPtr<Proto> {
         let sz = p.gc_size();
+        if self.total + sz > self.threshold {
+            gc::gc_step(self, sz);
+        }
         self.total += sz;
         self.account_alloc(sz);
-        gc::gc_step(self, sz);
         self.protos.alloc(p)
     }
 
     pub fn alloc_func(&mut self, f: GcFunc) -> GcPtr<GcFunc> {
         let size = gc::account_func(&f);
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.funcs.alloc(f)
     }
 
     pub fn alloc_upval(&mut self, uv: Upval) -> GcPtr<Upval> {
         let size = gc::account_upval();
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         let p = self.upvals.alloc(uv);
         p.as_mut().init_closed();
         p
@@ -172,25 +227,31 @@ impl GcHeap {
 
     pub fn alloc_thread(&mut self, th: LuaState) -> GcPtr<LuaState> {
         let size = gc::account_thread(&th);
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.threads.alloc(th)
     }
 
     pub fn alloc_cdata(&mut self, cd: CData) -> GcPtr<CData> {
         let size = std::mem::size_of::<CData>() + cd.data.len();
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.cdatas.alloc(cd)
     }
 
     pub fn alloc_userdata(&mut self, ud: GcUserData) -> GcPtr<GcUserData> {
         let size = std::mem::size_of::<GcUserData>();
+        if self.total + size > self.threshold {
+            gc::gc_step(self, size);
+        }
         self.total += size;
         self.account_alloc(size);
-        gc::gc_step(self, size);
         self.userdatas.alloc(ud)
     }
 
@@ -200,8 +261,11 @@ impl GcHeap {
         let new_bytes = self.strings.bytes();
         if new_bytes > prev_bytes {
             let sz = new_bytes - prev_bytes;
+            if self.total + sz > self.threshold {
+                gc::gc_step(self, sz);
+            }
+            self.total += sz;
             self.account_alloc(sz);
-            gc::gc_step(self, sz);
         }
         sid
     }
@@ -213,8 +277,11 @@ impl GcHeap {
         let new_bytes = self.strings.bytes();
         if new_bytes > prev_bytes {
             let sz = new_bytes - prev_bytes;
+            if self.total + sz > self.threshold {
+                gc::gc_step(self, sz);
+            }
+            self.total += sz;
             self.account_alloc(sz);
-            gc::gc_step(self, sz);
         }
         sid
     }
@@ -275,6 +342,16 @@ pub struct GlobalState {
     /// The main thread. Set once the owning [`Lua`] is pinned. The interpreter
     /// entry points use this when no explicit thread is supplied.
     main: Option<StateRef>,
+    /// io file registry (fd → entry) and the default input/output fds.
+    /// Per-universe, unlike the old process-global statics.
+    pub files: Vec<Option<FileEntry>>,
+    pub default_input: Option<usize>,
+    pub default_output: Option<usize>,
+    /// fd → setvbuf mode: 0 = full (default), 1 = line, 2 = no buffering.
+    pub file_buf_mode: Vec<u8>,
+    /// fd → file-handle userdata cache: the same fd always yields the same
+    /// userdata (`io.input(io.stdin) == io.stdin`). GC marks these.
+    pub io_file_cache: Vec<Option<LuaValue>>,
 }
 
 impl GlobalState {
@@ -421,6 +498,11 @@ pub struct LuaState {
     /// line on the failed frame (the frame link alone only shows the
     /// caller's call site).
     pub err_raise_pc: Option<(u64, usize)>,
+    /// The args-base slot of the frame where the current runtime error was
+    /// raised (alongside `err_raise_pc`). Errors in metamethod or
+    /// protected-call frames leave those frames on the stack above the
+    /// handler; traceback starts its walk here so they are still shown.
+    pub err_trace_slot: Option<usize>,
     /// While a metamethod invoked through the cold execute-recursion
     /// paths (e.g. `__concat`) is running, the (name, function bits) of
     /// the active metamethod — debug.getinfo uses it to report
@@ -488,6 +570,7 @@ impl LuaState {
             errval: LuaValue::NIL,
             err_raise_slot: 0,
             err_raise_pc: None,
+            err_trace_slot: None,
             mmname: None,
             nyield: 0,
             status: if is_main {
@@ -516,6 +599,21 @@ impl LuaState {
     /// Also serves as a GC check point so loops that push values (e.g. table
     /// stores, string concatenation) eventually trigger collection.
     #[inline]
+    /// The stack grows dynamically up to this many slots; used by the VM
+    /// to bound recursion (lj_checkstack).
+    pub fn max_stack(&self) -> usize {
+        self._max_stack
+    }
+
+    /// Mutable access to the io file registry. Returns `'static` so io
+    /// callbacks can interleave `l.heap()`/`l.runtime_error` with file
+    /// operations without a self-referential borrow. Safe because the io
+    /// library is single-threaded and `GlobalState` outlives every thread.
+    pub fn files_mut(&self) -> &'static mut Vec<Option<FileEntry>> {
+        let g = self.g.get() as *mut GlobalState;
+        unsafe { &mut (*g).files }
+    }
+
     pub fn stack_ensure(&mut self, need: usize) {
         if need >= self.stack.len() {
             let new_len = (self.stack.len() * 2).max(need + 16).min(self._max_stack);
@@ -677,6 +775,7 @@ impl LuaState {
                         // Remember the raise site so the traceback can
                         // report the failed frame's error line.
                         self.err_raise_pc = Some((func.to_bits(), pc));
+                        self.err_trace_slot = Some(slot);
                         let line = if pc < pt.lines.len() {
                             pt.lines[pc] as usize
                         } else {
@@ -779,6 +878,11 @@ impl Lua {
             ipairs_iter: LuaValue::NIL,
             boot_time: boot,
             main: None,
+            files: Vec::new(),
+            default_input: None,
+            default_output: None,
+            file_buf_mode: Vec::new(),
+            io_file_cache: Vec::new(),
         }));
         let gs = unsafe { &mut *g };
         gs.globals = gs.heap.alloc_table(LuaTable::new(0, 1));
@@ -868,7 +972,9 @@ pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue,
         proto.source = Some(source_sid);
     }
     let proto_ref = register_proto(&mut g.heap, proto);
-    let env = g.globals;
+    // The loaded chunk inherits the *thread* environment (5.1: lua_load
+    // sets the closure's env to L->env, which setfenv(0) can change).
+    let env = l.thread_env;
     let fref = g.heap.alloc_func(GcFunc::Lua(LuaClosure {
         proto: proto_ref,
         env,

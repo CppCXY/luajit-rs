@@ -46,7 +46,7 @@ pub(crate) struct FuncState {
     pub bcbase: usize,
     /// Base of the variable stack for this function.
     pub vbase: usize,
-    pub flags: u8,
+    pub flags: u16,
     pub numparams: u8,
     pub framesize: u8,
     pub nuv: u8,
@@ -63,10 +63,13 @@ pub(crate) struct FuncState {
     /// activated by `var_add` after the initializer), but they are visible
     /// to nested function bodies parsed inside the initializer.
     pub pend_start: usize,
+    /// Chunk source name (interned), inherited by nested functions so
+    /// error messages from inside closures report the real file.
+    pub source: Option<StrId>,
 }
 
 impl FuncState {
-    pub fn new(vbase: usize) -> FuncState {
+    pub fn new(vbase: usize, source: Option<StrId>) -> FuncState {
         FuncState {
             kn: Vec::new(),
             kn_map: HashMap::new(),
@@ -89,6 +92,7 @@ impl FuncState {
             uvtmp: [0; 60],
             scopes: Vec::new(),
             pend_start: 0,
+            source,
         }
     }
 }

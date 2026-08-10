@@ -55,3 +55,8 @@ jobs:
         run: |
           cd tests/luajit3_test
           ../../"${{ matrix.exe }}" test.lua
+      - name: Run lua5.1 test suite
+        shell: bash
+        run: |
+          cd tests/lua5.1_test
+          ../../"${{ matrix.exe }}" all.lua

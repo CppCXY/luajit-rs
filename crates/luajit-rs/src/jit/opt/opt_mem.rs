@@ -5,7 +5,7 @@
 //! Modeled on `lj_opt_mem.c`'s FWD/DSE rules. Runs inline during FOLD
 //! as the recorder emits each instruction.
 
-use super::ir::*;
+use super::super::ir::*;
 
 /// Outgoing refs of a successfully scanned backward region: the store
 /// instruction ref and the forwarded value ref.

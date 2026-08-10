@@ -2065,14 +2065,6 @@ impl<'a> Asm<'a> {
         }
 
         // Allocate mcode
-        let dump_mcode = std::env::var("LUAJIT_RS_MCDUMP").is_ok();
-        if dump_mcode {
-            eprintln!(
-                "=== ARM64 MCODE tr={} PROLOGUE inner={} ===",
-                self.tr.traceno, inner
-            );
-            eprintln!("{}", hex_dump(&self.code.0));
-        }
         let mut area = McodeArea::alloc(self.code.len()).ok_or(TraceError::MCODEAL)?;
         area.as_mut_slice()[..self.code.len()].copy_from_slice(&self.code.0);
         if !area.protect_exec() {

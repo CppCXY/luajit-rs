@@ -13,8 +13,9 @@
 
 use crate::bc::*;
 use crate::gc::GcPtr;
+use crate::jit::bc_addr;
 use crate::jit::exec::{self, jit_str_byte, jit_tget, jit_tnextk};
-use crate::jit::{bc_addr, opt_fold};
+use crate::jit::opt::opt_fold;
 use crate::meta::MM;
 use crate::proto::Proto;
 use crate::state::LuaState;
@@ -1010,17 +1011,6 @@ impl Record {
         if cpt.as_ref().flags & crate::proto::PROTO_VARARG != 0 {
             return Err(TraceError::NYIBC);
         }
-        // Root traces cannot safely inline closure calls with closed
-        // upvalues: closures re-created by FNEW on each outer loop
-        // iteration get fresh upvalue cells whose addresses differ from
-        // the recording-time constants, producing hangs or crashes.
-        if self.parent == 0 {
-            for &uv in &cl.upvals {
-                if !uv.as_ref().is_open() {
-                    return Err(TraceError::BLACKL);
-                }
-            }
-        }
         // Up-recursion to the trace head (check_call_unroll): stop the
         // trace after `recunroll` inlined levels and link it to itself.
         let is_head_call = self.parent == 0
@@ -1088,7 +1078,14 @@ impl Record {
             // to the innermost frame's proto).
             self.pc = 1;
             if stop_uprec {
-                return Ok(Some((TraceLink::Uprec, self.cur.traceno)));
+                // Self-recursion: the Uprec link runs the recursion
+                // natively in machine-code frames that the Lua stack
+                // traceback cannot see — an infinite recursion's traceback
+                // then lacks the expected frames (errors.lua's
+                // `while stack[i] ~= l1` walk). GFAIL (not NYIBC) aborts
+                // without leaving a stitch prefix behind, so recursive
+                // functions stay fully interpreted.
+                return Err(TraceError::GFAIL);
             }
             return Ok(Some((TraceLink::Root, bc_d(callee_head) as TraceNo)));
         }
@@ -1220,8 +1217,12 @@ impl Record {
             fr.callee = cpt; // The pending return now belongs to the new callee.
         }
         if stop_tailrec {
+            // Tail self-recursion (e.g. `function y() y() end`) would run
+            // in native frames invisible to the Lua stack traceback. Run
+            // it in the interpreter so the recursion's frames (and the
+            // "stack overflow" it eventually raises) are real Lua frames.
             self.pc = 1;
-            return Ok(Some((TraceLink::Tailrec, self.cur.traceno)));
+            return Err(TraceError::GFAIL);
         }
         Ok(None)
     }
@@ -1372,12 +1373,18 @@ impl Record {
                     }
                 }
             }
-            // Below the trace's frames or on another thread: the cell can
-            // close behind our back.
-            return Err(TraceError::NYIBC);
+            // Below the trace's frames (e.g. an upvalue owned by the
+            // caller's frame): the slot address is stable while the trace
+            // runs — the stack only grows at trace entry and the owning
+            // frame cannot return (closing the upvalue) while the trace
+            // executes. Load through the constant slot address with a
+            // type guard, like the closed path (LuaJIT re-reads the
+            // pointer every access via UREFO; this VM's stack does not
+            // reallocate during a trace, so the constant is equivalent).
         }
-        // Closed upvalue: the cell address is a constant (pool slots are
-        // stable and closed cells never reopen); load with a type guard.
+        // Closed upvalue (or open, see above): the cell address is a
+        // constant (pool slots are stable and closed cells never reopen);
+        // load with a type guard.
         let t = Self::value_irt(val);
         let cell = self.cur.ir.kint64(uvp.value_ptr() as u64);
         let mut tr = self.cur.ir.emit_ins(IRIns::new(
@@ -1530,6 +1537,13 @@ impl Record {
             return Err(TraceError::NYIBC); // Runtime error path.
         }
         self.meta_guard(tab);
+        // GC-debt guard before the store: the store may grow the table,
+        // and a compiled loop otherwise never reaches a GC safe point.
+        // Emitting it here (before the side effect) means a GC exit
+        // resumes at the covering snapshot with nothing committed, so the
+        // interpreter re-executes the store cleanly instead of double
+        // applying it. One guard per trace (deduped by `rec_gcstep`).
+        self.rec_gcstep(l);
         let carg = self.cur.ir.emit_ins(IRIns::new(
             irt(IROp::CARG, IRT_NIL),
             tref_ref(key),
@@ -1549,10 +1563,6 @@ impl Record {
                 tref_ref(tab),
                 tref_ref(carg),
             ));
-            // Stores may grow the table via the exit path: the loop must
-            // still reach a GC safe point, so a pure-array trace gets the
-            // same IR_GCSTEP guard as a hash-store one (deduped per trace).
-            self.rec_gcstep(l);
             self.needsnap = true;
             return Ok(());
         }
@@ -1561,16 +1571,17 @@ impl Record {
             tref_ref(tab),
             tref_ref(carg),
         ));
-        self.rec_gcstep(l);
         Ok(())
     }
 
     /// GC-debt guard: exit when a collection is due (the boundary check
-    /// in the trace-entry dispatch arms then collects). Must follow any
-    /// on-trace allocation (table growth, string interning). One guard
-    /// per trace suffices: the debt accumulates and a single iteration
-    /// allocates far less than the threshold headroom (the loop peel
-    /// keeps one copy in the loop body).
+    /// in the trace-entry dispatch arms then collects). Must precede any
+    /// on-trace allocation (table growth, string interning) so a GC exit
+    /// resumes at a snapshot where no side effect of the current
+    /// instruction has committed yet — placing it after the store would
+    /// make the interpreter re-execute (and double-apply) the store.
+    /// One guard per trace suffices: the debt accumulates and a single
+    /// iteration allocates far less than the threshold headroom.
     fn rec_gcstep(&mut self, l: &LuaState) {
         if self.cur.ir.chain[IROp::GCSTEP as usize] != 0 {
             self.needsnap = true;
@@ -2194,7 +2205,7 @@ impl Record {
                 // the portable executor (wasm) and the native backends
                 // share one code path. Unsupported argument shapes fail
                 // the helper's type guard and exit to the interpreter.
-                if nargs < 1 || nargs > 2 {
+                if !(1..=2).contains(&nargs) {
                     return Err(TraceError::NYIBC);
                 }
                 let crate::func::GcFunc::C(cc) = fv.as_func().unwrap().as_ref() else {
@@ -2567,6 +2578,9 @@ impl Record {
             BCOp::KNIL => {
                 let mut s = bc_a(ins);
                 let last = bc_d(ins);
+                if last >= MAX_JSLOTS as u32 - self.baseslot as u32 {
+                    return Err(TraceError::STACKOV);
+                }
                 while s <= last {
                     self.set_base(s, TREF_NIL);
                     s += 1;
@@ -2779,12 +2793,6 @@ impl Record {
                 if dst + want > self.maxslot {
                     self.maxslot = dst + want;
                 }
-                if std::env::var("LUAJIT_RS_VARGDBG").is_ok() {
-                    for i in 0..want {
-                        let si = (self.baseslot as u32 + dst + i) as usize;
-                        eprintln!("  after: slot[{}] = {:#x}", si, self.slot[si]);
-                    }
-                }
             }
 
             BCOp::USETV | BCOp::USETS | BCOp::USETN | BCOp::USETP => {
@@ -2816,6 +2824,20 @@ impl Record {
                     tref_ref(carg),
                     IRCALL_USET,
                 ));
+                // The write invalidates any recorded alias of the
+                // upvalue's slot: a later UGET in the loop must re-load
+                // the slot instead of reusing the stale cached SLOAD
+                // (which would hoist the whole value chain as invariant).
+                let sp = l.stack.as_ptr() as usize;
+                let ptr = uv.as_ref().value_ptr() as usize;
+                let frame0 = base - (self.baseslot - 2);
+                if ptr >= sp && ptr < sp + l.stack.len() * 8 && (ptr - sp).is_multiple_of(8) {
+                    let idx = (ptr - sp) / 8;
+                    let abs = idx.saturating_sub(frame0).saturating_add(2);
+                    if (2..MAX_JSLOTS).contains(&abs) {
+                        self.slot[abs] = 0;
+                    }
+                }
             }
 
             // -- Table indexing ----------------------------------------------------
@@ -3007,7 +3029,13 @@ impl Record {
                 // registers/tables (replayed TSETS corrupts metatables:
                 // `__add` lookup then reads a bare address). Phase 2
                 // cannot recreate closures faithfully — abort instead.
-                return Err(TraceError::NYIBC);
+                //
+                // BLACKL (not NYIBC) disables JIT for the whole proto on
+                // the first failure: a closure-creating hot loop can never
+                // be recorded, and letting the penalty counter retry it
+                // dozens of times per loop iteration is pure overhead
+                // (measured: ~3x slower than plain interpretation).
+                return Err(TraceError::BLACKL);
             }
 
             // Everything else is NYI in Phase 2: calls, returns, tables,

@@ -84,6 +84,11 @@ pub(crate) fn do_resume(
             for i in 0..nargs {
                 co.stack[slot + 2 + i] = l.stack[args_at + i];
             }
+            // The suspended frame's outer link must survive: restore it if
+            // anything cleared it (the frame's RET reads it to return).
+            if co.stack[1].is_nil() && base >= 2 {
+                co.stack[1] = LuaValue::from_bits(FRAME_C);
+            }
             crate::vm::resume_continue(co, slot, want, nargs, pc, cl, base, protected)
         }
         Suspend::Return { base, slot } => {
@@ -200,8 +205,10 @@ fn lib_resume(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 fn lib_yield(l: &mut LuaState) -> LuaResult<i32> {
+    // LuaJIT allows yielding on the main thread: the yield acts as if it
+    // returned the (empty) resume values and execution continues.
     if l.is_main() {
-        return Err(l.runtime_error(b"attempt to yield from outside a coroutine"));
+        return Ok(0);
     }
     if !l.is_yieldable() {
         return Err(l.runtime_error(b"attempt to yield across C-call boundary"));
