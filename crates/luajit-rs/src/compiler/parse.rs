@@ -1669,7 +1669,14 @@ impl<'a> Parser<'a> {
         // every weak-table key). Clear the block's temp range on exit,
         // *after* UCLO so closed upvalues keep their values.
         let max_fr = bl.max_freereg;
-        if max_fr > nactvar {
+        // Inside a loop body the temporaries are rewritten every iteration;
+        // clearing them on the hot path is wasted work. Defer the KNIL to
+        // the loop's end: the enclosing loop scope (FSCOPE_LOOP) emits it
+        // once after the back-edge, so GC never sees stale loop temps
+        // (which would wrongly pin weak-table keys). Non-loop scopes clear
+        // inline as before.
+        let in_loop = self.cur().scopes.iter().any(|s| (s.flags & FSCOPE_LOOP) != 0);
+        if max_fr > nactvar && !in_loop {
             self.cur_mut().freereg = nactvar;
             self.bcemit_ad(BCOp::KNIL, nactvar, max_fr - 1);
         }
@@ -3266,6 +3273,19 @@ impl<'a> Parser<'a> {
         }
         let line = self.ls.linenumber;
         let pt = self.fs_finish(line);
+        if std::env::var("LUARS_BCDUMP").is_ok() {
+            for (i, &ins) in pt.bc.iter().enumerate() {
+                eprintln!(
+                    "  BC[{:3}] {:?} A={} B={} C={} D={}",
+                    i,
+                    crate::bc::bc_op(ins),
+                    crate::bc::bc_a(ins),
+                    crate::bc::bc_b(ins),
+                    crate::bc::bc_c(ins),
+                    crate::bc::bc_d(ins)
+                );
+            }
+        }
         debug_assert!(self.fs.is_empty());
         debug_assert!(pt.uv.is_empty());
         pt

@@ -1018,9 +1018,26 @@ fn lib_sethook(l: &mut LuaState) -> LuaResult<i32> {
     if hm == 0 && count > 0 {
         hm |= crate::vm::HOOKMASK_COUNT;
     }
+    // A debug hook observes every executed instruction (line/count events)
+    // and introspects the Lua stack (debug.getinfo/getlocal), so compiled
+    // traces — whose machine-code frames are invisible to the debug API and
+    // whose loop bodies skip the hook check — must be flushed. The JIT
+    // re-accumulates once the hook is cleared (like LuaJIT, which switches
+    // to non-JIT bytecode while a hook is set).
+    if hm != 0 && !hook.is_nil() {
+        let g = l.global();
+        g.jit.set_on(false);
+        for slot in g.jit.trace.iter_mut() {
+            *slot = None;
+        }
+    }
     // Lua 5.1: the line hook doesn't fire for the line the hook was
     // installed on; seed hook_line with the caller's current line.
     let cur_line = caller_line(l).unwrap_or(0);
+    // Clearing the hook re-enables JIT (the flush above turned it off).
+    if hook.is_nil() && hm == 0 {
+        l.global().jit.set_on(true);
+    }
     if let Some(t) = target {
         let t = t.as_mut();
         t.hook = if hook.is_nil() { LuaValue::NIL } else { hook };

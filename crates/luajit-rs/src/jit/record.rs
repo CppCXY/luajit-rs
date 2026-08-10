@@ -1079,12 +1079,12 @@ impl Record {
             self.pc = 1;
             if stop_uprec {
                 // Self-recursion: the Uprec link runs the recursion
-                // natively in machine-code frames that the Lua stack
-                // traceback cannot see — an infinite recursion's traceback
-                // then lacks the expected frames (errors.lua's
-                // `while stack[i] ~= l1` walk). GFAIL (not NYIBC) aborts
-                // without leaving a stitch prefix behind, so recursive
-                // functions stay fully interpreted.
+                // natively in machine-code frames. Currently disabled
+                // (GFAIL): the mcode recursive frame setup (snapshot
+                // restore + per-frame slot growth) is slower than the
+                // interpreter's frame push, so tail-recursion benchmarks
+                // regress (~25%). Recursive functions stay interpreted
+                // until the mcode frame path is optimized.
                 return Err(TraceError::GFAIL);
             }
             return Ok(Some((TraceLink::Root, bc_d(callee_head) as TraceNo)));
