@@ -619,31 +619,37 @@ enum CallFast {
 #[derive(Clone, Copy)]
 struct Frame {
     sp: *mut LuaValue,
-    base: usize,
+    /// The register window: `sp + base`. `reg`/`set` index off this single
+    /// pointer, so the hot arms keep the window in a CPU register and every
+    /// bytecode-register access is one indexed load/store (LuaJIT's BASE).
+    window: *mut LuaValue,
 }
 
 impl Frame {
     #[inline(always)]
     fn new(sp: *mut LuaValue, base: usize) -> Frame {
-        Frame { sp, base }
+        Frame {
+            sp,
+            window: unsafe { sp.add(base) },
+        }
     }
 
     /// Read bytecode register `i` (relative to the frame base).
     #[inline(always)]
     fn reg(self, i: u32) -> LuaValue {
-        unsafe { *self.sp.add(self.base + i as usize) }
+        unsafe { *self.window.add(i as usize) }
     }
 
     /// Write bytecode register `i`.
     #[inline(always)]
     fn set(self, i: u32, v: LuaValue) {
-        unsafe { *self.sp.add(self.base + i as usize) = v }
+        unsafe { *self.window.add(i as usize) = v }
     }
 
     /// The current frame base as an absolute stack index (LuaJIT's BASE).
     #[inline(always)]
     fn cur_base(self) -> usize {
-        self.base
+        unsafe { self.window.offset_from(self.sp) as usize }
     }
 
     /// Write the stack slot at absolute index `abs`.
@@ -656,19 +662,19 @@ impl Frame {
     /// window is not moved; use `at_abs`/`set_abs` otherwise.
     #[inline(always)]
     fn bp(self) -> *mut LuaValue {
-        unsafe { self.sp.add(self.base) }
+        self.window
     }
 
     /// The frame-link word at `base - 1`.
     #[inline(always)]
     fn frame_link(self) -> u64 {
-        unsafe { *self.sp.add(self.base - 1) }.to_bits()
+        unsafe { *self.window.sub(1) }.to_bits()
     }
 
     /// Write the callee slot at `base - 2` (FR2 func slot).
     #[inline(always)]
     fn set_func(self, v: LuaValue) {
-        unsafe { *self.sp.add(self.base - 2) = v }
+        unsafe { *self.window.sub(2) = v }
     }
 }
 
