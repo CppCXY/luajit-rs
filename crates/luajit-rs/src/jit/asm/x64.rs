@@ -802,15 +802,36 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
-    /// FLOAD IRFL_TAB_META as a guard: exit unless `tab.metatable` is
-    /// None (the niche encoding makes that a plain null check).
+    /// FLOAD IRFL_TAB_META: the guarded `metatable == nil` check (IRT_NIL)
+    /// exits when a metatable is present; the IRT_TAB form (inlined __call)
+    /// guards that one is present and leaves the NaN-boxed metatable in RAX
+    /// for a following EQ guard.
     fn asm_meta_guard(&mut self, ins: &IRIns) {
         const META_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
         self.gpr_load_ref(RAX, ins.op1 as IRRef);
         self.mov_r64_imm64(RCX, crate::value::LJ_GCVMASK);
         self.and_rr64(RAX, RCX); // NaN-boxed table value -> pointer.
-        self.cmp_mem64_imm8(RAX, META_OFF, 0);
-        self.guard(CC_NE);
+        if irt_type(ins.t()) == IRT_TAB {
+            // Guard the metatable is present (non-null), then box it with
+            // the table tag (LJ_TTAB << 47).
+            self.mov_r64_mem(RAX, RAX, META_OFF);
+            self.code.push(0x48); // REX.W
+            self.code.push(0x85); // test rax, rax (ZF iff metatable == NULL)
+            self.modrm(3, RAX, RAX);
+            self.guard(CC_E);
+            self.mov_r64_imm64(RCX, (crate::value::LJ_TTAB as u64) << 47);
+            self.code.push(0x48 | (((RCX >> 3) & 1) << 2) | ((RAX >> 3) & 1));
+            self.code.push(0x09); // or rax, rcx
+            self.modrm(3, RCX, RAX);
+            // Publish the boxed metatable to the env for the following EQ.
+            if self.needs_env[Self::iidx(self.cur)] {
+                self.mov_mem_r64(RENV, Self::env_disp(self.cur), RAX);
+                self.env_valid[Self::iidx(self.cur)] = true;
+            }
+        } else {
+            self.cmp_mem64_imm8(RAX, META_OFF, 0);
+            self.guard(CC_NE);
+        }
     }
 
     /// HLOAD: raw table get through the shared helper, with the SLOAD

@@ -1026,15 +1026,29 @@ impl<'a> Asm<'a> {
         Ok(())
     }
 
-    // FLOAD: meta guard (table.metatable == nil)
+    // FLOAD: meta guard (table.metatable == nil), or a guarded read of the
+    // metatable value (IRT_TAB, the inlined __call path) that boxes it into
+    // RSCRATCH2 for a following EQ guard.
     fn asm_meta_guard(&mut self, ins: &IRIns) {
         const META_OFF: i32 = std::mem::offset_of!(crate::table::LuaTable, metatable) as i32;
         self.gpr_load_ref(RSCRATCH, ins.op1 as IRRef);
         self.code.mov64(RSCRATCH2, crate::value::LJ_GCVMASK);
         self.code.and_rr(RSCRATCH, RSCRATCH, RSCRATCH2);
         self.code.ldr(RSCRATCH2, RSCRATCH, META_OFF);
-        self.code.cmp_imm(RSCRATCH2, 0);
-        self.guard(cond::NE);
+        if irt_type(ins.t()) == IRT_TAB {
+            self.code.cmp_imm(RSCRATCH2, 0);
+            self.guard(cond::EQ); // exit if no metatable
+            self.code.mov64(RSCRATCH3, (crate::value::LJ_TTAB as u64) << 47);
+            self.code.orr_rr(RSCRATCH2, RSCRATCH2, RSCRATCH3);
+            // Publish the boxed metatable to the env for the following EQ.
+            if self.needs_env[Self::iidx(self.cur)] {
+                self.code.str_d(RSCRATCH2, RENV, Self::env_ofs(self.cur));
+                self.env_valid[Self::iidx(self.cur)] = true;
+            }
+        } else {
+            self.code.cmp_imm(RSCRATCH2, 0);
+            self.guard(cond::NE); // exit if metatable present
+        }
     }
 
     // FSTORE: inlined setmetatable — store the metatable pointer (op2,

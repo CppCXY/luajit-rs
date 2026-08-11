@@ -985,7 +985,9 @@ impl Record {
         let fv = self.slot_val(l, base, a);
         self.getslot(l, base, a); // The identity guard reads the tref.
         let Some(gf) = fv.as_func() else {
-            return Err(TraceError::NYIBC); // __call metamethod NYI.
+            // `t(...)` where t is not a function: inline its `__call`
+            // metamethod (guard the metatable + `__call`, then dispatch).
+            return Ok(self.rec_call_mm(l, base, pc, a, nargs, want, fv)?);
         };
         match gf.as_ref() {
             crate::func::GcFunc::C(cc) => {
@@ -1001,6 +1003,196 @@ impl Record {
             }
             crate::func::GcFunc::Lua(_) => self.rec_call_lua(l, base, pc, a, nargs, want, fv),
         }
+    }
+
+    /// Inline a call whose callee is a non-function with a `__call`
+    /// metamethod: `t(...)` -> `__call(t, ...)`. Guards the object's
+    /// metatable and its `__call` field at runtime, then dispatches to the
+    /// metamethod like a plain call (self = the object). Returns the same
+    /// `Some` stop signal as `rec_call` for recursion/compiled callees.
+    fn rec_call_mm(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        pc: usize,
+        a: u32,
+        nargs: u32,
+        want: i32,
+        fv: LuaValue,
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
+        // Only tables with a `__call` are inlined; anything else (userdata
+        // with a C __call, primitive metatables) keeps the interpreter path.
+        let Some(tab) = fv.as_table() else {
+            return Err(TraceError::NYIBC);
+        };
+        let Some(mt) = tab.as_ref().metatable else {
+            return Err(TraceError::NYIBC);
+        };
+        let g = l.global();
+        let call_key = g.mmname[crate::meta::MM::Call as usize];
+        let mo = mt.as_ref().get_str(call_key);
+        if mo.is_nil() {
+            return Err(TraceError::NYIBC);
+        }
+        let Some(gf) = mo.as_func() else {
+            return Err(TraceError::NYIBC);
+        };
+        // Guard the runtime metatable of `fv` is the recorded one: FLOAD
+        // the metatable (guarded TAB), then EQ it against the constant.
+        let ftr = self.base_ref(a);
+        let mt_load = self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::FLOAD, IRT_GUARD | IRT_TAB),
+            tref_ref(ftr),
+            IRFL_TAB_META,
+        ));
+        let mt_const = self.cur.ir.kgc(LuaValue::table(mt).to_bits(), IRT_TAB);
+        self.cur
+            .ir
+            .emitir(irtg(IROp::EQ, IRT_TAB), tref_ref(mt_load), tref_ref(mt_const))?;
+        // Guard the metatable's `__call` field is the recorded metamethod.
+        let call_key_tref = self.cur.ir.kgc(call_key.to_bits(), IRT_STR);
+        let mo_load = self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::HLOAD, IRT_GUARD | IRT_FUNC),
+            tref_ref(mt_load),
+            tref_ref(call_key_tref),
+        ));
+        let mo_const = self.cur.ir.kgc(mo.to_bits(), IRT_FUNC);
+        self.cur
+            .ir
+            .emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(mo_load), tref_ref(mo_const))?;
+        // The runtime frame will see slot a = metamethod, self at a+2, and
+        // the original args shifted up one. Record the shift.
+        let self_tref = self.base_ref(a); // the object's tref (== ftr).
+        self.set_base(a, mo_const);
+        // Shift the args up by one: arg[i] was at a+2+i, moves to a+3+i.
+        for i in (0..nargs).rev() {
+            let tr = self.getslot(l, base, a + 2 + i);
+            self.set_base(a + 3 + i, tr);
+        }
+        // self = the original callee object.
+        self.set_base(a + 2, self_tref);
+        // Now slot a holds the metamethod: dispatch like a plain call.
+        let ftr2 = self.base_ref(a);
+        debug_assert!(ftr2 != 0);
+        let kf = self.cur.ir.kgc(mo.to_bits(), IRT_FUNC);
+        if !tref_isk(ftr2) {
+            self.cur
+                .ir
+                .emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(ftr2), tref_ref(kf))?;
+        }
+        match gf.as_ref() {
+            crate::func::GcFunc::C(cc) => {
+                let mut argv = [LuaValue::NIL; 3];
+                for i in 0..nargs.min(3) {
+                    argv[i as usize] = self.slot_val(l, base, a + 3 + i);
+                }
+                for i in 0..nargs {
+                    self.getslot(l, base, a + 3 + i);
+                }
+                self.rec_callff_core(l, a, want, nargs, mo, cc.f, &argv)?;
+                Ok(None)
+            }
+            crate::func::GcFunc::Lua(_) => {
+                // The self object counts as the first argument (a+2), so the
+                // call frame sees nargs+1 slots like the interpreter's
+                // meta_call layout.
+                self.rec_call_lua(l, base, pc, a, nargs + 1, want, mo)
+            }
+        }
+    }
+
+    /// Inline a table `__len` metamethod: guard the metatable and `__len`
+    /// field, then call the metamethod with (self = the table). Returns
+    /// `Ok(Some(...))` to stop the trace (recursion), `Ok(None)` after
+    /// inlining, or `Ok(0)`-style via `Ok(None)` for the caller.
+    fn rec_len_mm(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        a: u32,
+        tabv: LuaValue,
+        tab: TRef,
+        len_key: LuaValue,
+    ) -> Result<Option<(TraceLink, TraceNo)>, TraceError> {
+        let Some(t) = tabv.as_table() else {
+            return Err(TraceError::NYIBC);
+        };
+        let Some(mt) = t.as_ref().metatable else {
+            return Err(TraceError::NYIBC);
+        };
+        let mm = mt.as_ref().get_str(len_key);
+        let Some(gf) = mm.as_func() else {
+            return Err(TraceError::NYIBC);
+        };
+        // Guard the runtime metatable is the recorded one and its `__len`
+        // is the recorded metamethod.
+        let mt_load = self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::FLOAD, IRT_GUARD | IRT_TAB),
+            tref_ref(tab),
+            IRFL_TAB_META,
+        ));
+        let mt_const = self.cur.ir.kgc(LuaValue::table(mt).to_bits(), IRT_TAB);
+        self.cur.ir.emitir(
+            irtg(IROp::EQ, IRT_TAB),
+            tref_ref(mt_load),
+            tref_ref(mt_const),
+        )?;
+        let len_key_tref = self.cur.ir.kgc(len_key.to_bits(), IRT_STR);
+        let mm_load = self.cur.ir.emit_ins(IRIns::new(
+            irt(IROp::HLOAD, IRT_GUARD | IRT_FUNC),
+            tref_ref(mt_load),
+            tref_ref(len_key_tref),
+        ));
+        let mm_const = self.cur.ir.kgc(mm.to_bits(), IRT_FUNC);
+        self.cur.ir.emitir(
+            irtg(IROp::EQ, IRT_FUNC),
+            tref_ref(mm_load),
+            tref_ref(mm_const),
+        )?;
+        // Dispatch __len(self = table) — result lands in slot a.
+        self.inline_mm_call(l, base, a, mm, gf, &[tabv], 1, tab, &[])?;
+        Ok(None)
+    }
+
+    /// Inline a metamethod call (function-valued `__index`/`__call`): place
+    /// the metamethod in slot `a`, the arguments (self first) after it, and
+    /// dispatch through `rec_call_lua`/`rec_callff_core`. The metamethod's
+    /// result lands in slot `a` — the enclosing op's destination slot.
+    #[allow(clippy::too_many_arguments)]
+    fn inline_mm_call(
+        &mut self,
+        l: &LuaState,
+        base: usize,
+        a: u32,
+        mm: LuaValue,
+        gf: GcPtr<crate::func::GcFunc>,
+        args: &[LuaValue],
+        nargs: u32,
+        self_tref: TRef,
+        arg_trefs: &[TRef],
+    ) -> Result<(), TraceError> {
+        // Slot a = the metamethod; arguments (self, ...) follow at a+2.
+        let mm_tref = self.cur.ir.kgc(mm.to_bits(), IRT_FUNC);
+        self.set_base(a, mm_tref);
+        self.set_base(a + 2, self_tref);
+        for (i, &at) in arg_trefs.iter().enumerate() {
+            self.set_base(a + 3 + i as u32, at);
+        }
+        match gf.as_ref() {
+            crate::func::GcFunc::C(cc) => {
+                let mut argv = [LuaValue::NIL; 3];
+                argv[0] = args.first().copied().unwrap_or(LuaValue::NIL);
+                argv[1] = args.get(1).copied().unwrap_or(LuaValue::NIL);
+                argv[2] = args.get(2).copied().unwrap_or(LuaValue::NIL);
+                self.rec_callff_core(l, a, 1, nargs, mm, cc.f, &argv)?;
+            }
+            crate::func::GcFunc::Lua(_) => {
+                // The self object is the first argument (a+2); the frame sees
+                // `nargs` argument slots (self included).
+                self.rec_call_lua(l, base, self.pc, a, nargs, 1, mm)?;
+            }
+        }
+        Ok(())
     }
 
     /// Inline a call to a plain Lua closure: guard the closure identity,
@@ -1493,10 +1685,13 @@ impl Record {
     fn rec_tget(
         &mut self,
         l: &LuaState,
+        base: usize,
+        a: u32,
         mut tabv: LuaValue,
         tab: TRef,
         keyv: LuaValue,
         key: TRef,
+        inline_mm: bool,
     ) -> Result<TRef, TraceError> {
         if !tref_istab(tab) {
             return Err(TraceError::NYIBC); // __index on non-tables NYI.
@@ -1513,10 +1708,57 @@ impl Record {
                 let idx_key = g.mmname[crate::meta::MM::Index as usize];
                 let idx_val = mt.as_ref().get_str(idx_key);
                 if let Some(delegated) = idx_val.as_table() {
+                    // Guard the runtime metatable is the recorded one before
+                    // trusting the delegated lookup (a setmetatable mid-loop
+                    // must not silently re-target).
+                    let mt_load = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::FLOAD, IRT_GUARD | IRT_TAB),
+                        tref_ref(tab),
+                        IRFL_TAB_META,
+                    ));
+                    let mt_const = self.cur.ir.kgc(LuaValue::table(mt).to_bits(), IRT_TAB);
+                    self.cur.ir.emitir(
+                        irtg(IROp::EQ, IRT_TAB),
+                        tref_ref(mt_load),
+                        tref_ref(mt_const),
+                    )?;
                     tabv = LuaValue::table(delegated);
                     t = delegated;
                     tab = self.cur.ir.kgc(tabv.to_bits(), IRT_TAB);
                     v = LuaValue::from_bits(jit_tget(tabv.to_bits(), keyv.to_bits()));
+                } else if let Some(mm_fn) = idx_val.as_func() {
+                    if !inline_mm {
+                        return Err(TraceError::NYIBC);
+                    }
+                    // Function `__index`: inline the call in place of the
+                    // table read. Guard the metatable and the `__index`
+                    // field, then dispatch the metamethod with (self, key);
+                    // its result lands in slot a (the TGET destination).
+                    let mt_load = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::FLOAD, IRT_GUARD | IRT_TAB),
+                        tref_ref(tab),
+                        IRFL_TAB_META,
+                    ));
+                    let mt_const = self.cur.ir.kgc(LuaValue::table(mt).to_bits(), IRT_TAB);
+                    self.cur.ir.emitir(
+                        irtg(IROp::EQ, IRT_TAB),
+                        tref_ref(mt_load),
+                        tref_ref(mt_const),
+                    )?;
+                    let call_key_tref = self.cur.ir.kgc(idx_key.to_bits(), IRT_STR);
+                    let mm_load = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::HLOAD, IRT_GUARD | IRT_FUNC),
+                        tref_ref(mt_load),
+                        tref_ref(call_key_tref),
+                    ));
+                    let mm_const = self.cur.ir.kgc(idx_val.to_bits(), IRT_FUNC);
+                    self.cur.ir.emitir(
+                        irtg(IROp::EQ, IRT_FUNC),
+                        tref_ref(mm_load),
+                        tref_ref(mm_const),
+                    )?;
+                    self.inline_mm_call(l, base, a, idx_val, mm_fn, &[tabv, keyv], 2, tab, &[key])?;
+                    return Ok(0);
                 } else {
                     return Err(TraceError::NYIBC);
                 }
@@ -1554,11 +1796,14 @@ impl Record {
     fn rec_tset(
         &mut self,
         l: &LuaState,
+        base: usize,
+        a: u32,
         tabv: LuaValue,
         tab: TRef,
         keyv: LuaValue,
         key: TRef,
         val: TRef,
+        inline_mm: bool,
     ) -> Result<(), TraceError> {
         if !tref_istab(tab) {
             return Err(TraceError::NYIBC);
@@ -1579,8 +1824,67 @@ impl Record {
         if let Some(mt) = mt {
             let g = l.global();
             let nidx = g.mmname[crate::meta::MM::Newindex as usize];
-            if !mt.as_ref().get_str(nidx).is_nil() {
-                return Err(TraceError::NYIBC); // __newindex path NYI.
+            let mm = mt.as_ref().get_str(nidx);
+            if !mm.is_nil() {
+                if !inline_mm {
+                    return Err(TraceError::NYIBC); // __newindex path NYI.
+                }
+                // `__newindex` fires only when the key is absent (or holds
+                // nil): an existing non-nil key is a raw store (the
+                // interpreter's meta_tset checks `t[k]` first). For an
+                // existing key, guard the value stays non-nil and fall
+                // through to the raw HSTORE below.
+                if !LuaValue::from_bits(jit_tget(tabv.to_bits(), keyv.to_bits())).is_nil() {
+                    self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::HLOAD, IRT_GUARD | IRT_NIL),
+                        tref_ref(tab),
+                        tref_ref(key),
+                    ));
+                } else {
+                    // The key is absent: guard it stays nil (a rawset or
+                    // prior __newindex run may create it mid-loop), so the
+                    // trace keeps dispatching to __newindex correctly.
+                    self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::HLOAD, IRT_GUARD | IRT_NIL),
+                        tref_ref(tab),
+                        tref_ref(key),
+                    ));
+                    let Some(gf) = mm.as_func() else {
+                        return Err(TraceError::NYIBC);
+                    };
+                    // Guard the runtime metatable is the recorded one and
+                    // its `__newindex` is the recorded metamethod.
+                let mt_load = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::FLOAD, IRT_GUARD | IRT_TAB),
+                    tref_ref(tab),
+                    IRFL_TAB_META,
+                ));
+                let mt_const = self.cur.ir.kgc(LuaValue::table(mt).to_bits(), IRT_TAB);
+                self.cur.ir.emitir(
+                    irtg(IROp::EQ, IRT_TAB),
+                    tref_ref(mt_load),
+                    tref_ref(mt_const),
+                )?;
+                let nidx_tref = self.cur.ir.kgc(nidx.to_bits(), IRT_STR);
+                let mm_load = self.cur.ir.emit_ins(IRIns::new(
+                    irt(IROp::HLOAD, IRT_GUARD | IRT_FUNC),
+                    tref_ref(mt_load),
+                    tref_ref(nidx_tref),
+                ));
+                let mm_const = self.cur.ir.kgc(mm.to_bits(), IRT_FUNC);
+                self.cur.ir.emitir(
+                    irtg(IROp::EQ, IRT_FUNC),
+                    tref_ref(mm_load),
+                    tref_ref(mm_const),
+                )?;
+                    // Dispatch __newindex(self, key, value); result discarded.
+                    self.inline_mm_call(
+                        l, base, a, mm, gf,
+                        &[tabv, keyv, LuaValue::NIL], 3,
+                        tab, &[key, val],
+                    )?;
+                    return Ok(());
+                }
             }
         } else {
             // No metatable at all: guard it stays nil (a hot loop may
@@ -1731,7 +2035,7 @@ impl Record {
                     .ir
                     .emitir(irtn(IROp::ADD), tref_ref(ctrl), tref_ref(one))?;
                 let iv = argv[1].as_number().ok_or(TraceError::NYIBC)? + 1.0;
-                let v = self.rec_tget(l, argv[0], tab, LuaValue::number(iv), k)?;
+                let v = self.rec_tget(l, 0, 0, argv[0], tab, LuaValue::number(iv), k, false)?;
                 if tref_isnil(v) {
                     res[0] = TREF_NIL;
                     nres = 1;
@@ -1776,7 +2080,7 @@ impl Record {
                     res[0] = TREF_NIL;
                     nres = 1;
                 } else {
-                    let v = self.rec_tget(l, tabv, tab, nkv, nk)?;
+                    let v = self.rec_tget(l, 0, 0, tabv, tab, nkv, nk, false)?;
                     res[0] = nk;
                     res[1] = v;
                     nres = 2;
@@ -2268,7 +2572,7 @@ impl Record {
                 let keyv = argv[1];
                 let tab = self.base_ref(a + 2);
                 let key = self.base_ref(a + 3);
-                res[0] = self.rec_tget(l, tabv, tab, keyv, key)?;
+                res[0] = self.rec_tget(l, 0, 0, tabv, tab, keyv, key, false)?;
                 nres = 1;
             }
             Recff::RawSet => {
@@ -2277,7 +2581,7 @@ impl Record {
                 let tab = self.base_ref(a + 2);
                 let key = self.base_ref(a + 3);
                 let val = self.base_ref(a + 4);
-                self.rec_tset(l, tabv, tab, keyv, key, val)?;
+                self.rec_tset(l, 0, 0, tabv, tab, keyv, key, val, false)?;
                 nres = 0;
             }
             Recff::SetMetatable => {
@@ -2783,6 +3087,20 @@ impl Record {
                         IRCALL_STR_LEN,
                     ));
                 } else if tref_istab(rc) {
+                    // A metatable `__len` beats the raw length; inline it.
+                    // LEN's source operand is in the C field.
+                    let rcv2 = self.slot_val(l, base, bc_c(ins));
+                    if let Some(m) = rcv2
+                        .as_table()
+                        .and_then(|t| t.as_ref().metatable)
+                    {
+                        let g = l.global();
+                        let len_key = g.mmname[crate::meta::MM::Len as usize];
+                        if !m.as_ref().get_str(len_key).is_nil() {
+                            let r = self.rec_len_mm(l, base, bc_a(ins), rcv2, rc, len_key)?;
+                            return Ok(r);
+                        }
+                    }
                     // Raw length, mirroring the interpreter's table fast
                     // path (no __len for tables).
                     result = self.cur.ir.emit_ins(IRIns::new(
@@ -3094,7 +3412,7 @@ impl Record {
                 } else {
                     (rc, rcv)
                 };
-                result = self.rec_tget(l, tabv, rb, keyv, key)?;
+                result = self.rec_tget(l, base, bc_a(ins), tabv, rb, keyv, key, true)?;
             }
             BCOp::TSETV | BCOp::TSETS | BCOp::TSETB => {
                 let tabv = self.slot_val(l, base, bc_b(ins));
@@ -3106,7 +3424,7 @@ impl Record {
                     (rc, rcv)
                 };
                 let val = self.getslot(l, base, bc_a(ins));
-                self.rec_tset(l, tabv, tab, keyv, key, val)?;
+                self.rec_tset(l, base, bc_a(ins), tabv, tab, keyv, key, val, true)?;
             }
             BCOp::GGET | BCOp::GSET => {
                 // The environment table of the (specialized) closure is a
@@ -3121,10 +3439,10 @@ impl Record {
                 let tabv = LuaValue::table(env);
                 let tab = self.cur.ir.kgc(tabv.to_bits(), IRT_TAB);
                 if op == BCOp::GGET {
-                    result = self.rec_tget(l, tabv, tab, rcv, rc)?;
+                    result = self.rec_tget(l, 0, 0, tabv, tab, rcv, rc, false)?;
                 } else {
                     let val = self.getslot(l, base, bc_a(ins));
-                    self.rec_tset(l, tabv, tab, rcv, rc, val)?;
+                    self.rec_tset(l, base, bc_a(ins), tabv, tab, rcv, rc, val, true)?;
                 }
             }
 

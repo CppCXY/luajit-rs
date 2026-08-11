@@ -352,15 +352,28 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     env[(r - REF_BIAS) as usize] = v.to_bits();
                 }
                 IROp::FLOAD => {
-                    // Guarded `metatable == nil` check (IRFL_TAB_META).
+                    // IRFL_TAB_META: either the guarded `metatable == nil`
+                    // check (IRT_NIL) or a guarded read of the metatable
+                    // value (IRT_TAB, used by the inlined __call path).
                     debug_assert!(ins.is_guard());
                     let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
-                    let mt = tv
+                    let t = tv
                         .as_table()
                         .expect("FLOAD on a non-table")
-                        .as_ref()
-                        .metatable;
-                    if mt.is_some() {
+                        .as_ref();
+                    let mt = t.metatable;
+                    if irt_type(ins.t()) == IRT_TAB {
+                        let v = match mt {
+                            Some(m) => LuaValue::table(m),
+                            None => LuaValue::NIL,
+                        };
+                        if typecheck(v, ins.t()) {
+                            env[(r - REF_BIAS) as usize] = v.to_bits();
+                        } else {
+                            env[(r - REF_BIAS) as usize] = v.to_bits();
+                            return exit_snapshot(l, base, cbase, tr, env, snapidx);
+                        }
+                    } else if mt.is_some() {
                         return exit_snapshot(l, base, cbase, tr, env, snapidx);
                     }
                 }
