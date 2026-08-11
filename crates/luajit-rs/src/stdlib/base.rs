@@ -353,8 +353,15 @@ pub fn lib_setmetatable(l: &mut LuaState) -> LuaResult<i32> {
     // may run inside a trace, where freeing the registry would crash.
     let g = l.global();
     let nidx = g.mmname[crate::meta::MM::Newindex as usize];
-    let old_has = tab.as_ref().metatable.map(|m| !m.as_ref().get_str(nidx).is_nil()).unwrap_or(false);
-    let new_has = mt.as_table().map(|m| !m.as_ref().get_str(nidx).is_nil()).unwrap_or(false);
+    let old_has = tab
+        .as_ref()
+        .metatable
+        .map(|m| !m.as_ref().get_str(nidx).is_nil())
+        .unwrap_or(false);
+    let new_has = mt
+        .as_table()
+        .map(|m| !m.as_ref().get_str(nidx).is_nil())
+        .unwrap_or(false);
     tab.as_mut().metatable = mt.as_table();
     if old_has != new_has {
         g.jit.invalidate_all = true;

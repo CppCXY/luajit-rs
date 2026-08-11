@@ -518,12 +518,6 @@ impl<T> Pool<T> {
                 self.dealloc_block_raw(raw, mapped);
                 trimmed += 1;
             }
-            if std::env::var("LUARS_TRIMDBG").is_ok() {
-                eprintln!(
-                    "[trim] kind={:?} blocks={} freed={} bytes={} free_bytes={}",
-                    self.kind, trimmed, trimmed * sz, self.free_bytes, self.free_bytes
-                );
-            }
         }
     }
     pub fn free(&mut self, p: GcPtr<T>) {

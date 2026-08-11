@@ -81,13 +81,8 @@ pub const IRCALL_STR_CHAR_N: u32 = 18;
 /// CARG pair, 3 = op1 is CARG(CARG(a, b), c), 4 = one more level.
 pub fn ircall_arity(idx: u32) -> u32 {
     match idx {
-        IRCALL_STR_LEN
-        | IRCALL_STR_CHAR
-        | IRCALL_TAB_LEN
-        | IRCALL_TOSTR_NUM
-        | IRCALL_STR_UPPER
-        | IRCALL_STR_LOWER
-        | IRCALL_STR_REVERSE => 1,
+        IRCALL_STR_LEN | IRCALL_STR_CHAR | IRCALL_TAB_LEN | IRCALL_TOSTR_NUM | IRCALL_STR_UPPER
+        | IRCALL_STR_LOWER | IRCALL_STR_REVERSE => 1,
         IRCALL_STR_SUB | IRCALL_VARG => 3,
         IRCALL_FFI => 4,
         IRCALL_STRFMT => 4,
@@ -987,7 +982,7 @@ impl Record {
         let Some(gf) = fv.as_func() else {
             // `t(...)` where t is not a function: inline its `__call`
             // metamethod (guard the metatable + `__call`, then dispatch).
-            return Ok(self.rec_call_mm(l, base, pc, a, nargs, want, fv)?);
+            return self.rec_call_mm(l, base, pc, a, nargs, want, fv);
         };
         match gf.as_ref() {
             crate::func::GcFunc::C(cc) => {
@@ -1046,9 +1041,11 @@ impl Record {
             IRFL_TAB_META,
         ));
         let mt_const = self.cur.ir.kgc(LuaValue::table(mt).to_bits(), IRT_TAB);
-        self.cur
-            .ir
-            .emitir(irtg(IROp::EQ, IRT_TAB), tref_ref(mt_load), tref_ref(mt_const))?;
+        self.cur.ir.emitir(
+            irtg(IROp::EQ, IRT_TAB),
+            tref_ref(mt_load),
+            tref_ref(mt_const),
+        )?;
         // Guard the metatable's `__call` field is the recorded metamethod.
         let call_key_tref = self.cur.ir.kgc(call_key.to_bits(), IRT_STR);
         let mo_load = self.cur.ir.emit_ins(IRIns::new(
@@ -1057,9 +1054,11 @@ impl Record {
             tref_ref(call_key_tref),
         ));
         let mo_const = self.cur.ir.kgc(mo.to_bits(), IRT_FUNC);
-        self.cur
-            .ir
-            .emitir(irtg(IROp::EQ, IRT_FUNC), tref_ref(mo_load), tref_ref(mo_const))?;
+        self.cur.ir.emitir(
+            irtg(IROp::EQ, IRT_FUNC),
+            tref_ref(mo_load),
+            tref_ref(mo_const),
+        )?;
         // The runtime frame will see slot a = metamethod, self at a+2, and
         // the original args shifted up one. Record the shift.
         let self_tref = self.base_ref(a); // the object's tref (== ftr).
@@ -1854,34 +1853,40 @@ impl Record {
                     };
                     // Guard the runtime metatable is the recorded one and
                     // its `__newindex` is the recorded metamethod.
-                let mt_load = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::FLOAD, IRT_GUARD | IRT_TAB),
-                    tref_ref(tab),
-                    IRFL_TAB_META,
-                ));
-                let mt_const = self.cur.ir.kgc(LuaValue::table(mt).to_bits(), IRT_TAB);
-                self.cur.ir.emitir(
-                    irtg(IROp::EQ, IRT_TAB),
-                    tref_ref(mt_load),
-                    tref_ref(mt_const),
-                )?;
-                let nidx_tref = self.cur.ir.kgc(nidx.to_bits(), IRT_STR);
-                let mm_load = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::HLOAD, IRT_GUARD | IRT_FUNC),
-                    tref_ref(mt_load),
-                    tref_ref(nidx_tref),
-                ));
-                let mm_const = self.cur.ir.kgc(mm.to_bits(), IRT_FUNC);
-                self.cur.ir.emitir(
-                    irtg(IROp::EQ, IRT_FUNC),
-                    tref_ref(mm_load),
-                    tref_ref(mm_const),
-                )?;
+                    let mt_load = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::FLOAD, IRT_GUARD | IRT_TAB),
+                        tref_ref(tab),
+                        IRFL_TAB_META,
+                    ));
+                    let mt_const = self.cur.ir.kgc(LuaValue::table(mt).to_bits(), IRT_TAB);
+                    self.cur.ir.emitir(
+                        irtg(IROp::EQ, IRT_TAB),
+                        tref_ref(mt_load),
+                        tref_ref(mt_const),
+                    )?;
+                    let nidx_tref = self.cur.ir.kgc(nidx.to_bits(), IRT_STR);
+                    let mm_load = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::HLOAD, IRT_GUARD | IRT_FUNC),
+                        tref_ref(mt_load),
+                        tref_ref(nidx_tref),
+                    ));
+                    let mm_const = self.cur.ir.kgc(mm.to_bits(), IRT_FUNC);
+                    self.cur.ir.emitir(
+                        irtg(IROp::EQ, IRT_FUNC),
+                        tref_ref(mm_load),
+                        tref_ref(mm_const),
+                    )?;
                     // Dispatch __newindex(self, key, value); result discarded.
                     self.inline_mm_call(
-                        l, base, a, mm, gf,
-                        &[tabv, keyv, LuaValue::NIL], 3,
-                        tab, &[key, val],
+                        l,
+                        base,
+                        a,
+                        mm,
+                        gf,
+                        &[tabv, keyv, LuaValue::NIL],
+                        3,
+                        tab,
+                        &[key, val],
                     )?;
                     return Ok(());
                 }
@@ -2314,9 +2319,9 @@ impl Record {
                 // interpreter.
                 let k0 = self.cur.ir.knum(0.0);
                 let k255 = self.cur.ir.knum(255.0);
-                if nargs >= 2 && nargs <= 3 {
+                if (2..=3).contains(&nargs) {
                     let mut args = [0u32; 3];
-                    for i in 0..nargs as usize {
+                    for (i, slot) in args.iter_mut().enumerate().take(nargs as usize) {
                         let c = self.base_ref(a + 2 + i as u32);
                         if !tref_isnum(c) {
                             return Err(TraceError::NYIBC);
@@ -2331,7 +2336,7 @@ impl Record {
                             tref_ref(c),
                             tref_ref(k255),
                         ));
-                        args[i] = tref_ref(c);
+                        *slot = tref_ref(c);
                     }
                     let c0 = self.cur.ir.emit_ins(IRIns::new(
                         irt(IROp::CARG, IRT_NIL),
@@ -2354,34 +2359,34 @@ impl Record {
                     ));
                     self.rec_gcstep(l);
                     nres = 1;
-                    return Ok(());
+                } else {
+                    if nargs != 1 {
+                        return Err(TraceError::NYIBC);
+                    }
+                    let c = self.base_ref(a + 2);
+                    if !tref_isnum(c) {
+                        return Err(TraceError::NYIBC);
+                    }
+                    // Out-of-range exits to the interpreter, which raises
+                    // "out of range" (string.char(300) is an error).
+                    self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::UGE, IRT_GUARD | IRT_INT),
+                        tref_ref(c),
+                        tref_ref(k0),
+                    ));
+                    self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::ULE, IRT_GUARD | IRT_INT),
+                        tref_ref(c),
+                        tref_ref(k255),
+                    ));
+                    res[0] = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_STR),
+                        tref_ref(c),
+                        IRCALL_STR_CHAR,
+                    ));
+                    self.rec_gcstep(l);
+                    nres = 1;
                 }
-                if nargs != 1 {
-                    return Err(TraceError::NYIBC);
-                }
-                let c = self.base_ref(a + 2);
-                if !tref_isnum(c) {
-                    return Err(TraceError::NYIBC);
-                }
-                // Out-of-range exits to the interpreter, which raises
-                // "out of range" (string.char(300) is an error).
-                self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::UGE, IRT_GUARD | IRT_INT),
-                    tref_ref(c),
-                    tref_ref(k0),
-                ));
-                self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::ULE, IRT_GUARD | IRT_INT),
-                    tref_ref(c),
-                    tref_ref(k255),
-                ));
-                res[0] = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CALLL, IRT_STR),
-                    tref_ref(c),
-                    IRCALL_STR_CHAR,
-                ));
-                self.rec_gcstep(l);
-                nres = 1;
             }
             Recff::TableInsert => {
                 let tab = self.base_ref(a + 2);
@@ -2605,10 +2610,7 @@ impl Record {
                 let g = l.global();
                 // Protected metatable check (lj_meta_lookup(o, MM_metatable)):
                 // abort if the current metatable exposes `__metatable`.
-                if let Some(cur_mt) = tabv
-                    .as_table()
-                    .and_then(|t| t.as_ref().metatable)
-                {
+                if let Some(cur_mt) = tabv.as_table().and_then(|t| t.as_ref().metatable) {
                     let mmet = g.mmname[crate::meta::MM::Metatable as usize];
                     if !cur_mt.as_ref().get_str(mmet).is_nil() {
                         return Err(TraceError::NYIBC);
@@ -2685,7 +2687,11 @@ impl Record {
                     return Err(TraceError::NYIBC);
                 }
                 let nconv = crate::strfmt::compile(l.str_static(fmt_sid))
-                    .map(|p| p.iter().filter(|part| matches!(part, crate::strfmt::FmtPart::Conv(_, _))).count())
+                    .map(|p| {
+                        p.iter()
+                            .filter(|part| matches!(part, crate::strfmt::FmtPart::Conv(_, _)))
+                            .count()
+                    })
                     .unwrap_or(99);
                 if nconv > 3 {
                     return Err(TraceError::NYIBC); // Multi-conv formats go to the interpreter.
@@ -2698,9 +2704,21 @@ impl Record {
                 // missing args are NIL): the native backends read arity 4
                 // as CARG(CARG(CARG(fmt,a0),a1),a2).
                 let abase = a as usize + 2;
-                let a0 = if 1 <= nfmt_args { self.base_ref(abase as u32 + 1) } else { 0 };
-                let a1 = if 2 <= nfmt_args { self.base_ref(abase as u32 + 2) } else { 0 };
-                let a2 = if 3 <= nfmt_args { self.base_ref(abase as u32 + 3) } else { 0 };
+                let a0 = if 1 <= nfmt_args {
+                    self.base_ref(abase as u32 + 1)
+                } else {
+                    0
+                };
+                let a1 = if 2 <= nfmt_args {
+                    self.base_ref(abase as u32 + 2)
+                } else {
+                    0
+                };
+                let a2 = if 3 <= nfmt_args {
+                    self.base_ref(abase as u32 + 3)
+                } else {
+                    0
+                };
                 let c0 = self.cur.ir.emit_ins(IRIns::new(
                     irt(IROp::CARG, IRT_NIL),
                     tref_ref(fmt_t),
@@ -3090,10 +3108,7 @@ impl Record {
                     // A metatable `__len` beats the raw length; inline it.
                     // LEN's source operand is in the C field.
                     let rcv2 = self.slot_val(l, base, bc_c(ins));
-                    if let Some(m) = rcv2
-                        .as_table()
-                        .and_then(|t| t.as_ref().metatable)
-                    {
+                    if let Some(m) = rcv2.as_table().and_then(|t| t.as_ref().metatable) {
                         let g = l.global();
                         let len_key = g.mmname[crate::meta::MM::Len as usize];
                         if !m.as_ref().get_str(len_key).is_nil() {

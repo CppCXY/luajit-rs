@@ -106,7 +106,8 @@ pub struct GcHeap {
     /// Compiled `string.format` formats, keyed by the format string's StrId
     /// (never recycled), so a hot loop reuses the parsed spec parts instead
     /// of re-parsing the format string every call.
-    pub fmt_cache: std::collections::HashMap<u32, std::sync::Arc<Vec<crate::util::strfmt::FmtPart>>>,
+    pub fmt_cache:
+        std::collections::HashMap<u32, std::sync::Arc<Vec<crate::util::strfmt::FmtPart>>>,
 }
 
 impl Default for GcHeap {
