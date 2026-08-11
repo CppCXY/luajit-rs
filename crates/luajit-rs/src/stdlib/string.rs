@@ -820,10 +820,20 @@ fn is_method_call(l: &LuaState) -> bool {
 }
 
 pub fn str_sub(l: &mut LuaState) -> LuaResult<i32> {
-    let s = match str_arg_coerce(l, 0, "sub") {
-        Some(s) => s,
-        None => return Err(err_bad_arg_type(l, 1, "sub", "string", arg(l, 0))),
-    };
+    let s: &[u8];
+    let owned: Vec<u8>;
+    match arg(l, 0).as_string_id() {
+        Some(sid) => s = l.str_static(sid),
+        None => {
+            let v = arg(l, 0);
+            if v.is_number() {
+                owned = crate::stdlib::tostring_bytes(l, v);
+                s = &owned;
+            } else {
+                return Err(err_bad_arg_type(l, 1, "sub", "string", arg(l, 0)));
+            }
+        }
+    }
     // The indices must be numbers (or numeric strings); a present but
     // non-numeric argument is an error (luaL_checknumber semantics).
     let method = is_method_call(l);

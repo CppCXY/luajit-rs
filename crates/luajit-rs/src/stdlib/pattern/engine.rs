@@ -926,7 +926,24 @@ fn find_bytes_in_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.len() > haystack.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    if needle.len() == 1 {
+        // Single byte: memchr-style scan (avoids the windows() allocator
+        // churn and per-position slice comparison).
+        return haystack.iter().position(|&b| b == needle[0]);
+    }
+    // Multi-byte: find the first byte, then verify the full needle (the
+    // common case is a rare first byte, so most positions bail after one
+    // compare).
+    let first = needle[0];
+    let rest = &needle[1..];
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if haystack[i] == first && &haystack[i + 1..i + needle.len()] == rest {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Fast plain-text gsub using byte slice search.
