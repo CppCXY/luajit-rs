@@ -820,7 +820,8 @@ impl<'a> Asm<'a> {
             self.modrm(3, RAX, RAX);
             self.guard(CC_E);
             self.mov_r64_imm64(RCX, (crate::value::LJ_TTAB as u64) << 47);
-            self.code.push(0x48 | (((RCX >> 3) & 1) << 2) | ((RAX >> 3) & 1));
+            self.code
+                .push(0x48 | (((RCX >> 3) & 1) << 2) | ((RAX >> 3) & 1));
             self.code.push(0x09); // or rax, rcx
             self.modrm(3, RCX, RAX);
             // Publish the boxed metatable to the env for the following EQ.
@@ -859,6 +860,7 @@ impl<'a> Asm<'a> {
             rec::IRCALL_STR_UPPER => exec::jit_str_upper as *const () as u64,
             rec::IRCALL_STR_LOWER => exec::jit_str_lower as *const () as u64,
             rec::IRCALL_STR_REVERSE => exec::jit_str_reverse as *const () as u64,
+            rec::IRCALL_STR_CHAR_N => exec::jit_str_char_n as *const () as u64,
             rec::IRCALL_TAB_LEN => exec::jit_alen as *const () as u64,
             rec::IRCALL_TAB_CONCAT => exec::jit_tconcat as *const () as u64,
             rec::IRCALL_CAT => exec::jit_cat as *const () as u64,

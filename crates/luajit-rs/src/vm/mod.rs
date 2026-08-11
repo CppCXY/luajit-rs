@@ -2202,8 +2202,7 @@ impl Interp {
                             continue;
                         }
                         (nf, nip, CallFast::Trace(f)) => {
-                            fr = nf;
-                            ip = nip;
+                            let _ = (nf, nip);
                             return Ok(f);
                         }
                         (nf, nip, CallFast::Slow) => {
@@ -2229,8 +2228,7 @@ impl Interp {
                             continue;
                         }
                         (nf, nip, CallFast::Trace(f)) => {
-                            fr = nf;
-                            ip = nip;
+                            let _ = (nf, nip);
                             return Ok(f);
                         }
                         (nf, nip, CallFast::Slow) => {
@@ -2579,9 +2577,10 @@ impl Interp {
                         // loop that mutates metatables each iteration can
                         // never produce a stable trace. The interpreted loop
                         // runs until hotcount accumulates again.
-                        let reset =
-                            (self.l().global().jit.param(crate::jit::JitParam::HotLoop) as u32
-                                * crate::jit::HOTCOUNT_LOOP as u32) as crate::jit::HotCount;
+                        let reset = (self.l().global().jit.param(crate::jit::JitParam::HotLoop)
+                            as u32
+                            * crate::jit::HOTCOUNT_LOOP as u32)
+                            as crate::jit::HotCount;
                         self.l().global().jit.hotcount_set(ip as usize, reset);
                         let reverted = unsafe { *ip.sub(1) };
                         let a2 = bc_a(reverted);
@@ -3130,10 +3129,9 @@ impl Interp {
     /// registers).
     #[inline(always)]
     fn resync_fr(&mut self) -> (Frame, *const BCIns) {
-        (
-            Frame::new(self.sp, self.base),
-            unsafe { self.bcp.add(self.pc) },
-        )
+        (Frame::new(self.sp, self.base), unsafe {
+            self.bcp.add(self.pc)
+        })
     }
 
     /// Inline fast path shared by BC_CALL and BC_CALLM (LuaJIT's
@@ -3191,7 +3189,8 @@ impl Interp {
             self.sync_fr(fr, ip);
             self.l().stack_ensure(need);
             self.sp = self.l().stack.as_mut_ptr();
-            (fr, ip) = self.resync_fr();
+            let (_, nip) = self.resync_fr();
+            ip = nip;
         }
         // The caller's frame link (return PC) always sits at `callbase - 1`;
         // a vararg callee chains its FRAME_VARG link on top of it.
@@ -3201,7 +3200,11 @@ impl Interp {
             // vararg frame back to the one holding the real link.
             self.set_at(newbase - 2, LuaValue::func(gf));
             for i in 0..numparams {
-                let v = if i < nargs { self.at(callbase + i) } else { LuaValue::NIL };
+                let v = if i < nargs {
+                    self.at(callbase + i)
+                } else {
+                    LuaValue::NIL
+                };
                 self.set_at(newbase + i, v);
             }
             let delta = (newbase - callbase) as u64;
@@ -3271,10 +3274,7 @@ impl Interp {
             return Ok((fr, ip, CallFast::Applied));
         }
         // hotcall (vm_hotcall): count the FUNCF header.
-        if !REC
-            && bc_op(head) == BCOp::FUNCF
-            && self.hot_count(ip as usize, HOTCOUNT_CALL)
-        {
+        if !REC && bc_op(head) == BCOp::FUNCF && self.hot_count(ip as usize, HOTCOUNT_CALL) {
             self.sync_fr(fr, ip);
             if self.hot_call(ptref) {
                 return Ok((fr, ip, CallFast::Trace(Flow::Rec))); // Record from callee.
@@ -3774,14 +3774,11 @@ impl Interp {
         // vector (a hot `function() ... end` loop allocates nothing here).
         if nuv == 0 {
             let env = self.lua_cl().env;
-            let fref = self
-                .l()
-                .heap()
-                .alloc_func(GcFunc::Lua(LuaClosure {
-                    proto,
-                    env,
-                    upvals: crate::func::Upvals::empty(),
-                }));
+            let fref = self.l().heap().alloc_func(GcFunc::Lua(LuaClosure {
+                proto,
+                env,
+                upvals: crate::func::Upvals::empty(),
+            }));
             return LuaValue::func(fref);
         }
         let env = self.lua_cl().env;

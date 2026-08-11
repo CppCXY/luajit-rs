@@ -269,12 +269,13 @@ fn handle_gc_fd(l: &mut LuaState) -> LuaResult<i32> {
     }
     let files = l.files_mut();
     if let Some(slot) = files.get_mut(fd)
-        && slot.is_some() {
-            if let Some(FileEntry::Pipe(child)) = slot {
-                let _ = child.wait();
-            }
-            *slot = None;
+        && slot.is_some()
+    {
+        if let Some(FileEntry::Pipe(child)) = slot {
+            let _ = child.wait();
         }
+        *slot = None;
+    }
     Ok(0)
 }
 

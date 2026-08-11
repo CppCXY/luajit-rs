@@ -179,9 +179,10 @@ fn debug_slotname(
                 }
                 m if m == crate::bc::BCMode::Base as u32
                     // CALL/VARG/UCLO/... write a slot range.
-                    && slot >= ra => {
-                        last = Some((i as usize, op as u32));
-                    }
+                    && slot >= ra =>
+                {
+                    last = Some((i as usize, op as u32));
+                }
                 _ => {}
             }
             i += 1;

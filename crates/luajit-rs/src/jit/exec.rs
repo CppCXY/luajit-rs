@@ -357,10 +357,7 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                     // value (IRT_TAB, used by the inlined __call path).
                     debug_assert!(ins.is_guard());
                     let tv = LuaValue::from_bits(val(env, ins.op1 as IRRef));
-                    let t = tv
-                        .as_table()
-                        .expect("FLOAD on a non-table")
-                        .as_ref();
+                    let t = tv.as_table().expect("FLOAD on a non-table").as_ref();
                     let mt = t.metatable;
                     if irt_type(ins.t()) == IRT_TAB {
                         let v = match mt {
@@ -428,7 +425,10 @@ fn run_ir(l: &mut LuaState, base: usize, tr: &GCtrace, env: &mut [u64]) -> ExitR
                         None
                     } else {
                         let mv = LuaValue::from_bits(val(env, ins.op2 as IRRef));
-                        Some(mv.as_table().expect("FSTORE metatable must be a table or nil"))
+                        Some(
+                            mv.as_table()
+                                .expect("FSTORE metatable must be a table or nil"),
+                        )
                     };
                     t.as_mut().metatable = mt;
                 }
@@ -1225,12 +1225,12 @@ pub extern "C" fn jit_strfmt(fmt_bits: u64, a0: u64, a1: u64, a2: u64) -> u64 {
         .unwrap_or(0);
     let nused = nconv.min(3);
     let mut args: Vec<FmtArg> = Vec::with_capacity(nused);
-    for i in 0..nused {
-        let v = LuaValue::from_bits(arg_bits[i]);
+    for &ab in &arg_bits[..nused] {
+        let v = LuaValue::from_bits(ab);
         args.push(if let Some(n) = v.as_number() {
             FmtArg::Num(n)
         } else if v.is_string() {
-            FmtArg::Str(str_bytes(arg_bits[i]))
+            FmtArg::Str(str_bytes(ab))
         } else {
             return LuaValue::NIL.to_bits();
         });

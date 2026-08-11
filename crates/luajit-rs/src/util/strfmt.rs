@@ -358,7 +358,7 @@ pub fn format_parts(parts: &[FmtPart], args: &[FmtArg]) -> Result<Vec<u8>, Strin
     let mut ai = 0usize;
     for part in parts {
         match part {
-            FmtPart::Lit(b) => out.extend_from_slice(&b),
+            FmtPart::Lit(b) => out.extend_from_slice(b),
             FmtPart::Conv(spec, conv) => {
                 let conv = *conv;
                 let next_num = |ai: &mut usize| -> Result<f64, String> {
@@ -371,7 +371,9 @@ pub fn format_parts(parts: &[FmtPart], args: &[FmtArg]) -> Result<Vec<u8>, Strin
                         FmtArg::Str(s) => std::str::from_utf8(s)
                             .ok()
                             .and_then(|s| s.trim().parse::<f64>().ok())
-                            .ok_or_else(|| "bad argument to 'format' (number expected)".to_string()),
+                            .ok_or_else(|| {
+                                "bad argument to 'format' (number expected)".to_string()
+                            }),
                     }
                 };
                 match conv {

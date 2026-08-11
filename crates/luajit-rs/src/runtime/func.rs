@@ -129,7 +129,10 @@ impl Upvals {
             for (i, &p) in v.iter().enumerate() {
                 uv[i] = p;
             }
-            Upvals::Inline { n: v.len() as u8, uv }
+            Upvals::Inline {
+                n: v.len() as u8,
+                uv,
+            }
         } else {
             Upvals::Heap(v)
         }

@@ -84,7 +84,7 @@ for bench in "${BENCHMARKS[@]}"; do
     echo ""
     
     echo -e "${MAGENTA}--- Luajit-RS ---${NC}"
-    LUAJIT_RS_TRDUMP=1 "$LUARS_BIN" "benchmarks/$bench"
+    "$LUARS_BIN" "benchmarks/$bench"
     
     if [ -n "$NATIVE_LUA" ]; then
         echo ""

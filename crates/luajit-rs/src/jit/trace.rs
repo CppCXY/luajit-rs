@@ -503,18 +503,7 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                 trace.inner_ofs = inner;
                 trace.stub_tails = tails;
             }
-            Err(e) => {
-                if js.trace_dump {
-                    eprintln!(
-                        "ASM-FAIL trace={} nins={} nsnap={} link={:?} err={:?}",
-                        trace.traceno,
-                        trace.ir.nins(),
-                        trace.snap.len(),
-                        trace.linktype,
-                        e
-                    );
-                }
-            }
+            Err(_e) => {}
         }
         trace
     };
@@ -751,10 +740,10 @@ pub fn trace_flush_all(l: &mut LuaState) {
     let js = &mut g.jit;
     let mut revert: Vec<(GcPtr<crate::proto::Proto>, usize, bc::BCIns)> = Vec::new();
     for tr in js.trace.iter() {
-        if let Some(tr) = tr {
-            if tr.root == 0 {
-                revert.push((tr.startpt, tr.startpc, tr.startins));
-            }
+        if let Some(tr) = tr
+            && tr.root == 0
+        {
+            revert.push((tr.startpt, tr.startpc, tr.startins));
         }
     }
     for slot in js.trace.iter_mut() {

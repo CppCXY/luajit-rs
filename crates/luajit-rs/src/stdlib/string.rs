@@ -625,8 +625,7 @@ pub fn str_format(l: &mut LuaState) -> LuaResult<i32> {
     let parts = if let Some(p) = l.heap().fmt_cache.get(&fmt_sid) {
         Arc::clone(p)
     } else {
-        let compiled = crate::strfmt::compile(fmt)
-            .map_err(|e| l.runtime_error(e.as_bytes()))?;
+        let compiled = crate::strfmt::compile(fmt).map_err(|e| l.runtime_error(e.as_bytes()))?;
         let p = Arc::new(compiled);
         l.heap().fmt_cache.insert(fmt_sid, Arc::clone(&p));
         p

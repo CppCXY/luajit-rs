@@ -1038,7 +1038,8 @@ impl<'a> Asm<'a> {
         if irt_type(ins.t()) == IRT_TAB {
             self.code.cmp_imm(RSCRATCH2, 0);
             self.guard(cond::EQ); // exit if no metatable
-            self.code.mov64(RSCRATCH3, (crate::value::LJ_TTAB as u64) << 47);
+            self.code
+                .mov64(RSCRATCH3, (crate::value::LJ_TTAB as u64) << 47);
             self.code.orr_rr(RSCRATCH2, RSCRATCH2, RSCRATCH3);
             // Publish the boxed metatable to the env for the following EQ.
             if self.needs_env[Self::iidx(self.cur)] {
@@ -1209,6 +1210,7 @@ impl<'a> Asm<'a> {
             rec::IRCALL_STR_UPPER => exec::jit_str_upper as *const () as u64,
             rec::IRCALL_STR_LOWER => exec::jit_str_lower as *const () as u64,
             rec::IRCALL_STR_REVERSE => exec::jit_str_reverse as *const () as u64,
+            rec::IRCALL_STR_CHAR_N => exec::jit_str_char_n as *const () as u64,
             rec::IRCALL_TAB_LEN => exec::jit_alen as *const () as u64,
             rec::IRCALL_TAB_CONCAT => exec::jit_tconcat as *const () as u64,
             rec::IRCALL_CAT => exec::jit_cat as *const () as u64,
