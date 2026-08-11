@@ -2068,19 +2068,41 @@ impl Record {
                 let keyv = if nargs >= 2 { argv[1] } else { LuaValue::NIL };
                 let nkv = LuaValue::from_bits(jit_tnextk(tabv.to_bits(), keyv.to_bits()));
                 let t_nk = Self::value_irt(nkv);
-                let carg = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CARG, IRT_NIL),
-                    tref_ref(tab),
-                    tref_ref(key),
-                ));
-                let mut nk = self.cur.ir.emit_ins(IRIns::new(
-                    irt(IROp::CALLL, IRT_GUARD | t_nk),
-                    tref_ref(carg),
-                    IRCALL_TAB_NEXTK,
-                ));
-                if irt_ispri(t_nk) {
-                    nk = tref_pri(t_nk);
-                }
+                // Native dense-array fast path (mirrors jit_tnextk's array
+                // scan, like IpairsAux): when the current key is a number
+                // and the recorded next key is exactly key+1 inside the
+                // array part, record k' = key+1 as IR — no helper call.
+                // Gaps / the phase transition exit through the ALOAD guard
+                // and fall back to the helper (side trace / interpreter).
+                let native_arr = tref_isnum(key)
+                    && !keyv.is_nil()
+                    && !nkv.is_nil()
+                    && keyv.as_number().zip(nkv.as_number()).is_some_and(|(k, nk)| nk == k + 1.0)
+                    && tabv.as_table().is_some_and(|t| {
+                        nkv.as_int32_exact()
+                            .is_some_and(|nk| nk >= 0 && (nk as u32) < t.as_ref().asize)
+                    });
+                let mut nk = if native_arr {
+                    let one = self.cur.ir.knum(1.0);
+                    self.cur
+                        .ir
+                        .emitir(irtn(IROp::ADD), tref_ref(key), tref_ref(one))?
+                } else {
+                    let carg = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CARG, IRT_NIL),
+                        tref_ref(tab),
+                        tref_ref(key),
+                    ));
+                    let mut nk = self.cur.ir.emit_ins(IRIns::new(
+                        irt(IROp::CALLL, IRT_GUARD | t_nk),
+                        tref_ref(carg),
+                        IRCALL_TAB_NEXTK,
+                    ));
+                    if irt_ispri(t_nk) {
+                        nk = tref_pri(t_nk);
+                    }
+                    nk
+                };
                 if nkv.is_nil() {
                     res[0] = TREF_NIL;
                     nres = 1;

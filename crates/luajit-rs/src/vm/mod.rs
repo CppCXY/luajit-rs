@@ -2644,9 +2644,38 @@ impl Interp {
                 BCOp::JMP => jump!(ins),
                 BCOp::ISNEXT => jump!(ins),
                 BCOp::ITERC | BCOp::ITERN => {
-                    sync!();
-                    self.iter_call(a, bc_b(ins) as usize)?;
-                    resync!();
+                    // Move the iterator triple (genf, state, ctl) into the
+                    // call slots, then dispatch like a 2-arg call. Lua
+                    // iterator closures take the inline fast path (no
+                    // do_call round-trip) — this is the hot inner loop of
+                    // `for k,v in <closure> do ... end`.
+                    let nret = bc_b(ins) as usize;
+                    let fs = fr.cur_base() + a as usize;
+                    let genf = self.at(fs - 3);
+                    let state = self.at(fs - 2);
+                    let ctl = self.at(fs - 1);
+                    self.set_at(fs, genf);
+                    self.set_at(fs + 2, state);
+                    self.set_at(fs + 3, ctl);
+                    match self.call_lua_fast::<REC>(a, 2, fr, ip)? {
+                        (nf, nip, CallFast::Applied) => {
+                            fr = nf;
+                            ip = nip;
+                            continue;
+                        }
+                        (nf, nip, CallFast::Trace(f)) => {
+                            fr = nf;
+                            ip = nip;
+                            return Ok(f);
+                        }
+                        (nf, nip, CallFast::Slow) => {
+                            fr = nf;
+                            ip = nip;
+                            sync!();
+                            self.do_call(a, 2, nret as i32 - 1)?;
+                            resync!();
+                        }
+                    }
                 }
                 BCOp::ITERL | BCOp::IITERL => {
                     if !REC
