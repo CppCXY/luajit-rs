@@ -509,14 +509,12 @@ impl<T> Pool<T> {
         // (build a big structure, drop it) returns most of the memory.
         if self.free_bytes > self.trim_check {
             let reserve = self.trim_check / 2;
-            let mut trimmed = 0usize;
             while self.free_bytes > reserve {
                 let Some((raw, mapped)) = self.freelist.pop() else {
                     break;
                 };
                 self.free_bytes = self.free_bytes.saturating_sub(sz);
                 self.dealloc_block_raw(raw, mapped);
-                trimmed += 1;
             }
         }
     }
@@ -1220,6 +1218,14 @@ pub fn gc_step(heap: &mut GcHeap, size: usize) -> bool {
     let full = size >= usize::MAX / 2;
     if heap.total > heap.threshold {
         heap.debt += heap.total - heap.threshold;
+    }
+    // Table-array growth (JIT table resizes) is tracked in `table_extra`;
+    // fold it into the step debt so a growing table is collected at the
+    // normal pacing instead of keeping the GCSTEP guard (`total + extra`)
+    // armed on every iteration. The sweep still zeroes any residual.
+    if !full {
+        heap.debt += heap.table_extra;
+        heap.table_extra = 0;
     }
     let lim = (GC_STEP_SIZE / 100).max(1) * heap.stepmul;
     let mut budget = if full { usize::MAX } else { lim };

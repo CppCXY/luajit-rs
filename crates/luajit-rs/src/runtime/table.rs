@@ -416,11 +416,21 @@ impl LuaTable {
             return;
         }
         if k > 0 && (k as u32) < LJ_MAX_ASIZE {
+            // Sequential fill fast path: a non-nil store exactly at the
+            // current array top (`k == asize`) grows the array directly
+            // (power of two), avoiding a full rehash scan of every prior
+            // key. A sparse large key (a[2^k]=true) or a nil store never
+            // matches, so it keeps the `set` -> `rehash` path.
+            if !v.is_nil() && (k as u32) == self.asize {
+                self.reasize(k as u32);
+                self.array[k as usize] = v;
+                self.barrier();
+                return;
+            }
             // Do NOT grow the array part directly to cover `k`: a sparse
             // large key (e.g. a[2^k] = true) would balloon the table to
             // 2^k slots. Go through `set` -> `rehash`, which decides the
             // array/hash split from the real density (`lj_tab_newkey`).
-            // Dense fills still grow the array on the 2^k boundaries.
             self.set(LuaValue::number(k as f64), v);
             return;
         }
@@ -687,6 +697,12 @@ impl LuaTable {
         let oldhmask = self.hmask;
 
         if asize > oldasize {
+            // Reserve double the new size so a sequential fill that keeps
+            // doubling (e.g. `t[i] = i`) reuses the buffer across growth
+            // steps instead of reallocating (and copying) every time.
+            if self.array.capacity() < asize as usize {
+                self.array.reserve(asize as usize);
+            }
             self.array.resize(asize as usize, LuaValue::NIL);
             self.asize = asize;
         }
