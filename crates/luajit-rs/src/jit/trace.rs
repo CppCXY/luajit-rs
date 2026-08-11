@@ -503,7 +503,18 @@ fn trace_stop(g: &mut GlobalState, mut rec: Box<Record>, linktype: TraceLink, ln
                 trace.inner_ofs = inner;
                 trace.stub_tails = tails;
             }
-            Err(_e) => {}
+            Err(e) => {
+                if js.trace_dump {
+                    eprintln!(
+                        "ASM-FAIL trace={} nins={} nsnap={} link={:?} err={:?}",
+                        trace.traceno,
+                        trace.ir.nins(),
+                        trace.snap.len(),
+                        trace.linktype,
+                        e
+                    );
+                }
+            }
         }
         trace
     };

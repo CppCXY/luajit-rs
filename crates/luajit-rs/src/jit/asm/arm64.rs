@@ -1042,7 +1042,7 @@ impl<'a> Asm<'a> {
             self.code.orr_rr(RSCRATCH2, RSCRATCH2, RSCRATCH3);
             // Publish the boxed metatable to the env for the following EQ.
             if self.needs_env[Self::iidx(self.cur)] {
-                self.code.str_d(RSCRATCH2, RENV, Self::env_ofs(self.cur));
+                self.code.str(RSCRATCH2, RENV, Self::env_ofs(self.cur));
                 self.env_valid[Self::iidx(self.cur)] = true;
             }
         } else {
