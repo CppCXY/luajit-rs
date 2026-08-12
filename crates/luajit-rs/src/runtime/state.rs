@@ -932,21 +932,28 @@ pub fn new_thread(l: &LuaState) -> StateRef {
 pub fn load(l: &mut LuaState, src: Vec<u8>, chunkname: &str) -> Result<LuaValue, String> {
     let g = l.global();
 
-    // Detect string.dump cache format: "\x1bLJ" + index
+    // Detect binary bytecode (`\x1bLJ`, our undump format) and the
+    // string.dump cache format ("\x1bLJ" + decimal index).
     let mut proto = if src.len() >= 3 && &src[..3] == b"\x1bLJ" {
-        let idx_str = String::from_utf8_lossy(&src[3..]);
-        if let Ok(idx) = idx_str.parse::<u32>() {
-            let cache_key = g.heap.intern(b"__LUARS_DUMP_CACHE");
-            let key = g.heap.str_value(cache_key);
-            let registry = g.registry.as_ref();
-            if let Some(fv) = registry.get(key).as_table()
-                && fv.as_ref().get_int(idx as i32).is_func()
-            {
-                return Ok(fv.as_ref().get_int(idx as i32));
+        // A decimal digit in byte 3 means the string.dump registry-cache
+        // form; anything else is a serialized prototype (undump).
+        let is_cache = src.get(3).map(|b| b.is_ascii_digit()).unwrap_or(false);
+        if !is_cache {
+            crate::compiler::undump::undump(&src, &mut g.heap.strings)?
+        } else {
+            let idx_str = String::from_utf8_lossy(&src[3..]);
+            if let Ok(idx) = idx_str.parse::<u32>() {
+                let cache_key = g.heap.intern(b"__LUARS_DUMP_CACHE");
+                let key = g.heap.str_value(cache_key);
+                let registry = g.registry.as_ref();
+                if let Some(fv) = registry.get(key).as_table()
+                    && fv.as_ref().get_int(idx as i32).is_func()
+                {
+                    return Ok(fv.as_ref().get_int(idx as i32));
+                }
             }
             return Err("corrupted dump cache".to_string());
         }
-        return Err("corrupted dump cache".to_string());
     } else {
         let mut parser = Parser::new(src, chunkname.to_string(), &mut g.heap.strings);
         let prev_hook = std::panic::take_hook();

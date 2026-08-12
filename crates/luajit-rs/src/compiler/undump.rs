@@ -52,8 +52,9 @@ fn read_kgc(r: &mut Reader, strs: &mut Interner) -> KGc {
     let tag = r.read_u8();
     match tag {
         0 => {
-            let sid: u32 = r.read_u32();
-            KGc::Str(sid)
+            let len = r.read_u32() as usize;
+            let bytes = r.read_bytes(len);
+            KGc::Str(strs.intern(bytes))
         }
         1 => KGc::Proto(Box::new(read_proto(r, strs))),
         2 => KGc::Table(Box::new(LuaTable::new(0, 0))),
@@ -105,6 +106,8 @@ fn read_proto(r: &mut Reader, strs: &mut Interner) -> Proto {
 
     let mut kstrv = Vec::with_capacity(kstrv_len);
     for _ in 0..kstrv_len {
+        // kstrv entries were removed from the dump format (register_proto
+        // rebuilds them from kgc); only legacy dumps carry a non-zero count.
         let raw = r.read_u32();
         kstrv.push(if raw == 0xFFFF_FFFF {
             LuaValue::NIL

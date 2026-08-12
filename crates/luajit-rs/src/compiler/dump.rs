@@ -38,7 +38,11 @@ fn write_kgc(w: &mut Writer, kgc: &KGc, strs: &Interner) {
     match kgc {
         KGc::Str(sid) => {
             w.w_u8(0);
-            w.w_u32(*sid);
+            // Serialize the string bytes, not the process-local sid; the
+            // reader re-interns them (sids are not stable across runs).
+            let b = strs.get(*sid);
+            w.w_u32(b.len() as u32);
+            w.w_bytes(b);
         }
         KGc::Proto(child) => {
             w.w_u8(1);
@@ -64,7 +68,9 @@ fn write_proto(w: &mut Writer, pt: &Proto, strs: &Interner) {
     w.w_u32(pt.bc.len() as u32);
     w.w_u32(pt.kgc.len() as u32);
     w.w_u32(pt.kn.len() as u32);
-    w.w_u32(pt.kstrv.len() as u32);
+    // kstrv is derived from kgc on the reader side (register_proto), so its
+    // size is always zero in the dump; the slot stays for format stability.
+    w.w_u32(0);
     w.w_u32(pt.uv.len() as u32);
     w.w_u32(pt.uvnames.len() as u32);
     w.w_u32(pt.firstline);
@@ -86,9 +92,6 @@ fn write_proto(w: &mut Writer, pt: &Proto, strs: &Interner) {
     }
     for &n in &pt.kn {
         w.w_f64(n);
-    }
-    for &sv in &pt.kstrv {
-        w.w_u32(sv.to_bits() as u32);
     }
     for &u in &pt.uv {
         w.w_u16(u);

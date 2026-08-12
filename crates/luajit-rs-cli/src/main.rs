@@ -17,6 +17,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::process::exit;
 
+use luajit_rs::internal::bc::{BC_MODE, BC_NAMES, bc_a, bc_b, bc_d};
+use luajit_rs::internal::dump::dump;
+use luajit_rs::internal::lex::Interner;
+use luajit_rs::internal::parse::Parser;
+use luajit_rs::internal::proto::{KGc, Proto};
 use luajit_rs::internal::state::{Lua, load};
 use luajit_rs::internal::table::LuaTable;
 use luajit_rs::{
@@ -33,6 +38,13 @@ struct Args {
     version: bool,
     noenv: bool,
     exec: bool,
+    /// `-b` bytecode save/list requested (save unless `bc_list`).
+    bc: bool,
+    /// `-bl`: list (disassemble) bytecode instead of saving.
+    bc_list: bool,
+    /// `-bg`: keep debug info (default; our dump always retains debug info).
+    #[allow(dead_code)]
+    bc_keep_debug: bool,
     argn: i32,
 }
 
@@ -41,6 +53,9 @@ fn collectargs(argv: &[String]) -> Result<Args, String> {
     let mut version = false;
     let mut noenv = false;
     let mut exec = false;
+    let mut bc = false;
+    let mut bc_list = false;
+    let mut bc_keep_debug = false;
     let mut i = 1;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -79,6 +94,21 @@ fn collectargs(argv: &[String]) -> Result<Args, String> {
                     return Err("conflicting options".into());
                 }
                 exec = true;
+                bc = true;
+                // Parse the flags following `-b`: `-bl` (list), `-bs` (strip,
+                // default), `-bg` (keep debug). The remaining letters (W/X/d
+                // and value-taking options n/t/a/o/F) are accepted by LuaJIT
+                // but not implemented here.
+                for c in a[2..].chars() {
+                    match c {
+                        'l' => bc_list = true,
+                        'g' => bc_keep_debug = true,
+                        's' => {}
+                        'W' | 'X' | 'd' => {}
+                        _ => return Err(format!("unrecognised option flag '{}'", c)),
+                    }
+                }
+                i += 1;
                 break;
             }
             Some('O') => {}
@@ -91,6 +121,9 @@ fn collectargs(argv: &[String]) -> Result<Args, String> {
         version,
         noenv,
         exec,
+        bc,
+        bc_list,
+        bc_keep_debug,
         argn: i as i32,
     })
 }
@@ -324,6 +357,251 @@ fn run_args(lua: &mut Lua, argv: &[String], argn: usize) -> i32 {
     0
 }
 
+// -- Bytecode save/list (-b[flags]) ----------------------------------------
+
+/// Read the input (file or `-` for stdin), compile to a prototype, then
+/// either disassemble (`-bl`) or serialize (`-b`).
+fn do_bcsave(args: &[String], argn: usize, flags: &Args) -> i32 {
+    let input = args.get(argn).cloned().unwrap_or_else(|| "-".into());
+    let output = args.get(argn + 1).cloned();
+
+    if !flags.bc_list && output.is_none() {
+        eprintln!("luajit-rs: -b requires both input and output");
+        return 1;
+    }
+
+    let (src, chunkname) = if input == "-" {
+        let mut buf = Vec::new();
+        if io::stdin().read_to_end(&mut buf).is_err() {
+            eprintln!("luajit-rs: cannot read stdin");
+            return 1;
+        }
+        (buf, "=stdin".to_string())
+    } else {
+        match std::fs::read(&input) {
+            Ok(b) => (b, format!("@{}", input)),
+            Err(e) => {
+                eprintln!("luajit-rs: cannot open {input}: {e}");
+                return 1;
+            }
+        }
+    };
+
+    // The parser throws CompileError via panic_any; translate it back to an
+    // error message instead of aborting with an unwind. Binary bytecode
+    // (`\x1bLJ` magic) is undumped instead of parsed.
+    let mut strs = Interner::new();
+    let is_binary = src.len() >= 3 && &src[..3] == b"\x1bLJ";
+    let result = if is_binary {
+        luajit_rs::internal::undump::undump(&src, &mut strs)
+            .map_err(|e| -> Box<dyn std::any::Any + Send> { Box::new(e) })
+    } else {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut parser = Parser::new(src, chunkname.clone(), &mut strs);
+            parser.parse()
+        }));
+        std::panic::set_hook(prev_hook);
+        r
+    };
+    let pt = match result {
+        Ok(pt) => pt,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<luajit_rs::internal::lex::CompileError>()
+                .map(|e| e.0.clone())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown compile error".into());
+            eprintln!("luajit-rs: {msg}");
+            return 1;
+        }
+    };
+
+    let mut out = Vec::new();
+    if flags.bc_list {
+        let mut list = String::new();
+        bclist(&pt, &strs, &chunkname, &mut list);
+        out.extend_from_slice(list.as_bytes());
+    } else {
+        // `-bg` (keep debug) is the default for our dump format; `-b`/`-bs`
+        // currently emit the same (debug info retained).
+        dump(&pt, &strs, &chunkname, &mut out);
+    }
+
+    match output.as_deref() {
+        None | Some("-") => {
+            let mut so = io::stdout();
+            let _ = so.write_all(&out);
+            let _ = so.flush();
+        }
+        Some(name) => {
+            if std::fs::write(name, &out).is_err() {
+                eprintln!("luajit-rs: cannot write {name}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// BCMode encodings (must match `BCMode` in compiler/bc.rs). The 16-bit
+/// BC_MODE packs A (bits 0-2), B (bits 3-6) and C/D (bits 7-10).
+const BCM_NONE: u16 = 0;
+const BCM_UV: u16 = 5;
+const BCM_LITS: u16 = 7;
+const BCM_NUM: u16 = 9;
+const BCM_STR: u16 = 10;
+const BCM_FUNC: u16 = 12;
+const BCM_JUMP: u16 = 13;
+
+/// Format a string constant like LuaJIT's `bcline`: control bytes escaped,
+/// values over 40 bytes truncated with a trailing `~`.
+fn fmt_str_const(s: &[u8]) -> String {
+    let mut out = String::from("\"");
+    for &c in s.iter().take(40) {
+        match c {
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(c as char),
+            other => out.push_str(&format!("\\{:03}", other)),
+        }
+    }
+    if s.len() > 40 {
+        out.push('~');
+    }
+    out.push('"');
+    out
+}
+
+/// Render one instruction as a single bytecode-list line, LuaJIT-style.
+fn bcline(pt: &Proto, strs: &Interner, pc: usize, prefix: &str) -> Option<String> {
+    let ins = *pt.bc.get(pc)?;
+    let op = (ins & 0xff) as usize;
+    if op >= BC_NAMES.len() {
+        return None;
+    }
+    let mode = BC_MODE[op];
+    let ma = mode & 7;
+    let mb = (mode >> 3) & 15;
+    let mc = (mode >> 7) & 15;
+    let a = bc_a(ins);
+    let name = BC_NAMES[op];
+    let a_fmt = if ma == BCM_NONE {
+        String::new()
+    } else {
+        format!("{a}")
+    };
+    let s = format!("{pc:04} {prefix:2} {name:<6} {a_fmt:>3} ");
+    let d = bc_d(ins);
+    if mc == BCM_JUMP {
+        return Some(format!(
+            "{s}=> {pc_d:04}\n",
+            pc_d = (pc as u32 + d - 0x7fff)
+        ));
+    }
+    // For ABC-form instructions the 16-bit D field packs B (high byte) and
+    // C (low byte); the low byte is the constant/operand selector here.
+    let d_c = if mb != BCM_NONE { d & 0xff } else { d };
+    if mb == BCM_NONE && mc == BCM_NONE {
+        return Some(format!("{s}\n"));
+    }
+    let mut kc: Option<String> = None;
+    match mc {
+        BCM_STR => {
+            if let Some(KGc::Str(sid)) = pt.kgc.get(d_c as usize) {
+                kc = Some(fmt_str_const(strs.get(*sid)));
+            }
+        }
+        BCM_NUM => {
+            if let Some(&n) = pt.kn.get(d_c as usize) {
+                kc = Some(format!("{n}"));
+            }
+        }
+        BCM_FUNC => {
+            if let Some(KGc::Proto(_)) = pt.kgc.get(d_c as usize) {
+                kc = Some("proto".to_string());
+            }
+        }
+        BCM_UV => {
+            if let Some(u) = pt.uvnames.get(d_c as usize) {
+                kc = Some(format!("uv:{u}"));
+            }
+        }
+        _ => {}
+    }
+    if ma == BCM_UV {
+        let ka = pt
+            .uvnames
+            .get(a as usize)
+            .cloned()
+            .unwrap_or_else(|| format!("uv:{a}"));
+        kc = match kc {
+            Some(k) => Some(format!("{ka} ; {k}")),
+            None => Some(ka),
+        };
+    }
+    if mb != BCM_NONE {
+        let b = bc_b(ins);
+        return Some(match kc {
+            Some(k) => format!("{s}{b:>3} {d_c:>3}  ; {k}\n"),
+            None => format!("{s}{b:>3} {d_c:>3}\n"),
+        });
+    }
+    if let Some(k) = kc {
+        return Some(format!("{s}{d_c:>3}      ; {k}\n"));
+    }
+    // BCMLits (KSHORT etc.) stores a signed 16-bit literal in D.
+    let d_s = if mc == BCM_LITS && d_c > 0x7fff {
+        d_c.wrapping_sub(0x10000)
+    } else {
+        d_c
+    };
+    Some(format!("{s}{d_s:>3}\n"))
+}
+
+/// Collect branch targets so jump destinations get a `=>` prefix.
+fn bctargets(pt: &Proto) -> std::collections::HashSet<usize> {
+    let mut t = std::collections::HashSet::new();
+    for (pc, &ins) in pt.bc.iter().enumerate().skip(1) {
+        let op = (ins & 0xff) as usize;
+        if op >= BC_NAMES.len() {
+            continue;
+        }
+        let mc = (BC_MODE[op] >> 7) & 15;
+        if mc == BCM_JUMP {
+            let d = bc_d(ins);
+            t.insert((pc + d as usize - 0x7fff) & usize::MAX);
+        }
+    }
+    t
+}
+
+/// Disassemble a prototype and all its child prototypes (recursively),
+/// LuaJIT-style (`-- BYTECODE -- @file:first-last` headers).
+fn bclist(pt: &Proto, strs: &Interner, chunkname: &str, out: &mut String) {
+    for kgc in &pt.kgc {
+        if let KGc::Proto(child) = kgc {
+            bclist(child, strs, chunkname, out);
+        }
+    }
+    out.push_str(&format!(
+        "-- BYTECODE -- {}:{}-{}\n",
+        chunkname.trim_start_matches('@'),
+        pt.firstline,
+        pt.numline
+    ));
+    let targets = bctargets(pt);
+    for pc in 1..pt.bc.len() {
+        let prefix = if targets.contains(&pc) { "=>" } else { "  " };
+        if let Some(line) = bcline(pt, strs, pc, prefix) {
+            out.push_str(&line);
+        }
+    }
+    out.push('\n');
+}
+
 #[cfg(windows)]
 fn install_crash_handler() {
     #[repr(C)]
@@ -437,6 +715,10 @@ fn run_main() {
 
     if run_args(&mut lua, &args, flags.argn as usize) != 0 {
         exit(1);
+    }
+
+    if flags.bc {
+        exit(do_bcsave(&args, flags.argn as usize, &flags));
     }
 
     if (flags.argn as usize) < args.len() {

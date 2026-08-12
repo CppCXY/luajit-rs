@@ -2077,12 +2077,15 @@ impl Record {
                 let native_arr = tref_isnum(key)
                     && !keyv.is_nil()
                     && !nkv.is_nil()
-                    && keyv.as_number().zip(nkv.as_number()).is_some_and(|(k, nk)| nk == k + 1.0)
+                    && keyv
+                        .as_number()
+                        .zip(nkv.as_number())
+                        .is_some_and(|(k, nk)| nk == k + 1.0)
                     && tabv.as_table().is_some_and(|t| {
                         nkv.as_int32_exact()
                             .is_some_and(|nk| nk >= 0 && (nk as u32) < t.as_ref().asize)
                     });
-                let mut nk = if native_arr {
+                let nk = if native_arr {
                     let one = self.cur.ir.knum(1.0);
                     self.cur
                         .ir

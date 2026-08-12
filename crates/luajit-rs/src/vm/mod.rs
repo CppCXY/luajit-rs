@@ -2670,8 +2670,7 @@ impl Interp {
                             continue;
                         }
                         (nf, nip, CallFast::Trace(f)) => {
-                            fr = nf;
-                            ip = nip;
+                            let _ = (nf, nip);
                             return Ok(f);
                         }
                         (nf, nip, CallFast::Slow) => {
@@ -3702,57 +3701,6 @@ impl Interp {
         }
         self.l().top = keep;
         None
-    }
-
-    // -- Generic for -----------------------------------------------------
-
-    fn iter_call(&mut self, a: u32, nret: usize) -> LuaResult<()> {
-        let fs = self.base + a as usize;
-        let genf = self.at(fs - 3);
-        let state = self.at(fs - 2);
-        let ctl = self.at(fs - 1);
-        self.set_at(fs, genf);
-        self.set_at(fs + 2, state);
-        self.set_at(fs + 3, ctl);
-        self.do_call(a, 2, nret as i32 - 1)
-    }
-
-    // -- Varargs ---------------------------------------------------------
-
-    /// Copy varargs into `dst..`, per BC_VARG. The varargs sit between the
-    /// vararg frame and the frame below it (see `enter_lua`); their extent
-    /// is recovered from the FRAME_VARG delta, LuaJIT-style.
-    #[allow(dead_code)]
-    fn vararg(&mut self, a: u32, b: u32) {
-        let base = self.base;
-        let link = self.at(base - 1).to_bits();
-        debug_assert!(link & FRAME_TYPE_MASK == FRAME_VARG);
-        let delta = (link >> 3) as usize;
-        if delta == 0 || delta > base {
-            return;
-        }
-        let numparams = self.proto().numparams as usize;
-        let varg_base = base - delta + numparams;
-        let nvarg = (delta - 2).saturating_sub(numparams);
-
-        let dst = base + a as usize;
-        if b == 0 {
-            for i in 0..nvarg {
-                self.set_at(dst + i, self.at(varg_base + i));
-            }
-            self.multres = nvarg;
-            self.l().top = dst + nvarg;
-        } else {
-            let want = (b - 1) as usize;
-            for i in 0..want {
-                let v = if i < nvarg {
-                    self.at(varg_base + i)
-                } else {
-                    LuaValue::NIL
-                };
-                self.set_at(dst + i, v);
-            }
-        }
     }
 
     // -- Upvalues / closures ---------------------------------------------
