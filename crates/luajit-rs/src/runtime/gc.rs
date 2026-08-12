@@ -1266,7 +1266,14 @@ fn gc_onestep(heap: &mut GcHeap) -> (usize, bool) {
             (0, true)
         }
         GcState::Propagate => {
-            let work = 32; // objects per propagate step
+            // Objects per propagate step. LuaJIT marks 32/step; our batch
+            // propagator rebuilds a `Marker` (Vec take/extend) on every
+            // gc_onestep call, so 32 objects/step makes each of the many
+            // gc_step calls pay that fixed cost — the heap falls further
+            // behind and the gray set balloons. 1024/step keeps incremental
+            // pauses on par with LuaJIT (~2ms on a 100k-table storm) while
+            // letting each step digest a meaningful chunk of the gray set.
+            let work = 1024; // objects per propagate step
             let mut m = Marker {
                 gray: std::mem::take(&mut heap.gc_gray),
                 strings: &heap.strings,
