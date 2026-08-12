@@ -347,11 +347,15 @@ pub struct CTState {
     /// Struct/union/enum tag → type ID (unifies forward declarations
     /// with their later definitions).
     pub tags: std::collections::HashMap<String, u32>,
+    /// Enum constant name → value (resolved by `ffi.C` lookups).
+    pub constants: std::collections::HashMap<String, i32>,
     /// Struct field lookup: (struct_id, field_name) → (field_id, offset_info).
     /// offset_info stores the field's type_id (hi 16 bits) and byte offset (lo 16 bits).
     pub field_names: std::collections::HashMap<(u32, String), (u32, u32)>,
     /// FFI callbacks (Lua closures cast to function pointers), indexed by id.
-    pub callbacks: Vec<Option<crate::ffi::callback::Callback>>,
+    pub callbacks: Vec<crate::ffi::callback::Callback>,
+    /// Trampoline address → callback id, for `cdata:free()` / `cdata:set()`.
+    pub callback_by_addr: std::collections::HashMap<usize, u32>,
     /// The thread callbacks run on (a dedicated coroutine, GC-rooted).
     pub callback_thread: Option<crate::state::StateRef>,
 }
@@ -372,8 +376,10 @@ impl CTState {
             names: std::collections::HashMap::new(),
             symbols: std::collections::HashMap::new(),
             tags: std::collections::HashMap::new(),
+            constants: std::collections::HashMap::new(),
             field_names: std::collections::HashMap::new(),
             callbacks: Vec::new(),
+            callback_by_addr: std::collections::HashMap::new(),
             callback_thread: None,
         };
         cts.init_predefined();

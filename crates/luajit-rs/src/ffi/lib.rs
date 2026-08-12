@@ -745,7 +745,7 @@ fn parse_type_specifier(l: &mut LuaState, toks: &mut DeclTok) -> LuaResult<u32> 
 }
 
 /// Create a fixed-size array type `elem[N]`.
-fn make_array_type(cts: &mut CTState, elem: u32, n: u32) -> u32 {
+pub(crate) fn make_array_type(cts: &mut CTState, elem: u32, n: u32) -> u32 {
     let elem_sz = cts.raw(elem).size;
     let total_sz = elem_sz.saturating_mul(n);
     let info = ct_info(CT::Array, 0) | elem;
@@ -767,7 +767,7 @@ fn make_array_type(cts: &mut CTState, elem: u32, n: u32) -> u32 {
 }
 
 /// Create a function type `ret(params)` (param fields chained via sib).
-fn make_func_type(cts: &mut CTState, ret: u32, params: Vec<u32>) -> u32 {
+pub(crate) fn make_func_type(cts: &mut CTState, ret: u32, params: Vec<u32>) -> u32 {
     let first_param = cts.top;
     for (i, &pt) in params.iter().enumerate() {
         let fid = cts.top;
@@ -844,6 +844,18 @@ pub fn ffi_cdef(l: &mut LuaState) -> LuaResult<i32> {
 
 pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
     let id = check_ctype(l)?;
+    // A function initializer for a function-pointer type becomes a callback.
+    if let Some(v) = (nargs(l) > 1).then(|| arg(l, 1))
+        && v.is_func()
+        && l.global()
+            .cts
+            .as_ref()
+            .is_some_and(|c| crate::ffi::callback::func_ctype_of(c, id).is_some())
+    {
+        let cd = crate::ffi::callback::ffi_callback_new(l, id, v)?;
+        push(l, cd);
+        return Ok(1);
+    }
     let ct = cts_of(l).raw(id);
     let size = if ct.size != u32::MAX {
         ct.size as usize
@@ -1491,6 +1503,33 @@ pub fn ffi_cast(l: &mut LuaState) -> LuaResult<i32> {
     }
 
     if let Some(cd) = val.as_cdata() {
+        // Casting an array/struct/pointer to a scalar/pointer type stores the
+        // source's address (array decay), rather than copying its contents.
+        let src_aggr = l
+            .global()
+            .cts
+            .as_ref()
+            .is_some_and(|c| {
+                let info = c.raw(cd.as_ref().ctypeid).info;
+                crate::ffi::ctype_ispointer(info)
+                    || crate::ffi::ctype_isstruct(info)
+            });
+        let dst_scalar = l
+            .global()
+            .cts
+            .as_ref()
+            .is_some_and(|c| {
+                let info = c.raw(id).info;
+                crate::ffi::ctype_isnum(info) || crate::ffi::ctype_isptr(info)
+            });
+        if src_aggr && dst_scalar {
+            let addr = cdata_arg_addr(l, cd);
+            let mut nc = CData::new(id, 8);
+            nc.set_ptr(addr);
+            let ptr = l.global().heap.cdatas.alloc(nc);
+            push(l, LuaValue::cdata(ptr));
+            return Ok(1);
+        }
         let mut nc = CData::new(id, cd.as_ref().data.len().max(1));
         let n = nc.data.len().min(cd.as_ref().data.len());
         nc.data[..n].copy_from_slice(&cd.as_ref().data[..n]);
@@ -1849,6 +1888,21 @@ fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
     };
 
     let raw_ct = cts.raw(cd.as_ref().ctypeid);
+
+    // Function-pointer cdata (callbacks) expose `free` / `set` methods.
+    if crate::ffi::callback::is_func_ptr_type(cts, cd.as_ref().ctypeid) {
+        if name == "free" {
+            let m = make_c_callback_method(l, cdata_cb_free);
+            push(l, m);
+            return Ok(1);
+        }
+        if name == "set" {
+            let m = make_c_callback_method(l, cdata_cb_set);
+            push(l, m);
+            return Ok(1);
+        }
+    }
+
     // Complex numbers expose `re` / `im` pseudo-fields (element 0/1).
     if crate::ffi::ctype_iscomplex(raw_ct.info) {
         let elem = cts.raw(ctype_cid(raw_ct.info));
@@ -2277,6 +2331,12 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
         }
     };
 
+    // Enum constants (`enum { X = 13 }`) resolve to their value.
+    if let Some(&v) = cts_of(l).constants.get(&name) {
+        push(l, LuaValue::number(v as f64));
+        return Ok(1);
+    }
+
     // If the symbol was declared in a cdef, keep its prototype so the
     // call wrapper can validate arguments against the parameter types
     // (lj_ccall's conversion; e.g. number -> pointer is not allowed).
@@ -2318,15 +2378,15 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
-/// The address a cdata argument carries into a C call: a function pointer's
-/// stored value, else the resolved storage address (aliases included).
+/// The address a cdata argument carries into a C call: a pointer's stored
+/// value, else the resolved storage address (aliases included).
 fn cdata_arg_addr(l: &LuaState, cd: crate::gc::GcPtr<crate::runtime::cdata::CData>) -> usize {
-    let is_fp = l
+    let is_ptr = l
         .global()
         .cts
         .as_ref()
-        .is_some_and(|cts| crate::ffi::callback::is_func_ptr_type(cts, cd.as_ref().ctypeid));
-    if is_fp {
+        .is_some_and(|cts| crate::ffi::ctype_isptr(cts.raw(cd.as_ref().ctypeid).info));
+    if is_ptr {
         return cd.as_ref().get_ptr();
     }
     let (off, root) = crate::runtime::cdata::resolve_ptr(cd);
@@ -2502,6 +2562,71 @@ fn cdata_call(l: &mut LuaState) -> LuaResult<i32> {
     };
     let addr = c.get_ptr();
     ffi_call_typed(l, addr, Some(fid), 1)
+}
+
+/// Wrap a callback-method C function in a closure with no upvalues.
+fn make_c_callback_method(l: &mut LuaState, f: CFunction) -> LuaValue {
+    let g = l.global();
+    let fref = g.heap.alloc_func(GcFunc::C(CClosure {
+        f,
+        env: g.globals,
+        upvals: vec![],
+    }));
+    LuaValue::func(fref)
+}
+
+/// The callback id behind a function-pointer cdata (looked up by address).
+fn callback_id_of(l: &LuaState, cd: crate::gc::GcPtr<CData>) -> Option<u32> {
+    let addr = cd.as_ref().get_ptr();
+    l.global().cts.as_ref()?.callback_by_addr.get(&addr).copied()
+}
+
+/// `cdata:free()` — free the callback (calling it afterwards raises).
+fn cdata_cb_free(l: &mut LuaState) -> LuaResult<i32> {
+    let cd = arg(l, 0)
+        .as_cdata()
+        .ok_or_else(|| err_bad_arg(l, 1, "callback:free", "cdata", ""))?;
+    let id = callback_id_of(l, cd)
+        .ok_or_else(|| l.runtime_error(b"attempt to free a non-callback cdata"))?;
+    let freed = l
+        .global()
+        .cts
+        .as_ref()
+        .and_then(|c| c.callbacks.get(id as usize))
+        .map(|cb| cb.freed)
+        .unwrap_or(true);
+    if freed {
+        return Err(l.runtime_error(b"attempt to free a freed callback"));
+    }
+    let cb = &mut l.global().cts.as_mut().unwrap().callbacks[id as usize];
+    cb.freed = true;
+    cb.func = LuaValue::NIL;
+    Ok(0)
+}
+
+/// `cdata:set(func)` — replace the callback's closure.
+fn cdata_cb_set(l: &mut LuaState) -> LuaResult<i32> {
+    let cd = arg(l, 0)
+        .as_cdata()
+        .ok_or_else(|| err_bad_arg(l, 1, "callback:set", "cdata", ""))?;
+    let func = arg(l, 1);
+    if !func.is_func() {
+        return Err(err_bad_arg(l, 2, "callback:set", "function", ""));
+    }
+    let id = callback_id_of(l, cd)
+        .ok_or_else(|| l.runtime_error(b"attempt to set a non-callback cdata"))?;
+    let freed = l
+        .global()
+        .cts
+        .as_ref()
+        .and_then(|c| c.callbacks.get(id as usize))
+        .map(|cb| cb.freed)
+        .unwrap_or(true);
+    if freed {
+        return Err(l.runtime_error(b"attempt to set a freed callback"));
+    }
+    l.global().cts.as_mut().unwrap().callbacks[id as usize].func = func;
+    Ok(0)
 }
 
 fn type_name_of(_l: &LuaState, v: LuaValue) -> String {

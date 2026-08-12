@@ -43,9 +43,21 @@ end
 
 do --- callback errors surface from the enclosing C call
   local ok, err = pcall(function()
-    local cb = ffi.cast("int (*)(void)", function() error("boom") end)
+    local cb = ffi.cast("int (*)(void)", function() error("boom") return 1 end)
     return cb()
   end)
   assert(ok == false)
   assert(string.find(err, "boom"))
+end
+
+do --- invalid callbacks fail when called (result conversion)
+  assert(pcall(function()
+    local cb = ffi.cast("int (*)(void)", function() end)
+    return cb()
+  end) == false)
+  assert(pcall(function()
+    local cb = ffi.cast("int (*)(void)", function(a) return a + 1 end)
+    return cb()
+  end) == false)
+  assert(ffi.cast("void (*)(void)", function() end) ~= nil)
 end

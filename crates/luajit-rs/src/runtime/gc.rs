@@ -1644,8 +1644,10 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
         m.mark_thread(cur);
     }
     if let Some(cts) = &g.cts {
-        for cb in cts.callbacks.iter().flatten() {
-            m.mark_value(cb.func);
+        for cb in cts.callbacks.iter() {
+            if !cb.freed {
+                m.mark_value(cb.func);
+            }
         }
         if let Some(th) = cts.callback_thread {
             m.mark_thread(th);

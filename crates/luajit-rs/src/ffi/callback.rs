@@ -46,6 +46,8 @@ pub struct Callback {
     pub mcode: McodeArea,
     /// The trampoline entry address.
     pub addr: usize,
+    /// Set by `cdata:free()`; the trampoline stays alive (calling it raises).
+    pub freed: bool,
 }
 
 /// Resolve the `CT::Func` ctype id behind a (possibly pointer-to-function)
@@ -85,15 +87,28 @@ pub extern "C" fn ffi_cb_handler(frame: *mut CCallbackFrame) -> u64 {
 }
 
 fn dispatch(cts: &mut CTState, cb_id: usize, frame: &CCallbackFrame) -> u64 {
-    let (func, fid) = match cts.callbacks.get(cb_id).and_then(|c| c.as_ref()) {
-        Some(c) => (c.func, c.func_ctype),
-        None => return 0,
-    };
-    let params = ccall_param_types(cts, fid);
-    let ret_tid = ccall_ret_type(cts, fid);
     let Some(thread) = cts.callback_thread else {
         return 0;
     };
+    let Some(cb) = cts.callbacks.get(cb_id) else {
+        return 0;
+    };
+    if cb.freed {
+        // Freed callback: surface an error at the enclosing ffi.C call.
+        let l = thread.as_mut();
+        l.runtime_error(b"attempt to call a freed callback");
+        l.global().ffi_cb_error = Some(l.errval);
+        return 0;
+    }
+    let func = cb.func;
+    let fid = cb.func_ctype;
+    let params = ccall_param_types(cts, fid);
+    let ret_tid = ccall_ret_type(cts, fid);
+    // Remember the closure's proto for result-conversion error locations.
+    let cb_proto = func.as_func().and_then(|fv| match fv.as_ref() {
+        crate::func::GcFunc::Lua(cl) => Some(cl.proto),
+        _ => None,
+    });
 
     let l = thread.as_mut();
     let mut args: Vec<LuaValue> = Vec::with_capacity(params.len());
@@ -111,7 +126,19 @@ fn dispatch(cts: &mut CTState, cb_id: usize, frame: &CCallbackFrame) -> u64 {
     }
 
     match vm::call(l, func, &args) {
-        Ok(results) => lua_to_c_ret(cts, ret_tid, &results),
+        Ok(results) => match lua_to_c_ret(cts, ret_tid, &results) {
+            Some(bits) => bits,
+            None => {
+                // Result conversion failed (e.g. nil for a non-void return).
+                if let Some(pt) = cb_proto {
+                    callback_error(l, pt.as_ref(), "ffi: callback result conversion failed");
+                } else {
+                    l.runtime_error(b"ffi: callback result conversion failed");
+                }
+                l.global().ffi_cb_error = Some(l.errval);
+                0
+            }
+        },
         Err(LuaError::Yield) => {
             l.runtime_error(b"callback: attempt to yield from C callback");
             l.global().ffi_cb_error = Some(l.errval);
@@ -123,6 +150,26 @@ fn dispatch(cts: &mut CTState, cb_id: usize, frame: &CCallbackFrame) -> u64 {
             l.global().ffi_cb_error = Some(l.errval);
             0
         }
+    }
+}
+
+/// The address of the `slot`-th stack-passed argument. The layout differs
+/// per ABI: Win64 reserves a 32-byte shadow space (and pushes the return
+/// address), SysV pushes the return address but reserves no shadow space,
+/// and ARM64 keeps the return address in `x30` (no stack slot).
+#[inline]
+fn stack_arg_addr(frame: &CCallbackFrame, slot: usize) -> *const u64 {
+    #[cfg(all(target_arch = "x86_64", windows))]
+    {
+        (frame.entry_rsp + 40 + slot * 8) as *const u64
+    }
+    #[cfg(all(target_arch = "x86_64", not(windows)))]
+    {
+        (frame.entry_rsp + 8 + slot * 8) as *const u64
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        (frame.entry_rsp + slot * 8) as *const u64
     }
 }
 
@@ -142,20 +189,16 @@ fn read_arg(
     {
         // Win64: positional — args 0..4 in gpr[i]/fpr[i], the rest on stack.
         if i < 4 {
-            if is_fp {
-                frame.fpr[i]
-            } else {
-                frame.gpr[i]
-            }
-        } else {
-            let slot = *stack;
-            *stack += 1;
-            unsafe { *((frame.entry_rsp + 8 + slot * 8) as *const u64) }
+            return if is_fp { frame.fpr[i] } else { frame.gpr[i] };
         }
+        let slot = *stack;
+        *stack += 1;
+        unsafe { *stack_arg_addr(frame, slot) }
     }
     #[cfg(not(windows))]
     {
-        // SysV: separate integer/FP register banks.
+        // SysV / ARM64: separate integer/FP register banks.
+        let int_n = if cfg!(target_arch = "aarch64") { 8 } else { 6 };
         if is_fp {
             if *fp_reg < 8 {
                 let r = frame.fpr[*fp_reg];
@@ -164,16 +207,16 @@ fn read_arg(
             } else {
                 let slot = *stack;
                 *stack += 1;
-                unsafe { *((frame.entry_rsp + 8 + slot * 8) as *const u64) }
+                unsafe { *stack_arg_addr(frame, slot) }
             }
-        } else if *int_reg < 6 {
+        } else if *int_reg < int_n {
             let r = frame.gpr[*int_reg];
             *int_reg += 1;
             r
         } else {
             let slot = *stack;
             *stack += 1;
-            unsafe { *((frame.entry_rsp + 8 + slot * 8) as *const u64) }
+            unsafe { *stack_arg_addr(frame, slot) }
         }
     }
 }
@@ -241,49 +284,67 @@ fn c_arg_to_lua(cts: &CTState, l: &mut LuaState, tid: u32, bits: u64, is_fp: boo
     }
 }
 
-/// Marshal the Lua results back to the C return value (raw bits).
-fn lua_to_c_ret(cts: &CTState, tid: u32, results: &[LuaValue]) -> u64 {
+/// The numeric value of a Lua value, treating booleans as 0/1.
+fn lua_num(v: LuaValue) -> Option<f64> {
+    v.as_number().or_else(|| {
+        if v.is_true() {
+            Some(1.0)
+        } else if v.is_false() {
+            Some(0.0)
+        } else {
+            None
+        }
+    })
+}
+
+/// Marshal the Lua results back to the C return value (raw bits). Returns
+/// `None` when the result cannot be converted (e.g. `nil` for a non-void
+/// return).
+fn lua_to_c_ret(cts: &CTState, tid: u32, results: &[LuaValue]) -> Option<u64> {
     let raw = cts.raw(tid);
     let t = ctype_type(raw.info);
     if t == CT::Void {
-        return 0;
+        return Some(0);
     }
     let v = results.first().copied().unwrap_or(LuaValue::NIL);
     let is_fp = crate::ffi::ctype_isfp(raw.info);
     if is_fp {
-        let n = v.as_number().unwrap_or(0.0);
-        return if raw.size == 4 {
+        let n = lua_num(v)?;
+        return Some(if raw.size == 4 {
             (n as f32).to_bits() as u64
         } else {
             n.to_bits()
-        };
+        });
     }
     if raw.info & ctinfo::BOOL != 0 {
-        return (v.as_number().unwrap_or(0.0) != 0.0) as u64;
+        return Some((lua_num(v).unwrap_or(0.0) != 0.0) as u64);
     }
     if t == CT::Ptr || t == CT::Func {
         if let Some(cd) = v.as_cdata() {
-            return cd.as_ref().get_ptr() as u64;
+            return Some(cd.as_ref().get_ptr() as u64);
         }
         if let Some(n) = v.as_number() {
-            return (n as i64) as u64;
+            return Some((n as i64) as u64);
         }
-        return 0;
+        if v.is_nil() {
+            return Some(0);
+        }
+        return None;
     }
     if let Some(cd) = v.as_cdata() {
         let d = &cd.as_ref().data;
         let mut buf = [0u8; 8];
         let n = d.len().min(8);
         buf[..n].copy_from_slice(&d[..n]);
-        return u64::from_le_bytes(buf);
+        return Some(u64::from_le_bytes(buf));
     }
-    let n = v.as_number().unwrap_or(0.0);
-    match raw.size {
+    let n = lua_num(v)?;
+    Some(match raw.size {
         1 => (n as i64 as u8) as u64,
         2 => (n as i64 as u16) as u64,
         4 => (n as i64 as u32) as u64,
         _ => (n as i64) as u64,
-    }
+    })
 }
 
 /// Create a callback for `func` cast to `ctype_id` (a function-pointer or
@@ -315,14 +376,14 @@ pub fn ffi_callback_new(l: &mut LuaState, ctype_id: u32, func: LuaValue) -> LuaR
     }
 
     // Emit the trampoline.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let code = {
         let cts_addr = l.global().cts.as_mut().unwrap() as *mut CTState as usize;
         let cb_id = l.global().cts.as_ref().unwrap().callbacks.len() as u32;
         let handler = ffi_cb_handler as *const () as usize;
         emit_trampoline(handler, cts_addr, cb_id)
     };
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = ctype_id;
         return Err(l.runtime_error(b"ffi: callbacks are not supported on this architecture"));
@@ -334,17 +395,25 @@ pub fn ffi_callback_new(l: &mut LuaState, ctype_id: u32, func: LuaValue) -> LuaR
     area.as_mut_slice()[..code.bytes.len()].copy_from_slice(&code.bytes);
     area.protect_exec();
 
+    let cb_id = l.global().cts.as_ref().unwrap().callbacks.len() as u32;
     l.global()
         .cts
         .as_mut()
         .unwrap()
         .callbacks
-        .push(Some(Callback {
+        .push(Callback {
             func,
             func_ctype: fid,
             mcode: area,
             addr: entry,
-        }));
+            freed: false,
+        });
+    l.global()
+        .cts
+        .as_mut()
+        .unwrap()
+        .callback_by_addr
+        .insert(entry, cb_id);
 
     // The cdata holds the trampoline address; call_c marshals function
     // pointers via get_ptr().
@@ -377,11 +446,33 @@ fn validate_callback_ctype(cts: &CTState, fid: u32) -> Result<(), String> {
     }
 }
 
+/// Raise a callback result-conversion error, located at the closure's last
+/// line (LuaJIT reports result-conversion errors there).
+fn callback_error(l: &mut LuaState, pt: &crate::proto::Proto, msg: &str) -> LuaError {
+    let line = pt.firstline + pt.numline;
+    let src = pt
+        .source
+        .map(|sid| {
+            let bytes = l.str_static(sid);
+            let s = if bytes.starts_with(b"@") || bytes.starts_with(b"=") {
+                &bytes[1..]
+            } else {
+                bytes
+            };
+            String::from_utf8_lossy(s).into_owned()
+        })
+        .unwrap_or_else(|| "=?".to_string());
+    let full = format!("{}:{}: {}", src, line, msg);
+    let sid = l.heap().intern(full.as_bytes());
+    l.errval = l.heap().str_value(sid);
+    LuaError::Runtime
+}
+
 // ---------------------------------------------------------------------------
-// Trampoline code generation (x86-64)
+// Trampoline code generation
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) struct TrampolineCode {
     pub bytes: Vec<u8>,
 }
@@ -475,4 +566,75 @@ fn emit_trampoline(handler: usize, cts: usize, cb_id: u32) -> TrampolineCode {
     TrampolineCode {
         bytes: b,
     }
+}
+
+// ---------------------------------------------------------------------------
+// ARM64 trampoline
+// ---------------------------------------------------------------------------
+
+/// Emit `movz` + three `movk`s loading a 64-bit immediate into `x{reg}`.
+#[cfg(target_arch = "aarch64")]
+fn arm64_mov_imm(b: &mut Vec<u8>, reg: u32, val: u64) {
+    let imm = |i: u32| ((val >> (16 * i)) & 0xFFFF) as u32;
+    b.extend_from_slice(&(0xD2800000 | (imm(0) << 5) | reg).to_le_bytes()); // movz xN, #lo
+    b.extend_from_slice(&(0xF2A00000 | (imm(1) << 5) | reg).to_le_bytes()); // movk lsl #16
+    b.extend_from_slice(&(0xF2C00000 | (imm(2) << 5) | reg).to_le_bytes()); // movk lsl #32
+    b.extend_from_slice(&(0xF2E00000 | (imm(3) << 5) | reg).to_le_bytes()); // movk lsl #48
+}
+
+#[cfg(target_arch = "aarch64")]
+fn emit_trampoline(handler: usize, cts: usize, cb_id: u32) -> TrampolineCode {
+    let mut b: Vec<u8> = Vec::with_capacity(256);
+    macro_rules! w {
+        ($ins:expr) => {
+            b.extend_from_slice(&($ins as u32).to_le_bytes());
+        };
+    }
+
+    const SP: u32 = 31;
+    const FRAME: u32 = 0xC0; // 0x98 frame + 16 bytes for the saved lr + padding.
+
+    // sub sp, sp, #FRAME
+    w!(0xD10003FF | (FRAME << 10));
+
+    // Save integer argument registers x0..x7 (gpr[0..8] at 0x00..0x40).
+    for i in 0..8u32 {
+        w!(0xF9000000 | (i << 10) | (SP << 5) | i);
+    }
+    // Save FP argument registers d0..d7 (fpr[0..8] at 0x40..0x80).
+    for i in 0..8u32 {
+        w!(0xFD000000 | ((8 + i) << 10) | (SP << 5) | i);
+    }
+
+    // entry_sp = sp + FRAME, stored at 0x80.
+    w!(0x91000000 | (FRAME << 10) | (SP << 5) | 9); // add x9, sp, #FRAME
+    w!(0xF9000000 | (16 << 10) | (SP << 5) | 9); // str x9, [sp, #0x80]
+
+    // cb_id (u32) at 0x88.
+    w!(0x52800000 | ((cb_id & 0xFFFF) << 5) | 10); // movz w10, #lo
+    w!(0x72A00000 | (((cb_id >> 16) & 0xFFFF) << 5) | 10); // movk w10, #hi, lsl #16
+    w!(0xB9000000 | (34 << 10) | (SP << 5) | 10); // str w10, [sp, #0x88]
+
+    // cts at 0x90.
+    arm64_mov_imm(&mut b, 10, cts as u64);
+    w!(0xF9000000 | (18 << 10) | (SP << 5) | 10); // str x10, [sp, #0x90]
+
+    // Save the link register (clobbered by blr) at 0xA0.
+    w!(0xF9000000 | (20 << 10) | (SP << 5) | 30); // str x30, [sp, #0xA0]
+
+    // frame pointer → x0 (the handler's first argument).
+    w!(0x91000000 | (0 << 10) | (SP << 5) | 0); // mov x0, sp
+
+    // Absolute call to the handler.
+    arm64_mov_imm(&mut b, 16, handler as u64);
+    w!(0xD63F0200); // blr x16
+
+    // Restore lr and copy the result to d0 (FP return).
+    w!(0xF9400000 | (20 << 10) | (SP << 5) | 30); // ldr x30, [sp, #0xA0]
+    w!(0x9E670000); // fmov d0, x0
+
+    w!(0x910003FF | (FRAME << 10)); // add sp, sp, #FRAME
+    w!(0xD65F03C0); // ret
+
+    TrampolineCode { bytes: b }
 }
