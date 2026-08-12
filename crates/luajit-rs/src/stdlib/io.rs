@@ -562,11 +562,12 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
                     Some(FileEntry::Write(f)) => write_chunks_buffered(f, &chunks, mode),
                     Some(FileEntry::ReadWrite(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                     Some(FileEntry::Stdout) | Some(FileEntry::Stderr) => {
+                        // Honor the setvbuf mode: the default (0/"full") is
+                        // block-buffered like C stdio, so a hot io.write loop
+                        // doesn't syscall+flush on every call. Only mode 2
+                        // ("no") flushes each call; mode 1 ("line") on \n.
                         let mut so = std::io::stdout();
-                        chunks
-                            .iter()
-                            .try_for_each(|c| so.write_all(c))
-                            .and_then(|_| so.flush())
+                        write_chunks_buffered(&mut so, &chunks, mode)
                     }
                     // io.popen("cmd", "w"): write to the child's stdin.
                     Some(FileEntry::Pipe(child)) => match child.stdin.as_mut() {
@@ -583,10 +584,7 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
             }
             None => {
                 let mut so = std::io::stdout();
-                chunks
-                    .iter()
-                    .try_for_each(|c| so.write_all(c))
-                    .and_then(|_| so.flush())
+                write_chunks_buffered(&mut so, &chunks, 0)
             }
         },
         Some(id) => {
@@ -597,17 +595,11 @@ fn do_write(l: &mut LuaState, fd: Option<usize>, first: usize) -> LuaResult<i32>
                 Some(FileEntry::ReadWrite(f)) => chunks.iter().try_for_each(|c| f.write_all(c)),
                 Some(FileEntry::Stdout) => {
                     let mut so = std::io::stdout();
-                    chunks
-                        .iter()
-                        .try_for_each(|c| so.write_all(c))
-                        .and_then(|_| so.flush())
+                    write_chunks_buffered(&mut so, &chunks, mode)
                 }
                 Some(FileEntry::Stderr) => {
                     let mut se = std::io::stderr();
-                    chunks
-                        .iter()
-                        .try_for_each(|c| se.write_all(c))
-                        .and_then(|_| se.flush())
+                    write_chunks_buffered(&mut se, &chunks, mode)
                 }
                 // io.popen("cmd", "w"): write to the child's stdin.
                 Some(FileEntry::Pipe(child)) => match child.stdin.as_mut() {

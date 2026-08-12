@@ -701,7 +701,7 @@ impl LuaTable {
             // doubling (e.g. `t[i] = i`) reuses the buffer across growth
             // steps instead of reallocating (and copying) every time.
             if self.array.capacity() < asize as usize {
-                self.array.reserve(asize as usize);
+                self.array.reserve(asize as usize * 2);
             }
             self.array.resize(asize as usize, LuaValue::NIL);
             self.asize = asize;
