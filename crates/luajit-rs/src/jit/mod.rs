@@ -31,7 +31,7 @@ mod asm;
 pub(crate) mod exec;
 #[allow(unused)]
 mod ir;
-mod mcode;
+pub mod mcode;
 mod opt;
 mod record;
 mod trace;

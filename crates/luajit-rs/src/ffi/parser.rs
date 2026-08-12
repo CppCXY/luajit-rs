@@ -6,7 +6,7 @@
 //! * Structs/unions with fields
 //! * Pointers, arrays, function types (limited)
 
-use crate::ffi::{CT, CTState, CType, CTypeID, ct_info, ctinfo, ctype_align};
+use crate::ffi::{CT, CTState, CType, CTypeID, ct_info, ctinfo, ctype_align, ctype_isfunc};
 
 // ---------------------------------------------------------------------------
 // Lexer
@@ -58,8 +58,17 @@ enum Token {
     KwStatic,
     KwConst,
     KwVolatile,
+    // Calling-convention / attribute keywords (parsed, ignored on x64).
+    KwCdecl,
+    KwStdcall,
+    KwFastcall,
+    KwRestrict,
+    KwInline,
+    KwAttribute,
+    KwExtension,
 }
 
+#[derive(Clone)]
 struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
@@ -165,6 +174,13 @@ impl<'a> Lexer<'a> {
             "static" => Token::KwStatic,
             "const" => Token::KwConst,
             "volatile" => Token::KwVolatile,
+            "__cdecl" | "_cdecl" => Token::KwCdecl,
+            "__stdcall" | "_stdcall" => Token::KwStdcall,
+            "__fastcall" | "_fastcall" => Token::KwFastcall,
+            "__restrict" | "restrict" | "__restrict__" => Token::KwRestrict,
+            "inline" | "__inline" | "__inline__" => Token::KwInline,
+            "__attribute__" | "__attribute" => Token::KwAttribute,
+            "__extension__" => Token::KwExtension,
             _ => Token::Ident,
         }
     }
@@ -256,6 +272,15 @@ struct DeclSpec {
     type_id: u32,
 }
 
+/// A declarator element, in declaration order (index 0 is the base/return
+/// type; each following element wraps the one before it).
+enum DeclElem {
+    Base(u32),
+    Ptr(u32),        // pointer (qualifier flags)
+    Func(Vec<u32>),  // function (parameter ctype ids)
+    Array(u32),      // array (element count; u32::MAX = `?`)
+}
+
 struct Parser<'a> {
     lex: Lexer<'a>,
     tok: Token,
@@ -313,6 +338,15 @@ impl<'a> Parser<'a> {
                 Token::KwVolatile => {
                     decl.flags |= ctinfo::VOLATILE;
                     self.next();
+                }
+                Token::KwCdecl | Token::KwStdcall | Token::KwFastcall
+                | Token::KwRestrict | Token::KwInline | Token::KwExtension => {
+                    // Calling conventions are a no-op on x64; ignore them.
+                    self.next();
+                }
+                Token::KwAttribute => {
+                    // Skip GCC `__attribute__((...))`.
+                    self.skip_attribute();
                 }
                 Token::KwUnsigned => {
                     decl.flags |= ctinfo::UNSIGNED;
@@ -428,6 +462,178 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(decl)
+    }
+
+    /// Skip a GCC `__attribute__((...))` (self.tok == KwAttribute on entry).
+    fn skip_attribute(&mut self) {
+        self.next(); // eat __attribute__
+        if self.tok == Token::LParen {
+            self.next();
+            if self.tok == Token::LParen {
+                self.next();
+                while self.tok != Token::RParen && self.tok != Token::Eof {
+                    self.next();
+                }
+                if self.tok == Token::RParen {
+                    self.next();
+                }
+            }
+            if self.tok == Token::RParen {
+                self.next();
+            }
+        }
+    }
+
+    /// Peek the token after the current one (without consuming).
+    fn peek_next(&mut self) -> Token {
+        let mut lx = self.lex.clone();
+        lx.next_token()
+    }
+
+    /// Is the current `(` the start of an inner declarator group (a
+    /// function-pointer declarator), rather than a parameter list?
+    fn decl_is_group(&mut self) -> bool {
+        matches!(
+            self.peek_next(),
+            Token::Star
+                | Token::LParen
+                | Token::KwCdecl
+                | Token::KwStdcall
+                | Token::KwFastcall
+        )
+    }
+
+    /// Parse a full C declarator after the declaration specifiers, returning
+    /// `(name, type_id)`. Handles pointers (`*`), parenthesized groups
+    /// (`(*name)`), array suffixes (`[N]` / `[?]`) and function suffixes
+    /// (`(params)`), using LuaJIT's declaration-stack model.
+    fn parse_declarator(&mut self, base: u32) -> Result<(Option<String>, u32), String> {
+        let mut stack = vec![DeclElem::Base(base)];
+        let mut pos = 0usize;
+        let name = self.decl_declarator(&mut stack, &mut pos)?;
+        let mut id = match stack[0] {
+            DeclElem::Base(b) => b,
+            _ => unreachable!(),
+        };
+        for e in &stack[1..] {
+            id = match e {
+                DeclElem::Ptr(q) => {
+                    let p = crate::ffi::lib::make_ptr_type(self.cts, id);
+                    if *q != 0 {
+                        self.cts.tab[p as usize].info |= *q;
+                    }
+                    p
+                }
+                DeclElem::Func(params) => {
+                    crate::ffi::lib::make_func_type(self.cts, id, params.clone())
+                }
+                DeclElem::Array(n) => crate::ffi::lib::make_array_type(self.cts, id, *n),
+                DeclElem::Base(_) => unreachable!(),
+            };
+        }
+        Ok((name, id))
+    }
+
+    fn decl_declarator(
+        &mut self,
+        stack: &mut Vec<DeclElem>,
+        pos: &mut usize,
+    ) -> Result<Option<String>, String> {
+        let mut name = None;
+        // Head of declarator: pointer operators (calling conventions and
+        // qualifiers between them are ignored).
+        while self.tok == Token::Star
+            || self.tok == Token::KwCdecl
+            || self.tok == Token::KwStdcall
+            || self.tok == Token::KwFastcall
+        {
+            let mut star = false;
+            let mut q = 0u32;
+            while self.tok == Token::Star
+                || self.tok == Token::KwCdecl
+                || self.tok == Token::KwStdcall
+                || self.tok == Token::KwFastcall
+                || self.tok == Token::KwConst
+                || self.tok == Token::KwVolatile
+            {
+                match self.tok {
+                    Token::Star => star = true,
+                    Token::KwConst => q |= ctinfo::CONST,
+                    Token::KwVolatile => q |= ctinfo::VOLATILE,
+                    _ => {}
+                }
+                self.next();
+            }
+            if star {
+                stack.insert(*pos + 1, DeclElem::Ptr(q));
+                *pos += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Inner declarator group or direct name.
+        if self.tok == Token::LParen && self.decl_is_group() {
+            self.next(); // consume '('
+            let saved = *pos;
+            name = self.decl_declarator(stack, pos)?;
+            self.expect(Token::RParen)?;
+            *pos = saved;
+        } else if self.tok == Token::Ident {
+            name = Some(self.ident()?);
+        }
+
+        // Tail of declarator: array and function suffixes.
+        loop {
+            if self.tok == Token::LBracket {
+                self.next();
+                let mut n = u32::MAX;
+                if self.tok == Token::Integer
+                    && let Ok(v) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>()
+                {
+                    n = v.max(1);
+                    self.next();
+                }
+                self.expect(Token::RBracket)?;
+                stack.insert(*pos + 1, DeclElem::Array(n));
+            } else if self.tok == Token::LParen {
+                self.next(); // consume '('
+                let params = self.parse_func_params()?;
+                stack.insert(*pos + 1, DeclElem::Func(params));
+            } else {
+                break;
+            }
+        }
+        Ok(name)
+    }
+
+    /// Parse a function parameter list `(params)`, terminated by `)`.
+    /// Each parameter is a full abstract/named declarator.
+    fn parse_func_params(&mut self) -> Result<Vec<u32>, String> {
+        let mut params = Vec::new();
+        while self.tok != Token::RParen && self.tok != Token::Eof {
+            // `(void)` — an empty parameter list.
+            if self.tok == Token::KwVoid {
+                let save_pos = self.lex.pos;
+                let save_buf = self.lex.buf.clone();
+                self.next();
+                if self.tok == Token::RParen {
+                    self.next();
+                    return Ok(params);
+                }
+                self.lex.pos = save_pos;
+                self.lex.buf = save_buf;
+                self.tok = Token::KwVoid;
+            }
+            let pdecl = self.parse_decl_spec()?;
+            let (_name, ptype) = self.parse_declarator(pdecl.type_id)?;
+            params.push(ptype);
+            if self.tok == Token::Comma {
+                self.next();
+            }
+        }
+        self.expect(Token::RParen)?;
+        Ok(params)
     }
 
     // -- Struct / Union --
@@ -699,20 +905,21 @@ impl<'a> Parser<'a> {
             self.next();
         } // optional tag
 
+        let mut next_val: i32 = 0;
         if self.tok == Token::LBrace {
             self.next();
             while self.tok != Token::RBrace && self.tok != Token::Eof {
                 if self.tok == Token::Ident {
+                    let name = String::from_utf8_lossy(&self.lex.buf).to_string();
                     self.next();
-                    if self.tok == Token::Eql {
+                    let v = if self.tok == Token::Eql {
                         self.next();
-                        while self.tok != Token::Comma
-                            && self.tok != Token::RBrace
-                            && self.tok != Token::Eof
-                        {
-                            self.next();
-                        }
-                    }
+                        self.parse_enum_value()
+                    } else {
+                        next_val
+                    };
+                    self.cts.constants.insert(name, v);
+                    next_val = v.wrapping_add(1);
                 }
                 if self.tok == Token::Comma {
                     self.next();
@@ -724,60 +931,50 @@ impl<'a> Parser<'a> {
         Ok(CTypeID::Int32 as u32)
     }
 
+    /// Parse a simple enum constant expression (integer/hex literal, an
+    /// optional unary minus, or a reference to an earlier constant). Any
+    /// remaining operators are skipped.
+    fn parse_enum_value(&mut self) -> i32 {
+        let mut neg = false;
+        if self.tok == Token::Minus {
+            neg = true;
+            self.next();
+        }
+        let v = match self.tok {
+            Token::Integer => {
+                let s = String::from_utf8_lossy(&self.lex.buf).to_string();
+                let v = if s.len() > 2 && (&s[..2] == "0x" || &s[..2] == "0X") {
+                    i32::from_str_radix(&s[2..], 16).unwrap_or(0)
+                } else {
+                    s.parse::<i32>().unwrap_or(0)
+                };
+                self.next();
+                v
+            }
+            Token::Ident => {
+                let name = String::from_utf8_lossy(&self.lex.buf).to_string();
+                self.next();
+                self.cts.constants.get(&name).copied().unwrap_or(0)
+            }
+            _ => 0,
+        };
+        while !matches!(self.tok, Token::Comma | Token::RBrace | Token::Eof) {
+            self.next();
+        }
+        if neg {
+            -v
+        } else {
+            v
+        }
+    }
+
     // -- Typedef --
 
     fn parse_typedef(&mut self) -> Result<(), String> {
         self.next(); // eat typedef
         let decl = self.parse_decl_spec()?;
-        let name = self.ident()?;
-        // Parse array declarator brackets (e.g. `typedef int arr_t[10]`).
-        let mut array_count: u32 = 1;
-        while self.tok == Token::LBracket {
-            self.next(); // eat [
-            if self.tok == Token::Question {
-                array_count = u32::MAX;
-                self.next();
-            } else if self.tok == Token::Integer
-                && let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>()
-            {
-                array_count = n.max(1);
-                self.next();
-            }
-            while self.tok != Token::RBracket && self.tok != Token::Eof {
-                self.next();
-            }
-            if self.tok == Token::RBracket {
-                self.next(); // eat ]
-            }
-        }
-        let base_id = decl.type_id;
-        let type_id = if array_count > 1 {
-            let elem = self.cts.get(base_id);
-            let total_sz = if array_count == u32::MAX {
-                u32::MAX
-            } else {
-                elem.size.saturating_mul(array_count)
-            };
-            let info = ct_info(CT::Array, 0) | base_id;
-            let existing = (0..self.cts.top as usize)
-                .find(|&i| self.cts.tab[i].info == info && self.cts.tab[i].size == total_sz);
-            if let Some(id) = existing {
-                id as u32
-            } else {
-                let id = self.cts.top;
-                self.cts.tab.push(CType {
-                    info,
-                    size: total_sz,
-                    sib: 0,
-                    next: 0,
-                    name: 0,
-                });
-                self.cts.top = self.cts.top.saturating_add(1);
-                id
-            }
-        } else {
-            base_id
-        };
+        let (name, type_id) = self.parse_declarator(decl.type_id)?;
+        let name = name.ok_or_else(|| "typedef requires a name".to_string())?;
         let info = ct_info(CT::Typedef, 0) | type_id;
         let sz = self.cts.get(type_id).size;
         let id = self.cts.top;
@@ -794,7 +991,7 @@ impl<'a> Parser<'a> {
             .checked_add(1)
             .ok_or_else(|| "too many C types (overflow)".to_string())?;
         self.cts.names.insert(name, id);
-        // Skip declarator suffix
+        // Skip declarator suffix / initializer.
         self.skip_until_semicolon();
         Ok(())
     }
@@ -850,14 +1047,14 @@ impl<'a> Parser<'a> {
             Token::Eof => Ok(()),
             _ => {
                 let decl = self.parse_decl_spec()?;
-                // Function declaration: `ret name(params) [asm("sym")];` —
-                // register the prototype so ffi.C lookups can validate
-                // call arguments against the declared parameter types.
-                if self.tok == Token::Ident {
-                    let name = String::from_utf8_lossy(&self.lex.buf).to_string();
-                    self.next();
-                    if self.tok == Token::LParen {
-                        self.parse_func_decl(decl, &name)?;
+                let (name, type_id) = self.parse_declarator(decl.type_id)?;
+                // A function declarator (`name(params)` or `(*name)(params)`)
+                // registers the prototype so ffi.C lookups can validate call
+                // arguments against the declared parameter types.
+                if let Some(name) = name {
+                    let raw = self.cts.get(type_id);
+                    if ctype_isfunc(raw.info) {
+                        self.register_func_decl(&name, type_id)?;
                         return Ok(());
                     }
                 }
@@ -867,55 +1064,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `ret name(param types) ...;` — register a function prototype:
-    /// a `CT::Func` entry whose child is the return type and whose field
-    /// chain holds the parameter types.
-    fn parse_func_decl(&mut self, decl: DeclSpec, name: &str) -> Result<(), String> {
-        self.expect(Token::LParen)?;
-        let mut params: Vec<u32> = Vec::new();
-        while self.tok != Token::RParen && self.tok != Token::Eof {
-            // `(void)` — empty parameter list.
-            if self.tok == Token::KwVoid {
-                let save_pos = self.lex.pos;
-                let save_buf = self.lex.buf.clone();
-                self.next();
-                if self.tok == Token::RParen {
-                    break;
-                }
-                self.lex.pos = save_pos;
-                self.lex.buf = save_buf;
-                self.tok = Token::KwVoid;
-            }
-            let pdecl = self.parse_decl_spec()?;
-            let mut ptype = pdecl.type_id;
-            // Pointer declarators (`ffi_err_point* op1`).
-            while self.tok == Token::Star || self.tok == Token::Slash {
-                if self.tok == Token::Star {
-                    ptype = crate::ffi::lib::make_ptr_type(self.cts, ptype);
-                }
-                self.next();
-            }
-            // Skip the parameter name (and any array brackets).
-            if self.tok == Token::Ident {
-                self.next();
-            }
-            while self.tok == Token::LBracket && self.tok != Token::Eof {
-                self.next();
-                while self.tok != Token::RBracket && self.tok != Token::Eof {
-                    self.next();
-                }
-                if self.tok == Token::RBracket {
-                    self.next();
-                }
-            }
-            params.push(ptype);
-            if self.tok == Token::Comma {
-                self.next();
-            }
-        }
-        self.expect(Token::RParen)?;
-        // Optional asm("name") — the real C symbol to resolve — then skip
-        // any remaining attributes to the semicolon.
+    /// Register a function prototype `name` with its `CT::Func` ctype id,
+    /// parsing an optional `asm("symbol")` redirect.
+    fn register_func_decl(&mut self, name: &str, func_id: u32) -> Result<(), String> {
         let mut asm_name: Option<String> = None;
         while self.tok != Token::Semicolon && self.tok != Token::Eof {
             if self.tok == Token::Ident
@@ -934,42 +1085,6 @@ impl<'a> Parser<'a> {
         if self.tok == Token::Semicolon {
             self.next();
         }
-
-        let num_params = params.len();
-        // Capture the field base *after* param parsing (make_ptr_type may
-        // have appended pointer types in the loop).
-        let first_param_id = self.cts.top;
-        for (i, &ptype) in params.iter().enumerate() {
-            let fid = first_param_id + i as u32;
-            self.cts.tab.push(CType {
-                info: ct_info(CT::Field, 0) | ptype,
-                size: 0,
-                sib: if i + 1 < num_params {
-                    (fid + 1) as u16
-                } else {
-                    0
-                },
-                next: 0,
-                name: 0,
-            });
-            self.cts.top = fid + 1;
-        }
-        let func_id = self.cts.top;
-        // The func's child (info low bits) is the return type; its `sib`
-        // chains to the first parameter field (lj_ctype.h layout).
-        let info = ct_info(CT::Func, 0) | decl.type_id;
-        self.cts.tab.push(CType {
-            info,
-            size: 0,
-            sib: if num_params > 0 {
-                first_param_id as u16
-            } else {
-                0
-            },
-            next: 0,
-            name: 0,
-        });
-        self.cts.top = func_id + 1;
         self.cts.names.insert(name.to_string(), func_id);
         self.cts.symbols.insert(
             name.to_string(),

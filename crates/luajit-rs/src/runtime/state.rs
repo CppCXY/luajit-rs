@@ -300,6 +300,9 @@ pub struct GlobalState {
     pub ctype_mts: Vec<Option<GcPtr<LuaTable>>>,
     /// `ffi.errno` state (the tests set/read it through FFI).
     pub ffi_errno: i32,
+    /// A callback raised an error during an ffi.C call; the enclosing
+    /// `call_c`/`jit_ffi_call` re-raises it once the C call returns.
+    pub ffi_cb_error: Option<LuaValue>,
     /// The internal ipairs iterator closure (not exposed as a global).
     pub ipairs_iter: LuaValue,
     /// `os.clock()` baseline: `Instant::now()` captured when the universe is
@@ -843,6 +846,7 @@ impl Lua {
             cts: None,
             ctype_mts: Vec::new(),
             ffi_errno: 0,
+            ffi_cb_error: None,
             ipairs_iter: LuaValue::NIL,
             boot_time: boot,
             main: None,
