@@ -1953,7 +1953,14 @@ impl Interp {
                         sync!();
                         self.gc_check(self.base + a as usize + 1)?;
                     }
-                    let t = self.l().heap().alloc_table(LuaTable::new(0, 0));
+                    // The compiler pre-allocates the array/hash size the
+                    // table literal will need (D = asize | hbits << 11, see
+                    // expr_table). Allocating it up front avoids repeated
+                    // realloc-and-copy as the literal is filled.
+                    let d = bc_d(ins);
+                    let asize = d & 0x7ff;
+                    let hbits = (d >> 11) & 0x1f;
+                    let t = self.l().heap().alloc_table(LuaTable::new(asize, hbits));
                     fr.set(a, LuaValue::table(t));
                 }
                 BCOp::TDUP => {
