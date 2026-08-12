@@ -13,6 +13,7 @@
 //! and `LuaValue::as_cdata()` for construction / access.
 //! Reference: LuaJIT/src/lj_ctype.h, lj_cdata.h, lj_cparse.h
 
+pub(crate) mod callback;
 mod clib;
 pub(crate) mod lib;
 mod parser;
@@ -349,6 +350,10 @@ pub struct CTState {
     /// Struct field lookup: (struct_id, field_name) → (field_id, offset_info).
     /// offset_info stores the field's type_id (hi 16 bits) and byte offset (lo 16 bits).
     pub field_names: std::collections::HashMap<(u32, String), (u32, u32)>,
+    /// FFI callbacks (Lua closures cast to function pointers), indexed by id.
+    pub callbacks: Vec<Option<crate::ffi::callback::Callback>>,
+    /// The thread callbacks run on (a dedicated coroutine, GC-rooted).
+    pub callback_thread: Option<crate::state::StateRef>,
 }
 
 impl Default for CTState {
@@ -368,6 +373,8 @@ impl CTState {
             symbols: std::collections::HashMap::new(),
             tags: std::collections::HashMap::new(),
             field_names: std::collections::HashMap::new(),
+            callbacks: Vec::new(),
+            callback_thread: None,
         };
         cts.init_predefined();
         cts

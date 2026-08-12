@@ -9,7 +9,7 @@ use std::ffi::CString;
 use crate::err::LuaResult;
 use crate::ffi::clib;
 use crate::ffi::parser::parse;
-use crate::ffi::{CT, CTState, CType, CTypeID, ct_info, ctype_align, ctype_cid, ctype_ispointer};
+use crate::ffi::{CT, CTState, CType, CTypeID, ct_info, ctype_align, ctype_cid, ctype_ispointer, ctype_isptr};
 use crate::func::{CClosure, CFunction, GcFunc};
 use crate::gc::GcPtr;
 use crate::meta::MM;
@@ -48,7 +48,7 @@ pub(crate) fn ccall_param_types(cts: &CTState, fid: u32) -> Vec<u32> {
 }
 
 /// The return type of a function ctype (the low 16 bits of its info).
-fn ccall_ret_type(cts: &CTState, fid: u32) -> u32 {
+pub(crate) fn ccall_ret_type(cts: &CTState, fid: u32) -> u32 {
     let raw = cts.raw(fid);
     if raw.info >> 28 == CT::Func as u32 {
         raw.info & 0xFFFF
@@ -109,57 +109,153 @@ fn ffi_param_kind(type_code: u64, i: usize) -> u64 {
     (type_code >> (2 + i * 4)) & 0xF
 }
 
-/// Call the C function at `addr` with a signature chosen from the encoded
-/// parameter/return kinds. The old fixed 6×i64 convention cannot carry
-/// doubles (FP args live in XMM registers), so common shapes get their
-/// real signatures; unknown declarations fall back to 6×i64 (the
-/// pre-declaration behavior). Pointer args ride in integer slots on
-/// every supported ABI.
-fn ffi_call_dispatch(addr: usize, type_code: u64, cargs: [i64; 2]) -> u64 {
-    let ret_fp = type_code & 1 != 0;
-    let p0 = ffi_param_kind(type_code, 0);
-    let p1 = ffi_param_kind(type_code, 1);
-    match (ret_fp, p0, p1) {
-        (true, 1, 0) => {
-            type F = unsafe extern "system" fn(f64) -> f64;
-            let f: F = unsafe { std::mem::transmute(addr) };
-            let r = unsafe { f(f64::from_bits(cargs[0] as u64)) };
-            LuaValue::number_raw(r).to_bits()
-        }
-        (true, 1, 1) => {
-            type F = unsafe extern "system" fn(f64, f64) -> f64;
-            let f: F = unsafe { std::mem::transmute(addr) };
-            let r = unsafe {
-                f(
-                    f64::from_bits(cargs[0] as u64),
-                    f64::from_bits(cargs[1] as u64),
-                )
-            };
-            LuaValue::number_raw(r).to_bits()
-        }
-        (false, 2, 0) | (false, 3, 0) => {
-            type F = unsafe extern "system" fn(i64) -> i64;
-            let f: F = unsafe { std::mem::transmute(addr) };
-            let r = unsafe { f(cargs[0]) };
-            LuaValue::number(r as f64).to_bits()
-        }
-        (false, 2, 2) => {
-            type F = unsafe extern "system" fn(i64, i64) -> i64;
-            let f: F = unsafe { std::mem::transmute(addr) };
-            let r = unsafe { f(cargs[0], cargs[1]) };
-            LuaValue::number(r as f64).to_bits()
-        }
-        _ => {
-            type CFn = unsafe extern "system" fn(i64, i64, i64, i64, i64, i64) -> i64;
-            let f: CFn = unsafe { std::mem::transmute(addr) };
-            let ret = unsafe { f(cargs[0], cargs[1], 0, 0, 0, 0) };
-            if ret_fp {
-                LuaValue::number_raw(f64::from_bits(ret as u64)).to_bits()
-            } else {
-                LuaValue::number(ret as f64).to_bits()
-            }
-        }
+/// Call the C function at `addr` with the given arguments. `args` carries
+/// the raw slot values (doubles as their bit pattern, integers/pointers as
+/// their value); `arg_fp` is a bitmask marking floating-point arguments.
+/// `ret_fp` selects the return register convention.
+///
+/// All-integer and all-floating-point argument lists are dispatched to a
+/// fixed signature with trailing zero padding (extra register/stack slots
+/// are ignored by the callee). Mixed lists are dispatched exactly for the
+/// common small shapes and otherwise fall back to the integer convention.
+///
+/// Returns the raw result bits (RAX for integer returns, XMM0 for FP); the
+/// caller encodes them into a Lua value according to the declared return
+/// type.
+fn ffi_call_dispatch(addr: usize, ret_fp: bool, args: &[i64], arg_fp: u64) -> u64 {
+    let n = args.len().min(FFI_MAX_ARGS);
+    let nfp = arg_fp.count_ones() as usize;
+    if nfp == 0 {
+        return call_ints(addr, ret_fp, args);
     }
+    if nfp == n {
+        return call_fps(addr, ret_fp, args);
+    }
+    // Mixed integer/floating-point: exact shapes up to two arguments.
+    match (ret_fp, n, arg_fp) {
+        (true, 2, 0b10) => {
+            type F = unsafe extern "system" fn(i64, f64) -> f64;
+            let f: F = unsafe { std::mem::transmute(addr) };
+            let r = unsafe { f(args[0], f64::from_bits(args[1] as u64)) };
+            r.to_bits()
+        }
+        (true, 2, 0b01) => {
+            type F = unsafe extern "system" fn(f64, i64) -> f64;
+            let f: F = unsafe { std::mem::transmute(addr) };
+            let r = unsafe { f(f64::from_bits(args[0] as u64), args[1]) };
+            r.to_bits()
+        }
+        (false, 2, 0b10) => {
+            type F = unsafe extern "system" fn(i64, f64) -> i64;
+            let f: F = unsafe { std::mem::transmute(addr) };
+            let r = unsafe { f(args[0], f64::from_bits(args[1] as u64)) };
+            r as u64
+        }
+        (false, 2, 0b01) => {
+            type F = unsafe extern "system" fn(f64, i64) -> i64;
+            let f: F = unsafe { std::mem::transmute(addr) };
+            let r = unsafe { f(f64::from_bits(args[0] as u64), args[1]) };
+            r as u64
+        }
+        _ => call_ints(addr, ret_fp, args),
+    }
+}
+
+/// Maximum number of arguments the fixed dispatch signatures carry.
+const FFI_MAX_ARGS: usize = 12;
+
+fn call_ints(addr: usize, ret_fp: bool, args: &[i64]) -> u64 {
+    let g = |i: usize| args.get(i).copied().unwrap_or(0);
+    if ret_fp {
+        type F = unsafe extern "system" fn(
+            i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+        ) -> f64;
+        let f: F = unsafe { std::mem::transmute(addr) };
+        let r = unsafe {
+            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10), g(11))
+        };
+        r.to_bits()
+    } else {
+        type F = unsafe extern "system" fn(
+            i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+        ) -> i64;
+        let f: F = unsafe { std::mem::transmute(addr) };
+        let r = unsafe {
+            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10), g(11))
+        };
+        r as u64
+    }
+}
+
+fn call_fps(addr: usize, ret_fp: bool, args: &[i64]) -> u64 {
+    let v: Vec<f64> = args.iter().map(|&b| f64::from_bits(b as u64)).collect();
+    let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
+    if ret_fp {
+        type F = unsafe extern "system" fn(
+            f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64,
+        ) -> f64;
+        let f: F = unsafe { std::mem::transmute(addr) };
+        let r = unsafe {
+            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10), g(11))
+        };
+        r.to_bits()
+    } else {
+        type F = unsafe extern "system" fn(
+            f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64,
+        ) -> i64;
+        let f: F = unsafe { std::mem::transmute(addr) };
+        let r = unsafe {
+            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10), g(11))
+        };
+        r as u64
+    }
+}
+
+/// Encode a raw FFI return value into a Lua value according to the declared
+/// return type: floats/doubles become numbers, 64-bit integers become cdata
+/// (preserving precision), pointers become pointer cdata, small integers
+/// become numbers. `None` (undeclared) assumes an integer return.
+fn encode_ffi_result(l: &mut LuaState, ret_tid: Option<u32>, bits: u64) -> LuaValue {
+    let Some(tid) = ret_tid else {
+        return LuaValue::number(bits as i64 as f64);
+    };
+    let raw = l.global().cts.as_ref().unwrap().raw(tid);
+    let t = crate::ffi::ctype_type(raw.info);
+    if crate::ffi::ctype_isfp(raw.info) {
+        return if raw.size == 4 {
+            LuaValue::number(f32::from_bits(bits as u32) as f64)
+        } else {
+            LuaValue::number_raw(f64::from_bits(bits))
+        };
+    }
+    if raw.info & crate::ffi::ctinfo::BOOL != 0 {
+        return LuaValue::boolean(bits != 0);
+    }
+    if t == CT::Ptr || t == CT::Func {
+        let mut cd = CData::new(tid, 8);
+        cd.set_ptr(bits as usize);
+        let p = l.global().heap.alloc_cdata(cd);
+        return LuaValue::cdata(p);
+    }
+    if raw.size == 8 {
+        let ctypeid = if raw.info & crate::ffi::ctinfo::UNSIGNED != 0 {
+            CTypeID::UInt64 as u32
+        } else {
+            CTypeID::Int64 as u32
+        };
+        let mut cd = CData::new(ctypeid, 8);
+        cd.data[..8].copy_from_slice(&bits.to_le_bytes());
+        let p = l.global().heap.alloc_cdata(cd);
+        return LuaValue::cdata(p);
+    }
+    // Small integer: sign-extend by size.
+    let n = match raw.size {
+        1 => (bits as u8 as i8) as f64,
+        2 => (bits as u16 as i16) as f64,
+        4 => (bits as u32 as i32) as f64,
+        _ => bits as i64 as f64,
+    };
+    LuaValue::number(n)
 }
 
 /// Trace-side FFI call (architecture-independent): up to two arguments,
@@ -199,13 +295,24 @@ pub extern "C" fn jit_ffi_call(addr_bits: u64, type_bits: u64, a1_bits: u64, a2_
         }
     };
     let mut cargs: [i64; 2] = [0; 2];
+    let mut arg_fp: u64 = 0;
     for (i, v) in [a1, a2].iter().enumerate() {
-        match marshal(*v, ffi_param_kind(type_code, i)) {
+        let kind = ffi_param_kind(type_code, i);
+        match marshal(*v, kind) {
             Some(x) => cargs[i] = x,
             None => return LuaValue::NIL.to_bits(),
         }
+        if kind == 1 {
+            arg_fp |= 1 << i;
+        }
     }
-    ffi_call_dispatch(addr, type_code, cargs)
+    let ret_fp = type_code & 1 != 0;
+    let bits = ffi_call_dispatch(addr, ret_fp, &cargs, arg_fp);
+    if ret_fp {
+        LuaValue::number_raw(f64::from_bits(bits)).to_bits()
+    } else {
+        LuaValue::number(bits as i64 as f64).to_bits()
+    }
 }
 
 /// Known C type names → predefined type IDs.
@@ -426,139 +533,215 @@ impl<'a> DeclTok<'a> {
     }
 }
 
-/// Parse an abstract declarator starting at `toks`. `base` is the
-/// element type; returns the declarator-applied type.
+/// A declarator element, in declaration order (index 0 is the base/return
+/// type; each following element wraps the one before it). Mirrors the
+/// `next` chain of LuaJIT's `CPDecl` stack.
+enum DeclElem {
+    Base(u32),
+    Ptr(u32),        // pointer (qualifier flags)
+    Func(Vec<u32>),  // function (parameter ctype ids)
+    Array(u32),      // array (element count; u32::MAX = `?`)
+}
+
+/// Parse an abstract declarator starting at `toks`. `base` is the element
+/// (return) type; returns the fully-declared type id.
+///
+/// Uses LuaJIT's declaration-stack model (`lj_cparse.c` `cp_declarator`):
+/// pointer operators are pushed *before* the insertion cursor, and the
+/// cursor is reset after a parenthesized group, so `int(*)(int,int)`
+/// yields a pointer-to-function while `int*(int,int)` yields a function
+/// returning a pointer.
 fn parse_abs_decl(l: &mut LuaState, base: u32, toks: &mut DeclTok) -> LuaResult<u32> {
-    let mut stars = 0usize;
-    let mut qual = 0u32;
-    loop {
-        match toks.peek() {
-            Some(b'*') => {
-                stars += 1;
-                toks.next_tok();
+    let mut stack = vec![DeclElem::Base(base)];
+    let mut pos = 0usize;
+    decl_declarator(l, toks, &mut stack, &mut pos)?;
+    let mut id = match stack[0] {
+        DeclElem::Base(b) => b,
+        _ => unreachable!("base element missing"),
+    };
+    for e in &stack[1..] {
+        id = match e {
+            DeclElem::Ptr(q) => {
+                let p = make_ptr_type(cts_of(l), id);
+                if *q != 0 {
+                    let cts = cts_of(l);
+                    cts.tab[p as usize].info |= *q;
+                }
+                p
             }
-            Some(_) => break,
-            None => break,
-        }
-    }
-    // Optional qualifier after the stars (`*const`).
-    if let Some(t) = toks.next_tok() {
-        if t == b"const" {
-            qual |= crate::ffi::ctinfo::CONST;
-        } else if t == b"volatile" {
-            qual |= crate::ffi::ctinfo::VOLATILE;
-        } else {
-            toks.pos -= t.len(); // push back
-            toks.skip_ws();
-        }
-    }
-    // A `(` after the stars is a function suffix when its content is a
-    // parameter type (`*(void)`); otherwise it groups a declarator.
-    let paren_is_group = if toks.peek() == Some(b'(') {
-        let save = toks.pos;
-        toks.next_tok();
-        let inner_tok = toks.next_tok().unwrap_or_default();
-        toks.pos = save;
-        let name = String::from_utf8_lossy(&inner_tok);
-        let known = quick_type_id(&name).is_some()
-            || l.global()
-                .cts
-                .as_ref()
-                .is_some_and(|c| c.names.contains_key(&name.to_string()))
-            || inner_tok == b"void";
-        !known
-    } else {
-        false
-    };
-    let t = if paren_is_group {
-        toks.next_tok();
-        let inner = parse_abs_decl(l, base, toks)?;
-        if toks.next_tok().as_deref() != Some(b")".as_slice()) {
-            return Err(l.runtime_error(b"ffi: expected ')' in declarator"));
-        }
-        parse_decl_suffixes(l, inner, toks)?
-    } else {
-        parse_decl_suffixes(l, base, toks)?
-    };
-    let mut id = t;
-    for _ in 0..stars {
-        id = make_ptr_type(cts_of(l), id);
-        if qual != 0 {
-            let cts = cts_of(l);
-            let mut e = cts.tab[id as usize].clone();
-            e.info |= qual;
-            cts.tab[id as usize] = e;
-        }
+            DeclElem::Func(params) => make_func_type(cts_of(l), id, params.clone()),
+            DeclElem::Array(n) => make_array_type(cts_of(l), id, *n),
+            DeclElem::Base(_) => unreachable!("base element in tail"),
+        };
     }
     Ok(id)
 }
 
-/// Array `[N]` and function `(params)` suffixes applied to `t`.
-fn parse_decl_suffixes(l: &mut LuaState, mut t: u32, toks: &mut DeclTok) -> LuaResult<u32> {
+/// Recursive declarator parser (the body of LuaJIT's `cp_declarator`).
+/// `stack` holds the element chain; `pos` is the insertion cursor into it.
+fn decl_declarator(
+    l: &mut LuaState,
+    toks: &mut DeclTok,
+    stack: &mut Vec<DeclElem>,
+    pos: &mut usize,
+) -> LuaResult<()> {
+    // Head of declarator: pointer operators.
+    while toks.peek() == Some(b'*') {
+        toks.next_tok();
+        let mut q = 0u32;
+        loop {
+            let save = toks.pos;
+            let Some(t) = toks.next_tok() else { break };
+            if t == b"const" {
+                q |= crate::ffi::ctinfo::CONST;
+            } else if t == b"volatile" {
+                q |= crate::ffi::ctinfo::VOLATILE;
+            } else {
+                toks.pos = save;
+                break;
+            }
+        }
+        stack.insert(*pos + 1, DeclElem::Ptr(q));
+        *pos += 1;
+    }
+
+    // A `(` starts an inner declarator group only when the next token is
+    // `*` or `(`; otherwise it is the parameter list of a function suffix.
+    if toks.peek() == Some(b'(') && decl_is_group(toks) {
+        toks.next_tok(); // consume '('
+        let saved = *pos;
+        decl_declarator(l, toks, stack, pos)?;
+        if toks.next_tok().as_deref() != Some(b")") {
+            return Err(l.runtime_error(b"ffi: expected ')' in declarator"));
+        }
+        *pos = saved;
+    }
+
+    // Tail of declarator: array and function suffixes.
     loop {
-        match toks.peek() {
-            Some(b'[') => {
-                toks.next_tok();
-                let mut n: u32 = 1;
-                let mut is_vla = false;
-                if let Some(tok) = toks.next_tok() {
-                    if tok == b"?" {
-                        is_vla = true;
-                    } else if let Ok(v) = String::from_utf8_lossy(&tok).parse::<u32>() {
-                        n = v.max(1);
-                    } else {
-                        toks.pos -= tok.len();
-                        toks.skip_ws();
-                    }
+        if toks.peek() == Some(b'[') {
+            toks.next_tok();
+            let mut n: u32 = 1;
+            if let Some(tok) = toks.next_tok() {
+                if tok == b"?" {
+                    n = u32::MAX;
+                } else if let Ok(v) = String::from_utf8_lossy(&tok).parse::<u32>() {
+                    n = v.max(1);
+                } else {
+                    toks.pos -= tok.len();
+                    toks.skip_ws();
                 }
-                if toks.next_tok().as_deref() != Some(b"]".as_slice()) {
-                    return Err(l.runtime_error(b"ffi: expected ']' in declarator"));
-                }
-                t = make_array_type(cts_of(l), t, if is_vla { u32::MAX } else { n });
             }
-            Some(b'(') => {
-                toks.next_tok();
-                let mut params: Vec<u32> = Vec::new();
-                loop {
-                    match toks.peek() {
-                        Some(b')') => {
-                            toks.next_tok();
-                            break;
-                        }
-                        Some(b'v') => {
-                            // `(void)`: consume `void` + `)`.
-                            toks.next_tok();
-                            if toks.peek() == Some(b')') {
-                                toks.next_tok();
-                            }
-                            break;
-                        }
-                        None => return Err(l.runtime_error(b"ffi: expected ')' in declarator")),
-                        _ => {
-                            let ptok = toks.next_tok().unwrap_or_default();
-                            let pid =
-                                quick_type_id(&String::from_utf8_lossy(&ptok)).or_else(|| {
-                                    l.global().cts.as_ref().and_then(|c| {
-                                        c.names
-                                            .get(&String::from_utf8_lossy(&ptok).into_owned())
-                                            .copied()
-                                    })
-                                });
-                            if let Some(pid) = pid {
-                                params.push(pid);
-                            }
-                            if toks.peek() == Some(b',') {
-                                toks.next_tok();
-                            }
-                        }
-                    }
-                }
-                t = make_func_type(cts_of(l), t, params);
+            if toks.next_tok().as_deref() != Some(b"]") {
+                return Err(l.runtime_error(b"ffi: expected ']' in declarator"));
             }
-            _ => break,
+            stack.insert(*pos + 1, DeclElem::Array(n));
+        } else if toks.peek() == Some(b'(') {
+            toks.next_tok(); // consume '('
+            let params = parse_params(l, toks)?;
+            stack.insert(*pos + 1, DeclElem::Func(params));
+        } else {
+            break;
         }
     }
-    Ok(t)
+    Ok(())
+}
+
+/// Is the `(` at the cursor an inner declarator group (vs. a function
+/// parameter list)? In abstract mode LuaJIT treats it as a group only when
+/// the following token is `*` or `(`.
+fn decl_is_group(toks: &mut DeclTok) -> bool {
+    let save = toks.pos;
+    toks.next_tok(); // consume '('
+    let t = toks.next_tok();
+    toks.pos = save;
+    matches!(t.as_deref(), Some(b"*") | Some(b"("))
+}
+
+/// Parse a function parameter list (`(params)`) — a comma-separated list of
+/// full abstract declarators, terminated by `)`.
+fn parse_params(l: &mut LuaState, toks: &mut DeclTok) -> LuaResult<Vec<u32>> {
+    let mut params = Vec::new();
+    if toks.peek() == Some(b')') {
+        toks.next_tok();
+        return Ok(params);
+    }
+    // `(void)` — an empty parameter list.
+    {
+        let save = toks.pos;
+        if toks.next_tok().as_deref() == Some(b"void") && toks.peek() == Some(b')') {
+            toks.next_tok();
+            return Ok(params);
+        }
+        toks.pos = save;
+    }
+    loop {
+        let p = parse_param(l, toks)?;
+        params.push(p);
+        match toks.peek() {
+            Some(b',') => {
+                toks.next_tok();
+            }
+            Some(b')') => {
+                toks.next_tok();
+                break;
+            }
+            _ => {
+                return Err(l.runtime_error(
+                    b"ffi: expected ',' or ')' in parameter list",
+                ))
+            }
+        }
+    }
+    Ok(params)
+}
+
+/// Parse one parameter: a type specifier followed by an abstract declarator.
+fn parse_param(l: &mut LuaState, toks: &mut DeclTok) -> LuaResult<u32> {
+    let base = parse_type_specifier(l, toks)?;
+    parse_abs_decl(l, base, toks)
+}
+
+/// Parse a type specifier (the leading words of a parameter or base type),
+/// returning the resolved base type id. Qualifiers (`const`/`volatile`) are
+/// dropped — they do not affect the FFI calling convention.
+fn parse_type_specifier(l: &mut LuaState, toks: &mut DeclTok) -> LuaResult<u32> {
+    let mut words: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let save = toks.pos;
+        let Some(tok) = toks.next_tok() else { break };
+        if matches!(tok.as_slice(), b"*" | b"(" | b")" | b"[" | b"]" | b",") {
+            toks.pos = save;
+            break;
+        }
+        match tok.as_slice() {
+            b"const" | b"volatile" => {}
+            _ => words.push(tok),
+        }
+    }
+    if words.is_empty() {
+        return Err(l.runtime_error(b"ffi: expected type in declarator"));
+    }
+    let joined = words
+        .iter()
+        .map(|w| String::from_utf8_lossy(w).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(id) = quick_type_id(&joined) {
+        return Ok(id);
+    }
+    for w in &words {
+        let name = String::from_utf8_lossy(w).into_owned();
+        if let Some(id) = quick_type_id(&name) {
+            return Ok(id);
+        }
+        if let Some(&id) = l.global().cts.as_ref().and_then(|c| c.names.get(&name)) {
+            return Ok(id);
+        }
+    }
+    Err(l.runtime_error(
+        format!("ffi: unknown type '{}'", joined).as_bytes(),
+    ))
 }
 
 /// Create a fixed-size array type `elem[N]`.
@@ -1000,175 +1183,146 @@ pub fn ffi_typeof(l: &mut LuaState) -> LuaResult<i32> {
 /// declarators render canonically (`int (*(*[1][2])[3][4])[5][6]`).
 fn type_name_of_id(l: &LuaState, id: u32) -> Option<Vec<u8>> {
     let cts = l.global().cts.as_ref()?;
-    let raw = cts.raw(id);
-    // Structs/unions render with their kind prefix ("union NAME").
-    let kind = crate::ffi::ctype_type(raw.info);
-    if kind == crate::ffi::CT::Struct {
-        let base = type_name_of_id_inner(l, id)?;
-        let prefix = if raw.info & crate::ffi::ctinfo::UNION != 0 {
-            "union "
-        } else {
-            "struct "
-        };
-        return Some(format!("{}{}", prefix, String::from_utf8_lossy(&base)).into_bytes());
-    }
-    if kind == crate::ffi::CT::Ptr || kind == crate::ffi::CT::Array || kind == crate::ffi::CT::Func
-    {
-        // Find the innermost scalar base, then render the declarator.
-        let mut cur = id;
-        let mut guard = 0;
-        while guard < 64 {
-            guard += 1;
-            let r = cts.raw(cur);
-            let k = crate::ffi::ctype_type(r.info);
-            if crate::ffi::ctype_iscomplex(r.info) {
-                break; // `complex` / `complex float` are bases.
-            }
-            if k == crate::ffi::CT::Ptr || k == crate::ffi::CT::Array || k == crate::ffi::CT::Func {
-                cur = ctype_cid(r.info);
-            } else {
-                break;
-            }
+    // Walk the declarator chain outer-first (LuaJIT's `ctype_repr`):
+    // pointers become prefixes, array/function suffixes; a pointer to an
+    // array/function wraps its suffix in parens. The walk stops at the base
+    // type (scalar/complex/struct/enum/typedef).
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut suffixes: Vec<String> = Vec::new();
+    let mut ptrto = false;
+    let mut cur = id;
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > 64 {
+            return None;
         }
-        let base = type_name_of_id_inner(l, cur)?;
-        let decl = render_decl_top(l, id)?;
-        if decl.is_empty() {
-            return Some(base);
+        let raw = cts.raw(cur);
+        let info = raw.info;
+        match crate::ffi::ctype_type(info) {
+            crate::ffi::CT::Ptr => {
+                let mut s = String::from("*");
+                if info & crate::ffi::ctinfo::CONST != 0 {
+                    s.push_str("const");
+                }
+                if info & crate::ffi::ctinfo::VOLATILE != 0 {
+                    if s.len() > 1 {
+                        s.push(' ');
+                    }
+                    s.push_str("volatile");
+                }
+                prefixes.push(s);
+                ptrto = true;
+            }
+            crate::ffi::CT::Array
+                if !crate::ffi::ctype_iscomplex(info)
+                    && !crate::ffi::ctype_isvector(info) =>
+            {
+                if ptrto {
+                    ptrto = false;
+                    prefixes.push("(".to_string());
+                    suffixes.push(")".to_string());
+                }
+                let child = cts.raw(ctype_cid(info));
+                let n = if raw.size == u32::MAX || child.size == 0 {
+                    "?".to_string()
+                } else {
+                    (raw.size / child.size).to_string()
+                };
+                suffixes.push(format!("[{}]", n));
+            }
+            crate::ffi::CT::Func => {
+                if ptrto {
+                    ptrto = false;
+                    prefixes.push("(".to_string());
+                    suffixes.push(")".to_string());
+                }
+                suffixes.push("()".to_string());
+            }
+            _ => break,
         }
-        // Arrays join without a space (`int[10]`), others with one.
-        let s = if decl.starts_with('[') {
-            format!("{}{}", String::from_utf8_lossy(&base), decl)
-        } else {
-            format!("{} {}", String::from_utf8_lossy(&base), decl)
-        };
-        return Some(s.into_bytes());
+        cur = ctype_cid(info);
     }
-    type_name_of_id_inner(l, id)
+    let base = base_type_name(l, cur)?;
+    let mut decl = String::new();
+    for p in prefixes.iter().rev() {
+        decl.push_str(p);
+    }
+    for s in &suffixes {
+        decl.push_str(s);
+    }
+    if decl.is_empty() {
+        return Some(base.into_bytes());
+    }
+    // Arrays join without a space (`int[10]`), pointers with one (`int *`).
+    let s = if decl.starts_with('[') {
+        format!("{}{}", base, decl)
+    } else {
+        format!("{} {}", base, decl)
+    };
+    Some(s.into_bytes())
 }
 
-/// Top-level declarator rendering (no surrounding parens).
-fn render_decl_top(l: &LuaState, id: u32) -> Option<String> {
+/// The name of a base (non-declarator) type: scalar, complex, struct/union,
+/// enum, or a named typedef.
+fn base_type_name(l: &LuaState, id: u32) -> Option<String> {
     let cts = l.global().cts.as_ref()?;
     let raw = cts.raw(id);
-    match crate::ffi::ctype_type(raw.info) {
-        crate::ffi::CT::Ptr => {
-            let mut s = "*".to_string();
-            if raw.info & crate::ffi::ctinfo::CONST != 0 {
-                s.push_str("const");
-            }
-            if raw.info & crate::ffi::ctinfo::VOLATILE != 0 {
-                s.push_str("volatile");
-            }
-            let child = render_decl_child(l, ctype_cid(raw.info))?;
-            s.push_str(&child);
-            Some(s)
-        }
-        crate::ffi::CT::Array => {
-            let child = render_decl_child(l, ctype_cid(raw.info))?;
-            let elem = cts.raw(ctype_cid(raw.info));
-            let n = if raw.size == u32::MAX || elem.size == 0 {
-                "?".to_string()
+    let info = raw.info;
+    let named = cts
+        .names
+        .iter()
+        .find(|(_, v)| **v == id)
+        .map(|(n, _)| n.clone());
+    match crate::ffi::ctype_type(info) {
+        crate::ffi::CT::Struct => {
+            let prefix = if info & crate::ffi::ctinfo::UNION != 0 {
+                "union "
             } else {
-                (raw.size / elem.size).to_string()
+                "struct "
             };
-            Some(format!("{}[{}]", child, n))
+            Some(format!("{}{}", prefix, named.unwrap_or_else(|| id.to_string())))
         }
-        crate::ffi::CT::Func => {
-            let child = render_decl_child(l, ctype_cid(raw.info))?;
-            Some(format!("{}()", child))
-        }
-        _ => Some(String::new()),
-    }
-}
-
-/// Subordinate declarator rendering (pointers/functions in parens).
-fn render_decl_child(l: &LuaState, id: u32) -> Option<String> {
-    let cts = l.global().cts.as_ref()?;
-    let raw = cts.raw(id);
-    if crate::ffi::ctype_iscomplex(raw.info) {
-        return Some(String::new()); // complex is a base, not a declarator
-    }
-    match crate::ffi::ctype_type(raw.info) {
-        crate::ffi::CT::Ptr => {
-            let mut s = "*".to_string();
-            if raw.info & crate::ffi::ctinfo::CONST != 0 {
-                s.push_str("const");
-            }
-            if raw.info & crate::ffi::ctinfo::VOLATILE != 0 {
-                s.push_str("volatile");
-            }
-            let child = render_decl_child(l, ctype_cid(raw.info))?;
-            s.push_str(&child);
-            Some(format!("({})", s))
-        }
-        crate::ffi::CT::Array => {
-            let child = render_decl_child(l, ctype_cid(raw.info))?;
-            let elem = cts.raw(ctype_cid(raw.info));
-            let n = if raw.size == u32::MAX || elem.size == 0 {
-                "?".to_string()
+        crate::ffi::CT::Enum => {
+            if id == CTypeID::CTypeIDType as u32 {
+                Some("ctype".to_string())
             } else {
-                (raw.size / elem.size).to_string()
-            };
-            Some(format!("{}[{}]", child, n))
+                Some(format!("enum {}", named.unwrap_or_else(|| id.to_string())))
+            }
         }
-        crate::ffi::CT::Func => {
-            let child = render_decl_child(l, ctype_cid(raw.info))?;
-            Some(format!("{}()", child))
+        crate::ffi::CT::Array if crate::ffi::ctype_iscomplex(info) => {
+            let elem = ctype_cid(info);
+            if elem == CTypeID::Double as u32 {
+                Some("complex".to_string())
+            } else {
+                Some("complex float".to_string())
+            }
         }
-        _ => Some(String::new()),
+        _ => named.or_else(|| scalar_type_name(id)),
     }
 }
 
-fn type_name_of_id_inner(l: &LuaState, id: u32) -> Option<Vec<u8>> {
-    let cts = l.global().cts.as_ref()?;
-    if let Some((n, _)) = cts.names.iter().find(|(_, v)| **v == id) {
-        return Some(n.clone().into_bytes());
-    }
-    let raw = cts.raw(id);
-    use crate::ffi::{ctype_cid, ctype_isarray, ctype_iscomplex, ctype_ispointer};
-    if ctype_iscomplex(raw.info) {
-        // Predefined complex types render as `complex` / `complex float`.
-        let elem = ctype_cid(raw.info);
-        return if elem == crate::ffi::CTypeID::Double as u32 {
-            Some(b"complex".to_vec())
-        } else {
-            Some(b"complex float".to_vec())
-        };
-    }
-    if ctype_isarray(raw.info) {
-        let elem = type_name_of_id(l, ctype_cid(raw.info))?;
-        let sz = raw.size;
-        let s = if sz == u32::MAX {
-            format!("{}[?]", String::from_utf8_lossy(&elem))
-        } else {
-            format!("{}[{}]", String::from_utf8_lossy(&elem), sz)
-        };
-        return Some(s.into_bytes());
-    }
-    if ctype_ispointer(raw.info) {
-        let elem = type_name_of_id(l, ctype_cid(raw.info))?;
-        return Some(format!("{} *", String::from_utf8_lossy(&elem)).into_bytes());
-    }
-    // Predefined scalar types.
+/// The printable name of a predefined scalar type.
+fn scalar_type_name(id: u32) -> Option<String> {
     let n = match id {
-        v if v == crate::ffi::CTypeID::Void as u32 => "void",
-        v if v == crate::ffi::CTypeID::Bool as u32 => "bool",
-        v if v == crate::ffi::CTypeID::CChar as u32 => "char",
-        v if v == crate::ffi::CTypeID::Int8 as u32 => "int8_t",
-        v if v == crate::ffi::CTypeID::UInt8 as u32 => "uint8_t",
-        v if v == crate::ffi::CTypeID::Int16 as u32 => "int16_t",
-        v if v == crate::ffi::CTypeID::UInt16 as u32 => "uint16_t",
-        v if v == crate::ffi::CTypeID::Int32 as u32 => "int",
-        v if v == crate::ffi::CTypeID::UInt32 as u32 => "unsigned int",
-        v if v == crate::ffi::CTypeID::Int64 as u32 => "int64_t",
-        v if v == crate::ffi::CTypeID::UInt64 as u32 => "uint64_t",
-        v if v == crate::ffi::CTypeID::Float as u32 => "float",
-        v if v == crate::ffi::CTypeID::Double as u32 => "double",
-        v if v == crate::ffi::CTypeID::ComplexFloat as u32 => "complex float",
-        v if v == crate::ffi::CTypeID::ComplexDouble as u32 => "complex",
+        v if v == CTypeID::Void as u32 => "void",
+        v if v == CTypeID::Bool as u32 => "bool",
+        v if v == CTypeID::CChar as u32 => "char",
+        v if v == CTypeID::Int8 as u32 => "int8_t",
+        v if v == CTypeID::UInt8 as u32 => "uint8_t",
+        v if v == CTypeID::Int16 as u32 => "int16_t",
+        v if v == CTypeID::UInt16 as u32 => "uint16_t",
+        v if v == CTypeID::Int32 as u32 => "int",
+        v if v == CTypeID::UInt32 as u32 => "unsigned int",
+        v if v == CTypeID::Int64 as u32 => "int64_t",
+        v if v == CTypeID::UInt64 as u32 => "uint64_t",
+        v if v == CTypeID::Float as u32 => "float",
+        v if v == CTypeID::Double as u32 => "double",
+        v if v == CTypeID::ComplexFloat as u32 => "complex float",
+        v if v == CTypeID::ComplexDouble as u32 => "complex",
         _ => return None,
     };
-    Some(n.to_string().into_bytes())
+    Some(n.to_string())
 }
 
 fn type_value(l: &mut LuaState, id: u32) -> LuaResult<i32> {
@@ -1322,6 +1476,19 @@ pub fn ffi_fill(l: &mut LuaState) -> LuaResult<i32> {
 pub fn ffi_cast(l: &mut LuaState) -> LuaResult<i32> {
     let id = check_ctype(l)?;
     let val = arg(l, 1);
+
+    // A Lua function cast to a function-pointer type becomes a C callback.
+    if val.is_func() {
+        let is_func_type = {
+            let cts = l.global().cts.as_ref();
+            cts.is_some_and(|c| crate::ffi::callback::func_ctype_of(c, id).is_some())
+        };
+        if is_func_type {
+            let cd = crate::ffi::callback::ffi_callback_new(l, id, val)?;
+            push(l, cd);
+            return Ok(1);
+        }
+    }
 
     if let Some(cd) = val.as_cdata() {
         let mut nc = CData::new(id, cd.as_ref().data.len().max(1));
@@ -1571,21 +1738,21 @@ fn array_element(l: &mut LuaState, cd: GcPtr<CData>, idx: i64) -> LuaResult<i32>
         push(l, LuaValue::NIL);
         return Ok(1);
     }
-    // Pointer-arith aliases resolve into their storage cdata; the
-    // resolved address may be negative for `p[-1]` style access.
-    let (base_off, root) = crate::runtime::cdata::resolve_ptr(cd);
-    let data_len = root.as_ref().data.len() as i64;
-    let addr = base_off + idx * elem_sz as i64;
-    if addr < 0 || addr + elem_sz as i64 > data_len {
-        push(l, LuaValue::NIL);
-        return Ok(1);
-    }
-    let data = &root.as_ref().data;
-    let elem_bytes = data[addr as usize..(addr + elem_sz as i64) as usize].to_vec();
-    // Non-scalar elements (structs/arrays) alias the storage so writes
-    // through the sub-cdata propagate.
+    let is_ptr = ctype_isptr(raw_ct.info);
     let elem_raw = cts.raw(elem_typeid);
-    if !crate::ffi::ctype_isnum(elem_raw.info) {
+    let scalar = crate::ffi::ctype_isnum(elem_raw.info);
+
+    // Non-scalar elements (structs/arrays) of an array/struct alias their
+    // storage so writes through the sub-cdata propagate; elements read
+    // through a pointer are copies (arbitrary memory cannot be aliased).
+    if !scalar && !is_ptr {
+        let (off, root) = crate::runtime::cdata::resolve_ptr(cd);
+        let data = &root.as_ref().data;
+        let addr = off + idx.wrapping_mul(elem_sz as i64);
+        if addr < 0 || addr + elem_sz as i64 > data.len() as i64 {
+            push(l, LuaValue::NIL);
+            return Ok(1);
+        }
         let sub = CData {
             ctypeid: elem_typeid,
             data: Box::new([]),
@@ -1596,6 +1763,14 @@ fn array_element(l: &mut LuaState, cd: GcPtr<CData>, idx: i64) -> LuaResult<i32>
         push(l, LuaValue::cdata(p));
         return Ok(1);
     }
+
+    let Some(elem_addr) = cdata_elem_addr(cd, raw_ct, idx, elem_sz) else {
+        push(l, LuaValue::NIL);
+        return Ok(1);
+    };
+    // Read the element bytes. Pointer cdata dereference through the stored
+    // address (arbitrary memory); arrays/structs read from the object's data.
+    let elem_bytes = unsafe { std::slice::from_raw_parts(elem_addr as *const u8, elem_sz) }.to_vec();
     let sub = CData {
         ctypeid: elem_typeid,
         data: elem_bytes.into_boxed_slice(),
@@ -1604,7 +1779,6 @@ fn array_element(l: &mut LuaState, cd: GcPtr<CData>, idx: i64) -> LuaResult<i32>
     };
     // Scalar elements read back as numbers (except 64-bit integers and
     // complex numbers, which stay cdata to preserve precision).
-    let elem_raw = cts.raw(elem_typeid);
     if elem_typeid == crate::ffi::CTypeID::Int64 as u32
         || elem_typeid == crate::ffi::CTypeID::UInt64 as u32
         || crate::ffi::ctype_iscomplex(elem_raw.info)
@@ -1618,6 +1792,36 @@ fn array_element(l: &mut LuaState, cd: GcPtr<CData>, idx: i64) -> LuaResult<i32>
         push(l, LuaValue::cdata(p));
     }
     Ok(1)
+}
+
+/// The in-memory address of element `idx` (byte address), with bounds
+/// checking against the object's known storage when available. Pointer
+/// cdata dereference through their stored address; pointer-arithmetic
+/// aliases resolve to their base object.
+fn cdata_elem_addr(
+    cd: GcPtr<CData>,
+    raw_ct: &CType,
+    idx: i64,
+    elem_sz: usize,
+) -> Option<usize> {
+    let c = cd.as_ref();
+    let is_ptr = ctype_isptr(raw_ct.info);
+    if is_ptr {
+        // Pointer: the object stores the target address in its first bytes.
+        let base = c.get_ptr();
+        if base == 0 {
+            return None;
+        }
+        return Some((base as i64).wrapping_add(idx.wrapping_mul(elem_sz as i64)) as usize);
+    }
+    // Array/struct/alias: resolve to the storage object.
+    let (off, root) = crate::runtime::cdata::resolve_ptr(cd);
+    let data = &root.as_ref().data;
+    let addr = off + idx.wrapping_mul(elem_sz as i64);
+    if addr < 0 || addr + elem_sz as i64 > data.len() as i64 {
+        return None;
+    }
+    Some(unsafe { data.as_ptr().add(addr as usize) } as usize)
 }
 
 fn cdata_index(l: &mut LuaState) -> LuaResult<i32> {
@@ -1849,12 +2053,9 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
         if elem_sz == 0 {
             return Ok(0);
         }
-        let (base_off, root) = crate::runtime::cdata::resolve_ptr(cd);
-        let addr = base_off + idx * elem_sz as i64;
-        let len = root.as_ref().data.len() as i64;
-        if addr < 0 || addr + elem_sz as i64 > len {
+        let Some(addr) = cdata_elem_addr(cd, raw_ct, idx, elem_sz) else {
             return Ok(0);
-        }
+        };
         let mut ebuf = vec![0u8; elem_sz];
         if let Some(src) = val.as_cdata() {
             let src_raw = cts.raw(src.as_ref().ctypeid);
@@ -1913,8 +2114,8 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
         } else {
             write_scalar_value(&mut ebuf, elem_typeid, val.as_number().unwrap_or(0.0));
         }
-        let a = addr as usize;
-        root.as_mut().data[a..a + elem_sz].copy_from_slice(&ebuf);
+        let dst = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, elem_sz) };
+        dst.copy_from_slice(&ebuf);
         return Ok(0);
     }
 
@@ -2117,14 +2318,41 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
     Ok(1)
 }
 
+/// The address a cdata argument carries into a C call: a function pointer's
+/// stored value, else the resolved storage address (aliases included).
+fn cdata_arg_addr(l: &LuaState, cd: crate::gc::GcPtr<crate::runtime::cdata::CData>) -> usize {
+    let is_fp = l
+        .global()
+        .cts
+        .as_ref()
+        .is_some_and(|cts| crate::ffi::callback::is_func_ptr_type(cts, cd.as_ref().ctypeid));
+    if is_fp {
+        return cd.as_ref().get_ptr();
+    }
+    let (off, root) = crate::runtime::cdata::resolve_ptr(cd);
+    (root.as_ref().data.as_ptr() as usize).wrapping_add(off.max(0) as usize)
+}
+
 /// Generic C call: read address from upvalue, marshal args as i64, call, return i64.
 /// When the symbol was declared in a cdef (upvalue 1 = ctypeid), validate
 /// each argument against the declared parameter types first (lj_cconv: a
 /// plain number cannot convert to a pointer type without a cast).
 pub(crate) fn call_c(l: &mut LuaState) -> LuaResult<i32> {
     let addr = l.upvalue(0).as_number().unwrap() as usize;
-    let narg = l.top - l.base;
     let decl_id = l.upvalue(1).as_number().map(|n| n as u32);
+    ffi_call_typed(l, addr, decl_id, 0)
+}
+
+/// Marshal `l.top - l.base - arg_start` arguments (starting at `arg_start`),
+/// call the C function at `addr`, and push its result. `decl_id` is the
+/// function ctype used to validate/marshal the arguments.
+fn ffi_call_typed(
+    l: &mut LuaState,
+    addr: usize,
+    decl_id: Option<u32>,
+    arg_start: usize,
+) -> LuaResult<i32> {
+    let narg = l.top - l.base - arg_start;
 
     // Collect the declared parameter types: the func's field chain.
     let param_types: Vec<u32> = decl_id
@@ -2135,22 +2363,34 @@ pub(crate) fn call_c(l: &mut LuaState) -> LuaResult<i32> {
     let mut cstrs: Vec<CString> = Vec::new();
     let mut cargs: Vec<i64> = Vec::with_capacity(narg);
     for i in 0..narg {
-        let a = arg(l, i);
+        let a = arg(l, arg_start + i);
         if let Some(ptype) = param_types.get(i).copied() {
             // Declared parameter type: pointer params accept cdata /
             // string / nil / lightuserdata, but not plain numbers
             // (lj_cconv.c CCX(P,I) without CCF_CAST).
             let ptype = ptype & 0xFFFF;
-            if let Some(cd) = a.as_cdata() {
-                cargs.push(cd.as_ref().data.as_ptr() as i64);
-                continue;
-            }
             let is_ptr = {
                 let cts = l.global().cts.as_ref().unwrap();
                 let raw = cts.raw(ptype);
                 raw.info >> 28 == CT::Ptr as u32 || raw.info >> 28 == CT::Func as u32
             };
             if is_ptr {
+                if let Some(cd) = a.as_cdata() {
+                    cargs.push(cdata_arg_addr(l, cd) as i64);
+                    continue;
+                }
+                // A Lua function passed to a function-pointer parameter
+                // becomes a C callback (lj_cconv CCV_CTLOT).
+                if a.is_func()
+                    && l.global()
+                        .cts
+                        .as_ref()
+                        .is_some_and(|c| crate::ffi::callback::func_ctype_of(c, ptype).is_some())
+                {
+                    let cd = crate::ffi::callback::ffi_callback_new(l, ptype, a)?;
+                    cargs.push(cd.as_cdata().unwrap().as_ref().get_ptr() as i64);
+                    continue;
+                }
                 if let Some(sid) = a.as_string_id() {
                     let bytes = l.heap().strings.get(sid).to_vec();
                     let cs = CString::new(bytes)
@@ -2181,7 +2421,13 @@ pub(crate) fn call_c(l: &mut LuaState) -> LuaResult<i32> {
             if let Some(n) = a.as_number() {
                 let cts = l.global().cts.as_ref().unwrap();
                 cargs.push(if ctype_is_fp(cts, ptype) {
-                    n.to_bits() as i64
+                    // A 4-byte float rides in the low 32 bits of the
+                    // register; a double uses all 64 bits.
+                    if cts.raw(ptype).size == 4 {
+                        ((n as f32).to_bits() as u64) as i64
+                    } else {
+                        n.to_bits() as i64
+                    }
                 } else {
                     n as i64
                 });
@@ -2203,7 +2449,7 @@ pub(crate) fn call_c(l: &mut LuaState) -> LuaResult<i32> {
             cargs.push(cs.as_ptr() as i64);
             cstrs.push(cs);
         } else if let Some(cd) = a.as_cdata() {
-            cargs.push(cd.as_ref().data.as_ptr() as i64);
+            cargs.push(cdata_arg_addr(l, cd) as i64);
         } else if let Some(n) = a.as_number() {
             cargs.push(n as i64);
         } else {
@@ -2212,17 +2458,50 @@ pub(crate) fn call_c(l: &mut LuaState) -> LuaResult<i32> {
     }
 
     let cts = l.global().cts.as_ref().unwrap();
-    let type_code = decl_id.map(|fid| ffi_type_code(cts, fid)).unwrap_or(0);
-    let v = LuaValue::from_bits(ffi_call_dispatch(
-        addr,
-        type_code,
-        [
-            cargs.first().copied().unwrap_or(0),
-            cargs.get(1).copied().unwrap_or(0),
-        ],
-    ));
+    let ret_tid = decl_id.map(|fid| ccall_ret_type(cts, fid));
+    let ret_fp = ret_tid.map(|t| ctype_is_fp(cts, t)).unwrap_or(false);
+    let mut arg_fp = 0u64;
+    if let Some(fid) = decl_id {
+        for (i, p) in ccall_param_types(cts, fid).iter().enumerate() {
+            if ctype_is_fp(cts, *p & 0xFFFF) {
+                arg_fp |= 1 << i;
+            }
+        }
+    }
+    let bits = ffi_call_dispatch(addr, ret_fp, &cargs, arg_fp);
+    let v = encode_ffi_result(l, ret_tid, bits);
+    // A callback invoked during the C call may have raised an error; surface
+    // it now (the C frame has returned).
+    if let Some(err) = l.global().ffi_cb_error.take() {
+        l.errval = err;
+        return Err(crate::LuaError::Runtime);
+    }
     push(l, v);
     Ok(1)
+}
+
+/// `__call` for a cdata value: a ctype value allocates an instance
+/// (`ffi.new`), a function pointer invokes the C function at its address
+/// (which may be a callback trampoline).
+fn cdata_call(l: &mut LuaState) -> LuaResult<i32> {
+    let v = arg(l, 0);
+    let Some(cd) = v.as_cdata() else {
+        return Err(err_bad_arg(l, 1, "cdata __call", "cdata", ""));
+    };
+    let c = cd.as_ref();
+    if c.ctypeid == CTypeID::CTypeIDType as u32 {
+        return ffi_new(l);
+    }
+    let fid = l
+        .global()
+        .cts
+        .as_ref()
+        .and_then(|cts| crate::ffi::callback::func_ctype_of(cts, c.ctypeid));
+    let Some(fid) = fid else {
+        return Err(l.runtime_error(b"attempt to call a non-function cdata"));
+    };
+    let addr = c.get_ptr();
+    ffi_call_typed(l, addr, Some(fid), 1)
 }
 
 fn type_name_of(_l: &LuaState, v: LuaValue) -> String {
@@ -2398,9 +2677,10 @@ pub fn open(l: &mut LuaState) {
             env,
             upvals: vec![],
         }));
-        // Calling a type value allocates an instance (ffi.new).
+        // Calling a type value allocates an instance; a function pointer
+        // invokes the C function (dispatch in cdata_call).
         let call_fn = g.heap.alloc_func(GcFunc::C(CClosure {
-            f: ffi_new,
+            f: cdata_call,
             env,
             upvals: vec![],
         }));
