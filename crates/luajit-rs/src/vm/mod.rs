@@ -57,6 +57,13 @@ pub fn run_finalizers(l: &mut LuaState) -> LuaResult<()> {
         // The finalizer ran: the object is now dead for the *next* cycle.
         let mo = crate::meta::meta_lookup(g, o.value(), MM::Gc);
         o.mark_finalized(g.heap.current_white);
+        if let crate::runtime::gc::Finalizable::CLib(cd) = &o {
+            // A dead CLibrary cdata releases its library reference directly
+            // (no Lua __gc; the library is dlclosed at refcount zero).
+            let idx = u64::from_le_bytes(cd.as_ref().data[..8].try_into().unwrap()) as usize;
+            crate::ffi::clib::gc_release(g, idx);
+            continue;
+        }
         if mo.is_nil() {
             continue;
         }

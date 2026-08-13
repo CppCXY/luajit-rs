@@ -14,7 +14,7 @@
 //! Reference: LuaJIT/src/lj_ctype.h, lj_cdata.h, lj_cparse.h
 
 pub(crate) mod callback;
-mod clib;
+pub(crate) mod clib;
 pub(crate) mod lib;
 mod parser;
 

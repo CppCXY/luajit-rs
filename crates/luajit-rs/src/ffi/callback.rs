@@ -171,6 +171,11 @@ fn stack_arg_addr(frame: &CCallbackFrame, slot: usize) -> *const u64 {
     {
         (frame.entry_rsp + slot * 8) as *const u64
     }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (frame, slot);
+        std::ptr::null()
+    }
 }
 
 /// Read the raw bits of the `i`-th argument from the saved frame, applying
@@ -377,50 +382,54 @@ pub fn ffi_callback_new(l: &mut LuaState, ctype_id: u32, func: LuaValue) -> LuaR
 
     // Emit the trampoline.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    let code = {
-        let cts_addr = l.global().cts.as_mut().unwrap() as *mut CTState as usize;
+    {
+        let code = {
+            let cts_addr = l.global().cts.as_mut().unwrap() as *mut CTState as usize;
+            let cb_id = l.global().cts.as_ref().unwrap().callbacks.len() as u32;
+            let handler = ffi_cb_handler as *const () as usize;
+            emit_trampoline(handler, cts_addr, cb_id)
+        };
+
+        let mut area = McodeArea::alloc(code.bytes.len().max(256))
+            .ok_or_else(|| l.runtime_error(b"ffi: out of memory for callback"))?;
+        let entry = area.ptr() as usize;
+        area.as_mut_slice()[..code.bytes.len()].copy_from_slice(&code.bytes);
+        area.protect_exec();
+
         let cb_id = l.global().cts.as_ref().unwrap().callbacks.len() as u32;
-        let handler = ffi_cb_handler as *const () as usize;
-        emit_trampoline(handler, cts_addr, cb_id)
-    };
+        l.global()
+            .cts
+            .as_mut()
+            .unwrap()
+            .callbacks
+            .push(Callback {
+                func,
+                func_ctype: fid,
+                mcode: area,
+                addr: entry,
+                freed: false,
+            });
+        l.global()
+            .cts
+            .as_mut()
+            .unwrap()
+            .callback_by_addr
+            .insert(entry, cb_id);
+
+        // The cdata holds the trampoline address; call_c marshals function
+        // pointers via get_ptr().
+        let mut cd = CData::new(ctype_id, 8);
+        cd.set_ptr(entry);
+        let ptr = l.global().heap.alloc_cdata(cd);
+        return Ok(LuaValue::cdata(ptr));
+    }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = ctype_id;
+        let _ = func;
+        let _ = fid;
         return Err(l.runtime_error(b"ffi: callbacks are not supported on this architecture"));
     }
-
-    let mut area = McodeArea::alloc(code.bytes.len().max(256))
-        .ok_or_else(|| l.runtime_error(b"ffi: out of memory for callback"))?;
-    let entry = area.ptr() as usize;
-    area.as_mut_slice()[..code.bytes.len()].copy_from_slice(&code.bytes);
-    area.protect_exec();
-
-    let cb_id = l.global().cts.as_ref().unwrap().callbacks.len() as u32;
-    l.global()
-        .cts
-        .as_mut()
-        .unwrap()
-        .callbacks
-        .push(Callback {
-            func,
-            func_ctype: fid,
-            mcode: area,
-            addr: entry,
-            freed: false,
-        });
-    l.global()
-        .cts
-        .as_mut()
-        .unwrap()
-        .callback_by_addr
-        .insert(entry, cb_id);
-
-    // The cdata holds the trampoline address; call_c marshals function
-    // pointers via get_ptr().
-    let mut cd = CData::new(ctype_id, 8);
-    cd.set_ptr(entry);
-    let ptr = l.global().heap.alloc_cdata(cd);
-    Ok(LuaValue::cdata(ptr))
 }
 
 /// Reject callback signatures with by-value struct/union/array params or a

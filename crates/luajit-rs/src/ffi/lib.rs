@@ -2346,13 +2346,14 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
         let g = l.global();
         let cts = g.cts.as_ref().unwrap();
         let idx = u64::from_le_bytes(cd.as_ref().data[..8].try_into().unwrap()) as usize;
-        let cl = match cts.clibs.get(idx) {
-            Some(cl) if cl.handle != 0 || cl.name == "C" => cl,
-            _ => {
-                push(l, LuaValue::NIL);
-                return Ok(1);
-            }
+        let released = match cts.clibs.get(idx) {
+            Some(cl) => !(cl.handle != 0 || cl.name == "C"),
+            None => true,
         };
+        if released {
+            push(l, LuaValue::NIL);
+            return Ok(1);
+        }
         // A cdef declaration keeps the prototype so the call wrapper can
         // validate arguments against the parameter types.
         let ctypeid = cts.names.get(&name).copied();
@@ -2361,7 +2362,19 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
             .get(&name)
             .cloned()
             .unwrap_or(name.clone());
-        let addr = cl.resolve(&sym_name).unwrap_or(0) as f64;
+        // Resolve (and cache) the address in the library.
+        let addr = {
+            let cts = l.global().cts.as_mut().unwrap();
+            let cl = &mut cts.clibs[idx];
+            match cl.cache.get(&sym_name) {
+                Some(&a) => a,
+                None => {
+                    let a = cl.resolve(&sym_name).unwrap_or(0);
+                    cl.cache.insert(sym_name.clone(), a);
+                    a
+                }
+            }
+        } as f64;
         if addr == 0.0 {
             push(l, LuaValue::NIL);
             return Ok(1);
@@ -3168,6 +3181,78 @@ mod tests {
         "#,
         );
         assert_eq!(r[0].as_number(), Some(42.0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ffi_load_clibrary_released_by_gc() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            -- The library cdata lives on a coroutine: when the coroutine
+            -- dies, its whole stack is freed and the reference is gone.
+            local co = coroutine.create(function()
+                local lib = assert(ffi.load("msvcrt"))
+                local f = lib.atoi
+                assert(f("5") == 5)
+            end)
+            assert(coroutine.resume(co))
+            co = nil
+            -- Several full cycles (including finalizer runs) must release
+            -- the library reference.
+            for _ = 1, 6 do collectgarbage("collect") end
+            return 1
+        "#,
+        );
+        let g = lua.global();
+        let cts = g.cts.as_ref().unwrap();
+        // The released library is uncached and closed (handle 0).
+        assert!(
+            cts.clib_names.get("msvcrt").is_none(),
+            "library uncached after GC release"
+        );
+        let cl = cts
+            .clibs
+            .iter()
+            .find(|cl| cl.name == "msvcrt")
+            .expect("registry entry remains");
+        assert_eq!(cl.refcount, 0, "refcount released by GC");
+        assert_eq!(cl.handle, 0, "library unloaded by GC");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ffi_load_clibrary_released_by_gc() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            local name = nil
+            for _, cand in ipairs({"libc.so.6", "libc.so"}) do
+                if ffi.load(cand) then name = cand break end
+            end
+            assert(name, "no libc found")
+            do
+                local lib = assert(ffi.load(name))
+                local f = lib.atoi
+                assert(f("5") == 5)
+            end
+            for _ = 1, 6 do collectgarbage("collect") end
+            return name
+        "#,
+        );
+        let g = lua.global();
+        let cts = g.cts.as_ref().unwrap();
+        assert!(
+            cts.clib_names.is_empty()
+                || cts.clibs.iter().all(|cl| cl.refcount == 0),
+            "all library references released by GC"
+        );
     }
 
     #[cfg(windows)]

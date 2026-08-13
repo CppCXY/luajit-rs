@@ -10,35 +10,43 @@ pub struct CLib {
     pub name: String,
     /// dlopen/LoadLibrary handle. 0 = default namespace (`ffi.C`).
     pub handle: usize,
-    /// Outstanding `ffi.load` references. Released by `cdata:free()`.
+    /// Outstanding `ffi.load` references. Released by `cdata:free()` or
+    /// GC finalization.
     pub refcount: u32,
+    /// Symbol name → resolved address (per-library resolution cache).
+    pub cache: std::collections::HashMap<String, usize>,
 }
 
 impl CLib {
     /// Open a named library (or the default namespace for ""/"C").
     /// Returns the error message string on failure.
     pub fn load(name: &str, global: bool) -> Result<CLib, String> {
-        let name = normalize_name(name);
-        if name == "C" {
-            // Default namespace: the process handle + system libraries.
-            return Ok(CLib {
-                name,
-                handle: 0,
-                refcount: 0,
-            });
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (name, global);
+            return Err("dynamic libraries not supported on this platform".to_string());
         }
-        let handle = load_library(&name, global).map_err(|e| {
-            format!(
-                "cannot load library '{}': {}",
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let name = normalize_name(name);
+            if name == "C" {
+                // Default namespace: the process handle + system libraries.
+                return Ok(CLib {
+                    name,
+                    handle: 0,
+                    refcount: 0,
+                    cache: std::collections::HashMap::new(),
+                });
+            }
+            let handle = load_library(&name, global)
+                .map_err(|e| format!("cannot load library '{}': {}", name, e))?;
+            Ok(CLib {
                 name,
-                e
-            )
-        })?;
-        Ok(CLib {
-            name,
-            handle,
-            refcount: 0,
-        })
+                handle,
+                refcount: 0,
+                cache: std::collections::HashMap::new(),
+            })
+        }
     }
 
     /// Resolve a symbol within this library (or the default namespace
@@ -47,7 +55,10 @@ impl CLib {
         if self.handle == 0 {
             return resolve_symbol(name);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         let cname = std::ffi::CString::new(name).ok()?;
+        #[cfg(target_arch = "wasm32")]
+        let _ = name;
         #[cfg(windows)]
         unsafe {
             let p = GetProcAddress(self.handle as isize, cname.as_ptr() as *const u8);
@@ -85,6 +96,7 @@ impl CLib {
 
 /// Normalize a `ffi.load` name: empty/"C"/"c" → default namespace; plain
 /// names get platform suffix candidates appended by `load_library`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn normalize_name(name: &str) -> String {
     if name.is_empty() || name == "C" || name == "c" {
         return "C".to_string();
@@ -92,10 +104,30 @@ pub fn normalize_name(name: &str) -> String {
     name.to_string()
 }
 
+/// Release a CLib reference when a CLibrary cdata dies (GC finalization).
+/// Unloads the library when the refcount reaches zero. No-op for stale or
+/// already-released entries.
+pub(crate) fn gc_release(g: &mut crate::state::GlobalState, idx: usize) {
+    let Some(cts) = g.cts.as_mut() else { return };
+    let Some(cl) = cts.clibs.get_mut(idx) else { return };
+    if cl.refcount == 0 {
+        return;
+    }
+    cl.refcount -= 1;
+    if cl.refcount == 0 {
+        let name = cl.name.clone();
+        cl.close();
+        if name != "C" {
+            cts.clib_names.remove(&name);
+        }
+    }
+}
+
 /// Open a library by name, trying platform suffix candidates:
 /// - Windows: `name`, then `name.dll`.
 /// - Linux: `name`, then `name.so`.
 /// - macOS: `name`, then `name.dylib`.
+#[cfg_attr(target_arch = "wasm32", allow(unused))]
 #[cfg_attr(windows, allow(unused_variables))]
 fn load_library(name: &str, global: bool) -> Result<usize, String> {
     let mut candidates: Vec<String> = vec![name.to_string()];
@@ -224,8 +256,15 @@ fn cstr(s: &str) -> std::ffi::CString {
 
 /// Resolve a symbol from the default C library.
 /// Cross-platform: Windows searches all default handles; Unix uses RTLD_DEFAULT.
+#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 pub fn resolve_symbol(name: &str) -> Option<usize> {
+    #[cfg(not(target_arch = "wasm32"))]
     let cname = std::ffi::CString::new(name).ok()?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = name;
+        return None;
+    }
 
     #[cfg(windows)]
     unsafe {

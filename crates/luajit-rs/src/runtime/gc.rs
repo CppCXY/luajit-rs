@@ -790,22 +790,28 @@ pub enum Gray {
 /// still alive).
 pub enum Finalizable {
     UData(GcPtr<GcUserData>),
+    /// A dead CLibrary cdata (`ffi.load`): releases its library reference
+    /// (no Lua `__gc` function; handled by `vm::run_finalizers`).
+    CLib(GcPtr<crate::runtime::cdata::CData>),
 }
 
 impl Finalizable {
     pub fn value(&self) -> LuaValue {
         match self {
             Finalizable::UData(u) => LuaValue::userdata(*u),
+            Finalizable::CLib(cd) => LuaValue::cdata(*cd),
         }
     }
     pub fn metatable(&self) -> Option<GcPtr<LuaTable>> {
         match self {
             Finalizable::UData(u) => u.as_ref().metatable,
+            Finalizable::CLib(_) => None,
         }
     }
     pub fn mark_finalized(&self, current_white: u8) {
         match self {
             Finalizable::UData(u) => gc_header(u.0).make_dead_next(current_white),
+            Finalizable::CLib(cd) => gc_header(cd.0).make_dead_next(current_white),
         }
     }
 }
@@ -865,6 +871,20 @@ impl<'g> Marker<'g> {
                     // However, the metatable must be marked.
                     if let Some(mt) = p.as_ref().metatable {
                         self.mark_table(mt);
+                    }
+                }
+            }
+            LJ_TCDATA => {
+                if let Some(p) = v.as_cdata()
+                    && !p.is_marked()
+                {
+                    p.set_marked();
+                    // Pointer-arith aliases hold a reference to their
+                    // storage cdata; keep it alive (the pool is never
+                    // swept, but liveness feeds finalization and weak
+                    // table clearing).
+                    if let Some(b) = p.as_ref().base {
+                        self.mark_value(LuaValue::cdata(b));
                     }
                 }
             }
@@ -1548,6 +1568,21 @@ fn separate_finalizable(heap: &GcHeap) -> Vec<Finalizable> {
             h.make_undead();
             h.set_finalized();
             out.push(Finalizable::UData(GcPtr(u)));
+        }
+    }
+    // Dead CLibrary cdata (`ffi.load`) release their library reference.
+    // The cdata pool is never swept, so the object stays allocated; the
+    // liveness bits still feed finalization.
+    for i in 0..heap.cdatas.objects.len() {
+        let cd = heap.cdatas.objects[i];
+        let h = gc_header(cd);
+        if !h.marked.get()
+            && !h.is_finalized()
+            && unsafe { cd.as_ref() }.ctypeid == crate::ffi::CTypeID::Clib as u32
+        {
+            h.make_undead();
+            h.set_finalized();
+            out.push(Finalizable::CLib(GcPtr(cd)));
         }
     }
     out
