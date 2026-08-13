@@ -3337,27 +3337,46 @@ mod tests {
             &mut lua,
             r#"
             local ffi = require("ffi")
+            -- Find a loadable libc; drop the probe reference immediately.
             local name = nil
-            for _, cand in ipairs({"libc.so.6", "libc.so"}) do
-                if ffi.load(cand) then name = cand break end
+            for _, cand in ipairs({"libc.so.6", "libc.so",
+                                   "libc.musl-x86_64.so.1", "libc.musl-aarch64.so.1"}) do
+                local probe = ffi.load(cand)
+                if probe then
+                    name = cand
+                    probe:free()
+                    break
+                end
             end
             assert(name, "no libc found")
-            do
+            -- The library cdata lives on a coroutine: when the coroutine
+            -- dies, its whole stack is freed and the reference is gone.
+            local co = coroutine.create(function()
                 local lib = assert(ffi.load(name))
                 local f = lib.atoi
                 assert(f("5") == 5)
-            end
+            end)
+            assert(coroutine.resume(co))
+            co = nil
+            -- Several full cycles (including finalizer runs) must release
+            -- the library reference.
             for _ = 1, 6 do collectgarbage("collect") end
-            return name
+            return 1
         "#,
         );
         let g = lua.global();
         let cts = g.cts.as_ref().unwrap();
+        // The released library is uncached and closed (handle 0).
         assert!(
-            cts.clib_names.is_empty()
-                || cts.clibs.iter().all(|cl| cl.refcount == 0),
-            "all library references released by GC"
+            cts.clib_names.keys().all(|k| !k.starts_with("libc")),
+            "library uncached after GC release"
         );
+        let released = cts
+            .clibs
+            .iter()
+            .filter(|cl| cl.name.starts_with("libc"))
+            .all(|cl| cl.refcount == 0 && cl.handle == 0);
+        assert!(released, "library references released by GC");
     }
 
     #[cfg(windows)]
