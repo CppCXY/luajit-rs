@@ -1,8 +1,152 @@
-//! C library loading — `ffi.C` namespace.
+//! C library loading — `ffi.C` namespace and `ffi.load`.
 //! Port of LuaJIT's `lj_clib.h/c`.
 //!
 //! Provides cross-platform dynamic library loading (dlopen/LoadLibrary)
-//! and symbol resolution (dlsym/GetProcAddress).
+//! and symbol resolution (dlsym/GetProcAddress), both from the default
+//! namespace (`ffi.C`) and from named libraries (`ffi.load`).
+
+/// A loaded C library (or the default namespace, handle 0).
+pub struct CLib {
+    pub name: String,
+    /// dlopen/LoadLibrary handle. 0 = default namespace (`ffi.C`).
+    pub handle: usize,
+    /// Outstanding `ffi.load` references. Released by `cdata:free()`.
+    pub refcount: u32,
+}
+
+impl CLib {
+    /// Open a named library (or the default namespace for ""/"C").
+    /// Returns the error message string on failure.
+    pub fn load(name: &str, global: bool) -> Result<CLib, String> {
+        let name = normalize_name(name);
+        if name == "C" {
+            // Default namespace: the process handle + system libraries.
+            return Ok(CLib {
+                name,
+                handle: 0,
+                refcount: 0,
+            });
+        }
+        let handle = load_library(&name, global).map_err(|e| {
+            format!(
+                "cannot load library '{}': {}",
+                name,
+                e
+            )
+        })?;
+        Ok(CLib {
+            name,
+            handle,
+            refcount: 0,
+        })
+    }
+
+    /// Resolve a symbol within this library (or the default namespace
+    /// when `handle == 0`). `None` when the symbol does not exist.
+    pub fn resolve(&self, name: &str) -> Option<usize> {
+        if self.handle == 0 {
+            return resolve_symbol(name);
+        }
+        let cname = std::ffi::CString::new(name).ok()?;
+        #[cfg(windows)]
+        unsafe {
+            let p = GetProcAddress(self.handle as isize, cname.as_ptr() as *const u8);
+            if !p.is_null() {
+                return Some(p as usize);
+            }
+        }
+        #[cfg(unix)]
+        unsafe {
+            let p = dlsym(self.handle as *mut std::ffi::c_void, cname.as_ptr());
+            if !p.is_null() {
+                return Some(p as usize);
+            }
+        }
+        None
+    }
+
+    /// Close the library (no-op for the default namespace). Only called
+    /// when the refcount reaches zero.
+    pub fn close(&mut self) {
+        if self.handle == 0 {
+            return;
+        }
+        #[cfg(windows)]
+        unsafe {
+            FreeLibrary(self.handle as isize);
+        }
+        #[cfg(unix)]
+        unsafe {
+            dlclose(self.handle as *mut std::ffi::c_void);
+        }
+        self.handle = 0;
+    }
+}
+
+/// Normalize a `ffi.load` name: empty/"C"/"c" → default namespace; plain
+/// names get platform suffix candidates appended by `load_library`.
+pub fn normalize_name(name: &str) -> String {
+    if name.is_empty() || name == "C" || name == "c" {
+        return "C".to_string();
+    }
+    name.to_string()
+}
+
+/// Open a library by name, trying platform suffix candidates:
+/// - Windows: `name`, then `name.dll`.
+/// - Linux: `name`, then `name.so`.
+/// - macOS: `name`, then `name.dylib`.
+#[cfg_attr(windows, allow(unused_variables))]
+fn load_library(name: &str, global: bool) -> Result<usize, String> {
+    let mut candidates: Vec<String> = vec![name.to_string()];
+    if !name.contains('.') {
+        #[cfg(windows)]
+        candidates.push(format!("{}.dll", name));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        candidates.push(format!("{}.so", name));
+        #[cfg(target_os = "macos")]
+        candidates.push(format!("{}.dylib", name));
+    }
+    let mut last_err = String::new();
+    for cand in &candidates {
+        #[cfg(windows)]
+        {
+            let c = match std::ffi::CString::new(cand.as_str()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            unsafe {
+                let h = LoadLibraryA(c.as_ptr() as *const u8);
+                if h != 0 {
+                    return Ok(h as usize);
+                }
+                last_err = format!("{} (error {})", cand, std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(unix)]
+        {
+            let c = match std::ffi::CString::new(cand.as_str()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let flags = if global { RTLD_GLOBAL | RTLD_NOW } else { RTLD_NOW };
+            unsafe {
+                let h = dlopen(c.as_ptr(), flags);
+                if !h.is_null() {
+                    return Ok(h as usize);
+                }
+                let err = dlerror();
+                last_err = if err.is_null() {
+                    format!("cannot open '{}'", cand)
+                } else {
+                    let s = std::ffi::CStr::from_ptr(err).to_string_lossy();
+                    format!("{} ({})", cand, s)
+                };
+            }
+        }
+    }
+    Err(last_err)
+}
 
 /// On Windows, searches these default libraries in order.
 #[cfg(windows)]
@@ -26,7 +170,26 @@ unsafe extern "system" {
     fn LoadLibraryA(name: *const u8) -> isize;
     fn GetProcAddress(h: isize, name: *const u8) -> *const std::ffi::c_void;
     fn GetModuleHandleExA(flags: u32, name: *const u8, out: *mut isize) -> i32;
+    fn FreeLibrary(h: isize) -> i32;
 }
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn dlopen(name: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+    fn dlerror() -> *mut std::ffi::c_char;
+    fn dlclose(handle: *mut std::ffi::c_void) -> i32;
+    fn dlsym(
+        handle: *mut std::ffi::c_void,
+        name: *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_void;
+}
+
+#[cfg(unix)]
+const RTLD_NOW: i32 = 2;
+#[cfg(all(unix, not(target_os = "macos")))]
+const RTLD_GLOBAL: i32 = 0x100;
+#[cfg(target_os = "macos")]
+const RTLD_GLOBAL: i32 = 0x8;
 
 /// Initialise the default library handles on Windows.
 /// Call once at startup, before any symbol resolution.
@@ -84,12 +247,6 @@ pub fn resolve_symbol(name: &str) -> Option<usize> {
         }
     }
     None
-}
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn dlsym(handle: *mut std::ffi::c_void, name: *const std::ffi::c_char)
-    -> *mut std::ffi::c_void;
 }
 
 /// `RTLD_DEFAULT`: 0 on Linux/FreeBSD, but `(void *)-2` on macOS — the

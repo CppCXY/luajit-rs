@@ -1636,6 +1636,12 @@ pub fn start_gc_cycle(g: &mut GlobalState) {
     for &v in g.mmname.iter() {
         m.mark_value(v);
     }
+    // Per-ctype metatables (ffi.metatype, the CLibrary metatable) live
+    // outside any Lua table; root them here (LuaJIT's GCROOT_* — the
+    // ctype metatables sit in the cts's type table, which the GC roots).
+    for mt in g.ctype_mts.iter().flatten() {
+        m.mark_table(*mt);
+    }
     for v in g.io_file_cache.iter().flatten() {
         m.mark_value(*v);
     }

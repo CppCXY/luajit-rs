@@ -29,7 +29,8 @@ direction and review.
   - portable IR executor fallback (also used on WebAssembly).
 - **Precise incremental garbage collector** with trace GC safe points.
 - **FFI** with `cdef` parser, `new`/`cast`/`sizeof`/`alignof`, C types
-  (struct/union/enum/complex/arrays/pointers), and native C function calls.
+  (struct/union/enum/complex/arrays/pointers), native C function calls,
+  callbacks, and `ffi.load` for named dynamic libraries.
 - **C-style API** (`luajit_rs::api`) — stack-based Lua C API mirror:
   `push_number`/`get_global`/`pcall`/`new_userdata`/`set_metatable` etc.
 - **Interactive REPL**, `-e`, `-l`, `-v`, stdin pipeline, script-file
@@ -105,7 +106,7 @@ with function replacement), `table` (incl. `sort` with custom comparator,
 
 Partially implemented: `ffi` (`cdef`/`new`/`sizeof`/`alignof`/`cast`/
 `typeid`/`typeof`/`abi`/`arch`/`os`/`istype`/`metatype`/`string`/`copy`/
-`fill`/`offsetof`/`errno` — no callbacks, no VLA, no `load`).
+`fill`/`offsetof`/`errno`/`load` — no VLA).
 
 ## Architecture
 

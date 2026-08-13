@@ -291,6 +291,7 @@ pub enum CTypeID {
     PUInt8,
     ACChar,
     CTypeIDType, // CTID_CTYPEID — cdata holding a type ID
+    Clib,        // CTID_CLIB — cdata holding a library (ffi.load)
     Max = 65536,
 }
 
@@ -299,7 +300,7 @@ impl CTypeID {
         if v > 32 {
             panic!("invalid CTypeID")
         }
-        // SAFETY: 0..32 are valid discriminants
+        // SAFETY: 0..=32 are valid discriminants
         unsafe { std::mem::transmute(v) }
     }
     pub const fn to_u32(self) -> u32 {
@@ -358,6 +359,11 @@ pub struct CTState {
     pub callback_by_addr: std::collections::HashMap<usize, u32>,
     /// The thread callbacks run on (a dedicated coroutine, GC-rooted).
     pub callback_thread: Option<crate::state::StateRef>,
+    /// Loaded C libraries (`ffi.load`). Indices are stable and stored in
+    /// CLibrary cdata payloads; released entries keep their slot (handle 0).
+    pub clibs: Vec<crate::ffi::clib::CLib>,
+    /// Normalized library name → registry index (load cache).
+    pub clib_names: std::collections::HashMap<String, usize>,
 }
 
 impl Default for CTState {
@@ -381,6 +387,8 @@ impl CTState {
             callbacks: Vec::new(),
             callback_by_addr: std::collections::HashMap::new(),
             callback_thread: None,
+            clibs: Vec::new(),
+            clib_names: std::collections::HashMap::new(),
         };
         cts.init_predefined();
         cts
@@ -396,7 +404,7 @@ impl CTState {
         let long_flag: u32 = 0;
 
         // Each entry: (info, size)
-        let predefined: [(u32, i32); 25] = [
+        let predefined: [(u32, i32); 26] = [
             // CTID_None
             (ct_info(CT::Attrib, ATTR_BAD), 0),
             // CTID_Void
@@ -462,6 +470,9 @@ impl CTState {
             (ct_info(CT::Array, CONST) | CTypeID::CChar as u32, -1),
             // CTID_CTYPEID
             (ct_info(CT::Enum, ALIGN2) | CTypeID::Int32 as u32, 4),
+            // CTID_CLIB — a library handle (ffi.load); payload holds the
+            // CLib registry index, not a pointer.
+            (ct_info(CT::Ptr, PTR_ALIGN) | CTypeID::Void as u32, PTR_SIZE),
         ];
 
         for (info, size) in &predefined {

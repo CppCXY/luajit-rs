@@ -2320,8 +2320,11 @@ fn cdata_newindex(l: &mut LuaState) -> LuaResult<i32> {
 // ffi.C: lazy symbol resolution and generic C call wrapper
 // ---------------------------------------------------------------------------
 
-/// `ffi.C.__index` — resolve a C symbol on first access and cache it.
+/// `__index` for `ffi.C` (a table) and for CLibrary cdata (`ffi.load`
+/// results). Resolves a C symbol on first access; `ffi.C` caches it in
+/// the table, CLibrary cdata resolve on every access.
 fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
+    let selfv = arg(l, 0);
     let key = arg(l, 1);
     let name = match key.as_string_id() {
         Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
@@ -2330,6 +2333,55 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
             return Ok(1);
         }
     };
+
+    // CLibrary cdata: resolve within its own handle.
+    if let Some(cd) = selfv.as_cdata()
+        && cd.as_ref().ctypeid == CTypeID::Clib as u32
+    {
+        if name == "free" {
+            let m = make_c_callback_method(l, cdata_clib_free);
+            push(l, m);
+            return Ok(1);
+        }
+        let g = l.global();
+        let cts = g.cts.as_ref().unwrap();
+        let idx = u64::from_le_bytes(cd.as_ref().data[..8].try_into().unwrap()) as usize;
+        let cl = match cts.clibs.get(idx) {
+            Some(cl) if cl.handle != 0 || cl.name == "C" => cl,
+            _ => {
+                push(l, LuaValue::NIL);
+                return Ok(1);
+            }
+        };
+        // A cdef declaration keeps the prototype so the call wrapper can
+        // validate arguments against the parameter types.
+        let ctypeid = cts.names.get(&name).copied();
+        let sym_name = cts
+            .symbols
+            .get(&name)
+            .cloned()
+            .unwrap_or(name.clone());
+        let addr = cl.resolve(&sym_name).unwrap_or(0) as f64;
+        if addr == 0.0 {
+            push(l, LuaValue::NIL);
+            return Ok(1);
+        }
+        let mut upvals = vec![LuaValue::number(addr)];
+        if let Some(id) = ctypeid {
+            upvals.push(LuaValue::number(id as f64));
+        }
+        let g = l.global() as *mut GlobalState;
+        let env = unsafe { (*g).globals };
+        let clos = unsafe {
+            (*g).heap.alloc_func(GcFunc::C(CClosure {
+                f: call_c,
+                env,
+                upvals,
+            }))
+        };
+        push(l, LuaValue::func(clos));
+        return Ok(1);
+    }
 
     // Enum constants (`enum { X = 13 }`) resolve to their value.
     if let Some(&v) = cts_of(l).constants.get(&name) {
@@ -2376,6 +2428,43 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
 
     push(l, v);
     Ok(1)
+}
+
+/// `CLibrary:free()` — release the `ffi.load` reference; the library is
+/// unloaded when the last reference is released. The cdata is invalidated
+/// (accessing it afterwards yields nil).
+fn cdata_clib_free(l: &mut LuaState) -> LuaResult<i32> {
+    let cd = arg(l, 0)
+        .as_cdata()
+        .ok_or_else(|| err_bad_arg(l, 1, "cdata:free", "cdata", ""))?;
+    if cd.as_ref().ctypeid != CTypeID::Clib as u32 {
+        return Err(l.runtime_error(b"attempt to free a non-library cdata"));
+    }
+    let idx = u64::from_le_bytes(cd.as_ref().data[..8].try_into().unwrap()) as usize;
+    let refcount = {
+        let cts = l.global().cts.as_ref().unwrap();
+        match cts.clibs.get(idx) {
+            Some(cl) => cl.refcount,
+            None => 0,
+        }
+    };
+    if refcount == 0 {
+        return Err(l.runtime_error(b"library is already freed"));
+    }
+    // Invalidate this cdata before releasing (double-free checks read it).
+    cd.as_mut().data[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    let g = l.global();
+    let cts = g.cts.as_mut().unwrap();
+    let cl = &mut cts.clibs[idx];
+    cl.refcount -= 1;
+    if cl.refcount == 0 {
+        let name = cl.name.clone();
+        cl.close();
+        if name != "C" {
+            cts.clib_names.remove(&name);
+        }
+    }
+    Ok(0)
 }
 
 /// The address a cdata argument carries into a C call: a pointer's stored
@@ -2744,10 +2833,52 @@ pub fn ffi_gc(l: &mut LuaState) -> LuaResult<i32> {
 }
 
 pub fn ffi_load(l: &mut LuaState) -> LuaResult<i32> {
-    push(l, LuaValue::NIL);
-    let sid = l.heap().intern(b"ffi.load not implemented");
-    push(l, l.heap().str_value(sid));
-    Ok(2)
+    let name = arg(l, 0);
+    let name_str = match name.as_string_id() {
+        Some(sid) => String::from_utf8_lossy(l.heap().strings.get(sid)).into_owned(),
+        None => String::new(),
+    };
+    let global = arg(l, 1) == LuaValue::TRUE;
+    let norm = clib::normalize_name(&name_str);
+
+    // Resolve or load the library (cached by normalized name).
+    let loaded = {
+        let cts = cts_of(l);
+        if let Some(&i) = cts.clib_names.get(&norm) {
+            Ok(i)
+        } else {
+            match clib::CLib::load(&norm, global) {
+                Ok(cl) => {
+                    let i = cts.clibs.len();
+                    cts.clibs.push(cl);
+                    cts.clib_names.insert(norm.clone(), i);
+                    Ok(i)
+                }
+                Err(msg) => Err(msg),
+            }
+        }
+    };
+
+    match loaded {
+        Ok(idx) => {
+            let g = l.global();
+            let cts = g.cts.as_mut().unwrap();
+            cts.clibs[idx].refcount += 1;
+            let mut cd = CData::new(CTypeID::Clib as u32, 8);
+            cd.data[..8].copy_from_slice(&(idx as u64).to_le_bytes());
+            let p = g.heap.cdatas.alloc(cd);
+            push(l, LuaValue::cdata(p));
+            Ok(1)
+        }
+        Err(msg) => {
+            l.stack_ensure(l.base + 2);
+            l.stack[l.base] = LuaValue::NIL;
+            let sid = l.heap().intern(msg.as_bytes());
+            l.stack[l.base + 1] = l.heap().str_value(sid);
+            l.top = l.base + 2;
+            Ok(2)
+        }
+    }
 }
 
 pub fn ffi_metatype(l: &mut LuaState) -> LuaResult<i32> {
@@ -2823,6 +2954,26 @@ pub fn open(l: &mut LuaState) {
             .as_mut()
             .set_str(tostring_k, LuaValue::func(tostring_fn));
         g.set_basemt(LJ_TCDATA, Some(cdata_mt));
+    }
+
+    // -- CLibrary metatable (ffi.load results) -------------------------------
+    // Registered per-ctype (ctype_mts[CTID_CLIB]) so `metatable_of` gives
+    // it precedence over the shared cdata metatable.
+    let clib_mt = unsafe { (*g).heap.alloc_table(LuaTable::new(0, 2)) };
+    {
+        let g = unsafe { &mut *g };
+        let index_k = g.mmname[MM::Index as usize];
+        let index_fn = g.heap.alloc_func(GcFunc::C(CClosure {
+            f: clib_index,
+            env,
+            upvals: vec![],
+        }));
+        clib_mt.as_mut().set_str(index_k, LuaValue::func(index_fn));
+        let n = CTypeID::Clib as usize + 1;
+        if g.ctype_mts.len() < n {
+            g.ctype_mts.resize(n, None);
+        }
+        g.ctype_mts[CTypeID::Clib as usize] = Some(clib_mt);
     }
 
     let heap = unsafe { &mut (*g).heap };
@@ -2929,4 +3080,144 @@ fn preload_loader(l: &mut LuaState) -> LuaResult<i32> {
     l.stack[l.base] = LuaValue::table(t);
     l.top = l.base + 1;
     Ok(1)
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use crate::state::Lua;
+    use crate::stdlib::open_libs;
+    use crate::value::LuaValue;
+    use crate::vm::call;
+
+    fn run(lua: &mut Lua, src: &str) -> Vec<LuaValue> {
+        let f =
+            crate::state::load(lua.main(), src.as_bytes().to_vec(), "=ffi_load_test").unwrap();
+        call(lua.main(), f, &[]).unwrap()
+    }
+
+    #[test]
+    fn ffi_load_default_namespace_resolves_symbols() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            local C = assert(ffi.load())
+            assert(type(C.atoi) == "function")
+            return C.atoi("4242")
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(4242.0));
+    }
+
+    #[test]
+    fn ffi_load_error_path_returns_nil_and_message() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            local lib, err = ffi.load("no_such_library_xyz_123")
+            assert(lib == nil)
+            assert(type(err) == "string")
+            assert(err:match("no_such_library_xyz_123") ~= nil)
+            return 1
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn ffi_load_refcount_and_free() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            local a = assert(ffi.load())
+            local b = assert(ffi.load())
+            a:free()
+            assert(b.atoi("7") == 7, "lib usable after one free")
+            b:free()
+            local ok, e = pcall(function() b:free() end)
+            assert(not ok and e:match("already freed"), "double free errors: " .. tostring(e))
+            assert(b.atoi == nil, "freed cdata resolves nil")
+            return 1
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn ffi_load_survives_gc() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            local lib = assert(ffi.load())
+            for _ = 1, 8 do collectgarbage("collect") end
+            assert(type(lib.atoi) == "function", "library usable after GC")
+            return lib.atoi("42")
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(42.0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ffi_load_named_library() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            local lib = assert(ffi.load("msvcrt"))
+            assert(type(lib.printf) == "function")
+            return lib.atoi("1234")
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(1234.0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ffi_load_named_library() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            local lib = ffi.load("libc.so.6") or ffi.load("libc.so")
+            assert(lib, "cannot load libc")
+            return lib.atoi("1234")
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(1234.0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ffi_load_named_library() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            local lib = ffi.load("/usr/lib/libSystem.B.dylib") or ffi.load("libSystem.B.dylib")
+            assert(lib, "cannot load libSystem")
+            return lib.atoi("1234")
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(1234.0));
+    }
 }
