@@ -9,8 +9,7 @@ use std::ffi::CString;
 use crate::err::LuaResult;
 use crate::ffi::clib;
 use crate::ffi::parser::parse;
-use crate::ffi::{CT, CTState, CType, CTypeID, ct_info, ctype_align, ctype_cid, ctype_ispointer, ctype_isptr};
-use crate::func::{CClosure, CFunction, GcFunc};
+use crate::ffi::{CT, CTState, CType, CTypeID, ct_info, ctinfo, ctype_align, ctype_cid, ctype_ispointer, ctype_isptr};use crate::func::{CClosure, CFunction, GcFunc};
 use crate::gc::GcPtr;
 use crate::meta::MM;
 use crate::runtime::cdata::CData;
@@ -398,6 +397,31 @@ fn check_ctype(l: &mut LuaState) -> LuaResult<u32> {
 /// incl. pointer suffixes, arrays, and inline declarations).
 fn check_type_name(l: &mut LuaState, name: &str) -> LuaResult<u32> {
     let trimmed = name.trim();
+    /// Is `cand` a known base type (scalar, typedef, or struct/union/enum
+    /// tag from an earlier cdef)?
+    fn known_base(l: &mut LuaState, cand: &str) -> bool {
+        let cand_cv = strip_cv(cand);
+        quick_type_id(&cand_cv).is_some()
+            || quick_type_id(cand).is_some()
+            || l.global()
+                .cts
+                .as_ref()
+                .is_some_and(|c| c.names.contains_key(&cand_cv))
+            || l.global()
+                .cts
+                .as_ref()
+                .is_some_and(|c| c.names.contains_key(cand))
+            || cand_cv
+                .strip_prefix("struct ")
+                .or_else(|| cand_cv.strip_prefix("union "))
+                .or_else(|| cand_cv.strip_prefix("enum "))
+                .is_some_and(|tag| {
+                    l.global()
+                        .cts
+                        .as_ref()
+                        .is_some_and(|c| c.tags.contains_key(tag))
+                })
+    }
     // Complex abstract declarators: `int (*(*[1][2])[3][4])[5][6]`,
     // `int (*const)(void)`. The base is the longest known type prefix;
     // the remainder is parsed as a declarator.
@@ -415,18 +439,7 @@ fn check_type_name(l: &mut LuaState, name: &str) -> LuaResult<u32> {
                 if cand.is_empty() {
                     continue;
                 }
-                let cand_cv = strip_cv(cand);
-                let known = quick_type_id(&cand_cv).is_some()
-                    || quick_type_id(cand).is_some()
-                    || l.global()
-                        .cts
-                        .as_ref()
-                        .is_some_and(|c| c.names.contains_key(&cand_cv))
-                    || l.global()
-                        .cts
-                        .as_ref()
-                        .is_some_and(|c| c.names.contains_key(cand));
-                if known && cand.len() > best_len {
+                if known_base(l, cand) && cand.len() > best_len {
                     best = i - 1;
                     best_len = cand.len();
                 }
@@ -442,14 +455,7 @@ fn check_type_name(l: &mut LuaState, name: &str) -> LuaResult<u32> {
         }
     };
     // The whole name may itself be a base ("complex float", typedefs).
-    let whole_cv = strip_cv(trimmed);
-    if !declarator.is_empty()
-        && (quick_type_id(&whole_cv).is_some()
-            || l.global()
-                .cts
-                .as_ref()
-                .is_some_and(|c| c.names.contains_key(&whole_cv)))
-    {
+    if !declarator.is_empty() && known_base(l, &strip_cv(trimmed)) {
         return resolve_base_type(l, trimmed);
     }
 
@@ -478,6 +484,17 @@ fn resolve_base_type(l: &mut LuaState, name: &str) -> LuaResult<u32> {
         return Ok(id);
     }
     if let Some(&id) = l.global().cts.as_ref().and_then(|c| c.names.get(&name_cv)) {
+        return Ok(id);
+    }
+    // Tag lookup: `struct/union/enum` tags registered by earlier cdefs
+    // (`struct s`, `union u`, `enum e`).
+    let tag = name_cv
+        .strip_prefix("struct ")
+        .or_else(|| name_cv.strip_prefix("union "))
+        .or_else(|| name_cv.strip_prefix("enum "));
+    if let Some(tag) = tag
+        && let Some(&id) = l.global().cts.as_ref().and_then(|c| c.tags.get(tag))
+    {
         return Ok(id);
     }
     let cts = cts_of(l);
@@ -842,6 +859,28 @@ pub fn ffi_cdef(l: &mut LuaState) -> LuaResult<i32> {
     Ok(0)
 }
 
+/// For a VLA struct (trailing `[?]` member): `(elem_type_id, elem_size)`.
+/// `None` for non-VLA structs. Walks the field sib chain.
+fn vla_member(cts: &CTState, struct_id: u32) -> Option<(u32, usize)> {
+    let st = cts.raw(struct_id);
+    if st.info & ctinfo::VLA == 0 {
+        return None;
+    }
+    let mut cur = st.info & 0xFFFF;
+    let mut guard = 0;
+    while cur != 0 && guard < 64 {
+        guard += 1;
+        let f = cts.get(cur);
+        let ft = cts.raw(f.info & 0xFFFF);
+        if ft.size == u32::MAX {
+            let elem = cts.raw(ctype_cid(ft.info));
+            return Some((ctype_cid(ft.info), elem.size.max(1) as usize));
+        }
+        cur = f.sib as u32;
+    }
+    None
+}
+
 pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
     let id = check_ctype(l)?;
     // A function initializer for a function-pointer type becomes a callback.
@@ -856,9 +895,29 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
         push(l, cd);
         return Ok(1);
     }
-    let ct = cts_of(l).raw(id);
-    let size = if ct.size != u32::MAX {
-        ct.size as usize
+    let (ct_size, ct_info) = {
+        let ct = cts_of(l).raw(id);
+        (ct.size, ct.info)
+    };
+    // A VLA struct (trailing `[?]` member): the first extra argument is
+    // the element count; the allocation is the fixed prefix plus the tail.
+    let vla = if crate::ffi::ctype_isstruct(ct_info) && ct_info & ctinfo::VLA != 0 {
+        vla_member(cts_of(l), id)
+    } else {
+        None
+    };
+    let size = if let Some((_, esz)) = vla {
+        let count = if nargs(l) > 1 {
+            arg(l, 1).as_number().unwrap_or(0.0) as usize
+        } else {
+            0
+        };
+        if count == 0 {
+            return Err(l.runtime_error(b"ffi: missing VLA size"));
+        }
+        ct_size as usize + count * esz.max(1)
+    } else if ct_size != u32::MAX {
+        ct_size as usize
     } else {
         0
     };
@@ -929,7 +988,10 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
             let v2 = arg(l, 1);
             if nvals > 1 && crate::ffi::ctype_isstruct(cts_of(l).raw(id).info) {
                 // Struct with sequential field initializers
-                // (ffi.new("struct { int a,b,c; }", 1, 2, 3)).
+                // (ffi.new("struct { int a,b,c; }", 1, 2, 3)). For a VLA
+                // struct the first extra argument is the element count
+                // (already consumed by the allocation); field values start
+                // after it and any remaining arguments fill the tail.
                 let fields: Vec<(u32, u32)> = {
                     let raw = cts_of(l).raw(id);
                     let mut cur = raw.info & 0xFFFF; // First field (struct info).
@@ -942,15 +1004,43 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
                     }
                     out
                 };
+                let arg_base = if vla.is_some() { 2 } else { 1 };
                 for (fi, &(ftype, foff)) in fields.iter().enumerate() {
-                    let arg_i = fi + 1;
+                    let (ftype_size, ftype_info) = {
+                        let c = cts_of(l).raw(ftype);
+                        (c.size, c.info)
+                    };
+                    if ftype_size == u32::MAX {
+                        // The VLA member: remaining arguments fill its
+                        // elements in order.
+                        let elem_id = crate::ffi::ctype_cid(ftype_info);
+                        let esz = cts_of(l).raw(elem_id).size.max(1) as usize;
+                        for ai in (fi + arg_base)..=nvals {
+                            let v = arg(l, ai);
+                            let off = foff as usize + (ai - (fi + arg_base)) * esz;
+                            if let Some(n) = v.as_number() {
+                                let mut ebuf = vec![0u8; esz];
+                                write_scalar_value(&mut ebuf, elem_id, n);
+                                if off + esz <= cd.data.len() {
+                                    cd.data[off..off + esz].copy_from_slice(&ebuf);
+                                }
+                            } else if let Some(src) = v.as_cdata()
+                                && off + esz <= cd.data.len()
+                            {
+                                let n = src.as_ref().data.len().min(esz);
+                                cd.data[off..off + n]
+                                    .copy_from_slice(&src.as_ref().data[..n]);
+                            }
+                        }
+                        break;
+                    }
+                    let arg_i = fi + arg_base;
                     if arg_i > nvals {
                         break;
                     }
                     let v = arg(l, arg_i);
 
-                    let ftype_raw = cts_of(l).raw(ftype);
-                    let sz = ftype_raw.size as usize;
+                    let sz = ftype_size as usize;
                     if let Some(n) = v.as_number() {
                         let mut ebuf = vec![0u8; sz.max(1)];
                         write_scalar_value(&mut ebuf, ftype, n);
@@ -958,7 +1048,7 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
                             cd.data[foff as usize..foff as usize + sz].copy_from_slice(&ebuf);
                         }
                     } else if let Some(src) = v.as_cdata() {
-                        if crate::ffi::ctype_ispointer(ftype_raw.info) {
+                        if crate::ffi::ctype_ispointer(ftype_info) {
                             // Pointer field: store the storage address.
                             let (off, root) = crate::runtime::cdata::resolve_ptr(src);
                             let addr = (root.as_ref().data.as_ptr() as i64).wrapping_add(off);
@@ -1112,15 +1202,13 @@ pub fn ffi_sizeof(l: &mut LuaState) -> LuaResult<i32> {
             // A ffi.typeof value: resolve the underlying type (a
             // variable-length array takes an explicit count).
             let id = u32::from_le_bytes(c.data[..4].try_into().unwrap_or([0; 4]));
-            let ct = cts_of(l).raw(id);
-            let (ct_size, ct_info) = (ct.size, ct.info);
-            if nargs > 1 && ct_size == u32::MAX {
-                let n = arg(l, 1).as_number().unwrap_or(0.0) as usize;
-                let elem = cts_of(l).raw(ctype_cid(ct_info)).size as usize;
-                push(l, LuaValue::number((n * elem) as f64));
+            let count = if nargs > 1 {
+                arg(l, 1).as_number().map(|n| n as usize)
             } else {
-                push(l, LuaValue::number(ct_size as f64));
-            }
+                None
+            };
+            let sz = ctype_size_of(cts_of(l), id, count);
+            push(l, LuaValue::number(sz));
             return Ok(1);
         }
         // A cdata instance reports its own (allocated) size.
@@ -1128,17 +1216,34 @@ pub fn ffi_sizeof(l: &mut LuaState) -> LuaResult<i32> {
         return Ok(1);
     }
     let id = check_ctype(l)?;
-    let ct = cts_of(l).raw(id);
-    let (ct_size, ct_info) = (ct.size, ct.info);
-    if nargs > 1 && ct_size == u32::MAX {
-        // Variable-length array: size = count * element size.
-        let n = arg(l, 1).as_number().unwrap_or(0.0) as usize;
-        let elem = cts_of(l).raw(ctype_cid(ct_info)).size as usize;
-        push(l, LuaValue::number((n * elem) as f64));
+    let count = if nargs > 1 {
+        arg(l, 1).as_number().map(|n| n as usize)
     } else {
-        push(l, LuaValue::number(ct_size as f64));
-    }
+        None
+    };
+    let sz = ctype_size_of(cts_of(l), id, count);
+    push(l, LuaValue::number(sz));
     Ok(1)
+}
+
+/// The size of a type, optionally with a runtime element count:
+/// - `?` array: `count * elem` (without a count: `u32::MAX`).
+/// - VLA struct: `fixed + count * elem` (without a count: the fixed part).
+/// - anything else: the static size.
+fn ctype_size_of(cts: &CTState, id: u32, count: Option<usize>) -> f64 {
+    let ct = cts.raw(id);
+    if crate::ffi::ctype_isstruct(ct.info) && ct.info & ctinfo::VLA != 0 {
+        let (_, esz) = vla_member(cts, id).expect("VLA struct without a VLA member");
+        return (ct.size as usize + count.unwrap_or(0) * esz) as f64;
+    }
+    if ct.size == u32::MAX {
+        let Some(n) = count else {
+            return ct.size as f64;
+        };
+        let elem = cts.raw(ctype_cid(ct.info)).size as usize;
+        return (n * elem) as f64;
+    }
+    ct.size as f64
 }
 
 pub fn ffi_alignof(l: &mut LuaState) -> LuaResult<i32> {
@@ -3304,5 +3409,85 @@ mod tests {
         "#,
         );
         assert_eq!(r[0].as_number(), Some(1234.0));
+    }
+
+    #[test]
+    fn ffi_struct_tag_resolution() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            ffi.cdef("struct p { int x; };")
+            assert(ffi.sizeof("struct p") == 4)
+            local v = ffi.new("struct p", 7)
+            assert(v.x == 7)
+            return v.x
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(7.0));
+    }
+
+    #[test]
+    fn ffi_vla_struct_new_sizeof_access() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            ffi.cdef("struct s { int len; int data[?]; }; typedef struct s S;")
+            -- allocation: count + field init + element inits
+            local s = ffi.new("struct s", 4, 99, 1, 2, 3, 4)
+            assert(s.len == 99, "field init")
+            for i = 0, 3 do assert(s.data[i] == i + 1, "elem " .. i) end
+            assert(ffi.sizeof(s) == 20, "instance size")
+            assert(ffi.sizeof("struct s") == 4, "fixed part")
+            assert(ffi.sizeof("struct s", 4) == 20, "type size with count")
+            -- typedef'd name
+            local t = ffi.new("S", 2)
+            t.len = 2
+            t.data[0] = 7
+            t.data[1] = 8
+            assert(t.data[1] == 8)
+            assert(ffi.sizeof("S", 2) == 12)
+            -- standalone VLA array
+            local a = ffi.new("int[?]", 3, 5)
+            assert(a[0] == 5 and a[2] == 5)
+            assert(ffi.sizeof(a) == 12)
+            assert(ffi.sizeof("int[?]", 3) == 12)
+            return 1
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(1.0));
+    }
+
+    #[test]
+    fn ffi_vla_errors() {
+        let mut lua = Lua::new();
+        open_libs(lua.main());
+        let r = run(
+            &mut lua,
+            r#"
+            local ffi = require("ffi")
+            ffi.cdef("struct s { int len; int data[?]; };")
+            -- missing VLA size
+            local ok, e = pcall(function() ffi.new("struct s") end)
+            assert(not ok and e:match("missing VLA size"), tostring(e))
+            -- VLA member must be last
+            local ok2, e2 = pcall(function()
+                ffi.cdef("struct bad { int a[?]; int b; };")
+            end)
+            assert(not ok2 and e2:match("must be the last field"), tostring(e2))
+            -- only one VLA member
+            local ok3 = pcall(function()
+                ffi.cdef("struct bad2 { int a[?]; int b[?]; };")
+            end)
+            assert(not ok3)
+            return 1
+        "#,
+        );
+        assert_eq!(r[0].as_number(), Some(1.0));
     }
 }

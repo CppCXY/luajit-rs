@@ -683,12 +683,18 @@ impl<'a> Parser<'a> {
         let mut field_infos: Vec<(String, u32, u32)> = Vec::new(); // (name, type_id, offset)
         let mut field_ids: Vec<u32> = Vec::new();
         let mut prev_fdecl_type: Option<u32> = None;
+        let mut vla_member_type: Option<u32> = None;
         let mut guard: usize = 0;
 
         while self.tok != Token::RBrace && self.tok != Token::Eof {
             guard += 1;
             if guard > 10000 {
                 return Err(format!("infinite loop in struct body, tok={:?}", self.tok));
+            }
+            // A VLA member must be the last field: anything after it is an
+            // error (the member size is only resolved at allocation time).
+            if vla_member_type.is_some() {
+                return Err("ffi: variable-length array member must be the last field".to_string());
             }
             // `type a, b, c;` — a comma-separated field name continues
             // with the previous declaration specifier.
@@ -729,6 +735,7 @@ impl<'a> Parser<'a> {
             // one-element `t[1]` is an array type.
             let mut array_multiplier: u32 = 1;
             let mut is_array = false;
+            let mut is_vla = false;
             while self.tok == Token::LBracket {
                 is_array = true;
                 self.next(); // eat [
@@ -737,6 +744,7 @@ impl<'a> Parser<'a> {
                     // Variable-length array: size u32::MAX, resolved at
                     // allocation time.
                     array_num = u32::MAX;
+                    is_vla = true;
                     self.next();
                 } else if self.tok == Token::Integer {
                     if let Ok(n) = String::from_utf8_lossy(&self.lex.buf).parse::<u32>() {
@@ -751,6 +759,10 @@ impl<'a> Parser<'a> {
                     self.next(); // eat ]
                 }
                 array_multiplier = array_multiplier.saturating_mul(array_num);
+            }
+
+            if is_vla && vla_member_type.is_some() {
+                return Err("ffi: only one variable-length array member is allowed".to_string());
             }
 
             let field_type_id = if array_multiplier > 1 || is_array {
@@ -777,6 +789,15 @@ impl<'a> Parser<'a> {
             } else {
                 fdecl.type_id
             };
+            if is_vla {
+                // The VLA member must be the last field (its size is
+                // resolved at allocation time).
+                if is_union {
+                    return Err("ffi: variable-length array member in a union is not allowed"
+                        .to_string());
+                }
+                vla_member_type = Some(field_type_id);
+            }
             // Comma-separated fields (`type a, b;`) share the *computed*
             // field type (an array declarator changes it).
             prev_fdecl_type = Some(field_type_id);
@@ -801,7 +822,12 @@ impl<'a> Parser<'a> {
             }
 
             // Extract field info before any mutable ops on cts
-            let field_size = {
+            let field_size = if is_vla {
+                // The VLA member contributes no bytes to the (fixed)
+                // struct size; its offset marks the tail.
+                let ct = self.cts.get(field_type_id);
+                (0u64, 1u32 << ctype_align(ct.info))
+            } else {
                 let ct = self.cts.get(field_type_id);
                 (ct.size as u64, 1u32 << ctype_align(ct.info))
             };
@@ -855,9 +881,14 @@ impl<'a> Parser<'a> {
         // The struct type itself (insert at end, after fields). A
         // previously forward-declared tag gets its entry completed.
         let first_field = field_ids.first().copied().unwrap_or(0);
-        let sinfo = ct_info(CT::Struct, if is_union { ctinfo::UNION } else { 0 })
+        let mut sinfo = ct_info(CT::Struct, if is_union { ctinfo::UNION } else { 0 })
             | first_field
             | (max_align.trailing_zeros() << ctinfo::SHIFT_ALIGN);
+        if vla_member_type.is_some() {
+            // A trailing `[?]` member: the struct size is the fixed prefix;
+            // allocation resolves the tail size at runtime.
+            sinfo |= ctinfo::VLA;
+        }
         let struct_id = if let Some(tag) = &tag
             && let Some(&fwd_id) = self.cts.tags.get(tag)
         {

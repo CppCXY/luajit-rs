@@ -106,7 +106,7 @@ with function replacement), `table` (incl. `sort` with custom comparator,
 
 Partially implemented: `ffi` (`cdef`/`new`/`sizeof`/`alignof`/`cast`/
 `typeid`/`typeof`/`abi`/`arch`/`os`/`istype`/`metatype`/`string`/`copy`/
-`fill`/`offsetof`/`errno`/`load` — no VLA).
+`fill`/`offsetof`/`errno`/`load` — incl. VLA `[?]` arrays and structs).
 
 ## Architecture
 
