@@ -1028,9 +1028,10 @@ mod tests {
     fn hopeless_side_exit_gets_blacklisted() {
         let mut lua = Lua::new();
         open_libs(lua.main());
-        // The taken branch calls an unrecordable builtin, so every side
-        // trace attempt aborts; after hotexit+tryside tries the exit is
-        // parked with SNAPCOUNT_DONE and never re-examined.
+        // The taken branch calls an unrecordable builtin (math.random is
+        // deliberately not recorded — stateful IR), so every side trace
+        // attempt aborts; after hotexit+tryside tries the exit is parked
+        // with SNAPCOUNT_DONE and never re-examined.
         let (f, pt) = load_proto(
             &mut lua,
             "local mr = math.random \

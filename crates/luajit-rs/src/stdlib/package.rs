@@ -17,6 +17,24 @@ use crate::{
 
 use super::{arg, err_bad_arg_type, push};
 
+// ── C-function trampoline factory ────────────────────────────────────────
+//
+// The engine itself has no machine-code bridge from a raw C function
+// pointer to a callable Lua closure. `luajit-rs-cpi` (the C API crate)
+// provides one and installs it here at startup; `package.loadlib` uses it
+// to wrap `luaopen_*` symbols from dynamic libraries. Without the factory,
+// loadlib reports dynamic loading as unavailable.
+
+type CfuncFactory = fn(*const std::ffi::c_void) -> Option<crate::func::CFunction>;
+
+static CFUNC_FACTORY: std::sync::OnceLock<CfuncFactory> = std::sync::OnceLock::new();
+
+/// Install the C-function trampoline factory. Call once at startup (the
+/// cpi crate's `install_factory` does this).
+pub fn set_cfunc_factory(f: CfuncFactory) {
+    let _ = CFUNC_FACTORY.set(f);
+}
+
 // ── constants ───────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
@@ -308,16 +326,77 @@ fn lib_searchpath(l: &mut LuaState) -> LuaResult<i32> {
 // ── package.loadlib ─────────────────────────────────────────────────────────
 
 fn lib_loadlib(l: &mut LuaState) -> LuaResult<i32> {
-    let n = 3usize;
-    l.stack_ensure(l.base + n);
-    l.stack[l.base] = LuaValue::NIL;
-    l.stack[l.base + 1] = l.heap().str_value(
-        l.heap()
-            .intern(b"dynamic libraries not enabled; no support for target OS"),
-    );
-    l.stack[l.base + 2] = l.heap().str_value(l.heap().intern(b"absent"));
-    l.top = l.base + n;
-    Ok(3)
+    let libname = arg(l, 0);
+    let funcname = arg(l, 1);
+    let lib_bytes = match libname.as_string_id() {
+        Some(sid) => l.str_static(sid).to_vec(),
+        None => return Err(err_bad_arg_type(l, 1, "loadlib", "string", libname)),
+    };
+    let func_bytes = match funcname.as_string_id() {
+        Some(sid) => l.str_static(sid).to_vec(),
+        None => return Err(err_bad_arg_type(l, 2, "loadlib", "string", funcname)),
+    };
+    let lib_str = String::from_utf8_lossy(&lib_bytes).into_owned();
+    let func_str = String::from_utf8_lossy(&func_bytes).into_owned();
+
+    let push_err = |l: &mut LuaState, msg: &str, what: &str| -> LuaResult<i32> {
+        l.stack_ensure(l.base + 3);
+        l.stack[l.base] = LuaValue::NIL;
+        let sid = l.heap().intern(msg.as_bytes());
+        l.stack[l.base + 1] = l.heap().str_value(sid);
+        let sid = l.heap().intern(what.as_bytes());
+        l.stack[l.base + 2] = l.heap().str_value(sid);
+        l.top = l.base + 3;
+        Ok(3)
+    };
+
+    let Some(factory) = CFUNC_FACTORY.get().copied() else {
+        return push_err(
+            l,
+            "dynamic libraries not enabled; link luajit-rs-cpi to load C modules",
+            "absent",
+        );
+    };
+
+    // `loadlib("path", "func")` is the standard form. An empty funcname
+    // falls back to a "path:func" spec (the @-notation is not supported).
+    let mut open_lib = lib_str.clone();
+    let mut open_func = func_str.clone();
+    if open_func.is_empty()
+        && let Some((p, f)) = lib_str.split_once(':')
+    {
+        open_lib = p.to_string();
+        open_func = f.to_string();
+    }
+
+    let cl = match crate::ffi::clib::CLib::load_raw(&open_lib, false) {
+        Ok(cl) => cl,
+        Err(e) => {
+            return push_err(l, &e, "open");
+        }
+    };
+    let addr = match cl.resolve(&open_func) {
+        Some(a) if a != 0 => a,
+        _ => {
+            return push_err(
+                l,
+                &format!("undefined symbol '{}'", open_func),
+                "init",
+            );
+        }
+    };
+    let Some(cf) = factory(addr as *const std::ffi::c_void) else {
+        return push_err(l, "cannot make a C function closure", "init");
+    };
+    let g = l.global();
+    let env = g.globals;
+    let clos = g.heap.alloc_func(crate::func::GcFunc::C(crate::func::CClosure {
+        f: cf,
+        env,
+        upvals: Vec::new(),
+    }));
+    push(l, LuaValue::func(clos));
+    Ok(1)
 }
 
 // ── package.seeall ──────────────────────────────────────────────────────────
@@ -555,12 +634,54 @@ fn loader_c(l: &mut LuaState) -> LuaResult<i32> {
     let mut tried = Vec::new();
     match searchpath(name, &path, b".", LUA_DIRSEP, &mut tried) {
         Some(fname) => {
-            // The library exists, but there is no dynamic loader in this
-            // VM; report it as a broken file (5.1's errorfile).
             let fname_str = String::from_utf8_lossy(&fname).into_owned();
-            let msg = format!("\n\tno file '{}' (broken)", fname_str);
-            push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
-            Ok(1)
+            let open = format!("luaopen_{}", String::from_utf8_lossy(name));
+            let cl = match crate::ffi::clib::CLib::load_raw(&fname_str, false) {
+                Ok(cl) => cl,
+                Err(e) => {
+                    let msg = format!("\n\t{} ({})", fname_str, e);
+                    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+                    return Ok(1);
+                }
+            };
+            let addr = match cl.resolve(&open) {
+                Some(a) if a != 0 => a,
+                _ => {
+                    let msg = format!(
+                        "\n\tno symbol '{}' in '{}'",
+                        open, fname_str
+                    );
+                    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+                    return Ok(1);
+                }
+            };
+            match CFUNC_FACTORY.get().copied() {
+                Some(factory) => {
+                    if let Some(cf) = factory(addr as *const std::ffi::c_void) {
+                        let g = l.global();
+                        let env = g.globals;
+                        let clos =
+                            g.heap.alloc_func(crate::func::GcFunc::C(crate::func::CClosure {
+                                f: cf,
+                                env,
+                                upvals: Vec::new(),
+                            }));
+                        push(l, LuaValue::func(clos));
+                        return Ok(1);
+                    }
+                    let msg = format!("\n\tcannot make a C function closure for '{}'", open);
+                    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+                    Ok(1)
+                }
+                None => {
+                    let msg = format!(
+                        "\n\tno C function support in '{}' (link luajit-rs-cpi)",
+                        fname_str
+                    );
+                    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+                    Ok(1)
+                }
+            }
         }
         None => {
             push(
@@ -597,9 +718,50 @@ fn loader_croot(l: &mut LuaState) -> LuaResult<i32> {
     match searchpath(root.as_bytes(), &path, b".", LUA_DIRSEP, &mut tried) {
         Some(fname) => {
             let fname_str = String::from_utf8_lossy(&fname).into_owned();
-            let msg = format!("\n\tno file '{}' (broken)", fname_str);
-            push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
-            Ok(1)
+            let open = format!("luaopen_{}", root);
+            let cl = match crate::ffi::clib::CLib::load_raw(&fname_str, false) {
+                Ok(cl) => cl,
+                Err(e) => {
+                    let msg = format!("\n\t{} ({})", fname_str, e);
+                    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+                    return Ok(1);
+                }
+            };
+            let addr = match cl.resolve(&open) {
+                Some(a) if a != 0 => a,
+                _ => {
+                    let msg = format!("\n\tno symbol '{}' in '{}'", open, fname_str);
+                    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+                    return Ok(1);
+                }
+            };
+            match CFUNC_FACTORY.get().copied() {
+                Some(factory) => {
+                    if let Some(cf) = factory(addr as *const std::ffi::c_void) {
+                        let g = l.global();
+                        let env = g.globals;
+                        let clos =
+                            g.heap.alloc_func(crate::func::GcFunc::C(crate::func::CClosure {
+                                f: cf,
+                                env,
+                                upvals: Vec::new(),
+                            }));
+                        push(l, LuaValue::func(clos));
+                        return Ok(1);
+                    }
+                    let msg = format!("\n\tcannot make a C function closure for '{}'", open);
+                    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+                    Ok(1)
+                }
+                None => {
+                    let msg = format!(
+                        "\n\tno C function support in '{}' (link luajit-rs-cpi)",
+                        fname_str
+                    );
+                    push(l, l.heap().str_value(l.heap().intern(msg.as_bytes())));
+                    Ok(1)
+                }
+            }
         }
         None => {
             push(
@@ -861,4 +1023,7 @@ fn ensure_sub_table(l: &mut LuaState, pkg_idx: i32, name: &str) {
         lua_pushvalue(l, -1);
         lua_setfield(l, pkg_idx, name);
     }
+    // Restore the stack: the callers expect no net stack change (a fresh
+    // state must end up with an empty stack after `open_libs`).
+    lua_pop(l, 1);
 }

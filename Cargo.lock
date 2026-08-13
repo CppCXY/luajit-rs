@@ -120,7 +120,16 @@ name = "luajit-rs-cli"
 version = "0.1.0"
 dependencies = [
  "luajit-rs",
+ "luajit-rs-cpi",
  "mimalloc",
+]
+
+[[package]]
+name = "luajit-rs-cpi"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "luajit-rs",
 ]
 
 [[package]]

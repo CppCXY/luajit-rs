@@ -678,6 +678,27 @@ fn main() {
 }
 
 fn run_main() {
+    // Enable loading native C modules through require/package.loadlib.
+    luajit_rs_cpi::install_factory();
+    // On Windows, keep the cdylib resident so modules compiled against its
+    // import library resolve their imports from this process.
+    #[cfg(windows)]
+    {
+        use std::ffi::CString;
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            let dll = dir.join("luajit_rs_cpi.dll");
+            if dll.exists()
+                && let Ok(c) = CString::new(dll.to_str().unwrap_or_default())
+            {
+                unsafe extern "system" {
+                    fn LoadLibraryA(name: *const u8) -> isize;
+                }
+                let _ = unsafe { LoadLibraryA(c.as_ptr() as *const u8) };
+            }
+        }
+    }
     #[cfg(windows)]
     install_crash_handler();
     let args: Vec<String> = std::env::args().collect();
