@@ -1,0 +1,17 @@
+[package]
+name = "luajit-rs-cpi"
+version = "0.1.0"
+edition = "2024"
+description = "C-style LuaJIT-compatible API (cdylib/staticlib) over luajit-rs"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+luajit-rs.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+cc = "1"

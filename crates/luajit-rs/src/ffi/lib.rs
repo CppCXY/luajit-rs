@@ -9,7 +9,11 @@ use std::ffi::CString;
 use crate::err::LuaResult;
 use crate::ffi::clib;
 use crate::ffi::parser::parse;
-use crate::ffi::{CT, CTState, CType, CTypeID, ct_info, ctinfo, ctype_align, ctype_cid, ctype_ispointer, ctype_isptr};use crate::func::{CClosure, CFunction, GcFunc};
+use crate::ffi::{
+    CT, CTState, CType, CTypeID, ct_info, ctinfo, ctype_align, ctype_cid, ctype_ispointer,
+    ctype_isptr,
+};
+use crate::func::{CClosure, CFunction, GcFunc};
 use crate::gc::GcPtr;
 use crate::meta::MM;
 use crate::runtime::cdata::CData;
@@ -167,20 +171,68 @@ fn call_ints(addr: usize, ret_fp: bool, args: &[i64]) -> u64 {
     let g = |i: usize| args.get(i).copied().unwrap_or(0);
     if ret_fp {
         type F = unsafe extern "system" fn(
-            i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
         ) -> f64;
         let f: F = unsafe { std::mem::transmute(addr) };
         let r = unsafe {
-            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10), g(11))
+            f(
+                g(0),
+                g(1),
+                g(2),
+                g(3),
+                g(4),
+                g(5),
+                g(6),
+                g(7),
+                g(8),
+                g(9),
+                g(10),
+                g(11),
+            )
         };
         r.to_bits()
     } else {
         type F = unsafe extern "system" fn(
-            i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
         ) -> i64;
         let f: F = unsafe { std::mem::transmute(addr) };
         let r = unsafe {
-            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10), g(11))
+            f(
+                g(0),
+                g(1),
+                g(2),
+                g(3),
+                g(4),
+                g(5),
+                g(6),
+                g(7),
+                g(8),
+                g(9),
+                g(10),
+                g(11),
+            )
         };
         r as u64
     }
@@ -191,20 +243,68 @@ fn call_fps(addr: usize, ret_fp: bool, args: &[i64]) -> u64 {
     let g = |i: usize| v.get(i).copied().unwrap_or(0.0);
     if ret_fp {
         type F = unsafe extern "system" fn(
-            f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
         ) -> f64;
         let f: F = unsafe { std::mem::transmute(addr) };
         let r = unsafe {
-            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10), g(11))
+            f(
+                g(0),
+                g(1),
+                g(2),
+                g(3),
+                g(4),
+                g(5),
+                g(6),
+                g(7),
+                g(8),
+                g(9),
+                g(10),
+                g(11),
+            )
         };
         r.to_bits()
     } else {
         type F = unsafe extern "system" fn(
-            f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
+            f64,
         ) -> i64;
         let f: F = unsafe { std::mem::transmute(addr) };
         let r = unsafe {
-            f(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7), g(8), g(9), g(10), g(11))
+            f(
+                g(0),
+                g(1),
+                g(2),
+                g(3),
+                g(4),
+                g(5),
+                g(6),
+                g(7),
+                g(8),
+                g(9),
+                g(10),
+                g(11),
+            )
         };
         r as u64
     }
@@ -555,9 +655,9 @@ impl<'a> DeclTok<'a> {
 /// `next` chain of LuaJIT's `CPDecl` stack.
 enum DeclElem {
     Base(u32),
-    Ptr(u32),        // pointer (qualifier flags)
-    Func(Vec<u32>),  // function (parameter ctype ids)
-    Array(u32),      // array (element count; u32::MAX = `?`)
+    Ptr(u32),       // pointer (qualifier flags)
+    Func(Vec<u32>), // function (parameter ctype ids)
+    Array(u32),     // array (element count; u32::MAX = `?`)
 }
 
 /// Parse an abstract declarator starting at `toks`. `base` is the element
@@ -703,11 +803,7 @@ fn parse_params(l: &mut LuaState, toks: &mut DeclTok) -> LuaResult<Vec<u32>> {
                 toks.next_tok();
                 break;
             }
-            _ => {
-                return Err(l.runtime_error(
-                    b"ffi: expected ',' or ')' in parameter list",
-                ))
-            }
+            _ => return Err(l.runtime_error(b"ffi: expected ',' or ')' in parameter list")),
         }
     }
     Ok(params)
@@ -756,9 +852,7 @@ fn parse_type_specifier(l: &mut LuaState, toks: &mut DeclTok) -> LuaResult<u32> 
             return Ok(id);
         }
     }
-    Err(l.runtime_error(
-        format!("ffi: unknown type '{}'", joined).as_bytes(),
-    ))
+    Err(l.runtime_error(format!("ffi: unknown type '{}'", joined).as_bytes()))
 }
 
 /// Create a fixed-size array type `elem[N]`.
@@ -1028,8 +1122,7 @@ pub fn ffi_new(l: &mut LuaState) -> LuaResult<i32> {
                                 && off + esz <= cd.data.len()
                             {
                                 let n = src.as_ref().data.len().min(esz);
-                                cd.data[off..off + n]
-                                    .copy_from_slice(&src.as_ref().data[..n]);
+                                cd.data[off..off + n].copy_from_slice(&src.as_ref().data[..n]);
                             }
                         }
                         break;
@@ -1332,8 +1425,7 @@ fn type_name_of_id(l: &LuaState, id: u32) -> Option<Vec<u8>> {
                 ptrto = true;
             }
             crate::ffi::CT::Array
-                if !crate::ffi::ctype_iscomplex(info)
-                    && !crate::ffi::ctype_isvector(info) =>
+                if !crate::ffi::ctype_iscomplex(info) && !crate::ffi::ctype_isvector(info) =>
             {
                 if ptrto {
                     ptrto = false;
@@ -1398,7 +1490,11 @@ fn base_type_name(l: &LuaState, id: u32) -> Option<String> {
             } else {
                 "struct "
             };
-            Some(format!("{}{}", prefix, named.unwrap_or_else(|| id.to_string())))
+            Some(format!(
+                "{}{}",
+                prefix,
+                named.unwrap_or_else(|| id.to_string())
+            ))
         }
         crate::ffi::CT::Enum => {
             if id == CTypeID::CTypeIDType as u32 {
@@ -1610,23 +1706,14 @@ pub fn ffi_cast(l: &mut LuaState) -> LuaResult<i32> {
     if let Some(cd) = val.as_cdata() {
         // Casting an array/struct/pointer to a scalar/pointer type stores the
         // source's address (array decay), rather than copying its contents.
-        let src_aggr = l
-            .global()
-            .cts
-            .as_ref()
-            .is_some_and(|c| {
-                let info = c.raw(cd.as_ref().ctypeid).info;
-                crate::ffi::ctype_ispointer(info)
-                    || crate::ffi::ctype_isstruct(info)
-            });
-        let dst_scalar = l
-            .global()
-            .cts
-            .as_ref()
-            .is_some_and(|c| {
-                let info = c.raw(id).info;
-                crate::ffi::ctype_isnum(info) || crate::ffi::ctype_isptr(info)
-            });
+        let src_aggr = l.global().cts.as_ref().is_some_and(|c| {
+            let info = c.raw(cd.as_ref().ctypeid).info;
+            crate::ffi::ctype_ispointer(info) || crate::ffi::ctype_isstruct(info)
+        });
+        let dst_scalar = l.global().cts.as_ref().is_some_and(|c| {
+            let info = c.raw(id).info;
+            crate::ffi::ctype_isnum(info) || crate::ffi::ctype_isptr(info)
+        });
         if src_aggr && dst_scalar {
             let addr = cdata_arg_addr(l, cd);
             let mut nc = CData::new(id, 8);
@@ -1914,7 +2001,8 @@ fn array_element(l: &mut LuaState, cd: GcPtr<CData>, idx: i64) -> LuaResult<i32>
     };
     // Read the element bytes. Pointer cdata dereference through the stored
     // address (arbitrary memory); arrays/structs read from the object's data.
-    let elem_bytes = unsafe { std::slice::from_raw_parts(elem_addr as *const u8, elem_sz) }.to_vec();
+    let elem_bytes =
+        unsafe { std::slice::from_raw_parts(elem_addr as *const u8, elem_sz) }.to_vec();
     let sub = CData {
         ctypeid: elem_typeid,
         data: elem_bytes.into_boxed_slice(),
@@ -1942,12 +2030,7 @@ fn array_element(l: &mut LuaState, cd: GcPtr<CData>, idx: i64) -> LuaResult<i32>
 /// checking against the object's known storage when available. Pointer
 /// cdata dereference through their stored address; pointer-arithmetic
 /// aliases resolve to their base object.
-fn cdata_elem_addr(
-    cd: GcPtr<CData>,
-    raw_ct: &CType,
-    idx: i64,
-    elem_sz: usize,
-) -> Option<usize> {
+fn cdata_elem_addr(cd: GcPtr<CData>, raw_ct: &CType, idx: i64, elem_sz: usize) -> Option<usize> {
     let c = cd.as_ref();
     let is_ptr = ctype_isptr(raw_ct.info);
     if is_ptr {
@@ -2462,11 +2545,7 @@ fn clib_index(l: &mut LuaState) -> LuaResult<i32> {
         // A cdef declaration keeps the prototype so the call wrapper can
         // validate arguments against the parameter types.
         let ctypeid = cts.names.get(&name).copied();
-        let sym_name = cts
-            .symbols
-            .get(&name)
-            .cloned()
-            .unwrap_or(name.clone());
+        let sym_name = cts.symbols.get(&name).cloned().unwrap_or(name.clone());
         // Resolve (and cache) the address in the library.
         let addr = {
             let cts = l.global().cts.as_mut().unwrap();
@@ -2785,7 +2864,12 @@ fn make_c_callback_method(l: &mut LuaState, f: CFunction) -> LuaValue {
 /// The callback id behind a function-pointer cdata (looked up by address).
 fn callback_id_of(l: &LuaState, cd: crate::gc::GcPtr<CData>) -> Option<u32> {
     let addr = cd.as_ref().get_ptr();
-    l.global().cts.as_ref()?.callback_by_addr.get(&addr).copied()
+    l.global()
+        .cts
+        .as_ref()?
+        .callback_by_addr
+        .get(&addr)
+        .copied()
 }
 
 /// `cdata:free()` — free the callback (calling it afterwards raises).
@@ -3203,15 +3287,13 @@ fn preload_loader(l: &mut LuaState) -> LuaResult<i32> {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
-    use super::*;
     use crate::state::Lua;
     use crate::stdlib::open_libs;
     use crate::value::LuaValue;
     use crate::vm::call;
 
     fn run(lua: &mut Lua, src: &str) -> Vec<LuaValue> {
-        let f =
-            crate::state::load(lua.main(), src.as_bytes().to_vec(), "=ffi_load_test").unwrap();
+        let f = crate::state::load(lua.main(), src.as_bytes().to_vec(), "=ffi_load_test").unwrap();
         call(lua.main(), f, &[]).unwrap()
     }
 

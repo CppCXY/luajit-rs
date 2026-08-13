@@ -33,6 +33,10 @@ direction and review.
   callbacks, and `ffi.load` for named dynamic libraries.
 - **C-style API** (`luajit_rs::api`) — stack-based Lua C API mirror:
   `push_number`/`get_global`/`pcall`/`new_userdata`/`set_metatable` etc.
+- **LuaJIT-compatible C ABI** (`crates/luajit-rs-cpi`) — cdylib/staticlib
+  with `lua.h`/`lauxlib.h`/`lualib.h` headers: embed from C, and load
+  native C extension modules via `require`/`package.loadlib`
+  (`luaL_register`-based modules compiled against the import library).
 - **Interactive REPL**, `-e`, `-l`, `-v`, stdin pipeline, script-file
   execution.
 
@@ -138,7 +142,10 @@ runs native code; we fall back to IR interpretation).
 ## Workspace
 
 - `crates/luajit-rs` — the engine (library).
-- `crates/luajit-rs-cli` — command-line frontend (`luajit-rs` binary).
+- `crates/luajit-rs-cli` — command-line frontend (`luajit-rs` binary;
+  links the C API so `require` can load native modules).
+- `crates/luajit-rs-cpi` — LuaJIT-compatible C API (cdylib + staticlib +
+  headers in `include/`).
 - `crates/luajit-wasm` — WebAssembly build of the engine.
 
 ## License

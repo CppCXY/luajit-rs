@@ -458,13 +458,20 @@ pub fn lua_getfield(l: &mut LuaState, idx: i32, k: &str) {
 }
 
 pub fn lua_setfield(l: &mut LuaState, idx: i32, k: &str) {
+    // Resolve the index before popping the value (negative indices count
+    // the pending value, per the C API convention).
+    let abs = lua_absindex(l, idx);
     let val = if l.top > l.base {
         l.top -= 1;
         l.stack[l.top]
     } else {
         LuaValue::NIL
     };
-    let tab = lua_index(l, idx);
+    let tab = if abs >= l.base && abs < l.top {
+        l.stack[abs]
+    } else {
+        LuaValue::NIL
+    };
     if let Some(t) = tab.as_table() {
         let sid = l.global().heap.intern(k.as_bytes());
         let lk = l.global().heap.str_value(sid);
@@ -474,13 +481,18 @@ pub fn lua_setfield(l: &mut LuaState, idx: i32, k: &str) {
 }
 
 pub fn lua_gettable(l: &mut LuaState, idx: i32) {
+    let abs = lua_absindex(l, idx); // before popping the key
     let key = if l.top > l.base {
         l.top -= 1;
         l.stack[l.top]
     } else {
         LuaValue::NIL
     };
-    let tab = lua_index(l, idx);
+    let tab = if abs >= l.base && abs < l.top {
+        l.stack[abs]
+    } else {
+        LuaValue::NIL
+    };
     if let Some(t) = tab.as_table() {
         let v = t.as_ref().get(key);
         lua_pushraw(l, v);
@@ -490,6 +502,7 @@ pub fn lua_gettable(l: &mut LuaState, idx: i32) {
 }
 
 pub fn lua_settable(l: &mut LuaState, idx: i32) {
+    let abs = lua_absindex(l, idx); // before popping key and value
     let val = if l.top > l.base {
         l.top -= 1;
         l.stack[l.top]
@@ -502,7 +515,11 @@ pub fn lua_settable(l: &mut LuaState, idx: i32) {
     } else {
         LuaValue::NIL
     };
-    let tab = lua_index(l, idx);
+    let tab = if abs >= l.base && abs < l.top {
+        l.stack[abs]
+    } else {
+        LuaValue::NIL
+    };
     if let Some(t) = tab.as_table() {
         t.as_mut().set(key, val);
         gc_table_write(l, t, val);
@@ -520,13 +537,18 @@ pub fn lua_rawgeti(l: &mut LuaState, idx: i32, n: i32) {
 }
 
 pub fn lua_rawseti(l: &mut LuaState, idx: i32, n: i32) {
+    let abs = lua_absindex(l, idx); // before popping the value
     let val = if l.top > l.base {
         l.top -= 1;
         l.stack[l.top]
     } else {
         LuaValue::NIL
     };
-    let tab = lua_index(l, idx);
+    let tab = if abs >= l.base && abs < l.top {
+        l.stack[abs]
+    } else {
+        LuaValue::NIL
+    };
     if let Some(t) = tab.as_table() {
         t.as_mut().set_int(n, val);
         gc_table_write(l, t, val);
@@ -536,13 +558,18 @@ pub fn lua_rawseti(l: &mut LuaState, idx: i32, n: i32) {
 // ── Raw get/set (bypass metamethods) ──────────────────────────────────
 
 pub fn lua_rawget(l: &mut LuaState, idx: i32) {
+    let abs = lua_absindex(l, idx); // before popping the key
     let key = if l.top > l.base {
         l.top -= 1;
         l.stack[l.top]
     } else {
         LuaValue::NIL
     };
-    let tab = lua_index(l, idx);
+    let tab = if abs >= l.base && abs < l.top {
+        l.stack[abs]
+    } else {
+        LuaValue::NIL
+    };
     if let Some(t) = tab.as_table() {
         let v = t.as_ref().get(key);
         lua_pushraw(l, v);
@@ -552,6 +579,7 @@ pub fn lua_rawget(l: &mut LuaState, idx: i32) {
 }
 
 pub fn lua_rawset(l: &mut LuaState, idx: i32) {
+    let abs = lua_absindex(l, idx); // before popping key and value
     let val = if l.top > l.base {
         l.top -= 1;
         l.stack[l.top]
@@ -564,7 +592,11 @@ pub fn lua_rawset(l: &mut LuaState, idx: i32) {
     } else {
         LuaValue::NIL
     };
-    let tab = lua_index(l, idx);
+    let tab = if abs >= l.base && abs < l.top {
+        l.stack[abs]
+    } else {
+        LuaValue::NIL
+    };
     if let Some(t) = tab.as_table() {
         t.as_mut().set(key, val);
         gc_table_write(l, t, val);
@@ -603,22 +635,31 @@ pub fn lua_touserdata(l: &LuaState, idx: i32) -> *mut u8 {
 // ── Metatables ────────────────────────────────────────────────────────
 
 pub fn lual_newmetatable(l: &mut LuaState, tname: &str) -> i32 {
-    let (registry, mt_val) = {
+    // LuaJIT semantics: the metatable is pushed in both cases; the return
+    // value reports whether it was created (1) or already existed (0).
+    let (registry, mt_val, created) = {
         let g = l.global();
         let sid = g.heap.intern(tname.as_bytes());
         let key = g.heap.str_value(sid);
         let registry = g.registry;
-        if !registry.as_ref().get(key).is_nil() {
-            return 0;
+        let existing = registry.as_ref().get(key);
+        if !existing.is_nil() {
+            (registry, existing, false)
+        } else {
+            let mt = g.heap.alloc_table(LuaTable::new(0, 2));
+            let mt_val = LuaValue::table(mt);
+            registry.as_mut().set(key, mt_val);
+            (registry, mt_val, true)
         }
-        let mt = g.heap.alloc_table(LuaTable::new(0, 2));
-        let mt_val = LuaValue::table(mt);
-        registry.as_mut().set(key, mt_val);
-        (registry, mt_val)
     };
     barrier_back(&mut l.global().heap, registry);
     barrier_fwd(&mut l.global().heap, mt_val);
-    1
+    lua_pushraw(l, mt_val);
+    if created {
+        1
+    } else {
+        0
+    }
 }
 
 pub fn lual_getmetatable(l: &mut LuaState, tname: &str) {
@@ -630,6 +671,7 @@ pub fn lual_getmetatable(l: &mut LuaState, tname: &str) {
 }
 
 pub fn lua_setmetatable(l: &mut LuaState, idx: i32) {
+    let abs = lua_absindex(l, idx); // before popping the metatable
     let mt_v = if l.top > l.base {
         l.top -= 1;
         l.stack[l.top]
@@ -637,7 +679,11 @@ pub fn lua_setmetatable(l: &mut LuaState, idx: i32) {
         LuaValue::NIL
     };
     let mt = mt_v.as_table();
-    let v = lua_index(l, idx);
+    let v = if abs >= l.base && abs < l.top {
+        l.stack[abs]
+    } else {
+        LuaValue::NIL
+    };
     match v.itype() {
         LJ_TTAB => {
             if let Some(t) = v.as_table() {

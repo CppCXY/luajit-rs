@@ -10,4 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 luajit-rs.workspace = true
+luajit-rs-cpi = { path = "../luajit-rs-cpi" }
 mimalloc.workspace = true

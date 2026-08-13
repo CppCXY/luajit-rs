@@ -49,6 +49,21 @@ impl CLib {
         }
     }
 
+    /// Load a library at an exact path (no suffix candidates) — used by
+    /// `package.loadlib`. The returned handle is intentionally not
+    /// registered anywhere: module libraries stay loaded for the process
+    /// lifetime (dlclose would invalidate their functions).
+    pub fn load_raw(path: &str, global: bool) -> Result<CLib, String> {
+        let handle = open_one(path, global)
+            .map_err(|e| format!("cannot load library '{}': {}", path, e))?;
+        Ok(CLib {
+            name: path.to_string(),
+            handle,
+            refcount: 0,
+            cache: std::collections::HashMap::new(),
+        })
+    }
+
     /// Resolve a symbol within this library (or the default namespace
     /// when `handle == 0`). `None` when the symbol does not exist.
     pub fn resolve(&self, name: &str) -> Option<usize> {
@@ -141,43 +156,58 @@ fn load_library(name: &str, global: bool) -> Result<usize, String> {
     }
     let mut last_err = String::new();
     for cand in &candidates {
-        #[cfg(windows)]
-        {
-            let c = match std::ffi::CString::new(cand.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            unsafe {
-                let h = LoadLibraryA(c.as_ptr() as *const u8);
-                if h != 0 {
-                    return Ok(h as usize);
-                }
-                last_err = format!("{} (error {})", cand, std::io::Error::last_os_error());
-            }
-        }
-        #[cfg(unix)]
-        {
-            let c = match std::ffi::CString::new(cand.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let flags = if global { RTLD_GLOBAL | RTLD_NOW } else { RTLD_NOW };
-            unsafe {
-                let h = dlopen(c.as_ptr(), flags);
-                if !h.is_null() {
-                    return Ok(h as usize);
-                }
-                let err = dlerror();
-                last_err = if err.is_null() {
-                    format!("cannot open '{}'", cand)
-                } else {
-                    let s = std::ffi::CStr::from_ptr(err).to_string_lossy();
-                    format!("{} ({})", cand, s)
-                };
-            }
+        match open_one(cand, global) {
+            Ok(h) => return Ok(h),
+            Err(e) => last_err = e,
         }
     }
     Err(last_err)
+}
+
+/// dlopen/LoadLibrary a single candidate name.
+#[cfg_attr(target_arch = "wasm32", allow(unused))]
+#[cfg_attr(windows, allow(unused_variables))]
+fn open_one(name: &str, global: bool) -> Result<usize, String> {
+    #[cfg(windows)]
+    {
+        let c = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return Err(format!("invalid library name '{}'", name)),
+        };
+        unsafe {
+            let h = LoadLibraryA(c.as_ptr() as *const u8);
+            if h != 0 {
+                return Ok(h as usize);
+            }
+            Err(format!("{} (error {})", name, std::io::Error::last_os_error()))
+        }
+    }
+    #[cfg(unix)]
+    {
+        let c = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return Err(format!("invalid library name '{}'", name)),
+        };
+        let flags = if global { RTLD_GLOBAL | RTLD_NOW } else { RTLD_NOW };
+        unsafe {
+            let h = dlopen(c.as_ptr(), flags);
+            if !h.is_null() {
+                return Ok(h as usize);
+            }
+            let err = dlerror();
+            if err.is_null() {
+                Err(format!("cannot open '{}'", name))
+            } else {
+                let s = std::ffi::CStr::from_ptr(err).to_string_lossy();
+                Err(format!("{} ({})", name, s))
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (name, global);
+        Err("dynamic libraries not supported on this platform".to_string())
+    }
 }
 
 /// On Windows, searches these default libraries in order.
@@ -228,10 +258,14 @@ const RTLD_GLOBAL: i32 = 0x8;
 ///
 /// # Safety
 /// Must be called on the main thread before any other clib operations.
+/// (Idempotent and thread-safe: parallel `luaL_openlibs` calls may race
+/// into this function, so the writes happen under a `std::sync::Once`.)
 #[cfg(windows)]
 pub unsafe fn init_default_libs() {
-    let handles = &raw mut CLIB_DEF_HANDLES;
-    unsafe {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| unsafe {
+        let handles = &raw mut CLIB_DEF_HANDLES;
         GetModuleHandleExA(2, std::ptr::null(), &mut (*handles)[CLIB_HANDLE_EXE]);
         GetModuleHandleExA(
             6,
@@ -246,7 +280,7 @@ pub unsafe fn init_default_libs() {
         (*handles)[CLIB_HANDLE_USER32] = LoadLibraryA(u32.as_ptr() as *const u8);
         let g32 = cstr("gdi32.dll");
         (*handles)[CLIB_HANDLE_GDI32] = LoadLibraryA(g32.as_ptr() as *const u8);
-    }
+    });
 }
 
 #[cfg(windows)]

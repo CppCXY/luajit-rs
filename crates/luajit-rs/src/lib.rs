@@ -15,6 +15,7 @@ use vm::err;
 // export the public API
 pub use api::*;
 pub use runtime::state::{Lua, LuaState};
+pub use stdlib::package::set_cfunc_factory;
 pub use stdlib::reg::{LibBuilder, LibTarget};
 pub use vm::err::{LuaError, LuaResult};
 
